@@ -1,0 +1,11 @@
+node_modules/
+*.log
+
+# editor / OS
+.DS_Store
+.vscode/
+.idea/
+
+# build output (none today — core is run as .ts via jiti/vitest)
+dist/
+*.tsbuildinfo
