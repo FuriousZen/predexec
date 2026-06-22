@@ -83,13 +83,50 @@ const PlanTreeSchema = Type.Object({
 
 const DESCRIPTION =
   "Run a tree of shell commands with deterministic branching — no model call between nodes. " +
-  "Depth 0 (one node, no edges) is normal execution. Add edges only when the next step depends on this node's output.";
+  "A straight-line sequence that always runs is ONE node with a `commands[]` list (not a chain " +
+  "of `always` edges). Independent commands go in one node with `parallel:true`. Add edges ONLY " +
+  "when the NEXT command depends on this node's output (exit code / match / fileExists).";
 
 const STEERING =
-  "\n\nWhen a task involves multiple shell steps where later steps depend on earlier results " +
-  "(e.g. build then test, check then branch), use the `predexec` tool to combine them into " +
-  "one call with edges gated on exit codes or output. Use plain `bash` for single commands " +
-  "or independent steps with no conditional logic.";
+  "\n\nUse the `predexec` tool for multi-step shell work to save round-trips:" +
+  "\n- A pipeline that always runs the same steps = ONE node, all steps in `commands[]`. Do NOT " +
+  "wire them as separate nodes joined by `always` edges — that adds no value over one node." +
+  "\n- Independent checks (lint AND test AND typecheck) = ONE node with `parallel:true`." +
+  "\n- Use edges only for genuine output-dependent branching (e.g. build succeeds → test)." +
+  "\n- A `mutationStop` or `noEdgeMatch` result is recoverable, not a failure: read why it " +
+  "stopped, fix the plan or resume with plain `bash` — don't abandon the tool. " +
+  "Use plain `bash` for a single command.";
+
+/**
+ * Free-tier models routinely emit nested JSON as a STRING (e.g. `nodes` arrives
+ * double-encoded, or the whole argument object is stringified). The strict
+ * schema rejects that with an opaque "must be object". Recover defensively: parse
+ * a stringified plan or a stringified `nodes`, and on failure return a message
+ * that says what shape was expected instead of a validator dump.
+ */
+export function coercePlan(params: unknown): PlanTree {
+  let p: unknown = params;
+  if (typeof p === "string") p = parseOrThrow(p, "plan");
+  if (p && typeof p === "object" && typeof (p as { nodes?: unknown }).nodes === "string") {
+    p = { ...(p as object), nodes: parseOrThrow((p as { nodes: string }).nodes, "nodes") };
+  }
+  const plan = p as PlanTree;
+  if (!plan || typeof plan !== "object" || typeof plan.root !== "string" || !Array.isArray(plan.nodes)) {
+    throw new Error(
+      "predexec expected an object with a string `root` and an array `nodes` (each {id, commands[]}). " +
+        "If your harness stringifies arguments, pass the plan as a JSON object, not a string.",
+    );
+  }
+  return plan;
+}
+
+function parseOrThrow(s: string, what: string): unknown {
+  try {
+    return JSON.parse(s);
+  } catch (err) {
+    throw new Error(`predexec could not parse \`${what}\` as JSON: ${(err as Error).message}`);
+  }
+}
 
 export default function predexec(pi: ExtensionAPI): void {
   pi.on("before_agent_start", async (event) => {
@@ -100,15 +137,25 @@ export default function predexec(pi: ExtensionAPI): void {
     name: "predexec",
     label: "predexec",
     description: DESCRIPTION,
-    promptSnippet: "Batch independent commands in one node; add edges only on output-dependent branches",
+    promptSnippet: "One node = a whole pipeline (commands[] or parallel:true); add edges only for output-dependent branches",
     promptGuidelines: [
-      "Independent steps go in ONE node (parallel:true if order doesn't matter). A separate node + edge is only for output-dependent branching.",
+      "A straight-line pipeline goes in ONE node's commands[]. Independent steps in ONE node with parallel:true. Separate nodes + edges are ONLY for output-dependent branching — never chain steps with `always` edges.",
       "Read-only only: writes/installs/deletes hard-stop without running. Tests, builds, linters, cat, ls, grep are not mutating.",
       "Conditions read raw stdout/stderr — don't wrap commands in markers or cd prefixes (set cwd on the plan instead).",
+      "A mutationStop/noEdgeMatch result is recoverable: read the reason, fix the plan or resume with bash — don't drop the tool.",
     ],
     parameters: PlanTreeSchema,
     async execute(_toolCallId, params: Static<typeof PlanTreeSchema>, signal, _onUpdate, ctx) {
-      const result = await runPlanTree(params as unknown as PlanTree, { cwd: ctx.cwd, signal });
+      let plan: PlanTree;
+      try {
+        plan = coercePlan(params);
+      } catch (err) {
+        return {
+          content: [{ type: "text" as const, text: (err as Error).message }],
+          details: { stoppedReason: "error", fellBack: true },
+        };
+      }
+      const result = await runPlanTree(plan, { cwd: ctx.cwd, signal });
       return {
         content: [{ type: "text" as const, text: result.transcript || "(no output)" }],
         details: {

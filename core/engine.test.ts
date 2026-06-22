@@ -138,6 +138,41 @@ describe("runPlanTree — traversal & stop reasons", () => {
     expect(r.pathTaken).toContain("a");
   });
 
+  it("does NOT false-positive on `>` comparisons inside single-quoted awk programs", async () => {
+    // The exact case that tripped the hoopoff/mimo session: `awk '$1 > 200'`.
+    const plan: PlanTree = {
+      root: "a",
+      nodes: [{
+        id: "a",
+        commands: ["find . -name '*.ts' -exec wc -l {} + | sort -rn | awk '$1 > 200 {print $2, $1}'"],
+      }],
+    };
+    const r = await runPlanTree(plan, { cwd });
+    expect(r.stoppedReason).not.toBe("mutationStop");
+    expect(r.pathTaken).toEqual(["a"]);
+  });
+
+  it("does NOT false-positive on `>` inside [[ ]] tests or (( )) arithmetic", async () => {
+    const plan: PlanTree = {
+      root: "a",
+      nodes: [{
+        id: "a",
+        commands: ["x=5; [[ $x > 3 ]] && echo big", "(( 4 > 2 )) && echo yes"],
+      }],
+    };
+    const r = await runPlanTree(plan, { cwd });
+    expect(r.stoppedReason).not.toBe("mutationStop");
+    expect(r.pathTaken).toEqual(["a"]);
+  });
+
+  it("mutationStop block names the offending command and token", async () => {
+    const plan: PlanTree = { root: "a", nodes: [{ id: "a", commands: ["echo ok", "echo hi > out.txt"] }] };
+    const r = await runPlanTree(plan, { cwd });
+    expect(r.stoppedReason).toBe("mutationStop");
+    expect(r.transcript).toContain("command 2"); // 1-based index of the offending command
+    expect(r.transcript).toContain("echo hi > out.txt");
+  });
+
   it("still catches real destructive commands (rm, file redirect)", async () => {
     const rmPlan: PlanTree = { root: "a", nodes: [{ id: "a", commands: ["rm -rf /tmp/whatever"] }] };
     expect((await runPlanTree(rmPlan, { cwd })).stoppedReason).toBe("mutationStop");
@@ -147,6 +182,11 @@ describe("runPlanTree — traversal & stop reasons", () => {
 
     const cpPlan: PlanTree = { root: "a", nodes: [{ id: "a", commands: ["cp -r src/ dest/"] }] };
     expect((await runPlanTree(cpPlan, { cwd })).stoppedReason).toBe("mutationStop");
+
+    // Destructive word inside single quotes must still be caught (only angle
+    // brackets are neutralized in quoted spans, not the whole span).
+    const quotedRm: PlanTree = { root: "a", nodes: [{ id: "a", commands: ["sh -c 'rm -rf /tmp/x'"] }] };
+    expect((await runPlanTree(quotedRm, { cwd })).stoppedReason).toBe("mutationStop");
   });
 
   it("plan.cwd: runs commands and resolves fileExists in the given dir", async () => {

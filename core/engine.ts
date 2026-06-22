@@ -53,9 +53,9 @@ export async function runPlanTree(plan: PlanTree, opts: RunOptions): Promise<Cor
   // eslint-disable-next-line no-constant-condition
   while (true) {
     // Mutation hard-stop: never RUN a mutating node in the read-only MVP.
-    const destructive = current.mutates || hasDestructiveCommand(current);
-    if (destructive) {
-      blocks.push(mutationBlock(current));
+    const detected = current.mutates ? null : findDestructive(current);
+    if (current.mutates || detected) {
+      blocks.push(mutationBlock(current, detected));
       return result(pathTaken, depth, "mutationStop", blocks.join("\n\n"), edgesEvaluated, edgesMatched);
     }
 
@@ -133,10 +133,35 @@ export function validatePlan(plan: PlanTree, byId: Map<string, PlanNode>): strin
   return null;
 }
 
-/** Conservative backstop for an undeclared write/install/delete. Defense in depth. */
-function hasDestructiveCommand(node: PlanNode): boolean {
-  if (node.mutates) return true;
-  return node.commands.some((c) => DESTRUCTIVE.test(c));
+/**
+ * Conservative backstop for an undeclared write/install/delete. Defense in depth.
+ * Returns the offending command (+ matched token) so the hard-stop can tell the
+ * model exactly what tripped it; null if the node is read-only.
+ */
+function findDestructive(node: PlanNode): { index: number; command: string; token: string } | null {
+  for (let i = 0; i < node.commands.length; i++) {
+    const m = DESTRUCTIVE.exec(sanitizeForRedirect(node.commands[i]));
+    if (m) return { index: i, command: node.commands[i], token: m[0].trim() };
+  }
+  return null;
+}
+
+/**
+ * Neutralize `>`/`<` where they are comparisons, not file redirects, so a read
+ * is not misread as a write: inside shell single-quoted programs (awk/sed/jq —
+ * e.g. `awk '$1 > 200'`), `[[ ... ]]` tests, and `(( ... ))` arithmetic. Only the
+ * angle brackets in those spans are dropped — the rest of the span is kept, so a
+ * genuinely destructive word inside quotes (`sh -c 'rm -rf /'`) is still caught
+ * by the rm/install/git checks. Real redirects (`echo x > f`) live OUTSIDE these
+ * spans and are untouched. Bare `test`/`[` are left alone: outside `[[ ]]`,
+ * `test $x > 5` IS a real redirect to a file named `5`.
+ */
+function sanitizeForRedirect(cmd: string): string {
+  const dropAngles = (s: string) => s.replace(/[<>]/g, " ");
+  return cmd
+    .replace(/'[^']*'/g, dropAngles)
+    .replace(/\[\[[\s\S]*?\]\]/g, dropAngles)
+    .replace(/\(\([\s\S]*?\)\)/g, dropAngles);
 }
 
 const DESTRUCTIVE =
@@ -151,12 +176,25 @@ function transcriptBlock(node: PlanNode, output: NodeOutput): string {
   return lines.join("\n");
 }
 
-function mutationBlock(node: PlanNode): string {
-  return [
+function mutationBlock(
+  node: PlanNode,
+  detected: { index: number; command: string; token: string } | null,
+): string {
+  const lines = [
     `## node ${node.id} — MUTATION HARD-STOP (not run)`,
     `commands: ${node.commands.join(node.parallel ? " & " : " ; ")}`,
-    "Speculation stops before any write/install/delete. Resume with normal tool calling to perform it.",
-  ].join("\n");
+  ];
+  if (detected) {
+    lines.push(
+      `Blocked by token \`${detected.token}\` in command ${detected.index + 1}: ${detected.command}`,
+      "If that token is a comparison (e.g. inside awk/`[[ ]]`/`(( ))`) and NOT a write, " +
+        "isolate it in its own node or rephrase, then retry.",
+    );
+  } else {
+    lines.push("Declared mutates:true.");
+  }
+  lines.push("Speculation stops before any write/install/delete. Resume with normal tool calling to perform it.");
+  return lines.join("\n");
 }
 
 function result(
