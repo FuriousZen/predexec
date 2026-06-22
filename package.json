@@ -4,6 +4,7 @@
   "private": true,
   "type": "module",
   "description": "Predictive execution: collapse an adaptive multi-level tool sequence into a single model round-trip via a deterministic plan tree. pi coding agent extension.",
+  "keywords": ["pi-package"],
   "main": "index.ts",
   "pi": {
     "extensions": [

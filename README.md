@@ -38,27 +38,32 @@ up only when branches are genuinely predictable.
 HIGH-confidence (may gate deeper speculation): `exitCode`, `fileExists`, `jsonPath`, `numeric`,
 `always`. LOW-confidence (may branch only to a read-only node): `match` (regex over stdout/stderr).
 
-## Try it out in a workspace
-
-**Prerequisites:** Node 22+ and the pi coding agent on your PATH (`npm i -g
-@earendil-works/pi-coding-agent`), with a provider configured in `~/.pi` (any provider works;
-predexec's payoff is largest on a request-limited free tier such as NVIDIA NIM or OpenRouter
-free). This repo also ships a `.devcontainer/` (Node 22 + pi + opencode, wired to NVIDIA NIM)
-if you'd rather develop in a container.
+## Install
 
 ```bash
-# 1. clone and install dev deps (pnpm — the project's package manager)
-git clone <this-repo-url> predexec && cd predexec
-corepack enable            # makes pnpm available (ships with Node)
-pnpm install
-
-# 2. launch pi in any project directory with predexec loaded live (no install step)
-cd /path/to/some/project
-pi -e /path/to/predexec/index.ts
+pi install git:github.com/FuriousZen/predexec
 ```
 
-`-e` loads the extension's `.ts` directly via jiti — no build. Once pi starts, the `predexec`
-tool is registered and the model will route multi-step work through it on its own.
+That's the whole install. pi clones the repo, runs `npm install --omit=dev` (pulling only the
+runtime deps `typebox` + `@earendil-works/pi-ai`), and registers the `predexec` tool from the
+package's `pi.extensions` manifest — no build step (it's loaded as `.ts` via jiti). Once pi
+starts, the model routes multi-step work through it on its own.
+
+```bash
+pi -e git:github.com/FuriousZen/predexec       # try it for one run, no settings change
+pi remove git:github.com/FuriousZen/predexec   # uninstall
+pi update --extensions                          # update installed packages
+```
+
+**Prerequisites:** Node 22+ and the pi coding agent on PATH (`npm i -g
+@earendil-works/pi-coding-agent`), authenticated for some provider. The simplest way is an env
+var — pi auto-detects provider keys from the environment (`OPENCODE_API_KEY`, `NVIDIA_API_KEY`,
+`OPENROUTER_API_KEY`, …), so no `~/.pi` editing is required. predexec's payoff is largest on a
+request-limited free tier (OpenCode Zen free models, NVIDIA NIM, OpenRouter free).
+
+> **Using the bundled devcontainer?** Nothing to do — `post-create` auto-installs predexec on
+> every rebuild, and `.devcontainer/.env` injects `NVIDIA_API_KEY` + `OPENCODE_API_KEY` so pi
+> is authenticated on first boot (see `.env.example`).
 
 **A prompt to see it work** (read-only, structurally predictable — predexec's sweet spot):
 
@@ -72,24 +77,26 @@ test command — resolving several branch points in a single round-trip instead 
 call per step. Inspect the tool result's `details` (`depthReached`, `pathTaken`,
 `stoppedReason`, `edgesEvaluated`/`edgesMatched`) to see the path the engine walked.
 
-## Develop
+## Develop / contribute
+
+Clone and use pnpm (the project's package manager):
 
 ```bash
+git clone https://github.com/FuriousZen/predexec && cd predexec
+corepack enable     # makes pnpm available (ships with Node)
 pnpm install
-pnpm test          # vitest unit tests (core)
-pnpm run typecheck # tsc --noEmit
+pnpm test           # vitest unit tests (core)
+pnpm run typecheck  # tsc --noEmit
 ```
 
-## Install into pi (persistent)
-
-Copy this directory into pi's global extensions dir and install runtime deps:
+Load your working copy live in pi while iterating — no build, jiti loads the `.ts`:
 
 ```bash
-cp -r predexec ~/.pi/agent/extensions/predexec
-cd ~/.pi/agent/extensions/predexec && pnpm install --prod
+pi -e /path/to/predexec/index.ts   # or just run `pi` inside the repo (package.json pi.extensions)
 ```
 
-pi auto-discovers `~/.pi/agent/extensions/*/index.ts` on start.
+(In the devcontainer the repo is already at `/workspaces/predexec/predexec` and the benchmark
+loads it via this same `-e` path, so your edits are always what's measured.)
 
 ## Layout
 
