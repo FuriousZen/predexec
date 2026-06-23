@@ -7,7 +7,7 @@
  */
 
 import { spawn } from "node:child_process";
-import type { NodeOutput, PlanNode, RunOptions } from "./types.ts";
+import type { NodeOutput, Operation, PlanNode, RunOptions, ToolOp } from "./types.ts";
 
 /** Per-stream capture cap (chars). Keeps the transcript bounded on noisy commands. */
 export const OUTPUT_CAP = 8192;
@@ -17,6 +17,10 @@ interface CommandResult {
   stdout: string;
   stderr: string;
   exitCode: number;
+}
+
+export function isToolOp(op: Operation): op is ToolOp {
+  return typeof op === "object" && op !== null && typeof op.tool === "string";
 }
 
 export async function runNode(node: PlanNode, opts: RunOptions): Promise<NodeOutput> {
@@ -31,23 +35,50 @@ export async function runNode(node: PlanNode, opts: RunOptions): Promise<NodeOut
   return aggregate(results);
 }
 
-async function runSequential(commands: string[], opts: RunOptions): Promise<CommandResult[]> {
+async function runSequential(commands: Operation[], opts: RunOptions): Promise<CommandResult[]> {
   const results: CommandResult[] = [];
   for (const command of commands) {
     if (opts.signal?.aborted) break;
-    const res = await runOne(command, opts);
+    const res = await runOneOp(command, opts);
     results.push(res);
-    // Stop-on-first-error: a non-zero exit halts the sequential batch.
     if (res.exitCode !== 0) break;
   }
   return results;
 }
 
-async function runParallel(commands: string[], opts: RunOptions): Promise<CommandResult[]> {
-  return Promise.all(commands.map((command) => runOne(command, opts)));
+async function runParallel(commands: Operation[], opts: RunOptions): Promise<CommandResult[]> {
+  return Promise.all(commands.map((command) => runOneOp(command, opts)));
 }
 
-function runOne(command: string, opts: RunOptions): Promise<CommandResult> {
+async function runOneOp(op: Operation, opts: RunOptions): Promise<CommandResult> {
+  if (typeof op === "string") return runShell(op, opts);
+  if (isToolOp(op)) return runToolOp(op, opts);
+  return { command: "unknown", stdout: "", stderr: "invalid operation: expected string or {tool, ...}", exitCode: 1 };
+}
+
+async function runToolOp(op: ToolOp, opts: RunOptions): Promise<CommandResult> {
+  const label = formatToolOpLabel(op);
+  if (!opts.executeToolOp) {
+    return { command: label, stdout: "", stderr: "no tool executor provided for tool operations", exitCode: 1 };
+  }
+  try {
+    const result = await opts.executeToolOp(op, { cwd: opts.cwd, signal: opts.signal });
+    if (result.stdout) opts.onCommandOutput?.(result.stdout);
+    if (result.stderr) opts.onCommandOutput?.(result.stderr);
+    return { command: label, ...result };
+  } catch (err) {
+    const msg = (err as Error).message ?? String(err);
+    return { command: label, stdout: "", stderr: msg, exitCode: 1 };
+  }
+}
+
+/** Produce a short label like `read:src/foo.ts` or `grep:pattern` for transcript headers. */
+export function formatToolOpLabel(op: ToolOp): string {
+  const primary = (op.path ?? op.pattern ?? op.command ?? "") as string;
+  return primary ? `${op.tool}:${primary}` : op.tool;
+}
+
+function runShell(command: string, opts: RunOptions): Promise<CommandResult> {
   return new Promise<CommandResult>((resolvePromise) => {
     let stdout = "";
     let stderr = "";

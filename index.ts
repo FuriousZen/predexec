@@ -12,7 +12,13 @@
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { runPlanTree, parseConditionString, type PlanTree } from "./core/index.ts";
+import {
+  createReadTool,
+  createGrepTool,
+  createFindTool,
+  createLsTool,
+} from "@earendil-works/pi-coding-agent";
+import { runPlanTree, parseConditionString, type PlanTree, type ToolOp } from "./core/index.ts";
 
 /**
  * Condition is modelled as a single loose object (discriminated by `kind`)
@@ -77,8 +83,14 @@ const PlanNode = {
     id: { type: "string", description: "Unique node id." },
     commands: {
       type: "array",
-      items: { type: "string" },
-      description: "Shell commands. Sequential (stop-on-first-error) unless parallel:true.",
+      items: {
+        description:
+          "Shell command (string) or tool call (object with 'tool' key). " +
+          "Read-only tools: read ({tool,path,offset?,limit?}), grep ({tool,pattern,path?,glob?,ignoreCase?}), " +
+          "find ({tool,pattern,path?}), ls ({tool,path?}). " +
+          "Mutating tools (hard-stop): edit, write.",
+      },
+      description: "Shell commands and/or tool calls. Sequential (stop-on-first-error) unless parallel:true.",
     },
     parallel: {
       type: "boolean",
@@ -113,9 +125,38 @@ const PlanTreeSchema = {
 };
 
 const DESCRIPTION =
-  "Run read-only shell commands with deterministic branching. " +
-  "Commands run sequentially (stop-on-first-error) or concurrently (parallel:true). " +
+  "Run read-only shell commands and tool calls with deterministic branching. " +
+  "Each node runs shell commands (strings) and/or tool calls ({tool, ...args}) sequentially or concurrently. " +
   "Edges evaluate conditions on output to choose the next node with no model call between levels.";
+
+type TextContent = { type: "text"; text: string };
+
+function createToolExecutor(cwd: string, signal?: AbortSignal) {
+  const tools: Record<string, { execute: (id: string, params: any, signal?: AbortSignal) => Promise<{ content: { type: string; text?: string }[]; details?: unknown }> }> = {
+    read: createReadTool(cwd),
+    grep: createGrepTool(cwd),
+    find: createFindTool(cwd),
+    ls: createLsTool(cwd),
+  };
+
+  return async (op: ToolOp, opts: { cwd: string; signal?: AbortSignal }) => {
+    const tool = tools[op.tool];
+    if (!tool) {
+      return { stdout: "", stderr: `unknown tool: ${op.tool}`, exitCode: 1 };
+    }
+    try {
+      const { tool: _name, ...args } = op;
+      const result = await tool.execute(`predexec-${Date.now()}`, args, opts.signal ?? signal);
+      const stdout = result.content
+        .filter((c): c is TextContent => c.type === "text" && typeof c.text === "string")
+        .map((c) => c.text)
+        .join("\n");
+      return { stdout, stderr: "", exitCode: 0 };
+    } catch (err) {
+      return { stdout: "", stderr: (err as Error).message, exitCode: 1 };
+    }
+  };
+}
 
 const BASH_NUDGE =
   "[predexec] Use predexec instead of bash for read-only commands.";
@@ -192,8 +233,9 @@ export default function predexec(pi: ExtensionAPI): void {
     name: "predexec",
     label: "predexec",
     description: DESCRIPTION,
-    promptSnippet: "Default tool for non-mutative shell work — commands, pipelines, and branching sequences",
+    promptSnippet: "Default tool for read-only work — shell commands, tool calls (read/grep/find/ls), and branching sequences",
     promptGuidelines: [
+      'Use predexec for all read-only work: shell commands as strings, or tool calls as {tool:"read",path:"..."}, {tool:"grep",pattern:"...",path:"..."}, {tool:"find",pattern:"..."}, {tool:"ls",path:"..."}.',
       'Edge conditions can be strings: "exit == 0", "stdout =~ /pattern/", "file exists path", "always". Use object form only for jsonPath/numeric.',
       "Read-only: writes/installs/deletes hard-stop. Tests, builds, linters, cat, ls, grep are not mutating.",
       "mutationStop/noEdgeMatch is recoverable: read the transcript, fix the plan or resume with bash.",
@@ -241,9 +283,12 @@ export default function predexec(pi: ExtensionAPI): void {
 
       if (onUpdate) emitUpdate("");
 
+      const executeToolOp = createToolExecutor(ctx.cwd, signal);
+
       const result = await runPlanTree(plan, {
         cwd: ctx.cwd,
         signal,
+        executeToolOp,
         onProgress(event) {
           streamedText = event.transcript;
           emitUpdate(event.transcript, {

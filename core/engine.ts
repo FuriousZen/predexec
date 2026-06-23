@@ -17,16 +17,18 @@
 
 import { resolve } from "node:path";
 import { evaluateCondition } from "./conditions.ts";
-import { runNode } from "./runner.ts";
+import { runNode, isToolOp, formatToolOpLabel } from "./runner.ts";
 import {
   DEFAULT_MAX_DEPTH,
   HIGH_CONFIDENCE_KINDS,
   type CoreResult,
   type NodeOutput,
+  type Operation,
   type PlanNode,
   type PlanTree,
   type RunOptions,
   type StoppedReason,
+  type ToolOp,
 } from "./types.ts";
 
 export async function runPlanTree(plan: PlanTree, opts: RunOptions): Promise<CoreResult> {
@@ -140,6 +142,11 @@ export function validatePlan(plan: PlanTree, byId: Map<string, PlanNode>): strin
   return null;
 }
 
+/** Tool names that are definitively read-only — no regex analysis needed. */
+const READ_ONLY_TOOLS = new Set(["read", "grep", "find", "ls"]);
+/** Tool names that are definitively mutating — hard-stop unconditionally. */
+const MUTATING_TOOLS = new Set(["edit", "write"]);
+
 /**
  * Conservative backstop for an undeclared write/install/delete. Defense in depth.
  * Returns the offending command (+ matched token) so the hard-stop can tell the
@@ -147,11 +154,26 @@ export function validatePlan(plan: PlanTree, byId: Map<string, PlanNode>): strin
  */
 function findDestructive(node: PlanNode): { index: number; command: string; token: string } | null {
   for (let i = 0; i < node.commands.length; i++) {
-    const cmd = node.commands[i]!;
-    const m = DESTRUCTIVE.exec(sanitizeForRedirect(cmd));
-    if (m) return { index: i, command: cmd, token: m[0].trim() };
+    const op = node.commands[i]!;
+    if (isToolOp(op)) {
+      const result = checkToolOpDestructive(op);
+      if (result) return { index: i, command: formatToolOpLabel(op), token: result };
+      continue;
+    }
+    const m = DESTRUCTIVE.exec(sanitizeForRedirect(op));
+    if (m) return { index: i, command: op, token: m[0].trim() };
   }
   return null;
+}
+
+function checkToolOpDestructive(op: ToolOp): string | null {
+  if (READ_ONLY_TOOLS.has(op.tool)) return null;
+  if (MUTATING_TOOLS.has(op.tool)) return `tool:${op.tool}`;
+  if (op.tool === "bash" && typeof op.command === "string") {
+    const m = DESTRUCTIVE.exec(sanitizeForRedirect(op.command));
+    return m ? m[0].trim() : null;
+  }
+  return `unknown tool:${op.tool}`;
 }
 
 /**
@@ -176,9 +198,11 @@ const DESTRUCTIVE =
   /\b(rm|rmdir|mv|dd|mkfs|chmod|chown|truncate)\b|\bcp\s+-|(?<![\d&=])>(?!\s*\/dev\/null|[&=])|\b(npm|pnpm|yarn|pip|pip3|apt|apt-get|brew|cargo|go)\s+(install|add|i|remove|uninstall|rm)\b|\bgit\s+(push|commit|reset|checkout|clean|rm)\b/;
 
 function transcriptBlock(node: PlanNode, output: NodeOutput): string {
-  // The command itself is already in the plan (tool-call args); echoing it here
-  // would re-enter context as input on the follow-up turn. Emit id + exit only.
   const lines = [`## node ${node.id} (exit ${output.exitCode})`];
+  const toolOps = node.commands.filter(isToolOp);
+  if (toolOps.length > 0) {
+    lines.push(toolOps.map((op) => `[${formatToolOpLabel(op)}]`).join(" "));
+  }
   if (output.stdout) lines.push("stdout:", output.stdout.trimEnd());
   if (output.stderr) lines.push("stderr:", output.stderr.trimEnd());
   const truncated =
@@ -191,13 +215,17 @@ function transcriptBlock(node: PlanNode, output: NodeOutput): string {
   return lines.join("\n");
 }
 
+function formatOp(op: Operation): string {
+  return isToolOp(op) ? formatToolOpLabel(op) : op;
+}
+
 function mutationBlock(
   node: PlanNode,
   detected: { index: number; command: string; token: string } | null,
 ): string {
   const lines = [
     `## node ${node.id} — MUTATION HARD-STOP (not run)`,
-    `commands: ${node.commands.join(node.parallel ? " & " : " ; ")}`,
+    `commands: ${node.commands.map(formatOp).join(node.parallel ? " & " : " ; ")}`,
   ];
   if (detected) {
     lines.push(

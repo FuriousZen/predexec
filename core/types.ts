@@ -10,10 +10,19 @@
 
 export type NodeId = string;
 
+/** A tool call operation within a node batch. The `tool` key names the tool; remaining keys are tool-specific args. */
+export interface ToolOp {
+  tool: string;
+  [key: string]: unknown;
+}
+
+/** A single step in a node's batch: a shell command (string) or a tool call (object). */
+export type Operation = string | ToolOp;
+
 export interface PlanNode {
   id: NodeId;
-  /** The batch run at this node. Sequential by default; concurrent if `parallel`. */
-  commands: string[];
+  /** The batch run at this node. Strings are shell commands; objects are tool calls. Sequential by default; concurrent if `parallel`. */
+  commands: Operation[];
   /** Run `commands` concurrently instead of sequentially. Default false. */
   parallel?: boolean;
   /**
@@ -116,11 +125,19 @@ export interface ProgressEvent {
 export type OnProgress = (event: ProgressEvent) => void;
 export type OnCommandOutput = (data: string) => void;
 
+/** Adapter-provided callback to execute tool operations. Returns normalized shell-like output. */
+export type ToolExecutor = (
+  op: ToolOp,
+  opts: { cwd: string; signal?: AbortSignal },
+) => Promise<{ stdout: string; stderr: string; exitCode: number }>;
+
 export interface RunOptions {
   cwd: string;
   signal?: AbortSignal;
   onProgress?: OnProgress;
   onCommandOutput?: OnCommandOutput;
+  /** Callback to execute tool operations ({tool, ...args}). Required when plan contains tool ops. */
+  executeToolOp?: ToolExecutor;
 }
 
 /** Engine-level backstop when a plan omits maxDepth. */

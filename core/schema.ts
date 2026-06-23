@@ -99,8 +99,14 @@ export const PLAN_NODE_JSON_SCHEMA = {
     id: { type: "string", description: "Unique node id, referenced by edges." },
     commands: {
       type: "array",
-      items: { type: "string" },
-      description: "Shell commands. Sequential (stop-on-first-error) unless parallel:true.",
+      items: {
+        description:
+          "Shell command (string) or tool call (object with 'tool' key). " +
+          "Read-only tools: read ({tool,path,offset?,limit?}), grep ({tool,pattern,path?,glob?,ignoreCase?,literal?,context?,limit?}), " +
+          "find ({tool,pattern,path?,limit?}), ls ({tool,path?,limit?}). " +
+          "Mutating tools (hard-stop): edit, write.",
+      },
+      description: "Shell commands and/or tool calls. Sequential (stop-on-first-error) unless parallel:true.",
     },
     parallel: {
       type: "boolean",
