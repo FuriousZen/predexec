@@ -44,8 +44,8 @@ HIGH-confidence (may gate deeper speculation): `exitCode`, `fileExists`, `jsonPa
 pi install git:github.com/FuriousZen/predexec
 ```
 
-That's the whole install. pi clones the repo, runs `npm install --omit=dev` (pulling only the
-runtime deps `typebox` + `@earendil-works/pi-ai`), and registers the `predexec` tool from the
+That's the whole install. pi clones the repo, runs `npm install --omit=dev` (zero runtime
+dependencies), and registers the `predexec` tool from the
 package's `pi.extensions` manifest — no build step (it's loaded as `.ts` via jiti). Once pi
 starts, the model routes multi-step work through it on its own.
 
@@ -101,8 +101,7 @@ loads it via this same `-e` path, so your edits are always what's measured.)
 ## Layout
 
 ```
-index.ts     pi adapter — builds the typebox schema, wires ctx.cwd + signal, delegates to core
+index.ts     pi adapter — builds the JSON Schema, wires ctx.cwd + signal + onUpdate, delegates to core
 core/        PURE TS, zero harness imports (promotable to a standalone package)
   types.ts conditions.ts runner.ts engine.ts schema.ts index.ts
-core/*.test.ts   vitest unit tests
 ```

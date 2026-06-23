@@ -6,6 +6,9 @@ node_modules/
 .vscode/
 .idea/
 
+# tests (local-only, not tracked)
+__tests__/
+
 # build output (none today — core is run as .ts via jiti/vitest)
 dist/
 *.tsbuildinfo
