@@ -10,6 +10,17 @@
  * (types.ts). This is solely the registration/validation contract for adapters.
  */
 
+/**
+ * NOTE for adapter authors — provider compatibility caveat.
+ * This canonical schema uses `oneOf`, which several providers (notably Google)
+ * reject or mangle, as do literal/`const`-union enums. The pi adapter therefore
+ * does NOT consume this directly: it flattens Condition into a single loose
+ * `kind`-discriminated object (see `Condition` in ../index.ts) and lets the
+ * exception-safe evaluator switch on `kind`. Any new adapter targeting a
+ * strict-union-hostile provider must do the same flattening — do not feed this
+ * `oneOf` form to such a provider. It is kept here as the precise, documented
+ * contract; the loose object is the wire-safe projection of it.
+ */
 export const CONDITION_JSON_SCHEMA = {
   oneOf: [
     {

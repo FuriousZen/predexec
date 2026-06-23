@@ -140,8 +140,9 @@ export function validatePlan(plan: PlanTree, byId: Map<string, PlanNode>): strin
  */
 function findDestructive(node: PlanNode): { index: number; command: string; token: string } | null {
   for (let i = 0; i < node.commands.length; i++) {
-    const m = DESTRUCTIVE.exec(sanitizeForRedirect(node.commands[i]));
-    if (m) return { index: i, command: node.commands[i], token: m[0].trim() };
+    const cmd = node.commands[i]!;
+    const m = DESTRUCTIVE.exec(sanitizeForRedirect(cmd));
+    if (m) return { index: i, command: cmd, token: m[0].trim() };
   }
   return null;
 }
@@ -165,7 +166,7 @@ function sanitizeForRedirect(cmd: string): string {
 }
 
 const DESTRUCTIVE =
-  /\b(rm|rmdir|mv|dd|mkfs|chmod|chown|truncate)\b|\bcp\s+-|(?<![\d&=])>(?!\/dev\/null|[&=])|\b(npm|pnpm|yarn|pip|pip3|apt|apt-get|brew|cargo|go)\s+(install|add|i|remove|uninstall|rm)\b|\bgit\s+(push|commit|reset|checkout|clean|rm)\b/;
+  /\b(rm|rmdir|mv|dd|mkfs|chmod|chown|truncate)\b|\bcp\s+-|(?<![\d&=])>(?!\s*\/dev\/null|[&=])|\b(npm|pnpm|yarn|pip|pip3|apt|apt-get|brew|cargo|go)\s+(install|add|i|remove|uninstall|rm)\b|\bgit\s+(push|commit|reset|checkout|clean|rm)\b/;
 
 function transcriptBlock(node: PlanNode, output: NodeOutput): string {
   // The command itself is already in the plan (tool-call args); echoing it here

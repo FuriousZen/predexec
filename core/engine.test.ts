@@ -122,6 +122,16 @@ describe("runPlanTree — traversal & stop reasons", () => {
     expect(r.pathTaken).toContain("a");
   });
 
+  it("does NOT false-positive on a spaced `> /dev/null` redirect (benign discard)", async () => {
+    const plan: PlanTree = {
+      root: "a",
+      nodes: [{ id: "a", commands: ["grep foo bar > /dev/null || echo none", "ls -la >/dev/null 2>&1"] }],
+    };
+    const r = await runPlanTree(plan, { cwd });
+    expect(r.stoppedReason).not.toBe("mutationStop");
+    expect(r.pathTaken).toEqual(["a"]);
+  });
+
   it("does NOT false-positive on JS arrow functions or >= comparisons in node -e", async () => {
     const plan: PlanTree = {
       root: "a",
