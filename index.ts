@@ -4,28 +4,14 @@
  * Registers ONE tool, `predexec`, that runs a pre-planned tree of command
  * batches with deterministic branch conditions in a single model round-trip.
  * All real logic lives in ./core (pure TS, zero harness imports); this file is
- * just: build the typebox schema, wire ctx.cwd + signal, format the result.
+ * just: build the JSON Schema, wire ctx.cwd + signal, format the result.
  *
  * Type-only import of the pi API keeps zero runtime dependency on the host
- * package (jiti strips `import type`). The only runtime imports are the schema
- * lib (typebox) and StringEnum (provider-compatible enums) — declared as deps
- * so resolution works once this dir is copied into ~/.pi/agent/extensions/.
+ * package (jiti strips `import type`). The schema is a plain JSON Schema
+ * literal — no runtime dependencies.
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { Type, type TUnsafe, type Static } from "typebox";
-
-function StringEnum<T extends readonly string[]>(
-  values: T,
-  options?: { description?: string; default?: T[number] },
-): TUnsafe<T[number]> {
-  return Type.Unsafe<T[number]>({
-    type: "string",
-    enum: values as unknown as string[],
-    ...(options?.description && { description: options.description }),
-    ...(options?.default && { default: options.default }),
-  });
-}
 import { runPlanTree, type PlanTree } from "./core/index.ts";
 
 /**
@@ -35,62 +21,89 @@ import { runPlanTree, type PlanTree } from "./core/index.ts";
  * exception-safe and switches on `kind`, so a superset object is robust. Field
  * descriptions teach which fields pair with which kind.
  */
-const Condition = Type.Object(
-  {
-    kind: StringEnum(["exitCode", "fileExists", "jsonPath", "numeric", "match", "always"], {
+const Condition = {
+  type: "object",
+  description: "Deterministic edge condition.",
+  properties: {
+    kind: {
+      type: "string",
+      enum: ["exitCode", "fileExists", "jsonPath", "numeric", "match", "always"],
       description: "exitCode/fileExists/jsonPath/numeric = high-confidence; match = low-confidence (read-only children only); always = unconditional.",
-    }),
-    op: Type.Optional(
-      StringEnum(["eq", "ne", "lt", "gt", "le", "ge", "exists"], {
-        description: "exitCode: eq/ne/lt/gt. numeric: lt/le/gt/ge/eq. jsonPath: eq/ne/exists.",
-      }),
-    ),
-    value: Type.Optional(Type.Any({ description: "Comparison value (exitCode/numeric/jsonPath)." })),
-    path: Type.Optional(
-      Type.String({ description: "fileExists: path relative to cwd. jsonPath: dot/bracket path in stdout JSON." }),
-    ),
-    source: Type.Optional(StringEnum(["stdout", "stderr"], { description: "Stream to test (match/numeric/jsonPath)." })),
-    extract: Type.Optional(Type.String({ description: "numeric: regex to extract number (group 1 or whole match)." })),
-    regex: Type.Optional(Type.String({ description: "match: regex to test." })),
-    negate: Type.Optional(Type.Boolean({ description: "Invert result (fileExists/match)." })),
+    },
+    op: {
+      type: "string",
+      enum: ["eq", "ne", "lt", "gt", "le", "ge", "exists"],
+      description: "exitCode: eq/ne/lt/gt. numeric: lt/le/gt/ge/eq. jsonPath: eq/ne/exists.",
+    },
+    value: { description: "Comparison value (exitCode/numeric/jsonPath)." },
+    path: {
+      type: "string",
+      description: "fileExists: path relative to cwd. jsonPath: dot/bracket path in stdout JSON.",
+    },
+    source: {
+      type: "string",
+      enum: ["stdout", "stderr"],
+      description: "Stream to test (match/numeric/jsonPath).",
+    },
+    extract: {
+      type: "string",
+      description: "numeric: regex to extract number (group 1 or whole match).",
+    },
+    regex: { type: "string", description: "match: regex to test." },
+    negate: { type: "boolean", description: "Invert result (fileExists/match)." },
   },
-  { description: "Deterministic edge condition." },
-);
+  required: ["kind"],
+} as const;
 
-const PlanEdge = Type.Object({
-  when: Condition,
-  to: Type.String({ description: "Target node id." }),
-});
+const PlanEdge = {
+  type: "object",
+  properties: {
+    when: Condition,
+    to: { type: "string", description: "Target node id." },
+  },
+  required: ["when", "to"],
+} as const;
 
-const PlanNode = Type.Object({
-  id: Type.String({ description: "Unique node id." }),
-  commands: Type.Array(Type.String(), {
-    description: "Shell commands. Sequential (stop-on-first-error) unless parallel:true.",
-  }),
-  parallel: Type.Optional(
-    Type.Boolean({ description: "Run commands concurrently instead of sequentially." }),
-  ),
-  mutates: Type.Optional(
-    Type.Boolean({
+const PlanNode = {
+  type: "object",
+  properties: {
+    id: { type: "string", description: "Unique node id." },
+    commands: {
+      type: "array",
+      items: { type: "string" },
+      description: "Shell commands. Sequential (stop-on-first-error) unless parallel:true.",
+    },
+    parallel: {
+      type: "boolean",
+      description: "Run commands concurrently instead of sequentially.",
+    },
+    mutates: {
+      type: "boolean",
       description:
         "True ONLY for writes/installs/deletes. Tests/builds/linters/cat/ls/grep are NOT mutating. Mutating nodes hard-stop without running.",
-    }),
-  ),
-  edges: Type.Optional(
-    Type.Array(PlanEdge, {
+    },
+    edges: {
+      type: "array",
+      items: PlanEdge,
       description: "Conditions evaluated in order; first match wins. Omit for a leaf.",
-    }),
-  ),
-});
+    },
+  },
+  required: ["id", "commands"],
+} as const;
 
-const PlanTreeSchema = Type.Object({
-  root: Type.String({ description: "Starting node id." }),
-  nodes: Type.Array(PlanNode),
-  cwd: Type.Optional(
-    Type.String({ description: "Base dir for commands and fileExists (relative to session cwd)." }),
-  ),
-  maxDepth: Type.Optional(Type.Number({ description: "Cap on speculation depth." })),
-});
+const PlanTreeSchema = {
+  type: "object",
+  properties: {
+    root: { type: "string", description: "Starting node id." },
+    nodes: { type: "array", items: PlanNode },
+    cwd: {
+      type: "string",
+      description: "Base dir for commands and fileExists (relative to session cwd).",
+    },
+    maxDepth: { type: "number", description: "Cap on speculation depth." },
+  },
+  required: ["root", "nodes"],
+};
 
 const DESCRIPTION =
   "Batch 2+ shell operations in one round-trip instead of chaining bash/read calls. " +
@@ -180,8 +193,8 @@ export default function predexec(pi: ExtensionAPI): void {
       "A mutationStop/noEdgeMatch result is recoverable: read the reason, fix the plan or resume with bash — don't drop the tool.",
       "Precision: use grep/find to locate, sed/head to extract — avoid cat on files you haven't verified are small.",
     ],
-    parameters: PlanTreeSchema,
-    async execute(_toolCallId, params: Static<typeof PlanTreeSchema>, signal, _onUpdate, ctx) {
+    parameters: PlanTreeSchema as any,
+    async execute(_toolCallId, params: Record<string, unknown>, signal, _onUpdate, ctx) {
       let plan: PlanTree;
       try {
         plan = coercePlan(params);

@@ -16,9 +16,7 @@
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit"
   },
-  "dependencies": {
-    "typebox": "1.1.38"
-  },
+  "dependencies": {},
   "devDependencies": {
     "@earendil-works/pi-ai": "^0.79.8",
     "@earendil-works/pi-coding-agent": "^0.79.8",
