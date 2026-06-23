@@ -113,13 +113,12 @@ const PlanTreeSchema = {
 };
 
 const DESCRIPTION =
-  "Run shell commands with deterministic branching. Use for all shell work — " +
-  "single commands, pipelines, and multi-step sequences. " +
+  "Run read-only shell commands with deterministic branching. " +
   "Commands run sequentially (stop-on-first-error) or concurrently (parallel:true). " +
   "Edges evaluate conditions on output to choose the next node with no model call between levels.";
 
 const BASH_NUDGE =
-  "[predexec] Use predexec instead of bash — even for single commands. " +
+  "[predexec] Use predexec instead of bash for read-only commands. " +
   "A one-command node with no edges is valid and saves a round-trip if you add more ops later.";
 
 /**
@@ -173,7 +172,7 @@ export default function predexec(pi: ExtensionAPI): void {
     return {
       systemPrompt: event.systemPrompt.replace(
         "Use bash for file operations like ls, rg, find",
-        "Use predexec for all read-only shell operations — even single commands. " +
+        "Use predexec for read-only shell operations. " +
           "Use bash for writes/installs/deletes (predexec hard-stops on those) and interactive commands",
       ),
     };
@@ -194,9 +193,8 @@ export default function predexec(pi: ExtensionAPI): void {
     name: "predexec",
     label: "predexec",
     description: DESCRIPTION,
-    promptSnippet: "Default tool for all shell work — single commands, pipelines, and branching sequences",
+    promptSnippet: "Default tool for non-mutative shell work — commands, pipelines, and branching sequences",
     promptGuidelines: [
-      "ALWAYS use predexec for read-only shell operations, even single commands. A one-command node with no edges is valid. Use bash directly for commands that write/install/delete (predexec hard-stops on those).",
       'Edge conditions can be strings: "exit == 0", "stdout =~ /pattern/", "file exists path", "always". Use object form only for jsonPath/numeric.',
       "Read-only: writes/installs/deletes hard-stop. Tests, builds, linters, cat, ls, grep are not mutating.",
       "mutationStop/noEdgeMatch is recoverable: read the transcript, fix the plan or resume with bash.",
