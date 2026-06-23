@@ -174,6 +174,13 @@ function transcriptBlock(node: PlanNode, output: NodeOutput): string {
   const lines = [`## node ${node.id} (exit ${output.exitCode})`];
   if (output.stdout) lines.push("stdout:", output.stdout.trimEnd());
   if (output.stderr) lines.push("stderr:", output.stderr.trimEnd());
+  const truncated =
+    output.stdout?.includes("…[truncated]") || output.stderr?.includes("…[truncated]");
+  if (truncated) {
+    lines.push(
+      "⚠ Output truncated. Continue from where it stopped — use tail/sed -n/head with an offset to fetch the next slice, not the full output again.",
+    );
+  }
   return lines.join("\n");
 }
 
