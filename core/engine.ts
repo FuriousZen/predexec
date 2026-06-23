@@ -67,6 +67,13 @@ export async function runPlanTree(plan: PlanTree, opts: RunOptions): Promise<Cor
     pathTaken.push(current.id);
     blocks.push(transcriptBlock(current, output));
 
+    opts.onProgress?.({
+      nodeId: current.id,
+      transcript: blocks.join("\n\n"),
+      pathTaken: [...pathTaken],
+      depthReached: depth,
+    });
+
     if (opts.signal?.aborted) {
       return result(pathTaken, depth, "aborted", blocks.join("\n\n"), edgesEvaluated, edgesMatched);
     }

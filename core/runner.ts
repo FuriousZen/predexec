@@ -66,10 +66,14 @@ function runOne(command: string, opts: RunOptions): Promise<CommandResult> {
     };
 
     child.stdout?.on("data", (d: Buffer) => {
-      if (stdout.length < OUTPUT_CAP) stdout += d.toString();
+      const s = d.toString();
+      if (stdout.length < OUTPUT_CAP) stdout += s;
+      opts.onCommandOutput?.(s);
     });
     child.stderr?.on("data", (d: Buffer) => {
-      if (stderr.length < OUTPUT_CAP) stderr += d.toString();
+      const s = d.toString();
+      if (stderr.length < OUTPUT_CAP) stderr += s;
+      opts.onCommandOutput?.(s);
     });
 
     child.on("error", (err: NodeJS.ErrnoException) => {

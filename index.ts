@@ -194,7 +194,7 @@ export default function predexec(pi: ExtensionAPI): void {
       "Precision: use grep/find to locate, sed/head to extract — avoid cat on files you haven't verified are small.",
     ],
     parameters: PlanTreeSchema as any,
-    async execute(_toolCallId, params: Record<string, unknown>, signal, _onUpdate, ctx) {
+    async execute(_toolCallId, params: Record<string, unknown>, signal, onUpdate, ctx) {
       let plan: PlanTree;
       try {
         plan = coercePlan(params);
@@ -204,7 +204,56 @@ export default function predexec(pi: ExtensionAPI): void {
           details: { stoppedReason: "error", fellBack: true },
         };
       }
-      const result = await runPlanTree(plan, { cwd: ctx.cwd, signal });
+
+      let lastUpdateAt = 0;
+      let pendingTimeout: ReturnType<typeof setTimeout> | undefined;
+      let streamedText = "";
+      const UPDATE_INTERVAL = 100;
+
+      const emitUpdate = (text: string, details?: Record<string, unknown>) => {
+        if (!onUpdate) return;
+        onUpdate({
+          content: [{ type: "text" as const, text: text || "(running…)" }],
+          details: details ?? {},
+        });
+      };
+
+      const scheduleOutputUpdate = () => {
+        if (!onUpdate) return;
+        const now = Date.now();
+        const elapsed = now - lastUpdateAt;
+        if (elapsed >= UPDATE_INTERVAL) {
+          lastUpdateAt = now;
+          emitUpdate(streamedText);
+        } else if (!pendingTimeout) {
+          pendingTimeout = setTimeout(() => {
+            pendingTimeout = undefined;
+            lastUpdateAt = Date.now();
+            emitUpdate(streamedText);
+          }, UPDATE_INTERVAL - elapsed);
+        }
+      };
+
+      if (onUpdate) emitUpdate("");
+
+      const result = await runPlanTree(plan, {
+        cwd: ctx.cwd,
+        signal,
+        onProgress(event) {
+          streamedText = event.transcript;
+          emitUpdate(event.transcript, {
+            nodeId: event.nodeId,
+            depthReached: event.depthReached,
+            pathTaken: event.pathTaken,
+          });
+        },
+        onCommandOutput(data) {
+          streamedText += data;
+          scheduleOutputUpdate();
+        },
+      });
+
+      if (pendingTimeout) clearTimeout(pendingTimeout);
       return {
         content: [{ type: "text" as const, text: result.transcript || "(no output)" }],
         details: {

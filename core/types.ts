@@ -106,9 +106,21 @@ export interface CoreResult {
   edgesMatched: number;
 }
 
+export interface ProgressEvent {
+  nodeId: string;
+  transcript: string;
+  pathTaken: NodeId[];
+  depthReached: number;
+}
+
+export type OnProgress = (event: ProgressEvent) => void;
+export type OnCommandOutput = (data: string) => void;
+
 export interface RunOptions {
   cwd: string;
   signal?: AbortSignal;
+  onProgress?: OnProgress;
+  onCommandOutput?: OnCommandOutput;
 }
 
 /** Engine-level backstop when a plan omits maxDepth. */
