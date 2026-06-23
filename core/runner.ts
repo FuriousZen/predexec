@@ -63,9 +63,11 @@ async function runToolOp(op: ToolOp, opts: RunOptions): Promise<CommandResult> {
   }
   try {
     const result = await opts.executeToolOp(op, { cwd: opts.cwd, signal: opts.signal });
-    if (result.stdout) opts.onCommandOutput?.(result.stdout);
-    if (result.stderr) opts.onCommandOutput?.(result.stderr);
-    return { command: label, ...result };
+    const stdout = result.stdout.length > OUTPUT_CAP ? `${result.stdout.slice(0, OUTPUT_CAP)}\n…[truncated]` : result.stdout;
+    const stderr = result.stderr.length > OUTPUT_CAP ? `${result.stderr.slice(0, OUTPUT_CAP)}\n…[truncated]` : result.stderr;
+    if (stdout) opts.onCommandOutput?.(stdout);
+    if (stderr) opts.onCommandOutput?.(stderr);
+    return { command: label, stdout, stderr, exitCode: result.exitCode };
   } catch (err) {
     const msg = (err as Error).message ?? String(err);
     return { command: label, stdout: "", stderr: msg, exitCode: 1 };

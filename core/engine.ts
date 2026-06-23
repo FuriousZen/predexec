@@ -212,9 +212,15 @@ function transcriptBlock(node: PlanNode, output: NodeOutput): string {
   const truncated =
     output.stdout?.includes("…[truncated]") || output.stderr?.includes("…[truncated]");
   if (truncated) {
-    lines.push(
-      "⚠ Output truncated. Continue from where it stopped — use tail/sed -n/head with an offset to fetch the next slice, not the full output again.",
-    );
+    const hasReadOps = toolOps.some((op) => op.tool === "read");
+    const hasShellCmds = node.commands.some((c) => typeof c === "string");
+    if (hasReadOps && !hasShellCmds) {
+      lines.push("⚠ Output truncated. Use read with offset to continue from where it stopped.");
+    } else if (hasReadOps) {
+      lines.push("⚠ Output truncated. Use read with offset or tail/sed -n/head to continue from where it stopped.");
+    } else {
+      lines.push("⚠ Output truncated. Use tail/sed -n/head with an offset to continue from where it stopped.");
+    }
   }
   return lines.join("\n");
 }
