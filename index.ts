@@ -118,8 +118,7 @@ const DESCRIPTION =
   "Edges evaluate conditions on output to choose the next node with no model call between levels.";
 
 const BASH_NUDGE =
-  "[predexec] Use predexec instead of bash for read-only commands. " +
-  "A one-command node with no edges is valid and saves a round-trip if you add more ops later.";
+  "[predexec] Use predexec instead of bash for read-only commands.";
 
 /**
  * Free-tier models routinely emit nested JSON as a STRING (e.g. `nodes` arrives
@@ -138,7 +137,7 @@ export function coercePlan(params: unknown): PlanTree {
   if (!plan || typeof plan !== "object" || typeof plan.root !== "string" || !Array.isArray(plan.nodes)) {
     throw new Error(
       "predexec expected an object with a string `root` and an array `nodes` (each {id, commands[]}). " +
-        "If your harness stringifies arguments, pass the plan as a JSON object, not a string.",
+      "If your harness stringifies arguments, pass the plan as a JSON object, not a string.",
     );
   }
   for (const node of plan.nodes) {
@@ -149,7 +148,7 @@ export function coercePlan(params: unknown): PlanTree {
         if (!parsed) {
           throw new Error(
             `predexec could not parse condition string "${edge.when}" on edge from "${node.id}". ` +
-              `Use: "exit == 0", "stdout =~ /pattern/", "file exists path", "always", or an object.`,
+            `Use: "exit == 0", "stdout =~ /pattern/", "file exists path", "always", or an object.`,
           );
         }
         (edge as { when: unknown }).when = parsed;
@@ -173,7 +172,7 @@ export default function predexec(pi: ExtensionAPI): void {
       systemPrompt: event.systemPrompt.replace(
         "Use bash for file operations like ls, rg, find",
         "Use predexec for read-only shell operations. " +
-          "Use bash for writes/installs/deletes (predexec hard-stops on those) and interactive commands",
+        "Use bash for writes/installs/deletes (predexec hard-stops on those) and interactive commands",
       ),
     };
   });
