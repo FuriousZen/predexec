@@ -13,8 +13,19 @@
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { StringEnum } from "@earendil-works/pi-ai";
-import { Type, type Static } from "typebox";
+import { Type, type TUnsafe, type Static } from "typebox";
+
+function StringEnum<T extends readonly string[]>(
+  values: T,
+  options?: { description?: string; default?: T[number] },
+): TUnsafe<T[number]> {
+  return Type.Unsafe<T[number]>({
+    type: "string",
+    enum: values as unknown as string[],
+    ...(options?.description && { description: options.description }),
+    ...(options?.default && { default: options.default }),
+  });
+}
 import { runPlanTree, type PlanTree } from "./core/index.ts";
 
 /**
@@ -82,20 +93,24 @@ const PlanTreeSchema = Type.Object({
 });
 
 const DESCRIPTION =
-  "Run a tree of shell commands with deterministic branching — no model call between nodes. " +
-  "A straight-line sequence that always runs is ONE node with a `commands[]` list (not a chain " +
-  "of `always` edges). Independent commands go in one node with `parallel:true`. Add edges ONLY " +
-  "when the NEXT command depends on this node's output (exit code / match / fileExists).";
+  "Batch 2+ shell operations in one round-trip instead of chaining bash/read calls. " +
+  "Group a straight pipeline in `commands[]`, independent steps with `parallel:true`, " +
+  "and edges only for output-dependent branching. " +
+  "One command → bash. One file → read. 2+ shell ops → predexec.";
 
 const STEERING =
-  "\n\nUse the `predexec` tool for multi-step shell work to save round-trips:" +
-  "\n- A pipeline that always runs the same steps = ONE node, all steps in `commands[]`. Do NOT " +
-  "wire them as separate nodes joined by `always` edges — that adds no value over one node." +
-  "\n- Independent checks (lint AND test AND typecheck) = ONE node with `parallel:true`." +
-  "\n- Use edges only for genuine output-dependent branching (e.g. build succeeds → test)." +
-  "\n- A `mutationStop` or `noEdgeMatch` result is recoverable, not a failure: read why it " +
-  "stopped, fix the plan or resume with plain `bash` — don't abandon the tool. " +
-  "Use plain `bash` for a single command.";
+  "\n\n## predexec batching\n" +
+  "When you need 2+ shell operations (reads, greps, checks), batch them in one predexec " +
+  "node instead of chaining bash/read calls — each chained call is a wasted round-trip.\n" +
+  "- Straight pipeline → ONE node, commands[] list.\n" +
+  "- Independent ops (cat 3 files, lint+test) → ONE node, parallel:true.\n" +
+  "- Output-dependent branching → edges (first match wins).\n" +
+  "- Precision: use grep/find to locate, then sed/head to extract — avoid cat on large files.\n" +
+  "- mutationStop/noEdgeMatch is recoverable: read why, fix the plan or resume with bash.";
+
+const BATCHING_NUDGE =
+  "[predexec] You just made consecutive bash/read calls. " +
+  "Batch independent shell ops in one predexec node (parallel:true) to save round-trips.";
 
 /**
  * Free-tier models routinely emit nested JSON as a STRING (e.g. `nodes` arrives
@@ -129,8 +144,28 @@ function parseOrThrow(s: string, what: string): unknown {
 }
 
 export default function predexec(pi: ExtensionAPI): void {
+  let bashReadCallsThisTurn = 0;
+
+  pi.on("turn_start", async () => {
+    bashReadCallsThisTurn = 0;
+  });
+
   pi.on("before_agent_start", async (event) => {
     return { systemPrompt: event.systemPrompt + STEERING };
+  });
+
+  pi.on("tool_result", async (event) => {
+    if (event.toolName === "bash" || event.toolName === "read") {
+      bashReadCallsThisTurn++;
+      if (bashReadCallsThisTurn >= 2) {
+        return {
+          content: [
+            ...event.content,
+            { type: "text" as const, text: `\n\n${BATCHING_NUDGE}` },
+          ],
+        };
+      }
+    }
   });
 
   pi.registerTool({
@@ -143,6 +178,7 @@ export default function predexec(pi: ExtensionAPI): void {
       "Read-only only: writes/installs/deletes hard-stop without running. Tests, builds, linters, cat, ls, grep are not mutating.",
       "Conditions read raw stdout/stderr — don't wrap commands in markers or cd prefixes (set cwd on the plan instead).",
       "A mutationStop/noEdgeMatch result is recoverable: read the reason, fix the plan or resume with bash — don't drop the tool.",
+      "Precision: use grep/find to locate, sed/head to extract — avoid cat on files you haven't verified are small.",
     ],
     parameters: PlanTreeSchema,
     async execute(_toolCallId, params: Static<typeof PlanTreeSchema>, signal, _onUpdate, ctx) {
