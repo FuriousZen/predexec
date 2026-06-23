@@ -197,6 +197,10 @@ function sanitizeForRedirect(cmd: string): string {
 const DESTRUCTIVE =
   /\b(rm|rmdir|mv|dd|mkfs|chmod|chown|truncate)\b|\bcp\s+-|(?<![\d&=])>(?!\s*\/dev\/null|[&=])|\b(npm|pnpm|yarn|pip|pip3|apt|apt-get|brew|cargo|go)\s+(install|add|i|remove|uninstall|rm)\b|\bgit\s+(push|commit|reset|checkout|clean|rm)\b/;
 
+export function isDestructiveCommand(cmd: string): boolean {
+  return DESTRUCTIVE.test(sanitizeForRedirect(cmd));
+}
+
 function transcriptBlock(node: PlanNode, output: NodeOutput): string {
   const lines = [`## node ${node.id} (exit ${output.exitCode})`];
   const toolOps = node.commands.filter(isToolOp);

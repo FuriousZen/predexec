@@ -18,7 +18,7 @@ import {
   createFindTool,
   createLsTool,
 } from "@earendil-works/pi-coding-agent";
-import { runPlanTree, parseConditionString, type PlanTree, type ToolOp } from "./core/index.ts";
+import { runPlanTree, parseConditionString, isDestructiveCommand, type PlanTree, type ToolOp } from "./core/index.ts";
 
 /**
  * Condition is modelled as a single loose object (discriminated by `kind`)
@@ -177,8 +177,8 @@ export function coercePlan(params: unknown): PlanTree {
   const plan = p as PlanTree;
   if (!plan || typeof plan !== "object" || typeof plan.root !== "string" || !Array.isArray(plan.nodes)) {
     throw new Error(
-      "predexec expected an object with a string `root` and an array `nodes` (each {id, commands[]}). " +
-      "If your harness stringifies arguments, pass the plan as a JSON object, not a string.",
+      "predexec expected a JSON object with `root` (string) and `nodes` (array of {id, commands[]}). " +
+      "Pass the plan as an object, not a string.",
     );
   }
   for (const node of plan.nodes) {
@@ -209,17 +209,27 @@ function parseOrThrow(s: string, what: string): unknown {
 
 export default function predexec(pi: ExtensionAPI): void {
   pi.on("before_agent_start", async (event) => {
-    return {
-      systemPrompt: event.systemPrompt.replace(
-        "Use bash for file operations like ls, rg, find",
-        "Use predexec for read-only shell operations. " +
-        "Use bash for writes/installs/deletes (predexec hard-stops on those) and interactive commands",
-      ),
-    };
+    let sp = event.systemPrompt;
+    const replaced = sp.replace(
+      "Use bash for file operations like ls, rg, find",
+      "Use predexec for read-only shell operations. " +
+      "Use bash for writes/installs/deletes (predexec hard-stops on those) and interactive commands",
+    );
+    if (replaced !== sp) {
+      sp = replaced;
+    } else {
+      sp = sp.replace(
+        /^(Guidelines:\n)/m,
+        "$1- Use predexec for read-only shell operations. Use bash only for writes/installs/deletes and interactive commands\n",
+      );
+    }
+    return { systemPrompt: sp };
   });
 
   pi.on("tool_result", async (event) => {
     if (event.toolName === "bash") {
+      const cmd = (event as { input?: { command?: string } }).input?.command ?? "";
+      if (!cmd || isDestructiveCommand(cmd)) return;
       return {
         content: [
           ...event.content,
@@ -235,10 +245,8 @@ export default function predexec(pi: ExtensionAPI): void {
     description: DESCRIPTION,
     promptSnippet: "Default tool for read-only work — shell commands, tool calls (read/grep/find/ls), and branching sequences",
     promptGuidelines: [
-      'Use predexec for all read-only work: shell commands as strings, or tool calls as {tool:"read",path:"..."}, {tool:"grep",pattern:"...",path:"..."}, {tool:"find",pattern:"..."}, {tool:"ls",path:"..."}.',
-      'Edge conditions can be strings: "exit == 0", "stdout =~ /pattern/", "file exists path", "always". Use object form only for jsonPath/numeric.',
-      "Read-only: writes/installs/deletes hard-stop. Tests, builds, linters, cat, ls, grep are not mutating.",
-      "mutationStop/noEdgeMatch is recoverable: read the transcript, fix the plan or resume with bash.",
+      'predexec: shell strings for bash; {tool:"read",path:...}, {tool:"grep",pattern:...}, {tool:"find",pattern:...}, {tool:"ls",path:...} for tool calls. Use parallel:true for independent reads, cwd for a shared base dir, and edges to branch.',
+      "predexec: mutationStop/noEdgeMatch is recoverable — read the transcript and resume with bash. Never retry the same plan blindly.",
     ],
     parameters: PlanTreeSchema as any,
     async execute(_toolCallId, params: Record<string, unknown>, signal, onUpdate, ctx) {
@@ -285,11 +293,14 @@ export default function predexec(pi: ExtensionAPI): void {
 
       const executeToolOp = createToolExecutor(ctx.cwd, signal);
 
+      let done = false;
+
       const result = await runPlanTree(plan, {
         cwd: ctx.cwd,
         signal,
         executeToolOp,
         onProgress(event) {
+          if (done) return;
           streamedText = event.transcript;
           emitUpdate(event.transcript, {
             nodeId: event.nodeId,
@@ -298,11 +309,13 @@ export default function predexec(pi: ExtensionAPI): void {
           });
         },
         onCommandOutput(data) {
+          if (done) return;
           streamedText += data;
           scheduleOutputUpdate();
         },
       });
 
+      done = true;
       if (pendingTimeout) clearTimeout(pendingTimeout);
       return {
         content: [{ type: "text" as const, text: result.transcript || "(no output)" }],

@@ -3,7 +3,7 @@
  * Adapters import only from here.
  */
 
-export { runPlanTree, validatePlan } from "./engine.ts";
+export { runPlanTree, validatePlan, isDestructiveCommand } from "./engine.ts";
 export { evaluateCondition, parseConditionString } from "./conditions.ts";
 export { runNode, isToolOp, formatToolOpLabel, OUTPUT_CAP } from "./runner.ts";
 export {
