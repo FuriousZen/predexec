@@ -113,13 +113,14 @@ const PlanTreeSchema = {
 };
 
 const DESCRIPTION =
-  "Batch shell commands in one round-trip with deterministic branching. " +
+  "Run shell commands with deterministic branching. Use for all shell work — " +
+  "single commands, pipelines, and multi-step sequences. " +
   "Commands run sequentially (stop-on-first-error) or concurrently (parallel:true). " +
   "Edges evaluate conditions on output to choose the next node with no model call between levels.";
 
-const BATCHING_NUDGE =
-  "[predexec] You just made 3+ consecutive bash calls. " +
-  "Batch independent shell ops in one predexec node (parallel:true) to save round-trips.";
+const BASH_NUDGE =
+  "[predexec] Use predexec instead of bash — even for single commands. " +
+  "A one-command node with no edges is valid and saves a round-trip if you add more ops later.";
 
 /**
  * Free-tier models routinely emit nested JSON as a STRING (e.g. `nodes` arrives
@@ -168,23 +169,24 @@ function parseOrThrow(s: string, what: string): unknown {
 }
 
 export default function predexec(pi: ExtensionAPI): void {
-  let bashCallsThisTurn = 0;
-
-  pi.on("turn_start", async () => {
-    bashCallsThisTurn = 0;
+  pi.on("before_agent_start", async (event) => {
+    return {
+      systemPrompt: event.systemPrompt.replace(
+        "Use bash for file operations like ls, rg, find",
+        "Use predexec for all read-only shell operations — even single commands. " +
+          "Use bash for writes/installs/deletes (predexec hard-stops on those) and interactive commands",
+      ),
+    };
   });
 
   pi.on("tool_result", async (event) => {
     if (event.toolName === "bash") {
-      bashCallsThisTurn++;
-      if (bashCallsThisTurn >= 3) {
-        return {
-          content: [
-            ...event.content,
-            { type: "text" as const, text: `\n\n${BATCHING_NUDGE}` },
-          ],
-        };
-      }
+      return {
+        content: [
+          ...event.content,
+          { type: "text" as const, text: `\n\n${BASH_NUDGE}` },
+        ],
+      };
     }
   });
 
@@ -192,9 +194,9 @@ export default function predexec(pi: ExtensionAPI): void {
     name: "predexec",
     label: "predexec",
     description: DESCRIPTION,
-    promptSnippet: "Batch 2+ shell ops in one call with deterministic branching — replaces chained bash calls",
+    promptSnippet: "Default tool for all shell work — single commands, pipelines, and branching sequences",
     promptGuidelines: [
-      "2+ shell ops in one predexec call. Straight pipeline → commands[]. Independent ops → parallel:true. Edges ONLY for output-dependent branching (never chain with always).",
+      "ALWAYS use predexec for read-only shell operations, even single commands. A one-command node with no edges is valid. Use bash directly for commands that write/install/delete (predexec hard-stops on those).",
       'Edge conditions can be strings: "exit == 0", "stdout =~ /pattern/", "file exists path", "always". Use object form only for jsonPath/numeric.',
       "Read-only: writes/installs/deletes hard-stop. Tests, builds, linters, cat, ls, grep are not mutating.",
       "mutationStop/noEdgeMatch is recoverable: read the transcript, fix the plan or resume with bash.",
