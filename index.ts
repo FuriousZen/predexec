@@ -106,23 +106,12 @@ const PlanTreeSchema = {
 };
 
 const DESCRIPTION =
-  "Batch 2+ shell operations in one round-trip instead of chaining bash/read calls. " +
-  "Group a straight pipeline in `commands[]`, independent steps with `parallel:true`, " +
-  "and edges only for output-dependent branching. " +
-  "One command → bash. One file → read. 2+ shell ops → predexec.";
-
-const STEERING =
-  "\n\n## predexec batching\n" +
-  "When you need 2+ shell operations (reads, greps, checks), batch them in one predexec " +
-  "node instead of chaining bash/read calls — each chained call is a wasted round-trip.\n" +
-  "- Straight pipeline → ONE node, commands[] list.\n" +
-  "- Independent ops (cat 3 files, lint+test) → ONE node, parallel:true.\n" +
-  "- Output-dependent branching → edges (first match wins).\n" +
-  "- Precision: use grep/find to locate, then sed/head to extract — avoid cat on large files.\n" +
-  "- mutationStop/noEdgeMatch is recoverable: read why, fix the plan or resume with bash.";
+  "Batch shell commands in one round-trip with deterministic branching. " +
+  "Commands run sequentially (stop-on-first-error) or concurrently (parallel:true). " +
+  "Edges evaluate conditions on output to choose the next node with no model call between levels.";
 
 const BATCHING_NUDGE =
-  "[predexec] You just made consecutive bash/read calls. " +
+  "[predexec] You just made 3+ consecutive bash calls. " +
   "Batch independent shell ops in one predexec node (parallel:true) to save round-trips.";
 
 /**
@@ -157,20 +146,16 @@ function parseOrThrow(s: string, what: string): unknown {
 }
 
 export default function predexec(pi: ExtensionAPI): void {
-  let bashReadCallsThisTurn = 0;
+  let bashCallsThisTurn = 0;
 
   pi.on("turn_start", async () => {
-    bashReadCallsThisTurn = 0;
-  });
-
-  pi.on("before_agent_start", async (event) => {
-    return { systemPrompt: event.systemPrompt + STEERING };
+    bashCallsThisTurn = 0;
   });
 
   pi.on("tool_result", async (event) => {
-    if (event.toolName === "bash" || event.toolName === "read") {
-      bashReadCallsThisTurn++;
-      if (bashReadCallsThisTurn >= 2) {
+    if (event.toolName === "bash") {
+      bashCallsThisTurn++;
+      if (bashCallsThisTurn >= 3) {
         return {
           content: [
             ...event.content,
@@ -185,13 +170,11 @@ export default function predexec(pi: ExtensionAPI): void {
     name: "predexec",
     label: "predexec",
     description: DESCRIPTION,
-    promptSnippet: "One node = a whole pipeline (commands[] or parallel:true); add edges only for output-dependent branches",
+    promptSnippet: "Batch 2+ shell ops in one call with deterministic branching — replaces chained bash calls",
     promptGuidelines: [
-      "A straight-line pipeline goes in ONE node's commands[]. Independent steps in ONE node with parallel:true. Separate nodes + edges are ONLY for output-dependent branching — never chain steps with `always` edges.",
-      "Read-only only: writes/installs/deletes hard-stop without running. Tests, builds, linters, cat, ls, grep are not mutating.",
-      "Conditions read raw stdout/stderr — don't wrap commands in markers or cd prefixes (set cwd on the plan instead).",
-      "A mutationStop/noEdgeMatch result is recoverable: read the reason, fix the plan or resume with bash — don't drop the tool.",
-      "Precision: use grep/find to locate, sed/head to extract — avoid cat on files you haven't verified are small.",
+      "2+ shell ops in one predexec call. Straight pipeline → commands[]. Independent ops → parallel:true. Edges ONLY for output-dependent branching (never chain with always).",
+      "Read-only: writes/installs/deletes hard-stop. Tests, builds, linters, cat, ls, grep are not mutating.",
+      "mutationStop/noEdgeMatch is recoverable: read the transcript, fix the plan or resume with bash.",
     ],
     parameters: PlanTreeSchema as any,
     async execute(_toolCallId, params: Record<string, unknown>, signal, onUpdate, ctx) {
