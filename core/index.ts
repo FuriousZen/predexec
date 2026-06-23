@@ -4,7 +4,7 @@
  */
 
 export { runPlanTree, validatePlan } from "./engine.ts";
-export { evaluateCondition } from "./conditions.ts";
+export { evaluateCondition, parseConditionString } from "./conditions.ts";
 export { runNode, OUTPUT_CAP } from "./runner.ts";
 export {
   PLAN_TREE_JSON_SCHEMA,

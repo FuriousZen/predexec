@@ -12,7 +12,7 @@
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { runPlanTree, type PlanTree } from "./core/index.ts";
+import { runPlanTree, parseConditionString, type PlanTree } from "./core/index.ts";
 
 /**
  * Condition is modelled as a single loose object (discriminated by `kind`)
@@ -58,7 +58,14 @@ const Condition = {
 const PlanEdge = {
   type: "object",
   properties: {
-    when: Condition,
+    when: {
+      description:
+        'Condition as object OR shorthand string. ' +
+        'Strings: "exit == 0", "exit != 0", "exit > N", "exit < N", ' +
+        '"stdout =~ /regex/", "stderr =~ /regex/", "stdout !~ /regex/", ' +
+        '"file exists path", "file missing path", "always". ' +
+        "Object form (for jsonPath/numeric): see Condition schema.",
+    },
     to: { type: "string", description: "Target node id." },
   },
   required: ["when", "to"],
@@ -134,6 +141,21 @@ export function coercePlan(params: unknown): PlanTree {
         "If your harness stringifies arguments, pass the plan as a JSON object, not a string.",
     );
   }
+  for (const node of plan.nodes) {
+    if (!node.edges) continue;
+    for (const edge of node.edges) {
+      if (typeof edge.when === "string") {
+        const parsed = parseConditionString(edge.when);
+        if (!parsed) {
+          throw new Error(
+            `predexec could not parse condition string "${edge.when}" on edge from "${node.id}". ` +
+              `Use: "exit == 0", "stdout =~ /pattern/", "file exists path", "always", or an object.`,
+          );
+        }
+        (edge as { when: unknown }).when = parsed;
+      }
+    }
+  }
   return plan;
 }
 
@@ -173,6 +195,7 @@ export default function predexec(pi: ExtensionAPI): void {
     promptSnippet: "Batch 2+ shell ops in one call with deterministic branching — replaces chained bash calls",
     promptGuidelines: [
       "2+ shell ops in one predexec call. Straight pipeline → commands[]. Independent ops → parallel:true. Edges ONLY for output-dependent branching (never chain with always).",
+      'Edge conditions can be strings: "exit == 0", "stdout =~ /pattern/", "file exists path", "always". Use object form only for jsonPath/numeric.',
       "Read-only: writes/installs/deletes hard-stop. Tests, builds, linters, cat, ls, grep are not mutating.",
       "mutationStop/noEdgeMatch is recoverable: read the transcript, fix the plan or resume with bash.",
     ],
