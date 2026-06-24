@@ -14,5 +14,5 @@
     "allowImportingTsExtensions": true,
     "noEmit": true
   },
-  "include": ["index.ts", "core/**/*.ts"]
+  "include": [".pi/extension/index.ts", ".opencode/plugins/predexec.ts", "core/**/*.ts"]
 }

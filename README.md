@@ -6,12 +6,13 @@ into a tree of deterministic predicates, and an engine walks the tree with **no 
 between levels**. On a request-limited free provider this trades abundant tokens for scarce
 provider requests.
 
-This package is a [pi coding agent](https://www.npmjs.com/package/@earendil-works/pi-coding-agent)
-extension registering one tool, `predexec`. See [CLAUDE.md](../CLAUDE.md) for the full design
-and current status.
+This package ships as both a [pi coding agent](https://www.npmjs.com/package/@earendil-works/pi-coding-agent)
+extension and an [opencode](https://opencode.ai) plugin, each registering one tool, `predexec`.
+See [CLAUDE.md](../CLAUDE.md) for the full design and current status.
 
-> **Status: read-only MVP.** The pure-TS core and the pi adapter are done and unit-tested.
-> predexec speculates **read-only only** — any write/install/delete hard-stops before running.
+> **Status: read-only MVP.** The pure-TS core, pi adapter, and opencode adapter are done and
+> unit-tested. predexec speculates **read-only only** — any write/install/delete hard-stops
+> before running.
 
 ## How it works
 
@@ -40,6 +41,8 @@ HIGH-confidence (may gate deeper speculation): `exitCode`, `fileExists`, `jsonPa
 
 ## Install
 
+### pi coding agent
+
 ```bash
 pi install git:github.com/FuriousZen/predexec
 ```
@@ -58,12 +61,35 @@ pi update --extensions                          # update installed packages
 **Prerequisites:** Node 22+ and the pi coding agent on PATH (`npm i -g
 @earendil-works/pi-coding-agent`), authenticated for some provider. The simplest way is an env
 var — pi auto-detects provider keys from the environment (`OPENCODE_API_KEY`, `NVIDIA_API_KEY`,
-`OPENROUTER_API_KEY`, …), so no `~/.pi` editing is required. predexec's payoff is largest on a
-request-limited free tier (OpenCode Zen free models, NVIDIA NIM, OpenRouter free).
+`OPENROUTER_API_KEY`, …), so no `~/.pi` editing is required.
+
+### opencode
+
+Add predexec as a git-backed plugin in your `opencode.json` (global `~/.config/opencode/` or
+project-level):
+
+```json
+{
+  "plugin": ["predexec@git+https://github.com/FuriousZen/predexec.git"]
+}
+```
+
+Restart opencode. It installs the package through its plugin manager (Bun clones the repo,
+resolving the `predexec` tool from the package's `main`) and registers it on startup — no build
+step. To pin a version, append a ref: `predexec@git+https://github.com/FuriousZen/predexec.git#v0.1.0`.
+
+For local development, opencode also auto-discovers `.opencode/plugins/*.ts`, so running opencode
+**inside a clone of this repo** picks up `.opencode/plugins/predexec.ts` directly.
+
+**Prerequisites:** the [opencode](https://opencode.ai) CLI installed and authenticated for some
+provider.
+
+predexec's payoff is largest on a request-limited free tier (OpenCode Zen free models, NVIDIA
+NIM, OpenRouter free).
 
 > **Using the bundled devcontainer?** Nothing to do — `post-create` auto-installs predexec on
-> every rebuild, and `.devcontainer/.env` injects `NVIDIA_API_KEY` + `OPENCODE_API_KEY` so pi
-> is authenticated on first boot (see `.env.example`).
+> every rebuild, and `.devcontainer/.env` injects `NVIDIA_API_KEY` + `OPENCODE_API_KEY` so the
+> agent is authenticated on first boot (see `.env.example`).
 
 **A prompt to see it work** (read-only, structurally predictable — predexec's sweet spot):
 
@@ -92,16 +118,17 @@ pnpm run typecheck  # tsc --noEmit
 Load your working copy live in pi while iterating — no build, jiti loads the `.ts`:
 
 ```bash
-pi -e /path/to/predexec/index.ts   # or just run `pi` inside the repo (package.json pi.extensions)
+pi -e /path/to/predexec/.pi/extension/index.ts   # or just run `pi` inside the repo (package.json pi.extensions)
 ```
 
-(In the devcontainer the repo is already at `/workspaces/predexec/predexec` and the benchmark
-loads it via this same `-e` path, so your edits are always what's measured.)
+(In the devcontainer the repo is already at `/workspaces/predexec/predexec` and the adapter
+loads from this path, so your edits are always what's measured.)
 
 ## Layout
 
 ```
-index.ts     pi adapter — builds the JSON Schema, wires ctx.cwd + signal + onUpdate, delegates to core
-core/        PURE TS, zero harness imports (promotable to a standalone package)
+.pi/extension/index.ts             pi adapter — JSON Schema + ctx wiring, delegates to core
+.opencode/plugins/predexec.ts      opencode adapter — zod schema + context wiring, delegates to core
+core/                              PURE TS, zero harness imports (promotable to a standalone package)
   types.ts conditions.ts runner.ts engine.ts schema.ts index.ts
 ```
