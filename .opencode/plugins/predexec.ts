@@ -24,7 +24,7 @@ const DESCRIPTION =
   "Use parallel:true for independent commands, cwd for a shared base dir, and edges to branch. " +
   "mutationStop/noEdgeMatch is recoverable — read the transcript and resume with bash. Never retry the same plan blindly.";
 
-export const server: Plugin = async ({ directory }) => ({
+export const server: Plugin = async () => ({
   tool: {
     predexec: tool({
       description: DESCRIPTION,

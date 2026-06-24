@@ -1,14 +1,14 @@
 /**
- * predexec — pi coding agent adapter (read-only MVP, impl steps 0–1).
+ * predexec — pi coding agent adapter (read-only MVP).
  *
  * Registers ONE tool, `predexec`, that runs a pre-planned tree of command
  * batches with deterministic branch conditions in a single model round-trip.
- * All real logic lives in ./core (pure TS, zero harness imports); this file is
- * just: build the JSON Schema, wire ctx.cwd + signal, format the result.
+ * All real logic lives in ../../core (pure TS, zero harness imports); this file
+ * builds the JSON Schema, wires ctx.cwd + signal + onUpdate, and maps native
+ * tool ops (read/grep/find/ls) to pi's tool factories.
  *
- * Type-only import of the pi API keeps zero runtime dependency on the host
- * package (jiti strips `import type`). The schema is a plain JSON Schema
- * literal — no runtime dependencies.
+ * The pi API type is import-type-only, but the tool factories
+ * (createReadTool/etc.) are runtime imports from the host package.
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
