@@ -8,6 +8,12 @@
     "pi-package"
   ],
   "main": ".opencode/plugins/predexec.ts",
+  "files": [
+    ".pi",
+    ".opencode",
+    "core",
+    "README.md"
+  ],
   "pi": {
     "extensions": [
       "./.pi/extension/index.ts"
