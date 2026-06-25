@@ -159,7 +159,7 @@ function createToolExecutor(cwd: string, signal?: AbortSignal) {
 }
 
 const BASH_NUDGE =
-  "[predexec] Use predexec instead of bash for read-only commands.";
+  '[predexec] Batch read-only commands in one predexec call: {"root":"a","nodes":[{"id":"a","commands":["cmd1","cmd2"],"parallel":true}]}';
 
 // coercePlan is now in core/coerce.ts — re-export for backward compat with tests
 export { coercePlan } from "../../core/index.ts";
