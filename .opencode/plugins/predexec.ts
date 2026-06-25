@@ -132,9 +132,15 @@ export const server: Plugin = async ({ client }) => ({
   },
 
   "tool.execute.after": async (input, output) => {
-    if (input.tool !== "bash") return;
-    const cmd = input.args?.command ?? "";
-    if (!cmd || isDestructiveCommand(cmd)) return;
-    output.output += "\n[predexec] Use predexec instead of bash for read-only commands.";
+    // opencode's read-only native tools are read / grep / glob (no `find`/`ls`:
+    // glob is the file-finder, and `read` also pages directories).
+    if (["read", "grep", "glob"].includes(input.tool)) {
+      output.output += `\n[predexec] Use predexec instead of ${input.tool} for read-only operations to batch calls.`;
+    } else if (input.tool === "bash") {
+      const cmd = input.args?.command ?? "";
+      if (cmd && !isDestructiveCommand(cmd)) {
+        output.output += "\n[predexec] Use predexec instead of bash for read-only commands.";
+      }
+    }
   },
 });
