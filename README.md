@@ -65,18 +65,21 @@ var — pi auto-detects provider keys from the environment (`OPENCODE_API_KEY`, 
 
 ### opencode
 
-Add predexec as a git-backed plugin in your `opencode.json` (global `~/.config/opencode/` or
-project-level):
+Clone the repo into opencode's global plugins directory and create a re-export wrapper:
 
-```json
-{
-  "plugin": ["predexec@git+https://github.com/FuriousZen/predexec.git"]
-}
+```bash
+# 1. Clone the repo into the plugins directory
+git clone https://github.com/FuriousZen/predexec.git \
+  ~/.config/opencode/plugins/predexec
+
+# 2. Create the re-export wrapper
+cat > ~/.config/opencode/plugins/predexec.ts << 'EOF'
+export { server } from "./predexec/.opencode/plugins/predexec.ts";
+EOF
 ```
 
-Restart opencode. It installs the package through its plugin manager (Bun clones the repo,
-resolving the `predexec` tool from the package's `main`) and registers it on startup — no build
-step. To pin a version, append a ref: `predexec@git+https://github.com/FuriousZen/predexec.git#v0.1.0`.
+Restart opencode. It auto-discovers `~/.config/opencode/plugins/predexec.ts`, which re-exports
+the plugin — no build step, no config edit needed. To update, `git pull` inside the clone.
 
 For local development, opencode also auto-discovers `.opencode/plugins/*.ts`, so running opencode
 **inside a clone of this repo** picks up `.opencode/plugins/predexec.ts` directly.
