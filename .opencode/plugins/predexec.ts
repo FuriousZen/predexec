@@ -28,6 +28,7 @@ import {
   type ToolExecutor,
 } from "../../core/index.ts";
 import { STEERING_LINE, systemHasRoutingInstructions } from "../../steering.ts";
+import { recordRun } from "../../stats.ts";
 
 const DESCRIPTION =
   "Run read-only shell commands and tool calls with deterministic branching. " +
@@ -127,6 +128,8 @@ export const server: Plugin = async ({ client }) => ({
           signal: context.abort,
           executeToolOp,
         });
+
+        void recordRun(plan, result, "opencode");
 
         return result.transcript || "(no output)";
       },

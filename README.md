@@ -64,6 +64,7 @@ pi update --extensions               # update installed packages
 
 ```bash
 pi list                              # must show npm:predexec and its install path
+node node_modules/predexec/bin/predexec.mjs doctor   # all install checks green
 ```
 
 Then start `pi` and try the prompt under [A prompt to see it work](#a-prompt-to-see-it-work) —
@@ -99,6 +100,8 @@ Restart opencode after editing. To update, bump the version (or use `"predexec@l
 **Verify** (no model request needed):
 
 ```bash
+node node_modules/predexec/bin/predexec.mjs doctor   # static install checks
+node node_modules/predexec/bin/predexec.mjs doctor --live   # live probe: spawns opencode, confirms tool registered
 opencode serve --port 4599 &
 curl -s localhost:4599/experimental/tool/ids   # must include "predexec"
 ```
@@ -147,6 +150,20 @@ test command — resolving several branch points in a single round-trip instead 
 call per step. Inspect the tool result's `details` (`depthReached`, `pathTaken`,
 `stoppedReason`, `edgesEvaluated`/`edgesMatched`) to see the path the engine walked.
 
+## Doctor & stats
+
+predexec ships a zero-dep CLI (`bin/predexec.mjs`) for install diagnostics and request accounting:
+
+```bash
+npx -y predexec doctor              # checklist: node version, pi/opencode config, cache, zod
+npx -y predexec doctor --live       # + spawns opencode and probes tool registration
+npx -y predexec stats               # aggregate recorded runs: ops collapsed, requests saved, edge hit-rate
+```
+
+Stats are append-only JSONL in `$PREDEXEC_STATE_DIR` (or `$XDG_STATE_HOME/predexec`, or
+`~/.local/state/predexec`). Each adapter calls `recordRun` after every `runPlanTree` — fire-and-forget,
+errors swallowed (a stats failure must never break a tool call).
+
 ## Develop / contribute
 
 Clone and use pnpm (the project's package manager):
@@ -176,6 +193,8 @@ loads from this path, so your edits are always what's measured.)
 core/                              PURE TS, zero harness imports (promotable to a standalone package)
   types.ts conditions.ts runner.ts engine.ts coerce.ts schema.ts index.ts
 steering.ts                        shared steering text/marker (harness-facing; not in core/)
+stats.ts                           request-accounting recorder (append-only JSONL; harness-facing)
+bin/predexec.mjs                   CLI: doctor + stats (plain JS, no deps)
 skills/predexec/SKILL.md           declarative pi routing skill (loaded via pi.skills)
 configs/opencode/AGENTS.md         drop-in routing block for opencode projects
 ```

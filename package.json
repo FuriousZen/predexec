@@ -1,6 +1,6 @@
 {
   "name": "predexec",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "type": "module",
   "packageManager": "pnpm@11.9.0",
   "description": "Predictive execution: collapse an adaptive multi-level tool sequence into a single model round-trip via a deterministic plan tree. pi coding agent extension / opencode plugin.",
@@ -19,13 +19,18 @@
     "pi-package"
   ],
   "main": ".opencode/plugins/predexec.ts",
+  "bin": {
+    "predexec": "./bin/predexec.mjs"
+  },
   "files": [
     ".pi",
     ".opencode",
+    "bin",
     "core",
     "skills",
     "configs",
     "steering.ts",
+    "stats.ts",
     "README.md"
   ],
   "pi": {

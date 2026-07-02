@@ -19,6 +19,7 @@ import {
   createLsTool,
 } from "@earendil-works/pi-coding-agent";
 import { runPlanTree, coercePlan, isDestructiveCommand, type PlanTree, type ToolOp } from "../../core/index.ts";
+import { estimateRequestsSaved, recordRun } from "../../stats.ts";
 
 /**
  * Condition is modelled as a single loose object (discriminated by `kind`)
@@ -262,6 +263,7 @@ export default function predexec(pi: ExtensionAPI): void {
 
       done = true;
       if (pendingTimeout) clearTimeout(pendingTimeout);
+      void recordRun(plan, result, "pi");
       return {
         content: [{ type: "text" as const, text: result.transcript || "(no output)" }],
         details: {
@@ -271,6 +273,7 @@ export default function predexec(pi: ExtensionAPI): void {
           fellBack: result.fellBack,
           edgesEvaluated: result.edgesEvaluated,
           edgesMatched: result.edgesMatched,
+          requestsSaved: estimateRequestsSaved(plan, result),
         },
         // No `terminate` in the read-only MVP: a read-only leaf usually still
         // needs the model. Deferred to impl step 4 (gated mutations + success leaves).
