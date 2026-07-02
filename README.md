@@ -45,19 +45,25 @@ HIGH-confidence (may gate deeper speculation): `exitCode`, `fileExists`, `jsonPa
 ### pi coding agent
 
 ```bash
-pi install git:github.com/FuriousZen/predexec
+pi install predexec
 ```
 
-That's the whole install. pi clones the repo, runs `npm install --omit=dev` (zero runtime
-dependencies), and registers the `predexec` tool from the
-package's `pi.extensions` manifest (plus a terse routing skill from `pi.skills`,
+That's the whole install. pi fetches the package from npm, runs `npm install --omit=dev`
+(zero runtime dependencies), and registers the `predexec` tool from the package's
+`pi.extensions` manifest (plus a terse routing skill from `pi.skills`,
 `skills/predexec/SKILL.md`) — no build step (it's loaded as `.ts` via jiti). Once pi
 starts, the model routes multi-step work through it on its own.
 
 ```bash
-pi -e git:github.com/FuriousZen/predexec       # try it for one run, no settings change
-pi remove git:github.com/FuriousZen/predexec   # uninstall
-pi update --extensions                          # update installed packages
+pi -e predexec                       # try it for one run, no settings change
+pi remove predexec                   # uninstall
+pi update --extensions               # update installed packages
+```
+
+To install from the git repo HEAD instead of the published npm release:
+
+```bash
+pi install git:github.com/FuriousZen/predexec
 ```
 
 **Prerequisites:** Node 22+ and the pi coding agent on PATH (`npm i -g
@@ -67,21 +73,20 @@ var — pi auto-detects provider keys from the environment (`OPENCODE_API_KEY`, 
 
 ### opencode
 
-Clone the repo into opencode's global plugins directory and create a re-export wrapper:
+Install the package and create a one-line re-export wrapper:
 
 ```bash
-# 1. Clone the repo into the plugins directory
-git clone https://github.com/FuriousZen/predexec.git \
-  ~/.config/opencode/plugins/predexec
+# 1. Install from npm
+npm install -g predexec
 
 # 2. Create the re-export wrapper
 cat > ~/.config/opencode/plugins/predexec.ts << 'EOF'
-export { server } from "./predexec/.opencode/plugins/predexec.ts";
+export { server } from "predexec";
 EOF
 ```
 
-Restart opencode. It auto-discovers `~/.config/opencode/plugins/predexec.ts`, which re-exports
-the plugin — no build step, no config edit needed. To update, `git pull` inside the clone.
+Restart opencode. It auto-discovers `~/.config/opencode/plugins/predexec.ts`, which
+re-exports the plugin — no build step, no config edit needed. To update, `npm update -g predexec`.
 
 The plugin injects a one-line routing rule into the system prompt as a **guarded fallback**.
 opencode has no plugin-skill loader (unlike pi, which loads `skills/predexec/SKILL.md` via
