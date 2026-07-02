@@ -81,6 +81,13 @@ EOF
 Restart opencode. It auto-discovers `~/.config/opencode/plugins/predexec.ts`, which re-exports
 the plugin — no build step, no config edit needed. To update, `git pull` inside the clone.
 
+The plugin injects a one-line routing rule into the system prompt as a **guarded fallback**.
+opencode has no plugin-skill loader (unlike pi, which loads `skills/predexec/SKILL.md` via
+`pi.skills`), so to steer it declaratively instead, drop the block from
+[configs/opencode/AGENTS.md](configs/opencode/AGENTS.md) into your project's `AGENTS.md` (or
+`CLAUDE.md`). When opencode loads that natively, the plugin detects it (via the `predexec` marker)
+and skips its own injection — no duplication.
+
 For local development, opencode also auto-discovers `.opencode/plugins/*.ts`, so running opencode
 **inside a clone of this repo** picks up `.opencode/plugins/predexec.ts` directly.
 

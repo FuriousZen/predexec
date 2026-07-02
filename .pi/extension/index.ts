@@ -165,23 +165,11 @@ const BASH_NUDGE =
 export { coercePlan } from "../../core/index.ts";
 
 export default function predexec(pi: ExtensionAPI): void {
-  pi.on("before_agent_start", async (event) => {
-    let sp = event.systemPrompt;
-    const replaced = sp.replace(
-      "Use bash for file operations like ls, rg, find",
-      "Use predexec for read-only shell operations. " +
-      "Use bash for writes/installs/deletes (predexec hard-stops on those) and interactive commands",
-    );
-    if (replaced !== sp) {
-      sp = replaced;
-    } else {
-      sp = sp.replace(
-        /^(Guidelines:\n)/m,
-        "$1- Use predexec for read-only shell operations. Use bash only for writes/installs/deletes and interactive commands\n",
-      );
-    }
-    return { systemPrompt: sp };
-  });
+  // Routing steering is delivered declaratively via the `predexec` skill
+  // (skills/predexec/SKILL.md, registered through package.json `pi.skills`) plus
+  // the tool's promptSnippet/promptGuidelines below — pi surfaces both natively.
+  // No imperative system-prompt mutation here (that coupled to pi's internal
+  // wording and broke silently when it changed).
 
   pi.on("tool_result", async (event) => {
     if (event.toolName === "bash") {

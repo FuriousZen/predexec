@@ -12,11 +12,17 @@
     ".pi",
     ".opencode",
     "core",
+    "skills",
+    "configs",
+    "steering.ts",
     "README.md"
   ],
   "pi": {
     "extensions": [
       "./.pi/extension/index.ts"
+    ],
+    "skills": [
+      "./skills"
     ]
   },
   "scripts": {

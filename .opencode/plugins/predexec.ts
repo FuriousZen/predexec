@@ -20,6 +20,7 @@ import {
   type ToolOp,
   type ToolExecutor,
 } from "../../core/index.ts";
+import { STEERING_LINE, systemHasRoutingInstructions } from "../../steering.ts";
 
 const DESCRIPTION =
   "Run read-only shell commands and tool calls with deterministic branching. " +
@@ -125,10 +126,14 @@ export const server: Plugin = async ({ client }) => ({
     }),
   },
 
+  // opencode has no native plugin-skill loader (unlike pi's `pi.skills`), so we
+  // inject the routing line here — but only as a guarded fallback. When the host
+  // already carries the rule (e.g. a project AGENTS.md/CLAUDE.md with the same
+  // block — see configs/opencode/AGENTS.md), we stay silent to avoid duplication.
   "experimental.chat.system.transform": async (_input, output) => {
-    output.system.push(
-      "Use predexec for all read-only shell operations. Use bash only for writes/installs/deletes and interactive commands.",
-    );
+    if (!systemHasRoutingInstructions(output.system)) {
+      output.system.push(STEERING_LINE);
+    }
   },
 
   "tool.execute.after": async (input, output) => {
