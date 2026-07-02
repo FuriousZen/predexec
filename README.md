@@ -45,7 +45,7 @@ HIGH-confidence (may gate deeper speculation): `exitCode`, `fileExists`, `jsonPa
 ### pi coding agent
 
 ```bash
-pi install predexec
+pi install npm:predexec
 ```
 
 That's the whole install. pi fetches the package from npm, runs `npm install --omit=dev`
@@ -55,8 +55,8 @@ That's the whole install. pi fetches the package from npm, runs `npm install --o
 starts, the model routes multi-step work through it on its own.
 
 ```bash
-pi -e predexec                       # try it for one run, no settings change
-pi remove predexec                   # uninstall
+pi -e npm:predexec                   # try it for one run, no settings change
+pi remove npm:predexec               # uninstall
 pi update --extensions               # update installed packages
 ```
 
@@ -73,27 +73,28 @@ var — pi auto-detects provider keys from the environment (`OPENCODE_API_KEY`, 
 
 ### opencode
 
-Install the package and create a one-line re-export wrapper:
+Add predexec to your `opencode.json` (project root, or `~/.config/opencode/opencode.json` for global):
 
-```bash
-# 1. Install from npm
-npm install -g predexec
-
-# 2. Create the re-export wrapper
-cat > ~/.config/opencode/plugins/predexec.ts << 'EOF'
-export { server } from "predexec";
-EOF
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugin": ["predexec"]
+}
 ```
 
-Restart opencode. It auto-discovers `~/.config/opencode/plugins/predexec.ts`, which
-re-exports the plugin — no build step, no config edit needed. To update, `npm update -g predexec`.
+That's the whole install — opencode resolves the plugin from npm, loads `.opencode/plugins/predexec.ts`
+in-process via Bun, and registers the `predexec` tool natively. No global install, no wrapper file.
+Restart opencode after editing. To update, bump the version (or use `"predexec@latest"`) and restart.
 
 The plugin injects a one-line routing rule into the system prompt as a **guarded fallback**.
-opencode has no plugin-skill loader (unlike pi, which loads `skills/predexec/SKILL.md` via
-`pi.skills`), so to steer it declaratively instead, drop the block from
-[configs/opencode/AGENTS.md](configs/opencode/AGENTS.md) into your project's `AGENTS.md` (or
-`CLAUDE.md`). When opencode loads that natively, the plugin detects it (via the `predexec` marker)
-and skips its own injection — no duplication.
+To steer declaratively instead, copy the routing block into your project's `AGENTS.md`:
+
+```bash
+cp node_modules/predexec/configs/opencode/AGENTS.md AGENTS.md
+```
+
+When opencode loads that natively, the plugin detects it (via the `predexec` marker) and skips
+its own injection — no duplication.
 
 For local development, opencode also auto-discovers `.opencode/plugins/*.ts`, so running opencode
 **inside a clone of this repo** picks up `.opencode/plugins/predexec.ts` directly.
