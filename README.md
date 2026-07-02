@@ -90,8 +90,11 @@ The plugin injects a one-line routing rule into the system prompt as a **guarded
 To steer declaratively instead, copy the routing block into your project's `AGENTS.md`:
 
 ```bash
-cp node_modules/predexec/configs/opencode/AGENTS.md AGENTS.md
+curl -fsSL https://raw.githubusercontent.com/FuriousZen/predexec/main/configs/opencode/AGENTS.md -o AGENTS.md
 ```
+
+(A plugin install has no project `node_modules` — opencode keeps the package in its own
+cache — so fetch the block from the repo, or `cp configs/opencode/AGENTS.md` from a clone.)
 
 When opencode loads that natively, the plugin detects it (via the `predexec` marker) and skips
 its own injection — no duplication.
