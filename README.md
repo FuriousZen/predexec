@@ -8,7 +8,7 @@ provider requests.
 
 This package ships as both a [pi coding agent](https://www.npmjs.com/package/@earendil-works/pi-coding-agent)
 extension and an [opencode](https://opencode.ai) plugin, each registering one tool, `predexec`.
-See [CLAUDE.md](../CLAUDE.md) for the full design and current status.
+See [How it works](#how-it-works) below for the design and current status.
 
 > **Status: read-only MVP.** The pure-TS core, pi adapter, and opencode adapter are done and
 > unit-tested. predexec speculates **read-only only** — any write/install/delete hard-stops
@@ -16,8 +16,9 @@ See [CLAUDE.md](../CLAUDE.md) for the full design and current status.
 
 ## How it works
 
-The model fills in a **plan tree**: each node is a shell command batch; each edge is a
-machine-evaluable **condition** on that node's output. After running a node, the engine
+The model fills in a **plan tree**: each node runs a batch of shell commands and/or read-only
+tool calls (`read`/`grep`/`find`/`ls`); each edge is a machine-evaluable **condition** on that
+node's output. After running a node, the engine
 evaluates outgoing edges in order, follows the first match to a child, and repeats — with no
 model in the loop. It stops and returns a transcript when it reaches:
 
@@ -49,7 +50,8 @@ pi install git:github.com/FuriousZen/predexec
 
 That's the whole install. pi clones the repo, runs `npm install --omit=dev` (zero runtime
 dependencies), and registers the `predexec` tool from the
-package's `pi.extensions` manifest — no build step (it's loaded as `.ts` via jiti). Once pi
+package's `pi.extensions` manifest (plus a terse routing skill from `pi.skills`,
+`skills/predexec/SKILL.md`) — no build step (it's loaded as `.ts` via jiti). Once pi
 starts, the model routes multi-step work through it on its own.
 
 ```bash
@@ -140,5 +142,8 @@ loads from this path, so your edits are always what's measured.)
 .pi/extension/index.ts             pi adapter — JSON Schema + ctx wiring, delegates to core
 .opencode/plugins/predexec.ts      opencode adapter — zod schema + context wiring, delegates to core
 core/                              PURE TS, zero harness imports (promotable to a standalone package)
-  types.ts conditions.ts runner.ts engine.ts schema.ts index.ts
+  types.ts conditions.ts runner.ts engine.ts coerce.ts schema.ts index.ts
+steering.ts                        shared steering text/marker (harness-facing; not in core/)
+skills/predexec/SKILL.md           declarative pi routing skill (loaded via pi.skills)
+configs/opencode/AGENTS.md         drop-in routing block for opencode projects
 ```
