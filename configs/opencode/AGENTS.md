@@ -1,8 +1,9 @@
 # predexec routing
 
 Drop this block into your project's `AGENTS.md` (or `CLAUDE.md`) so opencode loads the
-predexec routing rule natively. When present, the predexec plugin detects it (via the
-`predexec` marker) and skips its own system-prompt injection — no duplication.
+predexec routing rule natively. When present, the predexec plugin detects it (a quorum
+of routing-rule markers, not a mere mention of the name) and skips its own
+system-prompt injection — no duplication.
 
 ---
 

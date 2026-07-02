@@ -60,6 +60,16 @@ pi remove npm:predexec               # uninstall
 pi update --extensions               # update installed packages
 ```
 
+**Verify:**
+
+```bash
+pi list                              # must show npm:predexec and its install path
+```
+
+Then start `pi` and try the prompt under [A prompt to see it work](#a-prompt-to-see-it-work) —
+the tool result's `details` (`pathTaken`, `stoppedReason`) confirm the engine actually walked
+a plan tree.
+
 To install from the git repo HEAD instead of the published npm release:
 
 ```bash
@@ -86,6 +96,17 @@ That's the whole install — opencode resolves the plugin from npm, loads `.open
 in-process via Bun, and registers the `predexec` tool natively. No global install, no wrapper file.
 Restart opencode after editing. To update, bump the version (or use `"predexec@latest"`) and restart.
 
+**Verify** (no model request needed):
+
+```bash
+opencode serve --port 4599 &
+curl -s localhost:4599/experimental/tool/ids   # must include "predexec"
+```
+
+If `predexec` is missing from the list, the plugin was **silently skipped** — opencode surfaces
+plugin load failures only as internal session events, so this curl is the reliable check.
+Then, in a session, try the prompt under [A prompt to see it work](#a-prompt-to-see-it-work).
+
 The plugin injects a one-line routing rule into the system prompt as a **guarded fallback**.
 To steer declaratively instead, copy the routing block into your project's `AGENTS.md`:
 
@@ -96,8 +117,8 @@ curl -fsSL https://raw.githubusercontent.com/FuriousZen/predexec/main/configs/op
 (A plugin install has no project `node_modules` — opencode keeps the package in its own
 cache — so fetch the block from the repo, or `cp configs/opencode/AGENTS.md` from a clone.)
 
-When opencode loads that natively, the plugin detects it (via the `predexec` marker) and skips
-its own injection — no duplication.
+When opencode loads that natively, the plugin detects it (a quorum of routing-rule markers,
+not a mere mention of the name) and skips its own injection — no duplication.
 
 For local development, opencode also auto-discovers `.opencode/plugins/*.ts`, so running opencode
 **inside a clone of this repo** picks up `.opencode/plugins/predexec.ts` directly.
@@ -112,7 +133,9 @@ NIM, OpenRouter free).
 > every rebuild, and `.devcontainer/.env` injects `NVIDIA_API_KEY` + `OPENCODE_API_KEY` so the
 > agent is authenticated on first boot (see `.env.example`).
 
-**A prompt to see it work** (read-only, structurally predictable — predexec's sweet spot):
+### A prompt to see it work
+
+A read-only, structurally predictable task — predexec's sweet spot:
 
 ```
 Detect this project's package manager and run its test script.
