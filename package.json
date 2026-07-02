@@ -6,7 +6,7 @@
   "description": "Predictive execution: collapse an adaptive multi-level tool sequence into a single model round-trip via a deterministic plan tree. pi coding agent extension / opencode plugin.",
   "author": "FuriousZen",
   "license": "MIT",
-  "repository": { "type": "git", "url": "https://github.com/FuriousZen/predexec.git" },
+  "repository": { "type": "git", "url": "git+https://github.com/FuriousZen/predexec.git" },
   "homepage": "https://github.com/FuriousZen/predexec#readme",
   "bugs": "https://github.com/FuriousZen/predexec/issues",
   "engines": { "node": ">=22" },
