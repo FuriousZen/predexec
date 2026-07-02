@@ -1,15 +1,20 @@
 {
   "name": "predexec",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "type": "module",
   "packageManager": "pnpm@11.9.0",
   "description": "Predictive execution: collapse an adaptive multi-level tool sequence into a single model round-trip via a deterministic plan tree. pi coding agent extension / opencode plugin.",
   "author": "FuriousZen",
   "license": "MIT",
-  "repository": { "type": "git", "url": "git+https://github.com/FuriousZen/predexec.git" },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/FuriousZen/predexec.git"
+  },
   "homepage": "https://github.com/FuriousZen/predexec#readme",
   "bugs": "https://github.com/FuriousZen/predexec/issues",
-  "engines": { "node": ">=22" },
+  "engines": {
+    "node": ">=22"
+  },
   "keywords": [
     "pi-package"
   ],
@@ -44,5 +49,8 @@
     "@types/node": "24.12.4",
     "typescript": "5.9.3",
     "vitest": "4.1.9"
+  },
+  "dependencies": {
+    "zod": "~4.1.8"
   }
 }

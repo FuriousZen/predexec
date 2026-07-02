@@ -1,9 +1,32 @@
 import { describe, expect, it } from "vitest";
-import { createToolExecutor } from "../.opencode/plugins/predexec.ts";
+import plugin, { createToolExecutor, server } from "../.opencode/plugins/predexec.ts";
 import type { ToolOp } from "../core/index.ts";
 
 const run = (client: any, op: ToolOp) =>
   createToolExecutor(client, "/repo")(op, { cwd: "/repo" });
+
+describe("opencode plugin — loader contract", () => {
+  // opencode's readV1Plugin loads ONLY the default export and requires
+  // { server() }; a named-export-only module is silently skipped.
+  it("default-exports { id, server } for current opencode loaders", () => {
+    expect(plugin.id).toBe("predexec");
+    expect(plugin.server).toBe(server);
+    expect(typeof plugin.server).toBe("function");
+  });
+
+  it("server() registers the predexec tool with plain-object definition and hooks", async () => {
+    const hooks = await server({ client: {} } as any);
+    const def = (hooks as any).tool?.predexec;
+    expect(def).toBeDefined();
+    expect(typeof def.description).toBe("string");
+    expect(typeof def.execute).toBe("function");
+    // args must be zod v4 schemas — a v3 schema (or none) crashes the host
+    // with `n._zod.def` (see context-mode's zod3tov4 notes).
+    expect(def.args.plan._zod?.def).toBeDefined();
+    expect(typeof (hooks as any)["experimental.chat.system.transform"]).toBe("function");
+    expect(typeof (hooks as any)["tool.execute.after"]).toBe("function");
+  });
+});
 
 describe("opencode createToolExecutor — SDK response mapping", () => {
   it("read: passes file content through as stdout", async () => {

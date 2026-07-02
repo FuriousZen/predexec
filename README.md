@@ -49,7 +49,7 @@ pi install npm:predexec
 ```
 
 That's the whole install. pi fetches the package from npm, runs `npm install --omit=dev`
-(zero runtime dependencies), and registers the `predexec` tool from the package's
+(one runtime dependency, `zod`), and registers the `predexec` tool from the package's
 `pi.extensions` manifest (plus a terse routing skill from `pi.skills`,
 `skills/predexec/SKILL.md`) — no build step (it's loaded as `.ts` via jiti). Once pi
 starts, the model routes multi-step work through it on its own.

@@ -9,9 +9,16 @@
  * (file.read / find.text / find.files / file.list). Caveats vs pi: file.read
  * has no offset/limit (sliced client-side), and find.text (grep) is
  * directory-scoped with no glob.
+ *
+ * Export shape: opencode's plugin loader (readV1Plugin, ≥1.17.x) reads ONLY the
+ * default export and requires `{ server() }`; older hosts (and KiloCode) also
+ * see the named `server` export. Runtime imports are zod + our own modules only —
+ * `@opencode-ai/plugin` is type-only, because npm-installed plugins get
+ * production deps only and the host does not provide that package at import time.
  */
 
-import { tool, type Plugin } from "@opencode-ai/plugin";
+import { z } from "zod";
+import type { Plugin, ToolContext } from "@opencode-ai/plugin";
 import {
   runPlanTree,
   coercePlan,
@@ -97,15 +104,15 @@ export function createToolExecutor(client: OpencodeClient, cwd: string): ToolExe
 
 export const server: Plugin = async ({ client }) => ({
   tool: {
-    predexec: tool({
+    predexec: {
       description: DESCRIPTION,
       args: {
-        plan: tool.schema.any().describe(
+        plan: z.any().describe(
           'Plan tree object: {root, nodes:[{id, commands:[<shell string> | {tool:"read",path,offset?,limit?} | {tool:"grep",pattern,path?} | {tool:"find",pattern,path?} | {tool:"ls",path?}], parallel?, edges?:[{when,to}]}], cwd?, maxDepth?}. ' +
           "Note: grep is directory-scoped (no glob); read offset/limit are applied client-side.",
         ),
       },
-      async execute(args, context) {
+      async execute(args: { plan: unknown }, context: ToolContext) {
         let plan: PlanTree;
         try {
           plan = coercePlan(args.plan);
@@ -123,7 +130,7 @@ export const server: Plugin = async ({ client }) => ({
 
         return result.transcript || "(no output)";
       },
-    }),
+    },
   },
 
   // opencode has no native plugin-skill loader (unlike pi's `pi.skills`), so we
@@ -148,3 +155,7 @@ export const server: Plugin = async ({ client }) => ({
     }
   },
 });
+
+// What current opencode loaders (readV1Plugin) actually read; the named
+// `server` export above serves older hosts that iterate named exports.
+export default { id: "predexec", server };
