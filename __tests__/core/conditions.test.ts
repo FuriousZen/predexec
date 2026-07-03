@@ -2,7 +2,7 @@ import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { evaluateCondition, parseConditionString } from "../../core/conditions.ts";
+import { evaluateCondition, evaluateConditionWithDetail, parseConditionString } from "../../core/conditions.ts";
 import type { NodeOutput } from "../../core/types.ts";
 
 const out = (o: Partial<NodeOutput>): NodeOutput => ({ stdout: "", stderr: "", exitCode: 0, ...o });
@@ -109,5 +109,100 @@ describe("parseConditionString", () => {
   it("handles whitespace", () => {
     expect(parseConditionString("  always  ")).toEqual({ kind: "always" });
     expect(parseConditionString("exit  ==  0")).toEqual({ kind: "exitCode", op: "eq", value: 0 });
+  });
+});
+
+describe("evaluateConditionWithDetail — observed-value explanations", () => {
+  it("exitCode states the observed exit", () => {
+    const r = evaluateConditionWithDetail(out({ exitCode: 1 }), { kind: "exitCode", op: "eq", value: 0 }, "/");
+    expect(r.result).toBe(false);
+    expect(r.detail).toBe("exit == 0 → false (exit was 1)");
+  });
+
+  it("fileExists states the resolved target and its state", () => {
+    const r = evaluateConditionWithDetail(out({}), { kind: "fileExists", path: "nope.txt" }, "/tmp");
+    expect(r.result).toBe(false);
+    expect(r.detail).toContain("file exists nope.txt → false");
+    expect(r.detail).toContain("/tmp/nope.txt is missing");
+  });
+
+  it("match states the stream length on a miss and 'matched' on a hit", () => {
+    const miss = evaluateConditionWithDetail(
+      out({ stdout: "hello world" }),
+      { kind: "match", source: "stdout", regex: "ready" },
+      "/",
+    );
+    expect(miss.result).toBe(false);
+    expect(miss.detail).toBe("stdout =~ /ready/ → false (no match in 11-char stdout)");
+
+    const hit = evaluateConditionWithDetail(
+      out({ stdout: "server ready" }),
+      { kind: "match", source: "stdout", regex: "ready" },
+      "/",
+    );
+    expect(hit.result).toBe(true);
+    expect(hit.detail).toContain("→ true (matched)");
+  });
+
+  it("jsonPath distinguishes bad JSON, missing path, and observed value", () => {
+    const badJson = evaluateConditionWithDetail(
+      out({ stdout: "not json" }),
+      { kind: "jsonPath", source: "stdout", path: "a.b", op: "exists" },
+      "/",
+    );
+    expect(badJson.detail).toContain("stdout is not valid JSON");
+
+    const missing = evaluateConditionWithDetail(
+      out({ stdout: '{"a":{}}' }),
+      { kind: "jsonPath", source: "stdout", path: "a.b", op: "exists" },
+      "/",
+    );
+    expect(missing.detail).toContain("path not found");
+
+    const value = evaluateConditionWithDetail(
+      out({ stdout: '{"scripts":{"test":"vitest"}}' }),
+      { kind: "jsonPath", source: "stdout", path: "scripts.test", op: "eq", value: "jest" },
+      "/",
+    );
+    expect(value.result).toBe(false);
+    expect(value.detail).toContain('value was "vitest"');
+  });
+
+  it("numeric states the extracted number or the extraction failure", () => {
+    const extracted = evaluateConditionWithDetail(
+      out({ stdout: "3 failing" }),
+      { kind: "numeric", source: "stdout", extract: "(\\d+) failing", op: "eq", value: 0 },
+      "/",
+    );
+    expect(extracted.result).toBe(false);
+    expect(extracted.detail).toContain("(extracted 3)");
+
+    const nothing = evaluateConditionWithDetail(
+      out({ stdout: "all good" }),
+      { kind: "numeric", source: "stdout", extract: "(\\d+) failing", op: "eq", value: 0 },
+      "/",
+    );
+    expect(nothing.detail).toContain("regex matched nothing");
+  });
+
+  it("unknown kinds and thrown evaluations degrade to explained benign misses", () => {
+    const unknown = evaluateConditionWithDetail(out({}), { kind: "vibes" } as any, "/");
+    expect(unknown.result).toBe(false);
+    expect(unknown.detail).toContain('unknown condition kind "vibes"');
+
+    const badRegex = evaluateConditionWithDetail(
+      out({ stdout: "x" }),
+      { kind: "match", source: "stdout", regex: "(" },
+      "/",
+    );
+    expect(badRegex.result).toBe(false);
+    expect(badRegex.detail).toContain("→ false");
+  });
+
+  it("evaluateCondition stays a thin boolean wrapper (same verdicts)", () => {
+    const cond = { kind: "exitCode", op: "eq", value: 0 } as const;
+    expect(evaluateCondition(out({ exitCode: 0 }), cond, "/")).toBe(
+      evaluateConditionWithDetail(out({ exitCode: 0 }), cond, "/").result,
+    );
   });
 });

@@ -17,7 +17,7 @@
  * production deps only and the host does not provide that package at import time.
  */
 
-import { existsSync } from "node:fs";
+import { existsSync, statSync } from "node:fs";
 import { isAbsolute, resolve } from "node:path";
 import { z } from "zod";
 import type { Plugin, ToolContext } from "@opencode-ai/plugin";
@@ -72,6 +72,35 @@ export function createToolExecutor(client: OpencodeClient, cwd: string): ToolExe
         ? null
         : { stdout: "", stderr: `path not found: ${p} (resolved against ${directory})`, exitCode: 1 };
     const fail = (label: string, e: unknown) => ({ stdout: "", stderr: `${label}: ${errText(e)}`, exitCode: 1 });
+    // grep/find scope by DIRECTORY in opencode's v1 SDK. Honor an op's `path`
+    // by resolving it into the query directory; a FILE path fails loudly — the
+    // silent alternative (searching the whole repo) is false-hit fuel for edges.
+    const scopeDir = (
+      p: unknown,
+      tool: string,
+    ): { dir: string; err?: undefined } | { dir?: undefined; err: { stdout: string; stderr: string; exitCode: number } } => {
+      if (p === undefined) return { dir: directory };
+      const path = String(p);
+      const gone = missing(path);
+      if (gone) return { err: gone };
+      const abs = isAbsolute(path) ? path : resolve(directory, path);
+      try {
+        if (!statSync(abs).isDirectory()) {
+          return {
+            err: {
+              stdout: "",
+              stderr: `${tool}: opencode can only scope by directory; "${path}" is a file — use a shell command for single files`,
+              exitCode: 1,
+            },
+          };
+        }
+      } catch {
+        /* stat raced away; missing() already vetted existence */
+      }
+      return { dir: abs };
+    };
+    const sliceLimit = <T>(items: T[], limit: unknown): T[] =>
+      typeof limit === "number" && limit >= 0 ? items.slice(0, limit) : items;
     try {
       switch (op.tool) {
         case "read": {
@@ -92,17 +121,29 @@ export function createToolExecutor(client: OpencodeClient, cwd: string): ToolExe
         }
         case "grep": {
           const pattern = String(op.pattern ?? "");
-          const r = await client.find.text({ query: { pattern, directory } });
+          const unsupported = ["glob", "ignoreCase", "literal", "context"].filter((k) => op[k] !== undefined);
+          if (unsupported.length > 0) {
+            return {
+              stdout: "",
+              stderr: `grep: unsupported arg(s) in opencode adapter: ${unsupported.join(", ")} — use a shell grep instead`,
+              exitCode: 1,
+            };
+          }
+          const scoped = scopeDir(op.path, "grep");
+          if (scoped.err) return scoped.err;
+          const r = await client.find.text({ query: { pattern, directory: scoped.dir } });
           if (r.error) return fail(`grep ${pattern}`, r.error);
-          const matches = r.data ?? [];
+          const matches = sliceLimit(r.data ?? [], op.limit);
           const stdout = matches.map((m) => `${m.path.text}:${m.line_number}:${m.lines.text}`).join("\n");
           return { stdout, stderr: "", exitCode: stdout ? 0 : 1 };
         }
         case "find": {
           const pattern = String(op.pattern ?? "");
-          const r = await client.find.files({ query: { query: pattern, directory } });
+          const scoped = scopeDir(op.path, "find");
+          if (scoped.err) return scoped.err;
+          const r = await client.find.files({ query: { query: pattern, directory: scoped.dir } });
           if (r.error) return fail(`find ${pattern}`, r.error);
-          const stdout = (r.data ?? []).join("\n");
+          const stdout = sliceLimit(r.data ?? [], op.limit).join("\n");
           return { stdout, stderr: "", exitCode: stdout ? 0 : 1 };
         }
         case "ls": {
@@ -111,7 +152,8 @@ export function createToolExecutor(client: OpencodeClient, cwd: string): ToolExe
           if (gone) return gone;
           const r = await client.file.list({ query: { path, directory } });
           if (r.error) return fail(`ls ${path}`, r.error);
-          const stdout = (r.data ?? []).map((n) => n.name ?? n.path ?? "").filter(Boolean).join("\n");
+          const entries = sliceLimit(r.data ?? [], op.limit);
+          const stdout = entries.map((n) => n.name ?? n.path ?? "").filter(Boolean).join("\n");
           return { stdout, stderr: "", exitCode: 0 };
         }
         default:
@@ -131,7 +173,7 @@ export const server: Plugin = async ({ client }) => ({
         plan: z.any().describe(
           'Plan tree object: {root, nodes:[{id, commands:[<shell string> | {tool:"read",path,offset?,limit?} | {tool:"grep",pattern,path?} | {tool:"find",pattern,path?} | {tool:"ls",path?}], parallel?, edges?:[{when,to}]}], cwd?, maxDepth?}. ' +
           'when: "always" | "exit == 0" (ops ==,!=,<,>) | "stdout =~ /regex/" (also stderr, !~) | "file exists <path>" / "file missing <path>", or a {kind,...} condition object. ' +
-          "Note: grep is directory-scoped (no glob); read offset/limit are applied client-side.",
+          "Note: grep/find scope by a directory `path` (grep glob/ignoreCase/literal/context are unsupported here and error loudly); read offset/limit and grep/find/ls `limit` are applied client-side.",
         ),
       },
       async execute(args: { plan: unknown }, context: ToolContext) {

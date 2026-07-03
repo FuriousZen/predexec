@@ -16,7 +16,7 @@
  */
 
 import { resolve } from "node:path";
-import { evaluateCondition } from "./conditions.ts";
+import { evaluateConditionWithDetail } from "./conditions.ts";
 import { runNode, isToolOp, formatToolOpLabel } from "./runner.ts";
 import {
   DEFAULT_MAX_DEPTH,
@@ -99,16 +99,22 @@ export async function runPlanTree(plan: PlanTree, opts: RunOptions): Promise<Cor
     }
 
     let next: PlanNode | undefined;
+    const misses: string[] = [];
     for (const edge of edges) {
       edgesEvaluated++;
-      if (evaluateCondition(output, edge.when, effectiveCwd)) {
+      const { result: matched, detail } = evaluateConditionWithDetail(output, edge.when, effectiveCwd);
+      if (matched) {
         edgesMatched++;
         next = byId.get(edge.to)!;
         break;
       }
+      misses.push(`- → ${edge.to}: ${detail}`);
     }
 
     if (!next) {
+      // Echo what each condition saw, so the model fixes the condition instead
+      // of guessing why the walk stopped.
+      blocks.push([`No edge matched from node ${current.id}:`, ...misses].join("\n"));
       return result(pathTaken, depth, "noEdgeMatch", blocks.join("\n\n"), edgesEvaluated, edgesMatched);
     }
 
@@ -178,24 +184,35 @@ function checkToolOpDestructive(op: ToolOp): string | null {
 
 /**
  * Neutralize `>`/`<` where they are comparisons, not file redirects, so a read
- * is not misread as a write: inside shell single-quoted programs (awk/sed/jq —
- * e.g. `awk '$1 > 200'`), `[[ ... ]]` tests, and `(( ... ))` arithmetic. Only the
- * angle brackets in those spans are dropped — the rest of the span is kept, so a
- * genuinely destructive word inside quotes (`sh -c 'rm -rf /'`) is still caught
- * by the rm/install/git checks. Real redirects (`echo x > f`) live OUTSIDE these
- * spans and are untouched. Bare `test`/`[` are left alone: outside `[[ ]]`,
- * `test $x > 5` IS a real redirect to a file named `5`.
+ * is not misread as a write: inside shell quoted spans (awk/sed/jq programs and
+ * grep patterns — e.g. `awk '$1 > 200'`, `grep "a->b" f`), `[[ ... ]]` tests, and
+ * `(( ... ))` arithmetic. Only the angle brackets in those spans are dropped —
+ * the rest of the span is kept, so a genuinely destructive word inside quotes
+ * (`sh -c 'rm -rf /'`) is still caught by the rm/install/git checks. Real
+ * redirects (`echo x > f`) live OUTSIDE these spans and are untouched. Bare
+ * `test`/`[` are left alone: outside `[[ ]]`, `test $x > 5` IS a real redirect
+ * to a file named `5`.
  */
 function sanitizeForRedirect(cmd: string): string {
   const dropAngles = (s: string) => s.replace(/[<>]/g, " ");
   return cmd
     .replace(/'[^']*'/g, dropAngles)
+    .replace(/"[^"]*"/g, dropAngles)
     .replace(/\[\[[\s\S]*?\]\]/g, dropAngles)
     .replace(/\(\([\s\S]*?\)\)/g, dropAngles);
 }
 
+/**
+ * Blocklist heuristic — best-effort, not a sandbox. Alternations, in order:
+ * file removers/movers/creators, process killers, `cp -`, `sed` with an `-i`
+ * flag anywhere in its segment, `tee`, `wget` (unless stdout mode `-O-`/`-qO-`), `curl` with a
+ * file-output flag (`-o`/`-O`, incl. clustered), `find -delete`, `crontab`
+ * (unless `-l` list), real output redirects, package-manager installs/removes,
+ * and history-mutating git verbs. Deliberately out of scope: allowlist
+ * inversion, rsync/tar -x (mode-sensitive parsing).
+ */
 const DESTRUCTIVE =
-  /\b(rm|rmdir|mv|dd|mkfs|chmod|chown|truncate)\b|\bcp\s+-|(?<![\d&=])>(?!\s*\/dev\/null|[&=])|\b(npm|pnpm|yarn|pip|pip3|apt|apt-get|brew|cargo|go)\s+(install|add|i|remove|uninstall|rm)\b|\bgit\s+(push|commit|reset|checkout|clean|rm)\b/;
+  /\b(rm|rmdir|mv|dd|mkfs|chmod|chown|truncate|touch|mkdir|ln|shred|unlink|tee)\b|\b(kill|pkill|killall)\b|\bcp\s+-|\bsed\b[^|;&]*?\s-i\b|\bwget\b(?![^|;&]*-q?O\s?-(?:\s|$|[|;&]))|\bcurl\b[^|;&]*\s-\w*[oO]\b|\bfind\b[^|;&]*\s-delete\b|\bcrontab\b(?!\s+-l\b)|(?<![\d&=])>(?!\s*\/dev\/null|[&=])|\b(npm|pnpm|yarn|pip|pip3|apt|apt-get|brew|cargo|go)\s+(install|add|i|remove|uninstall|rm)\b|\bgit\s+(push|commit|reset|checkout|clean|rm|merge|rebase|restore|switch|apply|cherry-pick|revert|stash\s+(drop|pop|clear))\b/;
 
 export function isDestructiveCommand(cmd: string): boolean {
   return DESTRUCTIVE.test(sanitizeForRedirect(cmd));
@@ -240,8 +257,8 @@ function mutationBlock(
   if (detected) {
     lines.push(
       `Blocked by token \`${detected.token}\` in command ${detected.index + 1}: ${detected.command}`,
-      "If that token is a comparison (e.g. inside awk/`[[ ]]`/`(( ))`) and NOT a write, " +
-        "isolate it in its own node or rephrase, then retry.",
+      "If that token is a comparison (e.g. inside awk/`[[ ]]`/`(( ))`) or a quoted string/pattern " +
+        "and NOT a write, isolate it in its own node or rephrase, then retry.",
     );
   } else {
     lines.push("Declared mutates:true.");

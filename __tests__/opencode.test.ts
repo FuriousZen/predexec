@@ -116,6 +116,67 @@ describe("opencode createToolExecutor — SDK response mapping", () => {
   });
 });
 
+describe("opencode createToolExecutor — grep/find arg handling", () => {
+  const matchRow = (path: string, line: number) => ({
+    path: { text: path },
+    lines: { text: "const x = 1" },
+    line_number: line,
+  });
+
+  it("grep: `path` scopes the SDK query to the resolved directory", async () => {
+    let seen: any;
+    const client = { find: { text: async (o: any) => ((seen = o), { data: [matchRow("a.ts", 1)] }) } };
+    const r = await run(client, { tool: "grep", pattern: "x", path: "src" });
+    expect(seen.query.directory).toBe(join(repo, "src"));
+    expect(r.exitCode).toBe(0);
+  });
+
+  it("grep: a FILE `path` fails loudly instead of silently searching the repo", async () => {
+    const client = { find: { text: async () => ({ data: [] }) } };
+    const r = await run(client, { tool: "grep", pattern: "x", path: "a.ts" });
+    expect(r.exitCode).toBe(1);
+    expect(r.stderr).toContain('"a.ts" is a file');
+  });
+
+  it("grep: a missing `path` fails with the resolved location", async () => {
+    const client = { find: { text: async () => ({ data: [] }) } };
+    const r = await run(client, { tool: "grep", pattern: "x", path: "nope/" });
+    expect(r.exitCode).toBe(1);
+    expect(r.stderr).toContain("path not found: nope/");
+  });
+
+  it("grep: unsupported args error loudly, naming them", async () => {
+    const client = { find: { text: async () => ({ data: [] }) } };
+    const r = await run(client, { tool: "grep", pattern: "x", glob: "*.ts", ignoreCase: true });
+    expect(r.exitCode).toBe(1);
+    expect(r.stderr).toContain("unsupported arg(s) in opencode adapter: glob, ignoreCase");
+  });
+
+  it("grep: `limit` slices matches client-side", async () => {
+    const client = {
+      find: { text: async () => ({ data: [matchRow("a.ts", 1), matchRow("b.ts", 2), matchRow("c.ts", 3)] }) },
+    };
+    const r = await run(client, { tool: "grep", pattern: "x", limit: 2 });
+    expect(r.stdout.split("\n")).toHaveLength(2);
+  });
+
+  it("find: `path` scopes and `limit` slices", async () => {
+    let seen: any;
+    const client = { find: { files: async (o: any) => ((seen = o), { data: ["a.ts", "b.ts", "c.ts"] }) } };
+    const r = await run(client, { tool: "find", pattern: "*.ts", path: "src", limit: 1 });
+    expect(seen.query.directory).toBe(join(repo, "src"));
+    expect(r.stdout).toBe("a.ts");
+  });
+
+  it("ls: `limit` slices entries", async () => {
+    const client = {
+      file: { list: async () => ({ data: [{ name: "a" }, { name: "b" }, { name: "c" }] }) },
+    };
+    const r = await run(client, { tool: "ls", path: "src", limit: 2 });
+    expect(r.stdout).toBe("a\nb");
+  });
+});
+
 describe("opencode createToolExecutor — missing-path pre-check", () => {
   // Without the pre-check, opencode's server hides missing paths: file.read
   // returns empty content with no error (silent false success) and file.list

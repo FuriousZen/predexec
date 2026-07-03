@@ -48,55 +48,117 @@ export function parseConditionString(s: string): Condition | null {
   return null;
 }
 
-export function evaluateCondition(output: NodeOutput, cond: Condition, cwd: string): boolean {
+/** One evaluation with a model-readable account of what was observed. */
+export interface ConditionEvaluation {
+  result: boolean;
+  /** e.g. `exit == 0 → false (exit was 1)` — condition, verdict, observed value. */
+  detail: string;
+}
+
+const OP_SYM: Record<string, string> = { eq: "==", ne: "!=", lt: "<", le: "<=", gt: ">", ge: ">=" };
+
+/** Bounded JSON render for detail strings; never throws. */
+function showValue(v: unknown): string {
+  try {
+    const s = JSON.stringify(v);
+    const text = s === undefined ? String(v) : s;
+    return text.length > 80 ? `${text.slice(0, 80)}…` : text;
+  } catch {
+    return String(v);
+  }
+}
+
+/**
+ * Evaluate + explain in one pass. The `detail` string is what the engine echoes
+ * into the transcript when NO edge matches, so the model can fix its condition
+ * instead of guessing — a silent false is how authoring errors turn into
+ * misdiagnoses. Total and exception-safe like evaluateCondition.
+ */
+export function evaluateConditionWithDetail(
+  output: NodeOutput,
+  cond: Condition,
+  cwd: string,
+): ConditionEvaluation {
   try {
     switch (cond.kind) {
-      case "exitCode":
-        return compareInt(output.exitCode, cond.op, cond.value);
+      case "exitCode": {
+        const result = compareInt(output.exitCode, cond.op, cond.value);
+        return {
+          result,
+          detail: `exit ${OP_SYM[cond.op] ?? cond.op} ${cond.value} → ${result} (exit was ${output.exitCode})`,
+        };
+      }
 
       case "fileExists": {
         const target = isAbsolute(cond.path) ? cond.path : resolve(cwd, cond.path);
         const exists = existsSync(target);
-        return cond.negate ? !exists : exists;
+        const result = cond.negate ? !exists : exists;
+        return {
+          result,
+          detail: `file ${cond.negate ? "missing" : "exists"} ${cond.path} → ${result} (${target} ${exists ? "exists" : "is missing"})`,
+        };
       }
 
       case "jsonPath": {
-        const data = JSON.parse(output.stdout) as unknown;
+        const label = `jsonPath ${cond.path} ${cond.op}${cond.op === "exists" ? "" : ` ${showValue(cond.value)}`}`;
+        let data: unknown;
+        try {
+          data = JSON.parse(output.stdout) as unknown;
+        } catch {
+          return { result: false, detail: `${label} → false (stdout is not valid JSON)` };
+        }
         const { found, value } = getJsonPath(data, cond.path);
-        if (cond.op === "exists") return found;
-        if (!found) return cond.op === "ne"; // missing != any concrete value
-        if (cond.op === "eq") return deepEqual(value, cond.value);
-        return !deepEqual(value, cond.value); // "ne"
+        let result: boolean;
+        if (cond.op === "exists") result = found;
+        else if (!found) result = cond.op === "ne"; // missing != any concrete value
+        else if (cond.op === "eq") result = deepEqual(value, cond.value);
+        else result = !deepEqual(value, cond.value); // "ne"
+        const observed = found ? `value was ${showValue(value)}` : `path not found in stdout JSON`;
+        return { result, detail: `${label} → ${result} (${observed})` };
       }
 
       case "numeric": {
+        const label = `numeric /${cond.extract}/ ${OP_SYM[cond.op] ?? cond.op} ${cond.value}`;
         const m = new RegExp(cond.extract).exec(output.stdout);
-        if (!m) return false;
+        if (!m) return { result: false, detail: `${label} → false (regex matched nothing in stdout)` };
         const raw = m[1] ?? m[0];
         const n = Number(raw);
-        if (!Number.isFinite(n)) return false;
-        return compareFloat(n, cond.op, cond.value);
+        if (!Number.isFinite(n)) {
+          return { result: false, detail: `${label} → false (extracted ${showValue(raw)}, not a number)` };
+        }
+        const result = compareFloat(n, cond.op, cond.value);
+        return { result, detail: `${label} → ${result} (extracted ${n})` };
       }
 
       case "match": {
+        const sourceName = cond.source === "stderr" ? "stderr" : "stdout";
         const source = cond.source === "stderr" ? output.stderr : output.stdout;
         const hit = new RegExp(cond.regex).test(source);
-        return cond.negate ? !hit : hit;
+        const result = cond.negate ? !hit : hit;
+        return {
+          result,
+          detail: `${sourceName} ${cond.negate ? "!~" : "=~"} /${cond.regex}/ → ${result} (${hit ? "matched" : `no match in ${source.length}-char ${sourceName}`})`,
+        };
       }
 
       case "always":
-        return true;
+        return { result: true, detail: "always → true" };
 
       default: {
-        // Exhaustiveness guard: an unknown kind is treated as a benign miss.
+        // Exhaustiveness guard: an unknown kind is a benign miss, but SAY so.
         const _never: never = cond;
         void _never;
-        return false;
+        const kind = (cond as { kind?: unknown }).kind;
+        return { result: false, detail: `unknown condition kind ${showValue(kind)} → false` };
       }
     }
   } catch {
-    return false;
+    return { result: false, detail: "condition evaluation threw → false" };
   }
+}
+
+export function evaluateCondition(output: NodeOutput, cond: Condition, cwd: string): boolean {
+  return evaluateConditionWithDetail(output, cond, cwd).result;
 }
 
 function compareInt(actual: number, op: "eq" | "ne" | "lt" | "gt", value: number): boolean {

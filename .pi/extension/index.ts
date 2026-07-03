@@ -134,6 +134,28 @@ const DESCRIPTION =
 
 type TextContent = { type: "text"; text: string };
 
+/**
+ * Map a pi tool result to shell-like output — exported for unit tests.
+ *
+ * Exit-code PARITY with the opencode adapter: grep/find with zero results
+ * return exit 1, everything else that succeeded returns 0, so an `exit == 0`
+ * edge branches identically on both harnesses. pi tools don't expose a count;
+ * zero results are detected via the sentinel text pi emits with NO details
+ * (dist/core/tools/grep.js / find.js in @earendil-works/pi-coding-agent ^0.79 —
+ * revisit if those messages change upstream).
+ */
+export function mapToolResult(
+  tool: string,
+  stdout: string,
+  details: unknown,
+): { stdout: string; stderr: string; exitCode: number } {
+  const noResults =
+    details === undefined &&
+    ((tool === "grep" && stdout.trim() === "No matches found") ||
+      (tool === "find" && stdout.trim().startsWith("No files found matching pattern")));
+  return { stdout, stderr: "", exitCode: noResults ? 1 : 0 };
+}
+
 function createToolExecutor(cwd: string, signal?: AbortSignal) {
   const tools: Record<string, { execute: (id: string, params: any, signal?: AbortSignal) => Promise<{ content: { type: string; text?: string }[]; details?: unknown }> }> = {
     read: createReadTool(cwd),
@@ -154,7 +176,7 @@ function createToolExecutor(cwd: string, signal?: AbortSignal) {
         .filter((c): c is TextContent => c.type === "text" && typeof c.text === "string")
         .map((c) => c.text)
         .join("\n");
-      return { stdout, stderr: "", exitCode: 0 };
+      return mapToolResult(op.tool, stdout, result.details);
     } catch (err) {
       return { stdout: "", stderr: (err as Error).message, exitCode: 1 };
     }

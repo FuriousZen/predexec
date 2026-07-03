@@ -8,6 +8,66 @@
 import { parseConditionString } from "./conditions.ts";
 import type { PlanTree } from "./types.ts";
 
+const VALID_KINDS = "exitCode | fileExists | jsonPath | numeric | match | always";
+
+const compilesAsRegex = (s: string): boolean => {
+  try {
+    new RegExp(s);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+/**
+ * Structural validation for OBJECT conditions at coerce (authoring) time.
+ * The runtime evaluator is exception-safe and degrades malformed conditions to
+ * a silent benign `false` — correct for the walk, terrible feedback for the
+ * author. This surfaces those errors loudly instead, mirroring what
+ * parseConditionString already does for string shorthands. Returns an error
+ * message or null; may FILL a missing `source` (the evaluator reads stdout by
+ * default anyway). Extra fields are tolerated (pi's loose schema sends them).
+ */
+export function validateConditionObject(when: Record<string, unknown>): string | null {
+  switch (when.kind) {
+    case "exitCode":
+      if (!["eq", "ne", "lt", "gt"].includes(when.op as string) || typeof when.value !== "number") {
+        return "exitCode requires op (eq|ne|lt|gt) and a numeric value";
+      }
+      return null;
+    case "fileExists":
+      return typeof when.path === "string" ? null : "fileExists requires a string path";
+    case "jsonPath":
+      if (typeof when.path !== "string" || !["eq", "ne", "exists"].includes(when.op as string)) {
+        return "jsonPath requires a string path and op (eq|ne|exists)";
+      }
+      if (when.source === undefined) when.source = "stdout";
+      return null;
+    case "numeric":
+      if (typeof when.extract !== "string" || !compilesAsRegex(when.extract)) {
+        return "numeric requires a string `extract` that compiles as a regex";
+      }
+      if (!["lt", "le", "gt", "ge", "eq"].includes(when.op as string) || typeof when.value !== "number") {
+        return "numeric requires op (lt|le|gt|ge|eq) and a numeric value";
+      }
+      if (when.source === undefined) when.source = "stdout";
+      return null;
+    case "match":
+      if (typeof when.regex !== "string" || !compilesAsRegex(when.regex)) {
+        return "match requires a string `regex` that compiles";
+      }
+      if (when.source === undefined) when.source = "stdout";
+      if (!["stdout", "stderr"].includes(when.source as string)) {
+        return "match source must be stdout or stderr";
+      }
+      return null;
+    case "always":
+      return null;
+    default:
+      return `unknown condition kind ${JSON.stringify(when.kind)}. Valid kinds: ${VALID_KINDS}`;
+  }
+}
+
 /**
  * Free-tier models routinely emit nested JSON as a STRING (e.g. `nodes` arrives
  * double-encoded, or the whole argument object is stringified). Recover
@@ -39,6 +99,16 @@ export function coercePlan(params: unknown): PlanTree {
           );
         }
         (edge as { when: unknown }).when = parsed;
+      } else if (edge.when && typeof edge.when === "object") {
+        const problem = validateConditionObject(edge.when as Record<string, unknown>);
+        if (problem) {
+          throw new Error(`predexec: invalid condition on edge from "${node.id}": ${problem}.`);
+        }
+      } else {
+        throw new Error(
+          `predexec: edge from "${node.id}" has a ${typeof edge.when} \`when\` — ` +
+          `use a condition string or object.`,
+        );
       }
     }
   }

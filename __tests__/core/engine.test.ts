@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { runPlanTree, validatePlan } from "../../core/engine.ts";
+import { isDestructiveCommand, runPlanTree, validatePlan } from "../../core/engine.ts";
 import type { PlanNode, PlanTree, ToolOp, RunOptions } from "../../core/types.ts";
 
 const cwd = process.cwd();
@@ -207,6 +207,36 @@ describe("runPlanTree — traversal & stop reasons", () => {
     expect((await runPlanTree(quotedRm, { cwd })).stoppedReason).toBe("mutationStop");
   });
 
+  it("mutationStop: `sed -i` in a node hard-stops before running", async () => {
+    const plan: PlanTree = { root: "a", nodes: [{ id: "a", commands: ["sed -i 's/a/b/' file.txt"] }] };
+    const r = await runPlanTree(plan, { cwd });
+    expect(r.stoppedReason).toBe("mutationStop");
+    expect(r.pathTaken).toEqual([]);
+  });
+
+  it("noEdgeMatch: transcript explains what each condition observed", async () => {
+    const plan: PlanTree = {
+      root: "a",
+      nodes: [
+        {
+          id: "a",
+          commands: ["exit 3"],
+          edges: [
+            { when: { kind: "exitCode", op: "eq", value: 0 }, to: "build" },
+            { when: { kind: "match", source: "stdout", regex: "ready" }, to: "retry" },
+          ],
+        },
+        { id: "build", commands: ["echo build"] },
+        { id: "retry", commands: ["echo retry"] },
+      ],
+    };
+    const r = await runPlanTree(plan, { cwd });
+    expect(r.stoppedReason).toBe("noEdgeMatch");
+    expect(r.transcript).toContain("No edge matched from node a:");
+    expect(r.transcript).toContain("- → build: exit == 0 → false (exit was 3)");
+    expect(r.transcript).toMatch(/- → retry: stdout =~ \/ready\/ → false \(no match in \d+-char stdout\)/);
+  });
+
   it("plan.cwd: runs commands and resolves fileExists in the given dir", async () => {
     // process.cwd() is .../predexec; "core" is a real subdir with source files.
     const plan: PlanTree = {
@@ -406,5 +436,69 @@ describe("runPlanTree — tool operations", () => {
     };
     const r2 = await runPlanTree(dangerous, opts);
     expect(r2.stoppedReason).toBe("mutationStop");
+  });
+});
+
+describe("isDestructiveCommand — heuristic coverage (2026-07 audit)", () => {
+  // Writers the audit found the blocklist missing. Every one must be caught.
+  const writers = [
+    "sed -i s/a/b/ f",
+    "sed -e x -i f",
+    "tee out.log",
+    "wget http://x/f",
+    "curl -o out http://x",
+    "curl -sO http://x",
+    "find . -name x -delete",
+    "touch marker",
+    "mkdir -p build",
+    "ln -sf a b",
+    "kill -9 1234",
+    "pkill -f node",
+    "killall node",
+    "shred secrets.txt",
+    "unlink f",
+    "crontab jobs.txt",
+    "git stash drop",
+    "git stash pop",
+    "git rebase main",
+    "git restore f",
+    "git switch main",
+    "git merge feature",
+    "git cherry-pick abc123",
+    "git revert HEAD",
+    'bash -c "rm -rf x"',
+    "echo hi >> log",
+  ];
+  it.each(writers)("catches writer: %s", (cmd) => {
+    expect(isDestructiveCommand(cmd)).toBe(true);
+  });
+
+  // Reads that must NOT be blocked — incl. the stdout-mode / list-mode guards
+  // and double-quoted comparisons (the sanitizer previously only handled
+  // single quotes, so `grep "a->b"` false-positive hard-stopped).
+  const reads = [
+    'grep "a->b" src/x.ts',
+    'grep "x > 5" log.txt',
+    "wget -qO- http://x",
+    "wget -O- http://x",
+    "wget -O - http://x",
+    "crontab -l",
+    "curl http://x",
+    "curl -s http://x",
+    "curl -fsSL http://x",
+    "git status",
+    "git stash list",
+    "git log --oneline",
+    "sed s/a/b/ f",
+    "sed -n 5p f",
+    "find . -name x",
+    "cat f",
+  ];
+  it.each(reads)("does not block read: %s", (cmd) => {
+    expect(isDestructiveCommand(cmd)).toBe(false);
+  });
+
+  it("destructive word inside DOUBLE quotes is still caught (only angles are dropped)", () => {
+    expect(isDestructiveCommand('sh -c "rm -rf /tmp/x"')).toBe(true);
   });
 });

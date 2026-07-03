@@ -4,8 +4,13 @@
  */
 
 export { runPlanTree, validatePlan, isDestructiveCommand } from "./engine.ts";
-export { evaluateCondition, parseConditionString } from "./conditions.ts";
-export { coercePlan } from "./coerce.ts";
+export {
+  evaluateCondition,
+  evaluateConditionWithDetail,
+  parseConditionString,
+  type ConditionEvaluation,
+} from "./conditions.ts";
+export { coercePlan, validateConditionObject } from "./coerce.ts";
 export { runNode, isToolOp, formatToolOpLabel, OUTPUT_CAP } from "./runner.ts";
 export {
   PLAN_TREE_JSON_SCHEMA,
