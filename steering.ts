@@ -16,6 +16,16 @@ export const STEERING_LINE =
   "Use predexec for all read-only shell operations. Use bash only for writes/installs/deletes and interactive commands.";
 
 /**
+ * Speculate-only-on-verified-facts guideline, appended to both adapters' tool
+ * descriptions. Born from a live failure: a model built a 4-node tree on an
+ * assumed repo layout, every path missed, and the errors were misdiagnosed as
+ * a harness bug. Depth is only cheap when the branches are real.
+ */
+export const VERIFY_FIRST_LINE =
+  "Relative paths resolve against the session directory (the transcript's '# cwd:' header). " +
+  "Do not build depth on unverified paths: verify layout in the first node (ls) and gate children with 'file exists' edges.";
+
+/**
  * Quorum markers identifying predexec ROUTING RULES (not mere mentions of the
  * name) already present in the system prompt — e.g. via a host-loaded
  * AGENTS.md/CLAUDE.md. Any 2 of 3 confirm the rules are present and opencode

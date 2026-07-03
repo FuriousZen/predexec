@@ -20,6 +20,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { runPlanTree, coercePlan, isDestructiveCommand, type PlanTree, type ToolOp } from "../../core/index.ts";
 import { estimateRequestsSaved, recordRun } from "../../stats.ts";
+import { VERIFY_FIRST_LINE } from "../../steering.ts";
 
 /**
  * Condition is modelled as a single loose object (discriminated by `kind`)
@@ -128,7 +129,8 @@ const PlanTreeSchema = {
 const DESCRIPTION =
   "Run read-only shell commands and tool calls with deterministic branching. " +
   "Each node runs shell commands (strings) and/or tool calls ({tool, ...args}) sequentially or concurrently. " +
-  "Edges evaluate conditions on output to choose the next node with no model call between levels.";
+  "Edges evaluate conditions on output to choose the next node with no model call between levels. " +
+  VERIFY_FIRST_LINE;
 
 type TextContent = { type: "text"; text: string };
 

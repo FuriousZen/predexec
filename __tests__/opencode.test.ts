@@ -1,9 +1,19 @@
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import plugin, { createToolExecutor, server } from "../.opencode/plugins/predexec.ts";
 import type { ToolOp } from "../core/index.ts";
 
+// read/ls pre-check path existence against the cwd, so mocked-client tests
+// need a real directory with the paths their ops name.
+const repo = mkdtempSync(join(tmpdir(), "px-opencode-"));
+writeFileSync(join(repo, "a.ts"), "x");
+mkdirSync(join(repo, "src"));
+writeFileSync(join(repo, "src", "a.ts"), "x");
+
 const run = (client: any, op: ToolOp) =>
-  createToolExecutor(client, "/repo")(op, { cwd: "/repo" });
+  createToolExecutor(client, repo)(op, { cwd: repo });
 
 describe("opencode plugin — loader contract", () => {
   // opencode's readV1Plugin loads ONLY the default export and requires
@@ -46,7 +56,7 @@ describe("opencode createToolExecutor — SDK response mapping", () => {
     let seen: any;
     const client = { file: { read: async (o: any) => ((seen = o), { data: { content: "x" } }) } };
     await run(client, { tool: "read", path: "src/a.ts" });
-    expect(seen).toEqual({ query: { path: "src/a.ts", directory: "/repo" } });
+    expect(seen).toEqual({ query: { path: "src/a.ts", directory: repo } });
   });
 
   it("grep: formats matches as path:line:text", async () => {
@@ -87,10 +97,10 @@ describe("opencode createToolExecutor — SDK response mapping", () => {
     expect(r.exitCode).toBe(0);
   });
 
-  it("maps an SDK error to a non-zero exit", async () => {
+  it("maps an SDK error to a non-zero exit, attributed to the op", async () => {
     const client = { file: { read: async () => ({ error: "boom" }) } };
     const r = await run(client, { tool: "read", path: "a.ts" });
-    expect(r).toEqual({ stdout: "", stderr: "boom", exitCode: 1 });
+    expect(r).toEqual({ stdout: "", stderr: "read a.ts: boom", exitCode: 1 });
   });
 
   it("unknown tool => error result", async () => {
@@ -102,6 +112,62 @@ describe("opencode createToolExecutor — SDK response mapping", () => {
   it("a thrown SDK call is caught and reported", async () => {
     const client = { file: { read: async () => { throw new Error("network down"); } } };
     const r = await run(client, { tool: "read", path: "a.ts" });
-    expect(r).toEqual({ stdout: "", stderr: "network down", exitCode: 1 });
+    expect(r).toEqual({ stdout: "", stderr: "read: network down", exitCode: 1 });
+  });
+});
+
+describe("opencode createToolExecutor — missing-path pre-check", () => {
+  // Without the pre-check, opencode's server hides missing paths: file.read
+  // returns empty content with no error (silent false success) and file.list
+  // throws an opaque 500. Both must instead fail with the resolved location.
+  const sdkNeverCalled = {
+    file: {
+      read: async () => { throw new Error("SDK should not be called"); },
+      list: async () => { throw new Error("SDK should not be called"); },
+    },
+  };
+
+  it("read of a missing file => exit 1 with the resolved location", async () => {
+    const r = await run(sdkNeverCalled, { tool: "read", path: "nope/absent.ts" });
+    expect(r.exitCode).toBe(1);
+    expect(r.stderr).toBe(`path not found: nope/absent.ts (resolved against ${repo})`);
+  });
+
+  it("ls of a missing dir => exit 1 with the resolved location", async () => {
+    const r = await run(sdkNeverCalled, { tool: "ls", path: "core/" });
+    expect(r.exitCode).toBe(1);
+    expect(r.stderr).toContain("path not found: core/");
+    expect(r.stderr).toContain(repo);
+  });
+
+  it("absolute paths are checked as-is", async () => {
+    const r = await run(sdkNeverCalled, { tool: "read", path: "/definitely/not/here.ts" });
+    expect(r.exitCode).toBe(1);
+    expect(r.stderr).toContain("path not found: /definitely/not/here.ts");
+  });
+
+  it("existing paths still route to the SDK client", async () => {
+    const client = { file: { list: async () => ({ data: [{ name: "a.ts" }] }) } };
+    const r = await run(client, { tool: "ls", path: "src" });
+    expect(r).toEqual({ stdout: "a.ts", stderr: "", exitCode: 0 });
+  });
+});
+
+describe("opencode plugin — prompting surfaces", () => {
+  it("tool description carries the verify-first guideline", async () => {
+    const hooks = await server({ client: {} } as any);
+    const def = (hooks as any).tool.predexec;
+    expect(def.description).toContain("Do not build depth on unverified paths");
+    expect(def.description).toContain("# cwd:");
+  });
+
+  it("plan arg description teaches the condition string shorthands", async () => {
+    const hooks = await server({ client: {} } as any);
+    const def = (hooks as any).tool.predexec;
+    const desc = def.args.plan.description ?? "";
+    expect(desc).toContain('"exit == 0"');
+    expect(desc).toContain('"stdout =~ /regex/"');
+    expect(desc).toContain('"file exists <path>"');
+    expect(desc).toContain('"always"');
   });
 });

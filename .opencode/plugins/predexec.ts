@@ -17,6 +17,8 @@
  * production deps only and the host does not provide that package at import time.
  */
 
+import { existsSync } from "node:fs";
+import { isAbsolute, resolve } from "node:path";
 import { z } from "zod";
 import type { Plugin, ToolContext } from "@opencode-ai/plugin";
 import {
@@ -27,7 +29,7 @@ import {
   type ToolOp,
   type ToolExecutor,
 } from "../../core/index.ts";
-import { STEERING_LINE, systemHasRoutingInstructions } from "../../steering.ts";
+import { STEERING_LINE, VERIFY_FIRST_LINE, systemHasRoutingInstructions } from "../../steering.ts";
 import { recordRun } from "../../stats.ts";
 
 const DESCRIPTION =
@@ -35,7 +37,8 @@ const DESCRIPTION =
   "Each node runs shell commands (strings) and/or tool calls ({tool, ...args}) sequentially or concurrently (parallel:true). " +
   "Edges evaluate conditions on output to choose the next node with no model call between levels. " +
   "Use parallel:true for independent reads, cwd for a shared base dir, and edges to branch. " +
-  "mutationStop/noEdgeMatch is recoverable — read the transcript and resume with bash. Never retry the same plan blindly.";
+  "mutationStop/noEdgeMatch is recoverable — read the transcript and resume with bash. Never retry the same plan blindly. " +
+  VERIFY_FIRST_LINE;
 
 /** opencode v1 SDK client (the subset predexec calls). Loosely typed to avoid a hard SDK dep. */
 type OpencodeClient = {
@@ -60,11 +63,23 @@ const errText = (e: unknown): string =>
 export function createToolExecutor(client: OpencodeClient, cwd: string): ToolExecutor {
   return async (op: ToolOp, opts) => {
     const directory = opts.cwd ?? cwd;
+    // opencode's server surfaces missing paths badly — file.read of a missing
+    // file returns empty content with NO error, and file.list throws an opaque
+    // 500 ("Unexpected server error") — so read/ls pre-check existence and
+    // report the resolved location the model needs to correct its plan.
+    const missing = (p: string) =>
+      existsSync(isAbsolute(p) ? p : resolve(directory, p))
+        ? null
+        : { stdout: "", stderr: `path not found: ${p} (resolved against ${directory})`, exitCode: 1 };
+    const fail = (label: string, e: unknown) => ({ stdout: "", stderr: `${label}: ${errText(e)}`, exitCode: 1 });
     try {
       switch (op.tool) {
         case "read": {
-          const r = await client.file.read({ query: { path: String(op.path ?? ""), directory } });
-          if (r.error) return { stdout: "", stderr: errText(r.error), exitCode: 1 };
+          const path = String(op.path ?? "");
+          const gone = missing(path);
+          if (gone) return gone;
+          const r = await client.file.read({ query: { path, directory } });
+          if (r.error) return fail(`read ${path}`, r.error);
           let content = r.data?.content ?? "";
           // v1 file.read has no offset/limit — apply line-slicing client-side (offset is 1-based).
           if (typeof op.offset === "number" || typeof op.limit === "number") {
@@ -76,21 +91,26 @@ export function createToolExecutor(client: OpencodeClient, cwd: string): ToolExe
           return { stdout: content, stderr: "", exitCode: 0 };
         }
         case "grep": {
-          const r = await client.find.text({ query: { pattern: String(op.pattern ?? ""), directory } });
-          if (r.error) return { stdout: "", stderr: errText(r.error), exitCode: 1 };
+          const pattern = String(op.pattern ?? "");
+          const r = await client.find.text({ query: { pattern, directory } });
+          if (r.error) return fail(`grep ${pattern}`, r.error);
           const matches = r.data ?? [];
           const stdout = matches.map((m) => `${m.path.text}:${m.line_number}:${m.lines.text}`).join("\n");
           return { stdout, stderr: "", exitCode: stdout ? 0 : 1 };
         }
         case "find": {
-          const r = await client.find.files({ query: { query: String(op.pattern ?? ""), directory } });
-          if (r.error) return { stdout: "", stderr: errText(r.error), exitCode: 1 };
+          const pattern = String(op.pattern ?? "");
+          const r = await client.find.files({ query: { query: pattern, directory } });
+          if (r.error) return fail(`find ${pattern}`, r.error);
           const stdout = (r.data ?? []).join("\n");
           return { stdout, stderr: "", exitCode: stdout ? 0 : 1 };
         }
         case "ls": {
-          const r = await client.file.list({ query: { path: String(op.path ?? "."), directory } });
-          if (r.error) return { stdout: "", stderr: errText(r.error), exitCode: 1 };
+          const path = String(op.path ?? ".");
+          const gone = missing(path);
+          if (gone) return gone;
+          const r = await client.file.list({ query: { path, directory } });
+          if (r.error) return fail(`ls ${path}`, r.error);
           const stdout = (r.data ?? []).map((n) => n.name ?? n.path ?? "").filter(Boolean).join("\n");
           return { stdout, stderr: "", exitCode: 0 };
         }
@@ -98,7 +118,7 @@ export function createToolExecutor(client: OpencodeClient, cwd: string): ToolExe
           return { stdout: "", stderr: `unknown tool: ${op.tool}`, exitCode: 1 };
       }
     } catch (err) {
-      return { stdout: "", stderr: errText(err), exitCode: 1 };
+      return fail(String(op.tool), err);
     }
   };
 }
@@ -110,6 +130,7 @@ export const server: Plugin = async ({ client }) => ({
       args: {
         plan: z.any().describe(
           'Plan tree object: {root, nodes:[{id, commands:[<shell string> | {tool:"read",path,offset?,limit?} | {tool:"grep",pattern,path?} | {tool:"find",pattern,path?} | {tool:"ls",path?}], parallel?, edges?:[{when,to}]}], cwd?, maxDepth?}. ' +
+          'when: "always" | "exit == 0" (ops ==,!=,<,>) | "stdout =~ /regex/" (also stderr, !~) | "file exists <path>" / "file missing <path>", or a {kind,...} condition object. ' +
           "Note: grep is directory-scoped (no glob); read offset/limit are applied client-side.",
         ),
       },
