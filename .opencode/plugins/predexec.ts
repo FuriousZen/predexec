@@ -216,13 +216,13 @@ export const server: Plugin = async ({ client }) => ({
   },
 
   "tool.execute.after": async (input, output) => {
-    const nudge = '[predexec] Batch read-only commands in one predexec call: {"root":"a","nodes":[{"id":"a","commands":["cmd1","cmd2"],"parallel":true}]}\n';
+    const nudge = '\n[predexec] Batch read-only commands in one predexec call: {"root":"a","nodes":[{"id":"a","commands":["cmd1","cmd2"],"parallel":true}]}';
     if (["read", "grep", "glob"].includes(input.tool)) {
-      output.output = nudge + output.output;
+      output.output += nudge;
     } else if (input.tool === "bash") {
       const cmd = input.args?.command ?? "";
       if (cmd && !isDestructiveCommand(cmd)) {
-        output.output = nudge + output.output;
+        output.output += nudge;
       }
     }
   },

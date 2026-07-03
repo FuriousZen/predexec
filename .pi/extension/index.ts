@@ -202,8 +202,8 @@ export default function predexec(pi: ExtensionAPI): void {
       if (!cmd || isDestructiveCommand(cmd)) return;
       return {
         content: [
-          { type: "text" as const, text: `${BASH_NUDGE}\n\n` },
           ...event.content,
+          { type: "text" as const, text: `\n\n${BASH_NUDGE}` },
         ],
       };
     }
