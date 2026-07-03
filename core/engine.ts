@@ -17,7 +17,15 @@
 
 import { resolve } from "node:path";
 import { evaluateConditionWithDetail } from "./conditions.ts";
+import {
+  READ_ONLY_TOOLS,
+  MUTATING_TOOLS,
+  findDestructiveToken,
+  isDestructiveCommand,
+} from "./destructive.ts";
 import { runNode, isToolOp, formatToolOpLabel } from "./runner.ts";
+
+export { isDestructiveCommand };
 import {
   DEFAULT_MAX_DEPTH,
   HIGH_CONFIDENCE_KINDS,
@@ -59,6 +67,16 @@ export async function runPlanTree(plan: PlanTree, opts: RunOptions): Promise<Cor
     if (current.mutates || detected) {
       blocks.push(mutationBlock(current, detected));
       return result(pathTaken, depth, "mutationStop", blocks.join("\n\n"), edgesEvaluated, edgesMatched);
+    }
+
+    // Host-policy hard-stop: the host would deny or prompt for this command;
+    // predexec cannot prompt mid-walk, so it never runs it.
+    if (opts.checkCommandPolicy) {
+      const violation = findPolicyViolation(current, opts.checkCommandPolicy);
+      if (violation) {
+        blocks.push(policyBlock(current, violation));
+        return result(pathTaken, depth, "policyStop", blocks.join("\n\n"), edgesEvaluated, edgesMatched);
+      }
     }
 
     if (opts.signal?.aborted) {
@@ -148,11 +166,6 @@ export function validatePlan(plan: PlanTree, byId: Map<string, PlanNode>): strin
   return null;
 }
 
-/** Tool names that are definitively read-only — no regex analysis needed. */
-const READ_ONLY_TOOLS = new Set(["read", "grep", "find", "ls"]);
-/** Tool names that are definitively mutating — hard-stop unconditionally. */
-const MUTATING_TOOLS = new Set(["edit", "write"]);
-
 /**
  * Conservative backstop for an undeclared write/install/delete. Defense in depth.
  * Returns the offending command (+ matched token) so the hard-stop can tell the
@@ -166,8 +179,8 @@ function findDestructive(node: PlanNode): { index: number; command: string; toke
       if (result) return { index: i, command: formatToolOpLabel(op), token: result };
       continue;
     }
-    const m = DESTRUCTIVE.exec(sanitizeForRedirect(op));
-    if (m) return { index: i, command: op, token: m[0].trim() };
+    const token = findDestructiveToken(op);
+    if (token) return { index: i, command: op, token };
   }
   return null;
 }
@@ -176,46 +189,33 @@ function checkToolOpDestructive(op: ToolOp): string | null {
   if (READ_ONLY_TOOLS.has(op.tool)) return null;
   if (MUTATING_TOOLS.has(op.tool)) return `tool:${op.tool}`;
   if (op.tool === "bash" && typeof op.command === "string") {
-    const m = DESTRUCTIVE.exec(sanitizeForRedirect(op.command));
-    return m ? m[0].trim() : null;
+    return findDestructiveToken(op.command);
   }
   return `unknown tool:${op.tool}`;
 }
 
 /**
- * Neutralize `>`/`<` where they are comparisons, not file redirects, so a read
- * is not misread as a write: inside shell quoted spans (awk/sed/jq programs and
- * grep patterns — e.g. `awk '$1 > 200'`, `grep "a->b" f`), `[[ ... ]]` tests, and
- * `(( ... ))` arithmetic. Only the angle brackets in those spans are dropped —
- * the rest of the span is kept, so a genuinely destructive word inside quotes
- * (`sh -c 'rm -rf /'`) is still caught by the rm/install/git checks. Real
- * redirects (`echo x > f`) live OUTSIDE these spans and are untouched. Bare
- * `test`/`[` are left alone: outside `[[ ]]`, `test $x > 5` IS a real redirect
- * to a file named `5`.
+ * Host-policy check over a node's shell strings (incl. `{tool:"bash"}` ops).
+ * Runs the adapter-provided checker; a hit means the HOST would deny or prompt
+ * for this command — predexec cannot prompt mid-walk, so it hard-stops before
+ * running, same contract as the mutation stop.
  */
-function sanitizeForRedirect(cmd: string): string {
-  const dropAngles = (s: string) => s.replace(/[<>]/g, " ");
-  return cmd
-    .replace(/'[^']*'/g, dropAngles)
-    .replace(/"[^"]*"/g, dropAngles)
-    .replace(/\[\[[\s\S]*?\]\]/g, dropAngles)
-    .replace(/\(\([\s\S]*?\)\)/g, dropAngles);
-}
-
-/**
- * Blocklist heuristic — best-effort, not a sandbox. Alternations, in order:
- * file removers/movers/creators, process killers, `cp -`, `sed` with an `-i`
- * flag anywhere in its segment, `tee`, `wget` (unless stdout mode `-O-`/`-qO-`), `curl` with a
- * file-output flag (`-o`/`-O`, incl. clustered), `find -delete`, `crontab`
- * (unless `-l` list), real output redirects, package-manager installs/removes,
- * and history-mutating git verbs. Deliberately out of scope: allowlist
- * inversion, rsync/tar -x (mode-sensitive parsing).
- */
-const DESTRUCTIVE =
-  /\b(rm|rmdir|mv|dd|mkfs|chmod|chown|truncate|touch|mkdir|ln|shred|unlink|tee)\b|\b(kill|pkill|killall)\b|\bcp\s+-|\bsed\b[^|;&]*?\s-i\b|\bwget\b(?![^|;&]*-q?O\s?-(?:\s|$|[|;&]))|\bcurl\b[^|;&]*\s-\w*[oO]\b|\bfind\b[^|;&]*\s-delete\b|\bcrontab\b(?!\s+-l\b)|(?<![\d&=])>(?!\s*\/dev\/null|[&=])|\b(npm|pnpm|yarn|pip|pip3|apt|apt-get|brew|cargo|go)\s+(install|add|i|remove|uninstall|rm)\b|\bgit\s+(push|commit|reset|checkout|clean|rm|merge|rebase|restore|switch|apply|cherry-pick|revert|stash\s+(drop|pop|clear))\b/;
-
-export function isDestructiveCommand(cmd: string): boolean {
-  return DESTRUCTIVE.test(sanitizeForRedirect(cmd));
+function findPolicyViolation(
+  node: PlanNode,
+  check: (cmd: string) => string | null,
+): { index: number; command: string; rule: string } | null {
+  for (let i = 0; i < node.commands.length; i++) {
+    const op = node.commands[i]!;
+    const cmd = isToolOp(op)
+      ? op.tool === "bash" && typeof op.command === "string"
+        ? op.command
+        : null
+      : op;
+    if (cmd === null) continue;
+    const rule = check(cmd);
+    if (rule) return { index: i, command: cmd, rule };
+  }
+  return null;
 }
 
 function transcriptBlock(node: PlanNode, output: NodeOutput): string {
@@ -265,6 +265,17 @@ function mutationBlock(
   }
   lines.push("Speculation stops before any write/install/delete. Resume with normal tool calling to perform it.");
   return lines.join("\n");
+}
+
+function policyBlock(
+  node: PlanNode,
+  violation: { index: number; command: string; rule: string },
+): string {
+  return [
+    `## node ${node.id} — POLICY HARD-STOP (not run)`,
+    `Blocked by host permission rule '${violation.rule}' on command ${violation.index + 1}: ${violation.command}`,
+    "Run this via the host bash tool instead — it enforces/prompts per the host's permission config.",
+  ].join("\n");
 }
 
 function result(

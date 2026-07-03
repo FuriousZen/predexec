@@ -3,7 +3,13 @@
  * Adapters import only from here.
  */
 
-export { runPlanTree, validatePlan, isDestructiveCommand } from "./engine.ts";
+export { runPlanTree, validatePlan } from "./engine.ts";
+export {
+  isDestructiveCommand,
+  findDestructiveToken,
+  splitCommandSegments,
+  effectiveHead,
+} from "./destructive.ts";
 export {
   evaluateCondition,
   evaluateConditionWithDetail,

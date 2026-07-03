@@ -214,6 +214,35 @@ describe("opencode createToolExecutor — missing-path pre-check", () => {
   });
 });
 
+describe("opencode plugin — host permission policy e2e", () => {
+  const execute = async (directory: string, plan: unknown) => {
+    const hooks = await server({ client: {} } as any);
+    return (hooks as any).tool.predexec.execute(
+      { plan },
+      { directory, abort: new AbortController().signal },
+    );
+  };
+  const catPlan = { root: "a", nodes: [{ id: "a", commands: ["cat marker.txt"] }] };
+
+  it("a project opencode.json deny rule hard-stops the matching command", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "px-oc-policy-"));
+    writeFileSync(join(dir, "opencode.json"), '{"permission":{"bash":{"cat *":"deny"}}}');
+    writeFileSync(join(dir, "marker.txt"), "x");
+    const out = await execute(dir, catPlan);
+    expect(out).toContain("POLICY HARD-STOP (not run)");
+    expect(out).toContain("'cat *'");
+    expect(out).not.toContain("node a (exit");
+  });
+
+  it("without a permission block the same plan runs normally", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "px-oc-policy-"));
+    writeFileSync(join(dir, "opencode.json"), "{}");
+    writeFileSync(join(dir, "marker.txt"), "x");
+    const out = await execute(dir, catPlan);
+    expect(out).toContain("node a (exit 0)");
+  });
+});
+
 describe("opencode plugin — prompting surfaces", () => {
   it("tool description carries the verify-first guideline", async () => {
     const hooks = await server({ client: {} } as any);

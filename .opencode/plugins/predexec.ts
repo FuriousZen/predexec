@@ -31,6 +31,7 @@ import {
 } from "../../core/index.ts";
 import { STEERING_LINE, VERIFY_FIRST_LINE, systemHasRoutingInstructions } from "../../steering.ts";
 import { recordRun } from "../../stats.ts";
+import { createPolicyChecker, readOpencodeBashRules } from "../../policy.ts";
 
 const DESCRIPTION =
   "Run read-only shell commands and tool calls with deterministic branching. " +
@@ -38,6 +39,7 @@ const DESCRIPTION =
   "Edges evaluate conditions on output to choose the next node with no model call between levels. " +
   "Use parallel:true for independent reads, cwd for a shared base dir, and edges to branch. " +
   "mutationStop/noEdgeMatch is recoverable — read the transcript and resume with bash. Never retry the same plan blindly. " +
+  "Shell commands respect your opencode permission rules — deny/ask matches hard-stop before running. " +
   VERIFY_FIRST_LINE;
 
 /** opencode v1 SDK client (the subset predexec calls). Loosely typed to avoid a hard SDK dep. */
@@ -185,11 +187,15 @@ export const server: Plugin = async ({ client }) => ({
         }
 
         const executeToolOp = createToolExecutor(client as unknown as OpencodeClient, context.directory);
+        // Re-read per call (one small JSON read): config edits apply immediately,
+        // and an unconfigured host costs a cheap no-op checker.
+        const checkCommandPolicy = createPolicyChecker(readOpencodeBashRules(context.directory));
 
         const result = await runPlanTree(plan, {
           cwd: context.directory,
           signal: context.abort,
           executeToolOp,
+          checkCommandPolicy,
         });
 
         void recordRun(plan, result, "opencode");

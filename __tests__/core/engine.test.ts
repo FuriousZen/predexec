@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { isDestructiveCommand, runPlanTree, validatePlan } from "../../core/engine.ts";
+import { runPlanTree, validatePlan } from "../../core/engine.ts";
 import type { PlanNode, PlanTree, ToolOp, RunOptions } from "../../core/types.ts";
 
 const cwd = process.cwd();
@@ -436,69 +436,5 @@ describe("runPlanTree — tool operations", () => {
     };
     const r2 = await runPlanTree(dangerous, opts);
     expect(r2.stoppedReason).toBe("mutationStop");
-  });
-});
-
-describe("isDestructiveCommand — heuristic coverage (2026-07 audit)", () => {
-  // Writers the audit found the blocklist missing. Every one must be caught.
-  const writers = [
-    "sed -i s/a/b/ f",
-    "sed -e x -i f",
-    "tee out.log",
-    "wget http://x/f",
-    "curl -o out http://x",
-    "curl -sO http://x",
-    "find . -name x -delete",
-    "touch marker",
-    "mkdir -p build",
-    "ln -sf a b",
-    "kill -9 1234",
-    "pkill -f node",
-    "killall node",
-    "shred secrets.txt",
-    "unlink f",
-    "crontab jobs.txt",
-    "git stash drop",
-    "git stash pop",
-    "git rebase main",
-    "git restore f",
-    "git switch main",
-    "git merge feature",
-    "git cherry-pick abc123",
-    "git revert HEAD",
-    'bash -c "rm -rf x"',
-    "echo hi >> log",
-  ];
-  it.each(writers)("catches writer: %s", (cmd) => {
-    expect(isDestructiveCommand(cmd)).toBe(true);
-  });
-
-  // Reads that must NOT be blocked — incl. the stdout-mode / list-mode guards
-  // and double-quoted comparisons (the sanitizer previously only handled
-  // single quotes, so `grep "a->b"` false-positive hard-stopped).
-  const reads = [
-    'grep "a->b" src/x.ts',
-    'grep "x > 5" log.txt',
-    "wget -qO- http://x",
-    "wget -O- http://x",
-    "wget -O - http://x",
-    "crontab -l",
-    "curl http://x",
-    "curl -s http://x",
-    "curl -fsSL http://x",
-    "git status",
-    "git stash list",
-    "git log --oneline",
-    "sed s/a/b/ f",
-    "sed -n 5p f",
-    "find . -name x",
-    "cat f",
-  ];
-  it.each(reads)("does not block read: %s", (cmd) => {
-    expect(isDestructiveCommand(cmd)).toBe(false);
-  });
-
-  it("destructive word inside DOUBLE quotes is still caught (only angles are dropped)", () => {
-    expect(isDestructiveCommand('sh -c "rm -rf /tmp/x"')).toBe(true);
   });
 });

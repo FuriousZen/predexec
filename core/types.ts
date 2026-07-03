@@ -97,6 +97,7 @@ export type StoppedReason =
   | "noEdgeMatch"
   | "maxDepth"
   | "mutationStop"
+  | "policyStop"
   | "error"
   | "aborted";
 
@@ -138,6 +139,12 @@ export interface RunOptions {
   onCommandOutput?: OnCommandOutput;
   /** Callback to execute tool operations ({tool, ...args}). Required when plan contains tool ops. */
   executeToolOp?: ToolExecutor;
+  /**
+   * Adapter-provided host-policy check for shell commands. Returns the matched
+   * rule/pattern when the HOST would deny or prompt for the command (predexec
+   * cannot prompt mid-walk → policyStop hard-stop before running), null to run.
+   */
+  checkCommandPolicy?: (cmd: string) => string | null;
 }
 
 /** Engine-level backstop when a plan omits maxDepth. */
