@@ -42,8 +42,16 @@ function sanitizeForRedirect(cmd: string): string {
     .replace(/\(\([\s\S]*?\)\)/g, dropAngles);
 }
 
-/** Unquoted `>` that is a real file redirect (guards: fd dups, /dev/null, `>=`). */
-const REDIRECT_RE = /(?<![\d&=])>(?!\s*\/dev\/null|[&=])/;
+/**
+ * Unquoted `>` that is a real file redirect.
+ *
+ * Guards live in the LOOKAHEAD: `2>&1` / `>&2` (fd dup) and `>=` are excluded by
+ * `[&=]`, and `>/dev/null` by the /dev/null branch. The lookbehind only has to
+ * exclude JS arrow functions (`=>`). It must NOT exclude a leading digit — an
+ * explicit fd write like `echo hi 1>out.txt` or `2>err.log` is a real file write,
+ * and excluding `\d` let every numbered-fd redirect through.
+ */
+const REDIRECT_RE = /(?<!=)>(?!\s*\/dev\/null|[&=])/;
 
 /**
  * Word blocklist: file removers/movers/creators, process killers, `cp -`,
@@ -52,8 +60,47 @@ const REDIRECT_RE = /(?<![\d&=])>(?!\s*\/dev\/null|[&=])/;
  * clustered), `find -delete`, `crontab` (unless `-l` list), package-manager
  * installs/removes, and history-mutating git verbs.
  */
-const WORD_RE =
-  /\b(rm|rmdir|mv|dd|mkfs|chmod|chown|truncate|touch|mkdir|ln|shred|unlink|tee)\b|\b(kill|pkill|killall)\b|\bcp\s+-|\bsed\b[^|;&]*?\s-i\b|\bsort\b[^|;&]*?\s-o\b|\bwget\b(?![^|;&]*-q?O\s?-(?:\s|$|[|;&]))|\bcurl\b[^|;&]*\s-\w*[oO]\b|\bfind\b[^|;&]*\s-delete\b|\bcrontab\b(?!\s+-l\b)|\b(npm|pnpm|yarn|pip|pip3|apt|apt-get|brew|cargo|go)\s+(install|add|i|remove|uninstall|rm)\b|\bgit\s+(push|commit|reset|checkout|clean|rm|merge|rebase|restore|switch|apply|cherry-pick|revert|stash\s+(drop|pop|clear))\b/;
+const WORD_RE = new RegExp(
+  [
+    // file removers/movers/creators, process killers
+    /\b(rm|rmdir|mv|dd|mkfs|chmod|chown|truncate|touch|mkdir|ln|shred|unlink|tee)\b/,
+    /\b(kill|pkill|killall)\b/,
+    /\bcp\s+-/,
+    /\bsed\b[^|;&]*?\s-i\b/,
+    /\bsort\b[^|;&]*?\s-o\b/,
+    // `install` as a command (coreutils install copies+chmods); not `npm install`,
+    // which the package-manager branch already covers.
+    /(?<!\w[- ])\binstall\b\s+-/,
+    // wget unless stdout mode (-O- / -qO-)
+    /\bwget\b(?![^|;&]*-q?O\s?-(?:\s|$|[|;&]))/,
+    // curl with a file-output flag: clustered short (-o/-O/-sLo) or long form.
+    // The old pattern was `\s-\w*[oO]\b`, where `\w*` could not consume the
+    // second dash, so `--output` slipped through.
+    /\bcurl\b[^|;&]*\s(--output\b|--remote-name\b|-\w*[oO]\b)/,
+    // piping a download straight into an interpreter — the classic installer
+    // one-liner. Neither tier caught this: no redirect, no blocklisted word.
+    /\b(curl|wget)\b[^|;&]*\|\s*(sudo\s+)?(sh|bash|zsh|dash|python3?|node|ruby|perl)\b/,
+    /\bfind\b[^|;&]*\s-delete\b/,
+    /\bcrontab\b(?!\s+-l\b)/,
+    // package managers — install/remove plus the lockfile/link/upgrade verbs
+    /\b(npm|pnpm|yarn|bun|pip|pip3|apt|apt-get|brew|cargo|go|gem|poetry|composer)\s+(install|add|i|ci|remove|uninstall|rm|update|upgrade|link|dlx|prune)\b/,
+    /\bnpx\b/,
+    /\bpython3?\s+(-m\s*pip|setup\.py)\b/,
+    /\bmake\s+install\b/,
+    // history-mutating git verbs. Option tokens may sit between `git` and the
+    // verb (`git -C /repo reset --hard`, `git -c k=v commit`), so allow them.
+    // Read-only spellings are carved back out with negative lookaheads.
+    new RegExp(
+      String.raw`\bgit\s+(?:-\w+(?:\s+\S+)?\s+|--[\w-]+(?:=\S+)?\s+)*` +
+        String.raw`(push|commit|reset|checkout|clean|rm|mv|merge|rebase|restore|switch|apply|am|` +
+        String.raw`cherry-pick|revert|gc|prune|filter-branch|worktree|submodule|` +
+        String.raw`stash(?!\s+(list|show))|branch(?!\s+(-l\b|--list|-v\b))|tag(?!\s+-l\b)|` +
+        String.raw`config(?!\s+(--get|--list|-l\b))|remote(?!\s+(-v\b|show\b)))\b`,
+    ),
+  ]
+    .map((r) => r.source)
+    .join("|"),
+);
 
 /**
  * Command heads that only ever read (absent an exception below). Membership
@@ -63,7 +110,7 @@ const WORD_RE =
  */
 const READ_ONLY_HEADS = new Set([
   "cat", "ls", "head", "tail", "wc", "grep", "egrep", "fgrep", "rg", "file",
-  "stat", "du", "df", "ps", "env", "printenv", "echo", "printf", "which",
+  "stat", "du", "df", "ps", "printenv", "echo", "printf", "which",
   "whereis", "type", "pwd", "whoami", "id", "uname", "date", "hostname",
   "sort", "uniq", "cut", "tr", "column", "comm", "join", "paste", "fold",
   "rev", "nl", "od", "xxd", "hexdump", "strings", "basename", "dirname",
@@ -80,8 +127,12 @@ const READ_ONLY_HEADS = new Set([
 const HEAD_EXCEPTIONS: Record<string, RegExp> = {
   sed: /\s-i\b/,
   sort: /\s-o\b/,
-  awk: /system\s*\(/,
-  gawk: /system\s*\(/,
+  // awk writes without ever leaving its own program text: `awk 'BEGIN{print >
+  // "/etc/passwd"}'`. The redirect check cannot see it (sanitizeForRedirect
+  // drops angles inside quotes by design, so quoted comparisons don't
+  // false-positive), so the head must lose its safe-tier pass instead.
+  awk: /system\s*\(|\bprint\b[^}]*>|\bprintf\b[^}]*>|\bclose\s*\(/,
+  gawk: /system\s*\(|\bprint\b[^}]*>|\bprintf\b[^}]*>|\bclose\s*\(/,
   find: /\s(-delete|-exec|-execdir|-ok)\b/,
 };
 
@@ -97,6 +148,14 @@ const EVAL_SHELLS = new Set(["sh", "bash", "zsh", "dash"]);
  */
 const EVAL_WRITER_RE =
   /\bfs\.\w*[Ww]rite\w*|writeFile\w*|appendFile\w*|rmSync|unlinkSync|mkdirSync|renameSync|rmdirSync|cpSync|createWriteStream|truncateSync|chmodSync|symlinkSync|os\.(remove|unlink|rename|mkdir|rmdir|makedirs)|shutil\.|write_text|write_bytes|open\([^)]*['"][wa]/;
+
+/**
+ * awk/gawk writes that never leave the program text: `awk 'BEGIN{print >
+ * "/etc/passwd"}'`. Scanned against the RAW segment, because the redirect check
+ * runs on sanitized text where quoted angles are deliberately dropped, and the
+ * word scan has no awk-specific token to match.
+ */
+const AWK_WRITE_RE = /\b(print|printf)\b[^}]*>|\bsystem\s*\(|\bclose\s*\(/;
 
 /** Subshell/process-substitution markers: content we cannot attribute to a head. */
 const OPAQUE_SUBSHELL_RE = /\$\(|`|<\(|>\(/;
@@ -137,8 +196,22 @@ export function splitCommandSegments(cmd: string): string[] {
   }
 }
 
-/** Wrapper commands that defer to the next token. */
-const WRAPPERS = new Set(["time", "nice", "nohup", "command", "xargs"]);
+/**
+ * Wrapper commands that defer to the next token. `env` belongs here, not in
+ * READ_ONLY_HEADS: bare `env` prints the environment, but `env rm -rf /` runs
+ * rm. Treating it as a pure reader skipped the word scan entirely and let every
+ * `env <writer>` through. As a wrapper, `env FOO=1 rm …` resolves to `rm` (the
+ * VAR=val skip in effectiveHead already handles the assignment), and a bare
+ * `env` falls through to the word scan, which is the safe direction.
+ */
+const WRAPPERS = new Set(["time", "nice", "nohup", "command", "xargs", "env"]);
+
+/**
+ * Privileged escalation heads. Never speculated on: a privileged command is
+ * outside the recoverable read-only zone by definition, and detection would
+ * otherwise rest entirely on the word scan matching whatever it wraps.
+ */
+const PRIVILEGE_HEADS = new Set(["sudo", "doas", "pkexec"]);
 
 /**
  * The token that decides a segment's classification: skips VAR=val prefixes
@@ -156,8 +229,17 @@ export function effectiveHead(segment: string): string | null {
   return null;
 }
 
+/**
+ * In-place edit flags: `perl -i`, `perl -pi -e`, `ruby -i -pe` rewrite their
+ * input files directly. There is no redirect and no blocklisted word, so
+ * nothing else in the pipeline catches them.
+ */
+const INPLACE_EDIT_RE = /\s-\w*i(\.\w+)?\b/;
+
 function isEvalInvocation(head: string, segment: string): boolean {
-  if (EVAL_INTERPRETERS.has(head)) return /\s(-e|-c|--eval)\b/.test(segment);
+  // `-p`/`-n`/`--print` are eval flags too: `node -p 'require("fs").rmSync(…)'`
+  // executes exactly like `-e`, and clustered forms (`perl -pi -e`) are common.
+  if (EVAL_INTERPRETERS.has(head)) return /\s(-\w*[ecnp]\w*|--eval|--print)\b/.test(segment);
   if (EVAL_SHELLS.has(head)) return /\s-c\b/.test(segment);
   return false;
 }
@@ -174,6 +256,11 @@ export function findDestructiveToken(cmd: string): string | null {
 
   const segments = splitCommandSegments(cmd);
   const heads = segments.map(effectiveHead);
+
+  // Privileged escalation is never speculated on, whatever it wraps.
+  for (const head of heads) {
+    if (head && PRIVILEGE_HEADS.has(head)) return head;
+  }
 
   // Safe tier: every head is a pure reader, no exception fires, and there is
   // no subshell content we can't attribute. Word-scan skipped.
@@ -193,8 +280,14 @@ export function findDestructiveToken(cmd: string): string | null {
   // the quotes the sanitizer deliberately preserves words in.
   for (let i = 0; i < segments.length; i++) {
     const head = heads[i];
-    if (head && isEvalInvocation(head, segments[i]!)) {
-      const writer = EVAL_WRITER_RE.exec(segments[i]!);
+    if (!head) continue;
+    const segment = segments[i]!;
+    if ((head === "awk" || head === "gawk") && AWK_WRITE_RE.test(segment)) {
+      return AWK_WRITE_RE.exec(segment)![0].trim();
+    }
+    if (EVAL_INTERPRETERS.has(head) && INPLACE_EDIT_RE.test(segment)) return "-i";
+    if (isEvalInvocation(head, segment)) {
+      const writer = EVAL_WRITER_RE.exec(segment);
       if (writer) return writer[0].trim();
     }
   }

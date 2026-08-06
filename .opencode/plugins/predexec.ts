@@ -50,9 +50,17 @@ type OpencodeClient = {
   };
   find: {
     text(opts: { query: { pattern: string; directory?: string } }): Promise<{ data?: Array<{ path: { text: string }; lines: { text: string }; line_number: number }>; error?: unknown }>;
-    files(opts: { query: { query: string; directory?: string } }): Promise<{ data?: string[]; error?: unknown }>;
+    files(opts: { query: { query: string; directory?: string; limit?: number } }): Promise<{ data?: string[]; error?: unknown }>;
   };
 };
+
+/**
+ * opencode's /find (grep) endpoint passes a literal `limit: 10` to ripgrep and
+ * accepts no override — measured against opencode 1.18.14. /find/file defaults
+ * to 10 but honours an explicit `limit`.
+ */
+const OPENCODE_GREP_CAP = 10;
+const DEFAULT_FIND_LIMIT = 100;
 
 const errText = (e: unknown): string =>
   typeof e === "string" ? e : e instanceof Error ? e.message : JSON.stringify(e);
@@ -135,16 +143,39 @@ export function createToolExecutor(client: OpencodeClient, cwd: string): ToolExe
           if (scoped.err) return scoped.err;
           const r = await client.find.text({ query: { pattern, directory: scoped.dir } });
           if (r.error) return fail(`grep ${pattern}`, r.error);
-          const matches = sliceLimit(r.data ?? [], op.limit);
+          const raw = r.data ?? [];
+          const matches = sliceLimit(raw, op.limit);
           const stdout = matches.map((m) => `${m.path.text}:${m.line_number}:${m.lines.text}`).join("\n");
-          return { stdout, stderr: "", exitCode: stdout ? 0 : 1 };
+          // opencode's /find endpoint hard-codes limit:10 server-side and takes
+          // no limit parameter, so a hit count of exactly 10 is indistinguishable
+          // from "truncated". Silent truncation feeding a match/numeric edge is
+          // false-hit fuel, so say so instead of letting the model assume it saw
+          // everything. Verified against opencode 1.18.14.
+          // Only warn when the caller is actually seeing the cap: if they asked
+          // for fewer than we got, they received exactly what they requested.
+          const capped = raw.length >= OPENCODE_GREP_CAP && matches.length === raw.length;
+          return {
+            stdout,
+            stderr: capped
+              ? `grep: opencode caps results at ${OPENCODE_GREP_CAP} matches and cannot raise it — ` +
+                `results may be incomplete; use a shell \`rg\`/\`grep\` for an exhaustive search`
+              : "",
+            exitCode: stdout ? 0 : 1,
+          };
         }
         case "find": {
           const pattern = String(op.pattern ?? "");
           const scoped = scopeDir(op.path, "find");
           if (scoped.err) return scoped.err;
-          const r = await client.find.files({ query: { query: pattern, directory: scoped.dir } });
+          // The endpoint defaults to 10 results but DOES accept a limit — the
+          // adapter previously omitted it and then sliced client-side, so every
+          // find silently returned at most 10 regardless of op.limit.
+          const limit = typeof op.limit === "number" && op.limit > 0 ? op.limit : DEFAULT_FIND_LIMIT;
+          const r = await client.find.files({ query: { query: pattern, directory: scoped.dir, limit } });
           if (r.error) return fail(`find ${pattern}`, r.error);
+          // Send the limit AND slice: the query limit stops the server capping
+          // us at its default of 10, the slice keeps op.limit exact regardless
+          // of how the server interprets it.
           const stdout = sliceLimit(r.data ?? [], op.limit).join("\n");
           return { stdout, stderr: "", exitCode: stdout ? 0 : 1 };
         }
@@ -189,7 +220,8 @@ export const server: Plugin = async ({ client }) => ({
         const executeToolOp = createToolExecutor(client as unknown as OpencodeClient, context.directory);
         // Re-read per call (one small JSON read): config edits apply immediately,
         // and an unconfigured host costs a cheap no-op checker.
-        const checkCommandPolicy = createPolicyChecker(readOpencodeBashRules(context.directory));
+        const policy = readOpencodeBashRules(context.directory);
+        const checkCommandPolicy = createPolicyChecker(policy.rules, policy.unreadable);
 
         const result = await runPlanTree(plan, {
           cwd: context.directory,

@@ -14,6 +14,7 @@ export {
   evaluateCondition,
   evaluateConditionWithDetail,
   parseConditionString,
+  isSafeRegex,
   type ConditionEvaluation,
 } from "./conditions.ts";
 export { coercePlan, validateConditionObject } from "./coerce.ts";
@@ -39,4 +40,9 @@ export {
   type CoreResult,
   type ToolExecutor,
   type RunOptions,
+  // Callback types referenced by the exported RunOptions — without these an
+  // adapter could not name the shape of the handlers it passes in.
+  type ProgressEvent,
+  type OnProgress,
+  type OnCommandOutput,
 } from "./types.ts";

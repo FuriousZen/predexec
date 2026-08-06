@@ -5,6 +5,12 @@
  * regex, unparseable JSON, missing file) evaluates to `false`, never throwing.
  * A thrown exception mid-walk would be a silent false-hit hazard; returning
  * false instead degrades to a benign miss (no edge matches => fallback).
+ *
+ * Totality also has to cover NON-termination, which a try/catch cannot: regexes
+ * here are model-authored and run against up to OUTPUT_CAP characters, so a
+ * catastrophically-backtracking pattern hangs the whole walk rather than
+ * throwing. Measured on this code: `(a+)+$` against 32 a's took 32s, doubling
+ * per added character. isSafeRegex screens those out — see below.
  */
 
 import { existsSync } from "node:fs";
@@ -12,8 +18,41 @@ import { isAbsolute, resolve } from "node:path";
 import type { Condition, NodeOutput } from "./types.ts";
 
 const EXIT_RE = /^exit\s*(==|!=|>|<)\s*(\d+)$/;
+// Greedy `(.+)` with the `$` anchor takes everything between the first and last
+// `/`, which is what a regex containing a literal slash needs.
 const MATCH_RE = /^(stdout|stderr)\s*(=~|!~)\s*\/(.+)\/$/;
 const FILE_RE = /^file\s+(exists|missing)\s+(.+)$/;
+
+/**
+ * Reject regexes prone to catastrophic backtracking.
+ *
+ * Best-effort and deliberately narrow: it rejects a quantified group whose body
+ * ENDS open-ended — `(a+)+`, `([a-z]+)+`, `(\w+\s*)+`, `(\d+){2,}` — the shape
+ * behind essentially every practical ReDoS. A body ending in a fixed atom is
+ * anchored and allowed, so ordinary matchers like `(?:\d+\.)+\d+` still work.
+ *
+ * It does NOT catch quantified overlapping alternation like `(a|a)+`. A real
+ * fix needs a timeout the JS RegExp engine does not offer, so this narrows the
+ * gap rather than closing it.
+ */
+const QUANTIFIED_GROUP_RE = /\(([^)]*)\)\s*(?:[+*]|\{\d)/g;
+
+export function isSafeRegex(pattern: string): boolean {
+  QUANTIFIED_GROUP_RE.lastIndex = 0;
+  for (let m = QUANTIFIED_GROUP_RE.exec(pattern); m; m = QUANTIFIED_GROUP_RE.exec(pattern)) {
+    const body = (m[1] ?? "").replace(/^\?[:=!]|^\?<[=!]?[^>]*>/, "");
+    // Unsafe only when the repeated body ITSELF ends open-ended — `(a+)+`,
+    // `([a-z]+)+`, `(\w+\s*)+`. Then each outer repetition can split the same
+    // input many ways and the engine explores all of them.
+    //
+    // A body ending in a fixed atom is anchored and safe: in `(?:\d+\.)+` every
+    // iteration must consume a literal `.`, so there is nothing to backtrack
+    // over. Rejecting those would turn ordinary version/path matchers into
+    // permanently-false edges.
+    if (/[+*]$|\{\d+,\}$/.test(body)) return false;
+  }
+  return true;
+}
 
 const EXIT_OP: Record<string, "eq" | "ne" | "gt" | "lt"> = {
   "==": "eq", "!=": "ne", ">": "gt", "<": "lt",
@@ -119,6 +158,9 @@ export function evaluateConditionWithDetail(
 
       case "numeric": {
         const label = `numeric /${cond.extract}/ ${OP_SYM[cond.op] ?? cond.op} ${cond.value}`;
+        if (!isSafeRegex(cond.extract)) {
+          return { result: false, detail: `${label} → false (extract regex rejected: nested quantifier may not terminate)` };
+        }
         const m = new RegExp(cond.extract).exec(output.stdout);
         if (!m) return { result: false, detail: `${label} → false (regex matched nothing in stdout)` };
         const raw = m[1] ?? m[0];
@@ -133,6 +175,12 @@ export function evaluateConditionWithDetail(
       case "match": {
         const sourceName = cond.source === "stderr" ? "stderr" : "stdout";
         const source = cond.source === "stderr" ? output.stderr : output.stdout;
+        if (!isSafeRegex(cond.regex)) {
+          return {
+            result: false,
+            detail: `${sourceName} ${cond.negate ? "!~" : "=~"} /${cond.regex}/ → false (regex rejected: nested quantifier may not terminate)`,
+          };
+        }
         const hit = new RegExp(cond.regex).test(source);
         const result = cond.negate ? !hit : hit;
         return {

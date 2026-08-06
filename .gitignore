@@ -1,4 +1,6 @@
 node_modules/
+# also match a node_modules *symlink* (agent worktrees link to the main install)
+node_modules
 *.log
 
 # editor / OS
@@ -9,3 +11,10 @@ node_modules/
 # build output (none today — core is run as .ts via jiti/vitest)
 dist/
 *.tsbuildinfo
+
+# pnpm writes this locally with unresolved `allowBuilds` placeholders; it is
+# machine state, not project config (this repo has no workspaces).
+pnpm-workspace.yaml
+
+# agent worktrees live inside the repo but are never part of it
+.claude/worktrees/

@@ -21,40 +21,86 @@ describe("parseBashPermission — opencode config shapes", () => {
     ]);
   });
 
-  it("malformed json / missing permission / junk actions => no rules", () => {
-    expect(parseBashPermission("{not json")).toEqual([]);
+  it("missing permission / junk actions => no rules", () => {
     expect(parseBashPermission("{}")).toEqual([]);
     expect(parseBashPermission('{"permission":{}}')).toEqual([]);
     expect(parseBashPermission('{"permission":{"bash":{"x":"maybe"}}}')).toEqual([]);
     expect(parseBashPermission('{"permission":{"bash":[1,2]}}')).toEqual([]);
   });
+
+  it("throws on malformed json so the caller can fail closed", () => {
+    // Previously swallowed to []. An existing-but-unparseable policy file then
+    // read as "no rules" = allow everything, which is the worst possible guess.
+    expect(() => parseBashPermission("{not json")).toThrow();
+  });
+
+  it("bare string shorthand applies to bash", () => {
+    expect(parseBashPermission('{"permission":"deny"}')).toEqual([{ pattern: "*", action: "deny" }]);
+    expect(parseBashPermission('{"permission":"allow"}')).toEqual([]);
+  });
+
+  it("falls back to the '*' tool key when there is no explicit bash key", () => {
+    // `{"permission":{"*":"deny"}}` denies bash too; reading only `.bash` saw
+    // nothing here and allowed everything.
+    expect(parseBashPermission('{"permission":{"*":"deny"}}')).toEqual([{ pattern: "*", action: "deny" }]);
+    // An explicit bash key still wins over the fallback.
+    expect(parseBashPermission('{"permission":{"*":"deny","bash":"allow"}}')).toEqual([]);
+  });
+
+  it("preserves declaration order, which IS the precedence order", () => {
+    expect(parseBashPermission('{"permission":{"bash":{"*":"deny","git *":"allow"}}}')).toEqual([
+      { pattern: "*", action: "deny" },
+      { pattern: "git *", action: "allow" },
+    ]);
+  });
 });
 
-describe("readOpencodeBashRules — project + global, project first", () => {
+describe("readOpencodeBashRules — global first, project last (last-wins)", () => {
   let tmp: string;
   afterEach(() => tmp && rmSync(tmp, { recursive: true, force: true }));
 
-  it("merges both files with project rules listed first", () => {
+  const setup = () => {
     tmp = mkdtempSync(join(tmpdir(), "px-policy-"));
     const project = join(tmp, "proj");
     const configHome = join(tmp, "config");
     mkdirSync(project, { recursive: true });
     mkdirSync(join(configHome, "opencode"), { recursive: true });
+    return { project, env: { XDG_CONFIG_HOME: configHome } as NodeJS.ProcessEnv, configHome };
+  };
+
+  it("orders global before project so the nearer config wins under last-wins", () => {
+    const { project, env, configHome } = setup();
     writeFileSync(join(project, "opencode.json"), '{"permission":{"bash":{"cat *":"deny"}}}');
-    writeFileSync(
-      join(configHome, "opencode", "opencode.json"),
-      '{"permission":{"bash":{"git push *":"ask"}}}',
-    );
-    const rules = readOpencodeBashRules(project, { XDG_CONFIG_HOME: configHome } as NodeJS.ProcessEnv);
-    expect(rules).toEqual([
-      { pattern: "cat *", action: "deny" },
+    writeFileSync(join(configHome, "opencode", "opencode.json"), '{"permission":{"bash":{"git push *":"ask"}}}');
+    expect(readOpencodeBashRules(project, env).rules).toEqual([
       { pattern: "git push *", action: "ask" },
+      { pattern: "cat *", action: "deny" },
     ]);
+  });
+
+  it("reads .jsonc — comments used to silently yield zero rules (= allow all)", () => {
+    const { project, env } = setup();
+    writeFileSync(
+      join(project, "opencode.jsonc"),
+      '{\n  // no pushing\n  "permission": {"bash": {"git push *": "deny"}}\n}',
+    );
+    expect(readOpencodeBashRules(project, env).rules).toEqual([{ pattern: "git push *", action: "deny" }]);
+  });
+
+  it("reports a config that exists but does not parse, so the caller can fail closed", () => {
+    const { project, env } = setup();
+    writeFileSync(join(project, "opencode.json"), "{ this is not json");
+    const { rules, unreadable } = readOpencodeBashRules(project, env);
+    expect(rules).toEqual([]);
+    expect(unreadable).toHaveLength(1);
+    expect(createPolicyChecker(rules, unreadable)("echo hi")).toContain("not valid JSON");
   });
 
   it("missing files => no rules, never throws", () => {
     tmp = mkdtempSync(join(tmpdir(), "px-policy-"));
-    expect(readOpencodeBashRules(join(tmp, "nope"), { XDG_CONFIG_HOME: join(tmp, "noconf") } as NodeJS.ProcessEnv)).toEqual([]);
+    const out = readOpencodeBashRules(join(tmp, "nope"), { XDG_CONFIG_HOME: join(tmp, "noconf") } as NodeJS.ProcessEnv);
+    expect(out.rules).toEqual([]);
+    expect(out.unreadable).toEqual([]);
   });
 });
 
@@ -77,13 +123,32 @@ describe("createPolicyChecker — matching & precedence", () => {
     expect(check("git status && git diff")).toBe(null);
   });
 
-  it("longest matching pattern wins: specific allow overrides broad ask", () => {
+  it("LAST matching rule wins — the documented catch-all-first idiom", () => {
+    // https://opencode.ai/docs/permissions/ — "Rules are evaluated by pattern
+    // match, with the last matching rule winning."
     const check = createPolicyChecker([
       { pattern: "*", action: "ask" },
       { pattern: "git log*", action: "allow" },
     ]);
     expect(check("git log --oneline")).toBe(null);
     expect(check("cat .env")).toBe("*");
+  });
+
+  it("catch-all LAST denies everything, including earlier allows", () => {
+    // Regression: longest-pattern-wins picked `git *` (longer) and returned
+    // allow, so predexec ran a command opencode itself would have denied.
+    const check = createPolicyChecker([
+      { pattern: "git *", action: "allow" },
+      { pattern: "*", action: "deny" },
+    ]);
+    expect(check("git push origin main")).toBe("*");
+    expect(check("echo hi")).toBe("*");
+  });
+
+  it("supports ? as a single-character wildcard", () => {
+    const check = createPolicyChecker([{ pattern: "rm -r? *", action: "deny" }]);
+    expect(check("rm -rf tmp")).toBe("rm -r? *");
+    expect(check("rm -r tmp")).toBe(null);
   });
 
   it("global '*': 'ask' stops everything (predexec cannot prompt)", () => {

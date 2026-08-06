@@ -17,15 +17,8 @@
 
 import { resolve } from "node:path";
 import { evaluateConditionWithDetail } from "./conditions.ts";
-import {
-  READ_ONLY_TOOLS,
-  MUTATING_TOOLS,
-  findDestructiveToken,
-  isDestructiveCommand,
-} from "./destructive.ts";
+import { READ_ONLY_TOOLS, MUTATING_TOOLS, findDestructiveToken } from "./destructive.ts";
 import { runNode, isToolOp, formatToolOpLabel } from "./runner.ts";
-
-export { isDestructiveCommand };
 import {
   DEFAULT_MAX_DEPTH,
   HIGH_CONFIDENCE_KINDS,
@@ -49,7 +42,13 @@ export async function runPlanTree(plan: PlanTree, opts: RunOptions): Promise<Cor
   const effectiveCwd = plan.cwd ? resolve(opts.cwd, plan.cwd) : opts.cwd;
   const runOpts: RunOptions = { ...opts, cwd: effectiveCwd };
 
-  const maxDepth = plan.maxDepth ?? DEFAULT_MAX_DEPTH;
+  // maxDepth is model-authored, so it is a ceiling to enforce, not a number to
+  // trust. Cycles are legal (no cycle detection), so an unbounded value walks
+  // forever with no model in the loop; NaN is worse, because `depth + 1 > NaN`
+  // is always false and the bound never fires at all.
+  const maxDepth = Number.isFinite(plan.maxDepth)
+    ? Math.max(0, Math.min(plan.maxDepth as number, DEFAULT_MAX_DEPTH))
+    : DEFAULT_MAX_DEPTH;
   const pathTaken: string[] = [];
   // Surface the working dir so the model sees commands already run here and need
   // not prefix each one with `cd`.
@@ -147,8 +146,17 @@ export async function runPlanTree(plan: PlanTree, opts: RunOptions): Promise<Cor
  * only cleanly-separable predicates may gate a mutating child.
  */
 export function validatePlan(plan: PlanTree, byId: Map<string, PlanNode>): string | null {
-  if (!plan.nodes || plan.nodes.length === 0) return "no nodes";
+  if (!Array.isArray(plan?.nodes) || plan.nodes.length === 0) return "no nodes";
+
+  // Shape checks come first. The plan is model-authored, so a malformed node is
+  // an ordinary occurrence, not an exceptional one — and every one of these used
+  // to escape runPlanTree as a raw TypeError instead of a `stoppedReason:"error"`
+  // result the adapters could render.
   for (const node of plan.nodes) {
+    if (!node || typeof node !== "object") return "every node must be an object";
+    if (typeof node.id !== "string" || node.id === "") return "every node needs a non-empty string id";
+    if (!Array.isArray(node.commands)) return `node "${node.id}" needs a commands array`;
+    if (node.edges !== undefined && !Array.isArray(node.edges)) return `node "${node.id}" edges must be an array`;
     if (byId.has(node.id)) return `duplicate node id "${node.id}"`;
     byId.set(node.id, node);
   }
@@ -156,6 +164,11 @@ export function validatePlan(plan: PlanTree, byId: Map<string, PlanNode>): strin
 
   for (const node of plan.nodes) {
     for (const edge of node.edges ?? []) {
+      if (!edge || typeof edge !== "object") return `node "${node.id}" has a malformed edge`;
+      if (typeof edge.to !== "string") return `edge from "${node.id}" needs a string target`;
+      if (!edge.when || typeof edge.when !== "object" || typeof edge.when.kind !== "string") {
+        return `edge from "${node.id}" to "${edge.to}" has no condition kind`;
+      }
       const target = byId.get(edge.to);
       if (!target) return `edge from "${node.id}" points at missing node "${edge.to}"`;
       if (!HIGH_CONFIDENCE_KINDS.has(edge.when.kind) && target.mutates) {

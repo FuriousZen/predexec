@@ -160,12 +160,38 @@ describe("opencode createToolExecutor — grep/find arg handling", () => {
     expect(r.stdout.split("\n")).toHaveLength(2);
   });
 
-  it("find: `path` scopes and `limit` slices", async () => {
+  it("find: `path` scopes, and the limit is sent server-side as well as sliced", async () => {
     let seen: any;
     const client = { find: { files: async (o: any) => ((seen = o), { data: ["a.ts", "b.ts", "c.ts"] }) } };
     const r = await run(client, { tool: "find", pattern: "*.ts", path: "src", limit: 1 });
     expect(seen.query.directory).toBe(join(repo, "src"));
+    // Regression: omitting `limit` from the query let opencode apply its own
+    // default of 10, silently truncating every larger result set.
+    expect(seen.query.limit).toBe(1);
     expect(r.stdout).toBe("a.ts");
+  });
+
+  it("find: sends a limit above opencode's default of 10 when the op omits one", async () => {
+    let seen: any;
+    const client = { find: { files: async (o: any) => ((seen = o), { data: [] }) } };
+    await run(client, { tool: "find", pattern: "*.ts" });
+    expect(seen.query.limit).toBeGreaterThan(10);
+  });
+
+  it("grep: warns when opencode's hard 10-match cap may have truncated results", async () => {
+    const rows = Array.from({ length: 10 }, (_, i) => matchRow(`f${i}.ts`, i + 1));
+    const client = { find: { text: async () => ({ data: rows }) } };
+    const r = await run(client, { tool: "grep", pattern: "x" });
+    // The cap is server-side and unraisable, so a full page is indistinguishable
+    // from a truncated one — the model has to be told rather than left to assume.
+    expect(r.stderr).toContain("caps results at 10");
+    expect(r.exitCode).toBe(0);
+  });
+
+  it("grep: stays quiet when results are below the cap", async () => {
+    const client = { find: { text: async () => ({ data: [matchRow("a.ts", 1)] }) } };
+    const r = await run(client, { tool: "grep", pattern: "x" });
+    expect(r.stderr).toBe("");
   });
 
   it("ls: `limit` slices entries", async () => {

@@ -141,8 +141,8 @@ type TextContent = { type: "text"; text: string };
  * return exit 1, everything else that succeeded returns 0, so an `exit == 0`
  * edge branches identically on both harnesses. pi tools don't expose a count;
  * zero results are detected via the sentinel text pi emits with NO details
- * (dist/core/tools/grep.js / find.js in @earendil-works/pi-coding-agent ^0.79 —
- * revisit if those messages change upstream).
+ * (dist/core/tools/grep.js / find.js in @earendil-works/pi-coding-agent — the
+ * sentinels are unchanged as of 0.82.1; revisit if they change upstream).
  */
 export function mapToolResult(
   tool: string,

@@ -1,9 +1,9 @@
 {
   "name": "predexec",
-  "version": "0.1.8",
+  "version": "0.2.0",
   "type": "module",
   "packageManager": "pnpm@11.9.0",
-  "description": "Predictive execution: collapse an adaptive multi-level tool sequence into a single model round-trip via a deterministic plan tree. pi coding agent extension / opencode plugin.",
+  "description": "Predictive execution: collapse an adaptive multi-level tool sequence into a single model round-trip via a deterministic plan tree. pi coding agent extension / opencode plugin / Claude Code MCP server.",
   "author": "FuriousZen",
   "license": "MIT",
   "repository": {
@@ -20,13 +20,16 @@
   ],
   "main": ".opencode/plugins/predexec.ts",
   "bin": {
-    "predexec": "./bin/predexec.mjs"
+    "predexec": "./bin/predexec.mjs",
+    "predexec-mcp": "./bin/predexec-mcp.mjs"
   },
   "files": [
     ".pi",
     ".opencode",
+    ".claude-plugin",
     "bin",
     "core",
+    "mcp",
     "skills",
     "configs",
     "steering.ts",
@@ -49,14 +52,16 @@
     "prepublishOnly": "pnpm run typecheck"
   },
   "devDependencies": {
-    "@earendil-works/pi-ai": "^0.79.8",
-    "@earendil-works/pi-coding-agent": "^0.79.8",
-    "@opencode-ai/plugin": "^1.17.9",
+    "@earendil-works/pi-ai": "^0.82.1",
+    "@earendil-works/pi-coding-agent": "^0.82.1",
+    "@opencode-ai/plugin": "^1.18.14",
     "@types/node": "24.12.4",
     "typescript": "5.9.3",
     "vitest": "4.1.9"
   },
   "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "jiti": "^2.7.0",
     "zod": "~4.1.8"
   }
 }

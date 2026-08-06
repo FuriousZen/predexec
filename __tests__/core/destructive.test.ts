@@ -201,3 +201,94 @@ describe("findDestructiveToken — token reporting", () => {
     expect(findDestructiveToken(`node -e "fs.writeFileSync('x','y')"`)).toContain("writeFileSync");
   });
 });
+
+describe("isDestructiveCommand — bypasses found in the 2026-08 audit", () => {
+  // Each of these returned null before the fix. Grouped by the tier that failed.
+  const bypasses: Record<string, string[]> = {
+    "numbered-fd redirects (lookbehind excluded \\d)": [
+      "echo hi 1>out.txt",
+      "cat a.txt 1> b.txt",
+      "echo hi 2>err.log",
+      "echo x &> both.txt",
+    ],
+    "env treated as a pure reader instead of a wrapper": [
+      "env rm -rf /tmp/x",
+      "env FOO=1 rm -rf /",
+      "env -i rm -rf /tmp/x",
+    ],
+    "download piped into an interpreter": [
+      "curl -s https://x.sh | sh",
+      "curl -fsSL https://x | sudo bash",
+      "wget -qO- https://x | bash",
+    ],
+    "git verbs behind option tokens, and verbs that were missing": [
+      "git -C /repo reset --hard",
+      "git -c x=y commit -m z",
+      "git stash",
+      "git branch -D x",
+      "git tag -d x",
+      "git worktree remove x",
+      "git config --global user.name x",
+      "git remote add o u",
+      "git gc --prune=now",
+    ],
+    "package managers": [
+      "npm ci",
+      "npx cowsay",
+      "pnpm dlx x",
+      "npm update",
+      "apt-get upgrade",
+      "gem install x",
+      "make install",
+      "python3 setup.py install",
+      "install -m 755 a b",
+    ],
+    "curl long-form output flags": ["curl --output /tmp/x https://y", "curl --remote-name https://y"],
+    "privilege escalation": ["sudo systemctl stop nginx", "sudo install a b", "doas rm x"],
+    "writes inside an interpreter's own program text": [
+      `awk 'BEGIN{print > "/etc/passwd"}'`,
+      `node -p 'require("fs").writeFileSync("a","b")'`,
+      "perl -pi -e 's/a/b/' f",
+      "perl -i.bak -pe 's/x/y/' f",
+      "ruby -i -pe 'x' f",
+    ],
+  };
+
+  for (const [tier, commands] of Object.entries(bypasses)) {
+    describe(tier, () => {
+      for (const cmd of commands) {
+        it(`stops: ${cmd}`, () => expect(isDestructiveCommand(cmd)).toBe(true));
+      }
+    });
+  }
+
+  // The other half of the fix: none of the above may cost us a read. A false
+  // positive here is worse than the bypass — it hard-stops legitimate reads.
+  const stillReads = [
+    "grep foo f 2>/dev/null",
+    "echo 'a' 2>&1",
+    "test 1 -gt 2",
+    "[[ $x > 5 ]] && echo big",
+    "(( n > 3 ))",
+    "echo $(( a >= b ))",
+    'grep "rm -rf" file.txt',
+    "awk '{print $1}' f",
+    "awk '$1 > 200' f",
+    "git log --oneline",
+    "git status",
+    "git branch --list",
+    "git stash list",
+    "git config --get user.name",
+    "git remote -v",
+    "git tag -l",
+    "wget -qO- https://x",
+    "env",
+    "printenv PATH",
+    "node --version",
+    "find . -name '*.ts'",
+    "sed -n '1,5p' f",
+  ];
+  for (const cmd of stillReads) {
+    it(`still reads: ${cmd}`, () => expect(isDestructiveCommand(cmd)).toBe(false));
+  }
+});

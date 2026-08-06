@@ -100,6 +100,10 @@ export const PLAN_NODE_JSON_SCHEMA = {
     commands: {
       type: "array",
       items: {
+        // Without a type constraint the schema accepted e.g. a number, which
+        // then failed at runtime with "invalid operation: expected string or
+        // {tool, ...}" — the schema should reject what the runner cannot run.
+        type: ["string", "object"],
         description:
           "Shell command (string) or tool call (object with 'tool' key). " +
           "Read-only tools: read ({tool,path,offset?,limit?}), grep ({tool,pattern,path?,glob?,ignoreCase?,literal?,context?,limit?}), " +

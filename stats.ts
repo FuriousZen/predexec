@@ -16,7 +16,7 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import type { CoreResult, PlanTree } from "./core/index.ts";
 
-export type Harness = "pi" | "opencode";
+export type Harness = "pi" | "opencode" | "claude-code";
 
 /** One recorded run — one JSONL line. Bump `v` on schema changes. */
 export interface StatsRecord {

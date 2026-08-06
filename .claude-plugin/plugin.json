@@ -1,0 +1,17 @@
+{
+  "name": "predexec",
+  "description": "Predictive execution: collapse an adaptive, multi-level read-only tool sequence into a single model round-trip via a deterministic plan tree.",
+  "version": "0.2.0",
+  "mcpServers": {
+    "predexec": {
+      "type": "stdio",
+      "command": "npx",
+      "args": [
+        "-y",
+        "--package=predexec",
+        "predexec-mcp"
+      ],
+      "env": {}
+    }
+  }
+}

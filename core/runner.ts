@@ -128,23 +128,42 @@ function aggregate(results: CommandResult[]): NodeOutput {
   const failed = results.find((r) => r.exitCode !== 0);
   const last = results[results.length - 1];
   const exitCode = failed ? failed.exitCode : (last?.exitCode ?? 0);
+  // joinLabeled already budgets per command; the outer cap is a final backstop
+  // for the (rare) case where the per-command floor sums above OUTPUT_CAP.
   return { stdout: cap(stdout), stderr: cap(stderr), exitCode };
 }
 
+/**
+ * Join per-command output under index labels, giving each command its own slice
+ * of OUTPUT_CAP.
+ *
+ * Capping the *joined* string instead let one verbose early command consume the
+ * whole budget and silently delete every later command's output — they ran,
+ * they succeeded, and they vanished, while exitCode stayed 0 and edges branched
+ * on a batch that had lost most of its content. Silent truncation is a false-hit
+ * generator, which is the one failure mode the design cannot absorb: a miss
+ * costs ~0 requests, a wrong branch costs real ones.
+ *
+ * Per-command budgets keep every command represented, and an explicit marker
+ * tells the model which ones were shortened rather than leaving it to infer.
+ */
 function joinLabeled(results: CommandResult[], pick: (r: CommandResult) => string): string {
-  if (results.length === 1) return pick(results[0]!);
+  if (results.length === 1) return cap(pick(results[0]!));
+
+  const budget = Math.max(256, Math.floor(OUTPUT_CAP / results.length));
   return results
     .map((r, i) => {
       const text = pick(r);
+      if (!text) return "";
       // Index label, not the full command: the command is already in the plan
       // (tool-call args), so echoing it back double-counts it in context.
-      return text ? `[${i + 1}]\n${text}` : "";
+      return `[${i + 1}]\n${cap(text, budget)}`;
     })
     .filter(Boolean)
     .join("\n");
 }
 
-function cap(text: string): string {
-  if (text.length <= OUTPUT_CAP) return text;
-  return `${text.slice(0, OUTPUT_CAP)}\n…[truncated]`;
+function cap(text: string, limit = OUTPUT_CAP): string {
+  if (text.length <= limit) return text;
+  return `${text.slice(0, limit)}\n…[truncated: ${text.length - limit} more chars]`;
 }
