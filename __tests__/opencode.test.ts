@@ -2,7 +2,10 @@ import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import plugin, { createToolExecutor, server } from "../.opencode/plugins/predexec.ts";
+// `server` is accessed through the default export (`plugin.server`), not as a
+// named import: that mirrors what current opencode loaders (readV1Plugin)
+// actually read, and stays valid once the named `server` export is dropped.
+import plugin, { createToolExecutor } from "../.opencode/plugins/predexec.ts";
 import type { ToolOp } from "../core/index.ts";
 
 // read/ls pre-check path existence against the cwd, so mocked-client tests
@@ -20,12 +23,11 @@ describe("opencode plugin — loader contract", () => {
   // { server() }; a named-export-only module is silently skipped.
   it("default-exports { id, server } for current opencode loaders", () => {
     expect(plugin.id).toBe("predexec");
-    expect(plugin.server).toBe(server);
     expect(typeof plugin.server).toBe("function");
   });
 
   it("server() registers the predexec tool with plain-object definition and hooks", async () => {
-    const hooks = await server({ client: {} } as any);
+    const hooks = await plugin.server({ client: {} } as any);
     const def = (hooks as any).tool?.predexec;
     expect(def).toBeDefined();
     expect(typeof def.description).toBe("string");
@@ -242,7 +244,7 @@ describe("opencode createToolExecutor — missing-path pre-check", () => {
 
 describe("opencode plugin — host permission policy e2e", () => {
   const execute = async (directory: string, plan: unknown) => {
-    const hooks = await server({ client: {} } as any);
+    const hooks = await plugin.server({ client: {} } as any);
     return (hooks as any).tool.predexec.execute(
       { plan },
       { directory, abort: new AbortController().signal },
@@ -271,14 +273,14 @@ describe("opencode plugin — host permission policy e2e", () => {
 
 describe("opencode plugin — prompting surfaces", () => {
   it("tool description carries the verify-first guideline", async () => {
-    const hooks = await server({ client: {} } as any);
+    const hooks = await plugin.server({ client: {} } as any);
     const def = (hooks as any).tool.predexec;
     expect(def.description).toContain("Do not build depth on unverified paths");
     expect(def.description).toContain("# cwd:");
   });
 
   it("plan arg description teaches the condition string shorthands", async () => {
-    const hooks = await server({ client: {} } as any);
+    const hooks = await plugin.server({ client: {} } as any);
     const def = (hooks as any).tool.predexec;
     const desc = def.args.plan.description ?? "";
     expect(desc).toContain('"exit == 0"');

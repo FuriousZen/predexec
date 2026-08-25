@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -284,5 +284,26 @@ describe("mcp server — packaging and plugin wiring", () => {
     const skill = readFileSync(join(root, "skills", "predexec-claude", "SKILL.md"), "utf8");
     expect(skill).toMatch(/^---\n(?:[\s\S]*?\n)?name: predexec-claude\n/);
     expect(skill).toMatch(/\ndescription: \S/);
+  });
+
+  /**
+   * Characterizes the CURRENT (pre-isolation) manifest, not the target state:
+   * `package.json`'s `pi.skills` entries resolve to real directories today, but
+   * the root `skills/` dir still holds BOTH the pi skill (`skills/predexec`)
+   * and the Claude Code plugin skill (`skills/predexec-claude`) — so pi's skill
+   * loader and Claude Code's auto-discovered `skills/` root are not yet
+   * isolated from each other. A later task moves the pi skill under
+   * `.pi/skills/` and updates this same test to assert the isolated form.
+   */
+  it("pi.skills resolves to real directories on disk (current, not-yet-isolated manifest)", () => {
+    const pkg = readJson("package.json");
+    const skillDirs: string[] = pkg.pi.skills;
+    expect(skillDirs.length).toBeGreaterThan(0);
+    for (const rel of skillDirs) {
+      expect(statSync(join(root, rel)).isDirectory()).toBe(true);
+    }
+
+    const rootSkillEntries = readdirSync(join(root, "skills")).sort();
+    expect(rootSkillEntries).toEqual(["predexec", "predexec-claude"]);
   });
 });

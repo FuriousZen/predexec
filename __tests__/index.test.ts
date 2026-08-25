@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { coercePlan, mapToolResult } from "../.pi/extension/index.ts";
+// coercePlan is a CORE function; the pi adapter only re-exports it for
+// backward compat (see .pi/extension/index.ts), so tests exercise the real
+// owning module rather than that alias.
+import { coercePlan } from "../core/coerce.ts";
+import { mapToolResult } from "../.pi/extension/index.ts";
 
 describe("coercePlan — defensive param recovery", () => {
   const good = { root: "a", nodes: [{ id: "a", commands: ["echo hi"] }] };
