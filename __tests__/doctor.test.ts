@@ -101,6 +101,44 @@ describe("doctor — pi checks", () => {
     const statuses = checkPi(piOpts()).map((c) => c.status);
     expect(statuses).toContain("fail"); // declared but not installed
   });
+
+  it("fails when a pi.extensions/skills manifest entry does not exist in the installed package", () => {
+    scratch();
+    write("agent/settings.json", JSON.stringify({ packages: ["npm:predexec"] }));
+    write(
+      "agent/npm/node_modules/predexec/package.json",
+      JSON.stringify({
+        version: "0.1.3",
+        pi: { extensions: ["./dist/.pi/extension/index.js"], skills: ["./skills/predexec"] },
+      }),
+    );
+    write("agent/npm/node_modules/zod/package.json", JSON.stringify({ version: "4.1.8" }));
+    const checks = checkPi(piOpts());
+    const fails = checks.filter((c) => c.status === "fail");
+    expect(fails.some((c) => c.name.includes("./dist/.pi/extension/index.js"))).toBe(true);
+    expect(fails.some((c) => c.name.includes("./skills/predexec"))).toBe(true);
+    expect(fails[0]!.hint).toMatch(/reinstall|upgrade/);
+  });
+
+  it("passes when the declared pi manifest entries exist on disk", () => {
+    scratch();
+    write("agent/settings.json", JSON.stringify({ packages: ["npm:predexec"] }));
+    write(
+      "agent/npm/node_modules/predexec/package.json",
+      JSON.stringify({ version: "0.1.3", pi: { extensions: ["./dist/.pi/extension/index.js"] } }),
+    );
+    write("agent/npm/node_modules/predexec/dist/.pi/extension/index.js", "export default {};");
+    write("agent/npm/node_modules/zod/package.json", JSON.stringify({ version: "4.1.8" }));
+    expect(checkPi(piOpts()).every((c) => c.status === "ok")).toBe(true);
+  });
+
+  it("finds zod nested under the predexec package, not only hoisted", () => {
+    scratch();
+    write("agent/settings.json", JSON.stringify({ packages: ["npm:predexec"] }));
+    write("agent/npm/node_modules/predexec/package.json", JSON.stringify({ version: "0.1.3" }));
+    write("agent/npm/node_modules/predexec/node_modules/zod/package.json", JSON.stringify({ version: "4.1.8" }));
+    expect(checkPi(piOpts()).every((c) => c.status === "ok")).toBe(true);
+  });
 });
 
 describe("doctor — opencode checks", () => {
@@ -201,6 +239,26 @@ describe("doctor — opencode checks", () => {
     write("home/.config/opencode/opencode.json", JSON.stringify({ plugin: ["context-mode"] }));
     expect(checkOpencode(ocOpts())[0]!.status).toBe("info");
   });
+
+  it("diagnoses a CJS-compiled plugin distinctly from the generic pre-0.1.1 shape", () => {
+    scratch();
+    const CJS_PLUGIN = 'Object.defineProperty(exports, "__esModule", { value: true });\nexports.default = { id: "predexec", server: 1 };\n';
+    write("home/.config/opencode/opencode.json", JSON.stringify({ plugin: ["predexec"] }));
+    setupCache(CJS_PLUGIN, true);
+    const fail = checkOpencode(ocOpts()).find((c) => c.name === "opencode cache: plugin export shape");
+    expect(fail?.status).toBe("fail");
+    expect(fail?.hint).toContain("CommonJS");
+    expect(fail?.hint).not.toContain("clear the cache dir");
+  });
+
+  it("keeps the pre-0.1.1 'clear the cache' hint for a genuinely old named-export-only build", () => {
+    scratch();
+    write("home/.config/opencode/opencode.json", JSON.stringify({ plugin: ["predexec"] }));
+    setupCache(OLD_PLUGIN, true);
+    const fail = checkOpencode(ocOpts()).find((c) => c.name === "opencode cache: plugin export shape");
+    expect(fail?.status).toBe("fail");
+    expect(fail?.hint).toContain("clear the cache dir");
+  });
 });
 
 describe("CLI entrypoint", () => {
@@ -290,6 +348,32 @@ describe("doctor — claude code checks", () => {
       JSON.stringify({ projects: { [join(tmp, "proj")]: { enabledMcpjsonServers: ["predexec"] } } }),
     );
     expect(checkClaudeCode(ccOpts()).every((c) => c.status === "ok")).toBe(true);
+  });
+
+  it("recognizes a plugin-form install via installed_plugins.json when no mcp scope matches", () => {
+    scratch();
+    write(
+      "home/.claude/plugins/installed_plugins.json",
+      JSON.stringify({
+        version: 2,
+        plugins: {
+          "predexec@some-marketplace": [
+            { scope: "user", installPath: "/x/predexec/1.0.0", version: "1.0.0" },
+          ],
+        },
+      }),
+    );
+    const checks = checkClaudeCode(ccOpts());
+    expect(checks[0]!.status).toBe("ok");
+    expect(checks[0]!.name).toContain("plugin installed");
+    expect(checks.some((c) => c.status === "fail")).toBe(false);
+  });
+
+  it("mentions the plugin form as an alternative when nothing at all is registered", () => {
+    scratch();
+    const checks = checkClaudeCode(ccOpts({ installed: true }));
+    expect(checks[0]!.status).toBe("info");
+    expect(checks[0]!.hint).toContain("plugin form");
   });
 });
 

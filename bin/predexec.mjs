@@ -119,11 +119,9 @@ export function piPackageSource(entry) {
  * settings at `.pi/settings.json` installing into `.pi/npm/`. Both are checked.
  */
 export function checkPi(opts = {}) {
-  // Back-compat: earlier callers passed the agent dir positionally.
-  const o = typeof opts === "string" ? { piAgentDir: opts } : opts;
-  const piAgentDir = o.piAgentDir ?? join(homedir(), ".pi", "agent");
-  const cwd = o.cwd ?? process.cwd();
-  const installed = o.installed ?? onPath("pi");
+  const piAgentDir = opts.piAgentDir ?? join(homedir(), ".pi", "agent");
+  const cwd = opts.cwd ?? process.cwd();
+  const installed = opts.installed ?? onPath("pi");
 
   const scopes = [
     { label: "user", settings: join(piAgentDir, "settings.json"), root: piAgentDir },
@@ -174,7 +172,27 @@ export function checkPi(opts = {}) {
     );
 
     if (!pkg) continue;
-    const zod = readJson(join(scope.root, "npm", "node_modules", "zod", "package.json"));
+
+    // pi's resolveExtensionEntries requires existsSync on each manifest path and
+    // silently skips a miss — the same class of bug as the 0.1.8 bin issue, so a
+    // packaging slip that drops a declared file is a silent no-op, not a doctor
+    // failure, unless we check it ourselves.
+    for (const entry of [...(pkg.pi?.extensions ?? []), ...(pkg.pi?.skills ?? [])]) {
+      if (!existsSync(join(pkgDir, entry))) {
+        checks.push({
+          name: `pi manifest entry missing: ${entry}`,
+          status: "fail",
+          hint: "the installed package does not contain this file — reinstall/upgrade predexec (pi silently skips missing entries)",
+        });
+      }
+    }
+
+    // Two locations, like opencode's cache check: nested under the predexec
+    // package (npm dedupes less aggressively for a single top-level package) or
+    // hoisted to the shared npm/node_modules root.
+    const zod =
+      readJson(join(pkgDir, "node_modules", "zod", "package.json")) ??
+      readJson(join(scope.root, "npm", "node_modules", "zod", "package.json"));
     checks.push(
       zod
         ? { name: `pi install (${scope.label}): zod@${zod.version} present`, status: "ok" }
@@ -339,11 +357,21 @@ export function checkOpencode(opts = {}) {
     checks.push(
       pluginSrc.includes("export default")
         ? { name: "opencode cache: plugin default-exports { id, server }", status: "ok" }
-        : {
-            name: "opencode cache: plugin export shape",
-            status: "fail",
-            hint: "cached version predates 0.1.1 (silently skipped by the loader) — clear the cache dir and restart opencode",
-          },
+        : pluginSrc.includes("exports.default")
+          ? {
+              // predexec 0.3.0 shipped a CJS-compiled opencode entry (a stray
+              // .opencode/package.json without "type" made tsc's NodeNext emit
+              // compile this one file to CJS). Distinct from the pre-0.1.1 case
+              // below: clearing the cache re-fetches the same broken build.
+              name: "opencode cache: plugin export shape",
+              status: "fail",
+              hint: "compiled as CommonJS — packaging bug in this predexec version; upgrade predexec (do not clear the cache, it will re-fetch the same build)",
+            }
+          : {
+              name: "opencode cache: plugin export shape",
+              status: "fail",
+              hint: "cached version predates 0.1.1 (silently skipped by the loader) — clear the cache dir and restart opencode",
+            },
     );
   }
   return checks;
@@ -362,6 +390,23 @@ export function checkOpencode(opts = {}) {
  * A project-scope server sits at "Pending approval" until the user approves it
  * in an interactive session, which is `info` (actionable), never `fail`.
  */
+
+/**
+ * Plugin-form installs record themselves in `<configDir>/plugins/installed_plugins.json`
+ * (measured empirically: `{ version, plugins: { "<name>@<marketplace>": [{ scope,
+ * installPath, version, ... }] } }`), not in `.mcp.json` / `~/.claude.json` at all —
+ * so a plugin-wrapper user was invisible to the mcp-scope scan above and saw
+ * "not registered" while the server ran fine.
+ */
+export function findClaudeCodePlugin(configDir) {
+  const path = join(configDir, "plugins", "installed_plugins.json");
+  const data = readJson(path);
+  const plugins = data && typeof data.plugins === "object" ? data.plugins : null;
+  if (!plugins) return null;
+  const key = Object.keys(plugins).find((k) => /^predexec(@|$)/.test(k));
+  return key ? { key, path } : null;
+}
+
 export function checkClaudeCode(opts = {}) {
   const cwd = opts.cwd ?? process.cwd();
   const home = opts.home ?? homedir();
@@ -388,6 +433,10 @@ export function checkClaudeCode(opts = {}) {
     if (!installed && !existsSync(configDir)) {
       return [{ name: "claude code not installed", status: "skip", detail: "no claude on PATH and no ~/.claude" }];
     }
+    const plugin = findClaudeCodePlugin(configDir);
+    if (plugin) {
+      return [{ name: "claude code: predexec plugin installed", status: "ok", detail: plugin.path }];
+    }
     return [
       {
         name: "claude code: installed, predexec not registered",
@@ -395,7 +444,7 @@ export function checkClaudeCode(opts = {}) {
         // `--package=predexec` is load-bearing: `npx -y predexec-mcp` would look
         // for a REGISTRY PACKAGE of that name (there is none — predexec-mcp is a
         // bin inside the predexec package), so the bare form 404s.
-        hint: "run `claude mcp add predexec -- npx -y --package=predexec predexec-mcp`",
+        hint: "run `claude mcp add predexec -- npx -y --package=predexec predexec-mcp` (or install the plugin form — see README)",
       },
     ];
   }
