@@ -1,5 +1,5 @@
 import { execSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -12,10 +12,17 @@ type Json = Record<string, any>;
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 
+// npm install (Step 1) is the slow part of this suite's beforeAll; give it
+// real headroom rather than tripping vitest's default hook timeout on a cold
+// cache / first network fetch.
+const INSTALL_HOOK_TIMEOUT_MS = 120_000;
+
 describe("packed artifact verification", () => {
   let packDir: string;
   let extractDir: string;
+  let installDir: string;
   let tarballPath: string;
+  const npmCache = join(tmpdir(), "px-npm-cache");
 
   beforeAll(() => {
     // Ensure fresh build before packing. force:true because packing must be
@@ -26,26 +33,48 @@ describe("packed artifact verification", () => {
 
     packDir = mkdtempSync(join(tmpdir(), "px-pack-"));
     extractDir = join(packDir, "extracted");
+    installDir = join(packDir, "install");
     mkdirSync(extractDir, { recursive: true });
+    mkdirSync(installDir, { recursive: true });
 
     // Pack to temporary tarball
     const packOutput = execSync(`npm pack --pack-destination="${packDir}"`, {
       cwd: root,
       encoding: "utf8",
-      env: { ...process.env, npm_config_cache: join(tmpdir(), "px-npm-cache") },
+      env: { ...process.env, npm_config_cache: npmCache },
     }).trim();
 
     const tarballName = packOutput.split("\n").filter(Boolean).pop()!;
     tarballPath = join(packDir, tarballName);
 
     // Extract tarball (tar strips the top-level 'package/' dir when --strip-components=1 is used)
+    // Used ONLY by the file-list/file-content inspection tests below — they
+    // need no node_modules at all, so this directory never gets one.
     execSync(`tar -xzf "${tarballPath}" -C "${extractDir}" --strip-components=1`, {
       stdio: "pipe",
     });
 
-    // Symlink root node_modules so the isolated extracted directory can resolve its dependencies
-    execSync(`ln -s "${join(root, "node_modules")}" "${join(extractDir, "node_modules")}"`);
-  });
+    // Real `npm install` of the packed tarball into a fresh prefix — the
+    // execution tests (CLI, MCP stdio) run against THIS layout, not a
+    // symlink into the dev tree. A symlinked node_modules can never catch a
+    // runtime import missing from `dependencies`; a real install can, and it
+    // also exercises `isDirectInvocation`'s realpath guard under its real
+    // condition: npm installs `bin` entries as symlinks under
+    // node_modules/.bin, so process.argv[1] is the symlink while
+    // import.meta.url is the realpath'd module URL.
+    //
+    // --prefer-offline resolves from npmCache first but still permits a
+    // network fetch on a cache miss (it does not forbid network — only
+    // dropping this flag entirely would be a "fallback"). If the install
+    // fails for any reason, it must fail loudly here — no symlink fallback.
+    const stubPkg = { name: "pack-smoke", private: true };
+    writeFileSync(join(installDir, "package.json"), JSON.stringify(stubPkg), "utf8");
+    execSync(`npm install --omit=dev --no-audit --no-fund --prefer-offline "${tarballPath}"`, {
+      cwd: installDir,
+      stdio: "pipe",
+      env: { ...process.env, npm_config_cache: npmCache },
+    });
+  }, INSTALL_HOOK_TIMEOUT_MS);
 
   afterAll(() => {
     if (packDir) {
@@ -137,17 +166,28 @@ describe("packed artifact verification", () => {
     expect(mainSrc).not.toMatch(/\bexports\.default\b/);
   });
 
-  it("invokes extracted predexec CLI (doctor & --version)", () => {
-    const bin = join(extractDir, "bin", "predexec.mjs");
-    const ver = execSync(`node "${bin}" --version`, { encoding: "utf8" }).trim();
+  it("real npm install is dependency-scoped, not the dev tree", () => {
+    // Proves Step 1 installed FROM the packed tarball's declared `dependencies`
+    // (a real resolve) rather than any tree that happens to contain the dev
+    // checkout's devDependencies. @modelcontextprotocol/server is a declared
+    // runtime dependency and must be present; @earendil-works (the scope
+    // holding the pi devDependency, never a runtime dependency) must be absent.
+    expect(existsSync(join(installDir, "node_modules", "@modelcontextprotocol", "server"))).toBe(true);
+    expect(existsSync(join(installDir, "node_modules", "@earendil-works"))).toBe(false);
+    expect(existsSync(join(installDir, "node_modules", ".bin", "predexec"))).toBe(true);
+    expect(existsSync(join(installDir, "node_modules", ".bin", "predexec-mcp"))).toBe(true);
+  });
+
+  it("invokes installed predexec CLI (doctor & --version)", () => {
+    const ver = execSync(`node_modules/.bin/predexec --version`, { cwd: installDir, encoding: "utf8" }).trim();
     expect(ver).toMatch(/^\d+\.\d+\.\d+/);
 
-    const doc = execSync(`node "${bin}" doctor`, { encoding: "utf8" });
+    const doc = execSync(`node_modules/.bin/predexec doctor`, { cwd: installDir, encoding: "utf8" });
     expect(doc).toContain("predexec doctor");
   });
 
-  it("invokes extracted predexec-mcp binary over stdio (initialize, list, call)", async () => {
-    const bin = join(extractDir, "bin", "predexec-mcp.mjs");
+  it("invokes installed predexec-mcp binary over stdio (initialize, list, call)", async () => {
+    const bin = join(installDir, "node_modules", ".bin", "predexec-mcp");
     const testDir = mkdtempSync(join(tmpdir(), "px-pack-test-run-"));
     const noSettings = mkdtempSync(join(tmpdir(), "px-pack-nosettings-"));
 
