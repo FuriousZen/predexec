@@ -20,7 +20,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { isDestructiveCommand, type ToolOp } from "../../core/index.ts";
 import { executeAdapterPlan } from "../../adapter-runtime.ts";
-import { VERIFY_FIRST_LINE } from "../../steering.ts";
+import { BASH_NUDGE, RECOVERY_LINE, USAGE_LINE, VERIFY_FIRST_LINE } from "../../steering.ts";
 
 /**
  * Condition is modelled as a single loose object (discriminated by `kind`)
@@ -183,9 +183,6 @@ function createToolExecutor(cwd: string, signal?: AbortSignal) {
   };
 }
 
-const BASH_NUDGE =
-  '[predexec] Batch read-only commands in one predexec call: {"root":"a","nodes":[{"id":"a","commands":["cmd1","cmd2"],"parallel":true}]}';
-
 export default function predexec(pi: ExtensionAPI): void {
   // Routing steering is delivered declaratively via the `predexec` skill
   // (skills/predexec/SKILL.md, registered through package.json `pi.skills`) plus
@@ -212,8 +209,9 @@ export default function predexec(pi: ExtensionAPI): void {
     description: DESCRIPTION,
     promptSnippet: "Default tool for read-only work — shell commands, tool calls (read/grep/find/ls), and branching sequences",
     promptGuidelines: [
-      'predexec: shell strings for bash; {tool:"read",path:...}, {tool:"grep",pattern:...}, {tool:"find",pattern:...}, {tool:"ls",path:...} for tool calls. Use parallel:true for independent reads, cwd for a shared base dir, and edges to branch.',
-      "predexec: mutationStop/noEdgeMatch is recoverable — read the transcript and resume with bash. Never retry the same plan blindly.",
+      'predexec: shell strings for bash; {tool:"read",path:...}, {tool:"grep",pattern:...}, {tool:"find",pattern:...}, {tool:"ls",path:...} for tool calls. ' +
+        USAGE_LINE.trimEnd(),
+      "predexec: " + RECOVERY_LINE.trimEnd(),
     ],
     parameters: PlanTreeSchema as any,
     async execute(_toolCallId, params: Record<string, unknown>, signal, onUpdate, ctx) {

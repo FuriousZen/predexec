@@ -27,15 +27,22 @@ import {
   type ToolExecutor,
 } from "../../core/index.ts";
 import { executeAdapterPlan } from "../../adapter-runtime.ts";
-import { STEERING_LINE, VERIFY_FIRST_LINE, systemHasRoutingInstructions } from "../../steering.ts";
+import {
+  BASH_NUDGE,
+  DESCRIPTION_BASE,
+  RECOVERY_LINE,
+  STEERING_LINE,
+  USAGE_LINE,
+  VERIFY_FIRST_LINE,
+  WHEN_SYNTAX_LINE,
+  systemHasRoutingInstructions,
+} from "../../steering.ts";
 import { createPolicyChecker, readOpencodeBashRules } from "../../policy.ts";
 
 const DESCRIPTION =
-  "Run read-only shell commands and tool calls with deterministic branching. " +
-  "Each node runs shell commands (strings) and/or tool calls ({tool, ...args}) sequentially or concurrently (parallel:true). " +
-  "Edges evaluate conditions on output to choose the next node with no model call between levels. " +
-  "Use parallel:true for independent reads, cwd for a shared base dir, and edges to branch. " +
-  "mutationStop/noEdgeMatch is recoverable — read the transcript and resume with bash. Never retry the same plan blindly. " +
+  DESCRIPTION_BASE +
+  USAGE_LINE +
+  RECOVERY_LINE +
   "Shell commands respect your opencode permission rules — deny/ask matches hard-stop before running. " +
   VERIFY_FIRST_LINE;
 
@@ -231,7 +238,7 @@ const server: Plugin = async ({ client }) => ({
       args: {
         plan: z.any().describe(
           'Plan tree object: {root, nodes:[{id, commands:[<shell string> | {tool:"read",path,offset?,limit?} | {tool:"grep",pattern,path?} | {tool:"find",pattern,path?} | {tool:"ls",path?}], parallel?, edges?:[{when,to}]}], cwd?, maxDepth?}. ' +
-          'when: "always" | "exit == 0" (ops ==,!=,<,>) | "stdout =~ /regex/" (also stderr, !~) | "file exists <path>" / "file missing <path>", or a {kind,...} condition object. ' +
+          WHEN_SYNTAX_LINE +
           "Note: grep/find scope by a directory `path` (grep glob/ignoreCase/literal/context are unsupported here and error loudly); read offset/limit and grep/find/ls `limit` are applied client-side.",
         ),
       },
@@ -265,7 +272,7 @@ const server: Plugin = async ({ client }) => ({
   },
 
   "tool.execute.after": async (input, output) => {
-    const nudge = '\n[predexec] Batch read-only commands in one predexec call: {"root":"a","nodes":[{"id":"a","commands":["cmd1","cmd2"],"parallel":true}]}';
+    const nudge = "\n" + BASH_NUDGE;
     if (["read", "grep", "glob"].includes(input.tool)) {
       output.output += nudge;
     } else if (input.tool === "bash") {

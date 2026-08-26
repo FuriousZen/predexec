@@ -34,7 +34,7 @@ import { serveStdio, type StdioServerHandle } from "@modelcontextprotocol/server
 import { z } from "zod";
 import type { ToolExecutor } from "../core/index.ts";
 import { executeAdapterPlan } from "../adapter-runtime.ts";
-import { STEERING_LINE, VERIFY_FIRST_LINE } from "../steering.ts";
+import { DESCRIPTION_BASE, RECOVERY_LINE, STEERING_LINE, USAGE_LINE, VERIFY_FIRST_LINE, WHEN_SYNTAX_LINE } from "../steering.ts";
 import { createClaudePolicyChecker, readClaudeBashRules, type ClaudePolicyOptions } from "./policy-claude.ts";
 import { createToolExecutor } from "./tool-ops.ts";
 
@@ -44,15 +44,13 @@ export const TOOL_NAME = "predexec";
 /**
  * The tool description is the ONLY always-on steering channel here: an MCP
  * server has no system-prompt hook (pi loads a skill, opencode pushes a line),
- * so STEERING_LINE rides along with it. Everything but the permission sentence
- * is shared prose from ../steering.ts, so the three harnesses cannot drift.
+ * so STEERING_LINE rides along with it. DESCRIPTION composes shared prose from
+ * ../steering.ts plus the harness-specific permission sentence below.
  */
 export const DESCRIPTION =
-  "Run read-only shell commands and tool calls with deterministic branching. " +
-  "Each node runs shell commands (strings) and/or tool calls ({tool, ...args}) sequentially or concurrently (parallel:true). " +
-  "Edges evaluate conditions on output to choose the next node with no model call between levels. " +
-  "Use parallel:true for independent reads, cwd for a shared base dir, and edges to branch. " +
-  "mutationStop/noEdgeMatch is recoverable — read the transcript and resume with bash. Never retry the same plan blindly. " +
+  DESCRIPTION_BASE +
+  USAGE_LINE +
+  RECOVERY_LINE +
   "Shell commands are checked against your own Claude Code permission rules — a deny OR ask match hard-stops before running, " +
   "because predexec cannot prompt mid-walk. " +
   STEERING_LINE +
@@ -68,8 +66,7 @@ const PLAN_ARG_DESCRIPTION =
   'Plan tree object: {root, nodes:[{id, commands:[<shell string> | {tool:"read",path,offset?,limit?} | ' +
   '{tool:"grep",pattern,path?,glob?,ignoreCase?,literal?,context?,limit?} | {tool:"find",pattern,path?,limit?} | ' +
   '{tool:"ls",path?,limit?}], parallel?, edges?:[{when,to}]}], cwd?, maxDepth?}. ' +
-  'when: "always" | "exit == 0" (ops ==,!=,<,>) | "stdout =~ /regex/" (also stderr, !~) | ' +
-  '"file exists <path>" / "file missing <path>", or a {kind,...} condition object. ' +
+  WHEN_SYNTAX_LINE +
   "Note: tool ops read the filesystem directly (they are not Claude Code's native Read/Grep), " +
   "paths may not escape the session root, and grep/find fall back to a pure-Node walk that ignores .gitignore when ripgrep/fd are absent.";
 
