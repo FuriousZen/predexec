@@ -88,8 +88,8 @@ confined to a `read-only` sandbox — so there is no OS-level backstop at all, o
 `mcp/policy-codex.ts`'s `config.toml`/execpolicy-rules reading and predexec's own
 `destructive.ts` heuristic (see the sandbox warning under [Codex CLI](#codex-cli) below).
 Second, Codex's default per-call approval mode treats an *unannotated* tool as destructive, so
-declaring `readOnlyHint: true` is load-bearing just to run a plan without a prompt, not merely a
-nicety. What's better here: `AGENTS.md` is native to Codex, so declarative steering doesn't need
+declaring `readOnlyHint: true` is load-bearing just to run a plan without a prompt under
+default settings (per Codex's source), not merely a nicety. What's better here: `AGENTS.md` is native to Codex, so declarative steering doesn't need
 a plugin wrapper the way Claude Code's does.
 
 ## Install

@@ -60,6 +60,25 @@
  * caveat class as Claude Code's `--allowedTools`/`--disallowedTools`, and for
  * the same reason: a subprocess cannot see its parent's argv.
  *
+ * Leading env-assignments AND wrapper commands are stripped from each
+ * segment's tokens before prefix comparison — a fifth fail-open finding from
+ * final review, closed the same way (5): `FOO=1 git push` and
+ * `timeout 5 git push` must not dodge a `["git","push"]` rule any more than
+ * they dodge `policy-claude.ts`'s equivalent `Bash(git push *)` rule there.
+ * `stripLeadingWrappersAndAssignments` mirrors `policy-claude.ts`'s
+ * `stripBashWrappers`/`LEADING_ASSIGNMENT_RE` semantics EXACTLY — same
+ * `WRAPPERS`/`BARE_ONLY_WRAPPERS`/`OPTION_TAKING_WRAPPERS` sets, same
+ * assignment-then-wrapper loop — just ported to operate on
+ * `tokenizeForMatch`'s already-tokenized, already-unquoted output instead of
+ * the raw string, since that is the form this checker matches against. As
+ * with `extractSubstitutions` above, the logic is duplicated rather than
+ * imported (this file's import surface stays narrow, see above); the two
+ * checkers' precedence models differ too much to share a matching engine.
+ * Matching takes the union of the raw and stripped token forms (same
+ * reasoning as `policy-claude.ts`'s `forms` array): raw-only misses a
+ * `["git","push"]` rule on `timeout 5 git push`, stripped-only misses a
+ * `["timeout"]` rule on the same command.
+ *
  * Hardened after adversarial review (four fail-open findings, all closed):
  * (1) a `;`-joined `.rules` line can register several complete `prefix_rule`
  * calls in one line — real, valid Starlark — so statement-splitting now also
@@ -616,6 +635,79 @@ function tokenizeForMatch(segment: string): string[] {
 }
 
 /**
+ * Wrappers Claude Code strips before matching Bash rules — duplicated here,
+ * same set, same job: see `policy-claude.ts`'s `WRAPPERS` for the full
+ * rationale (`npx`/`docker exec` are pointedly absent from the host's own
+ * list, so they stay absent here too, for parity rather than by omission).
+ */
+const WRAPPERS = new Set(["timeout", "time", "nice", "nohup", "stdbuf", "noglob"]);
+/** Wrappers that take their own options, whose flags/durations are consumed too. */
+const OPTION_TAKING_WRAPPERS = new Set(["timeout", "nice", "stdbuf"]);
+/** Stripped only when NOT followed by a flag: `command -v foo` looks a command up rather than running it, and `xargs -n1 grep` is matched as an xargs command. */
+const BARE_ONLY_WRAPPERS = new Set(["command", "builtin", "xargs"]);
+const DURATION_RE = /^\d+(?:\.\d+)?[smhd]?$/;
+/** A whole token shaped like `NAME=value` — the tokenized equivalent of
+ * `policy-claude.ts`'s `LEADING_ASSIGNMENT_RE`, applied post-tokenization
+ * since `tokenizeForMatch` has already unquoted the value. */
+const TOKEN_ASSIGNMENT_RE = /^[A-Za-z_][A-Za-z0-9_]*=/;
+
+/** Strip a run of leading `NAME=value` tokens, always leaving at least one
+ * token behind (an assignment-only "command" has nothing left to match, so
+ * stripping the very last token would turn `[]` — matches-everything — into
+ * a false hit on a rule that targets a real command). Returns the same array
+ * reference when nothing changed, so the caller's loop can detect a fixed
+ * point cheaply. */
+function stripLeadingAssignments(tokens: string[]): string[] {
+  let i = 0;
+  while (i < tokens.length - 1 && TOKEN_ASSIGNMENT_RE.test(tokens[i]!)) i++;
+  return i === 0 ? tokens : tokens.slice(i);
+}
+
+/** Strip one leading wrapper invocation (and, for `OPTION_TAKING_WRAPPERS`,
+ * its own flags/duration argument) from the front of `tokens`. Returns the
+ * same array reference when nothing changed. */
+function stripLeadingWrapper(tokens: string[]): string[] {
+  const head = tokens[0];
+  if (!head || !(WRAPPERS.has(head) || BARE_ONLY_WRAPPERS.has(head))) return tokens;
+  const next = tokens[1];
+  const isFlag = next !== undefined && next.startsWith("-");
+  // `command -v`/`xargs -n1` are not wrapper invocations; leave them whole.
+  if (BARE_ONLY_WRAPPERS.has(head) && isFlag) return tokens;
+  let drop = 1;
+  if (OPTION_TAKING_WRAPPERS.has(head)) {
+    while (drop < tokens.length) {
+      const token = tokens[drop]!;
+      if (token.startsWith("-") || DURATION_RE.test(token)) drop++;
+      else break;
+    }
+  }
+  return drop >= tokens.length ? tokens : tokens.slice(drop);
+}
+
+/**
+ * Strip wrappers and leading env-assignments from an already-tokenized
+ * command segment, the same way `policy-claude.ts`'s `stripBashWrappers`
+ * strips them from a raw string — see the module header. Bounded like its
+ * counterpart: each pass must consume at least one token or the loop breaks,
+ * but a cap keeps a pathological input from spinning.
+ */
+function stripLeadingWrappersAndAssignments(tokens: string[]): string[] {
+  let cur = tokens;
+  for (let pass = 0; pass < 16; pass++) {
+    const before = cur;
+    cur = stripLeadingAssignments(cur);
+    cur = stripLeadingWrapper(cur);
+    if (cur === before) break;
+  }
+  return cur;
+}
+
+/** True when two token arrays are element-for-element identical. */
+function tokensEqual(a: string[], b: string[]): boolean {
+  return a.length === b.length && a.every((tok, i) => tok === b[i]);
+}
+
+/**
  * Build the `checkCommandPolicy` callback for the engine. Each pipeline
  * segment (via core's `splitCommandSegments`, same as policy.ts/
  * policy-claude.ts) is judged independently, so a compound
@@ -659,11 +751,20 @@ export function createCodexPolicyChecker(
             for (const segment of splitCommandSegments(line)) {
               const trimmed = segment.trim();
               if (!trimmed) continue;
-              const tokens = tokenizeForMatch(trimmed);
+              const rawTokens = tokenizeForMatch(trimmed);
+              const strippedTokens = stripLeadingWrappersAndAssignments(rawTokens);
+              // Union of raw and stripped forms: raw-only misses a
+              // `["git","push"]` rule on `FOO=1 git push` / `timeout 5 git
+              // push`; stripped-only misses a `["timeout"]` rule on the same
+              // command (see module header).
+              const tokenForms = tokensEqual(rawTokens, strippedTokens)
+                ? [rawTokens]
+                : [rawTokens, strippedTokens];
               let winner: CodexRule | null = null;
               for (const rule of rules) {
-                const matches =
-                  tokens.length >= rule.pattern.length && rule.pattern.every((tok, i) => tokens[i] === tok);
+                const matches = tokenForms.some(
+                  (toks) => toks.length >= rule.pattern.length && rule.pattern.every((tok, i) => toks[i] === tok),
+                );
                 if (matches && (!winner || SEVERITY[rule.decision] > SEVERITY[winner.decision])) winner = rule;
               }
               if (winner && winner.decision !== "allow") return formatPattern(winner.pattern);

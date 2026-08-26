@@ -491,6 +491,18 @@ describe("doctor — codex checks", () => {
     expect(checks.every((c) => c.status !== "fail")).toBe(true);
   });
 
+  it("reports ok for a registration using the --host=codex single-token form", () => {
+    scratch();
+    write(
+      "codex-home/config.toml",
+      configToml({ command: "npx", args: ["-y", "--package=predexec", "predexec-mcp", "--host=codex"] }),
+    );
+    const checks = checkCodex(cxOpts());
+    const fail = checks.find((c) => c.status === "fail" && /--host codex/.test(c.name));
+    expect(fail).toBeFalsy();
+    expect(checks.some((c) => c.status === "ok" && /registration/.test(c.name))).toBe(true);
+  });
+
   it("warns (fail) when the registration is missing --host codex", () => {
     scratch();
     write("codex-home/config.toml", configToml({ command: "npx", args: ["-y", "--package=predexec", "predexec-mcp"] }));

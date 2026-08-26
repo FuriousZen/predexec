@@ -707,6 +707,12 @@ function codexCommandExists(command, env) {
 }
 
 function codexArgsHaveHostCodex(args) {
+  // The launcher (`bin/predexec-mcp.mjs`'s `parseHostArg`) accepts both the
+  // two-token `--host codex` form and the single-token `--host=codex` form —
+  // a registration written the second way is fully healthy, not missing the
+  // flag, so both must satisfy this check or doctor false-fails a working
+  // install.
+  if (args.includes("--host=codex")) return true;
   const idx = args.indexOf("--host");
   return idx !== -1 && args[idx + 1] === "codex";
 }
@@ -729,8 +735,11 @@ export function checkCodex(opts = {}) {
     const v = runCodex(["--version"]);
     const version = v.status === 0 && v.stdout ? v.stdout.trim().split("\n")[0] : null;
     checks.push(
+      // `version` is already `codex --version`'s own stdout (e.g. "codex-cli
+      // 0.149.1"), which names the tool itself — prefixing another "codex "
+      // in front of it rendered as a doubled "codex codex-cli 0.149.1".
       version
-        ? { name: `codex ${version} (on PATH)`, status: "ok" }
+        ? { name: `${version} (on PATH)`, status: "ok" }
         : { name: "codex: on PATH, but `codex --version` failed", status: "info", detail: (v.stderr || "").trim() || undefined },
     );
   }

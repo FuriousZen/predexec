@@ -341,6 +341,28 @@ describe("createCodexPolicyChecker — quote evasion (P4: fail-open regression)"
   });
 });
 
+describe("createCodexPolicyChecker — leading env-assignment / wrapper bypass (safety-parity regression)", () => {
+  it("a leading NAME=value assignment does not defeat a forbidden prefix rule", () => {
+    const check = createCodexPolicyChecker([{ pattern: ["git", "push"], decision: "forbidden" }], []);
+    expect(check("FOO=1 git push origin main")).toBe("git push");
+  });
+
+  it("multiple leading assignments are all stripped before matching", () => {
+    const check = createCodexPolicyChecker([{ pattern: ["git", "push"], decision: "forbidden" }], []);
+    expect(check("FOO=1 BAR=2 git push origin main")).toBe("git push");
+  });
+
+  it("a wrapper command (timeout) does not defeat a forbidden prefix rule", () => {
+    const check = createCodexPolicyChecker([{ pattern: ["git", "push"], decision: "forbidden" }], []);
+    expect(check("timeout 5 git push origin main")).toBe("git push");
+  });
+
+  it("still matches a rule that targets the wrapper itself", () => {
+    const check = createCodexPolicyChecker([{ pattern: ["timeout"], decision: "forbidden" }], []);
+    expect(check("timeout 5 git push origin main")).toBe("timeout");
+  });
+});
+
 describe("createCodexPolicyChecker — newline and substitution bypass (P2: fail-open regression)", () => {
   const forbidCurl = () => createCodexPolicyChecker([{ pattern: ["curl"], decision: "forbidden" }], []);
 
