@@ -42,7 +42,7 @@
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { homedir, platform } from "node:os";
 import { dirname, join, parse as parsePath } from "node:path";
-import { splitCommandSegments } from "../core/index.ts";
+import { escapeRegExp, splitCommandSegments } from "../core/index.ts";
 
 export type ClaudePolicyAction = "allow" | "ask" | "deny";
 
@@ -230,7 +230,7 @@ function patternToRegex(pattern: string): RegExp | null {
       body = body.slice(0, -2);
       tail = "(?: [\\s\\S]*)?";
     }
-    const escaped = body.replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replace(/\\\*/g, "[\\s\\S]*");
+    const escaped = escapeRegExp(body).replace(/\\\*/g, "[\\s\\S]*");
     return new RegExp(`^${escaped}${tail}$`);
   } catch {
     return null;

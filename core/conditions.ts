@@ -54,6 +54,9 @@ export function isSafeRegex(pattern: string): boolean {
   return true;
 }
 
+/** Escape a string for literal use inside a RegExp. */
+export const escapeRegExp = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
 const EXIT_OP: Record<string, "eq" | "ne" | "gt" | "lt"> = {
   "==": "eq", "!=": "ne", ">": "gt", "<": "lt",
 };
@@ -203,10 +206,6 @@ export function evaluateConditionWithDetail(
   } catch {
     return { result: false, detail: "condition evaluation threw → false" };
   }
-}
-
-export function evaluateCondition(output: NodeOutput, cond: Condition, cwd: string): boolean {
-  return evaluateConditionWithDetail(output, cond, cwd).result;
 }
 
 function compareInt(actual: number, op: "eq" | "ne" | "lt" | "gt", value: number): boolean {

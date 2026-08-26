@@ -33,7 +33,7 @@ import { accessSync, constants } from "node:fs";
 import { readdir, readFile, stat } from "node:fs/promises";
 import { delimiter, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
-import type { ToolExecutor, ToolOp } from "../core/index.ts";
+import { escapeRegExp, type ToolExecutor, type ToolOp } from "../core/index.ts";
 
 /** The shell-like shape the core engine branches on (see core/runner.ts). */
 interface OpResult {
@@ -446,7 +446,7 @@ async function grepViaNode(
 > {
   let re: RegExp;
   try {
-    const source = flags.literal ? pattern.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") : pattern;
+    const source = flags.literal ? escapeRegExp(pattern) : pattern;
     re = new RegExp(source, flags.ignoreCase ? "i" : "");
   } catch (err) {
     return { err: fail("grep", `invalid pattern: ${errText(err)}`) };

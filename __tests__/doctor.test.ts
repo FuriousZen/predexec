@@ -17,6 +17,7 @@ import {
   stripJsonComments,
   summarizeStats,
 } from "../bin/predexec.mjs";
+import { stripJsonComments as policyStripJsonComments } from "../policy.ts";
 
 let tmp: string;
 const scratch = () => (tmp = mkdtempSync(join(tmpdir(), "px-doctor-")));
@@ -205,6 +206,18 @@ describe("doctor — opencode checks", () => {
     write("home/.config/opencode/opencode.jsonc", '{\n  // plugins\n  "plugin": ["predexec"]\n}');
     setupCache(GOOD_PLUGIN, true);
     expect(checkOpencode(ocOpts()).every((c) => c.status === "ok")).toBe(true);
+  });
+
+  it("bin/predexec.mjs and policy.ts carry independent stripJsonComments implementations that must stay in parity", () => {
+    const fixtures = [
+      '{"$schema":"https://x.dev/c.json"}', // comment-marker-lookalike inside a string
+      '{ // note\n "a": 1 /* b */ }', // line comment + block comment
+      '{\n  // no pushing\n  "permission": {"bash": {"git push *": "deny"}}\n}', // line comment before real content
+      '{\n  // plugins\n  "plugin": ["predexec"]\n}',
+    ];
+    for (const fixture of fixtures) {
+      expect(stripJsonComments(fixture)).toBe(policyStripJsonComments(fixture));
+    }
   });
 
   it("all green with entry + cached install + zod + default export", () => {

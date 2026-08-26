@@ -12,6 +12,9 @@ import type { NodeOutput, Operation, PlanNode, RunOptions, ToolOp } from "./type
 /** Per-stream capture cap (chars). Keeps the transcript bounded on noisy commands. */
 export const OUTPUT_CAP = 8192;
 
+/** Marker prefix for truncated output; engine.ts checks for `${TRUNCATION_MARKER}]`. */
+export const TRUNCATION_MARKER = "…[truncated" as const;
+
 interface CommandResult {
   command: string;
   stdout: string;
@@ -63,8 +66,8 @@ async function runToolOp(op: ToolOp, opts: RunOptions): Promise<CommandResult> {
   }
   try {
     const result = await opts.executeToolOp(op, { cwd: opts.cwd, signal: opts.signal });
-    const stdout = result.stdout.length > OUTPUT_CAP ? `${result.stdout.slice(0, OUTPUT_CAP)}\n…[truncated]` : result.stdout;
-    const stderr = result.stderr.length > OUTPUT_CAP ? `${result.stderr.slice(0, OUTPUT_CAP)}\n…[truncated]` : result.stderr;
+    const stdout = result.stdout.length > OUTPUT_CAP ? `${result.stdout.slice(0, OUTPUT_CAP)}\n${TRUNCATION_MARKER}]` : result.stdout;
+    const stderr = result.stderr.length > OUTPUT_CAP ? `${result.stderr.slice(0, OUTPUT_CAP)}\n${TRUNCATION_MARKER}]` : result.stderr;
     if (stdout) opts.onCommandOutput?.(stdout);
     if (stderr) opts.onCommandOutput?.(stderr);
     return { command: label, stdout, stderr, exitCode: result.exitCode };
@@ -165,5 +168,5 @@ function joinLabeled(results: CommandResult[], pick: (r: CommandResult) => strin
 
 function cap(text: string, limit = OUTPUT_CAP): string {
   if (text.length <= limit) return text;
-  return `${text.slice(0, limit)}\n…[truncated: ${text.length - limit} more chars]`;
+  return `${text.slice(0, limit)}\n${TRUNCATION_MARKER}: ${text.length - limit} more chars]`;
 }

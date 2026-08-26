@@ -31,7 +31,7 @@ const isUsableRegex = (s: string): boolean => compilesAsRegex(s) && isSafeRegex(
  * message or null; may FILL a missing `source` (the evaluator reads stdout by
  * default anyway). Extra fields are tolerated (pi's loose schema sends them).
  */
-export function validateConditionObject(when: Record<string, unknown>): string | null {
+function validateConditionObject(when: Record<string, unknown>): string | null {
   switch (when.kind) {
     case "exitCode":
       if (!["eq", "ne", "lt", "gt"].includes(when.op as string) || typeof when.value !== "number") {

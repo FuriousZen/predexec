@@ -11,6 +11,8 @@
  * quorum — see systemHasRoutingInstructions).
  */
 
+import { escapeRegExp } from "./core/index.ts";
+
 /** The one-line routing rule opencode injects when the host prompt lacks it. */
 export const STEERING_LINE =
   "Use predexec for all read-only shell operations. Use bash only for writes/installs/deletes and interactive commands.";
@@ -43,9 +45,6 @@ export const STEERING_MARKERS = [
 
 const QUORUM = 2;
 
-/** Escape a marker for literal use inside a RegExp. */
-const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-
 /**
  * True when the system prompt entries already carry predexec routing
  * instructions (≥2 marker hits). Single-token markers are word-boundary
@@ -57,7 +56,7 @@ export function systemHasRoutingInstructions(system: string[]): boolean {
     const text = system.filter((s) => typeof s === "string").join("\n");
     const hit = (marker: string): boolean => {
       if (marker.includes(" ")) return text.includes(marker);
-      return new RegExp(`(?:^|\\W)${escapeRe(marker)}(?:\\W|$)`).test(text);
+      return new RegExp(`(?:^|\\W)${escapeRegExp(marker)}(?:\\W|$)`).test(text);
     };
     return STEERING_MARKERS.filter(hit).length >= QUORUM;
   } catch {

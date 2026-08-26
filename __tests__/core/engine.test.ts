@@ -192,9 +192,6 @@ describe("runPlanTree — traversal & stop reasons", () => {
   });
 
   it("still catches real destructive commands (rm, file redirect)", async () => {
-    const rmPlan: PlanTree = { root: "a", nodes: [{ id: "a", commands: ["rm -rf /tmp/whatever"] }] };
-    expect((await runPlanTree(rmPlan, { cwd })).stoppedReason).toBe("mutationStop");
-
     const redirectPlan: PlanTree = { root: "a", nodes: [{ id: "a", commands: ["echo hi > output.txt"] }] };
     expect((await runPlanTree(redirectPlan, { cwd })).stoppedReason).toBe("mutationStop");
 

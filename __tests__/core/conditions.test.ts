@@ -2,10 +2,14 @@ import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { evaluateCondition, evaluateConditionWithDetail, parseConditionString } from "../../core/conditions.ts";
-import type { NodeOutput } from "../../core/types.ts";
+import { evaluateConditionWithDetail, parseConditionString } from "../../core/conditions.ts";
+import type { Condition, NodeOutput } from "../../core/types.ts";
 
 const out = (o: Partial<NodeOutput>): NodeOutput => ({ stdout: "", stderr: "", exitCode: 0, ...o });
+
+/** Local thin-wrapper helper standing in for the (removed) core export. */
+const evaluateCondition = (output: NodeOutput, cond: Condition, cwd: string): boolean =>
+  evaluateConditionWithDetail(output, cond, cwd).result;
 
 describe("evaluateCondition — exitCode", () => {
   it("compares with eq/ne/lt/gt", () => {
@@ -197,12 +201,5 @@ describe("evaluateConditionWithDetail — observed-value explanations", () => {
     );
     expect(badRegex.result).toBe(false);
     expect(badRegex.detail).toContain("→ false");
-  });
-
-  it("evaluateCondition stays a thin boolean wrapper (same verdicts)", () => {
-    const cond = { kind: "exitCode", op: "eq", value: 0 } as const;
-    expect(evaluateCondition(out({ exitCode: 0 }), cond, "/")).toBe(
-      evaluateConditionWithDetail(out({ exitCode: 0 }), cond, "/").result,
-    );
   });
 });

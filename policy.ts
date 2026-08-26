@@ -34,7 +34,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, parse as parsePath } from "node:path";
-import { splitCommandSegments } from "./core/index.ts";
+import { escapeRegExp, splitCommandSegments } from "./core/index.ts";
 
 export type PolicyAction = "allow" | "ask" | "deny";
 
@@ -174,8 +174,7 @@ export function readOpencodeBashRules(
  */
 function patternToRegex(pattern: string): RegExp | null {
   try {
-    const escaped = pattern
-      .replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+    const escaped = escapeRegExp(pattern)
       .replace(/\\\*/g, "[\\s\\S]*")
       .replace(/\\\?/g, "[\\s\\S]");
     return new RegExp(`^${escaped}$`);

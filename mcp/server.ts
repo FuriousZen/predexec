@@ -64,7 +64,7 @@ export const DESCRIPTION =
  * this adapter's, not opencode's: ./tool-ops.ts implements read/grep/find/ls
  * itself, so offset/limit/glob/ignoreCase/literal/context are all honored here.
  */
-export const PLAN_ARG_DESCRIPTION =
+const PLAN_ARG_DESCRIPTION =
   'Plan tree object: {root, nodes:[{id, commands:[<shell string> | {tool:"read",path,offset?,limit?} | ' +
   '{tool:"grep",pattern,path?,glob?,ignoreCase?,literal?,context?,limit?} | {tool:"find",pattern,path?,limit?} | ' +
   '{tool:"ls",path?,limit?}], parallel?, edges?:[{when,to}]}], cwd?, maxDepth?}. ' +
@@ -105,7 +105,7 @@ const textResult = (text: string, isError = false): ToolResult => ({
  * Read from package.json rather than hard-coded so it cannot drift; a failure
  * to read it must not stop the server from starting, hence the fallback.
  */
-export function packageVersion(): string {
+function packageVersion(): string {
   for (const rel of ["../package.json", "../../package.json"]) {
     try {
       const pkgPath = join(dirname(fileURLToPath(import.meta.url)), rel);
@@ -125,7 +125,7 @@ export function packageVersion(): string {
  * by `executeAdapterPlan`. Validation and unexpected errors return a result
  * with `stoppedReason: "error"`, flagged as `isError: true` for the client.
  */
-export async function runPredexecTool(
+async function runPredexecTool(
   rawPlan: unknown,
   opts: { cwd: string; executeToolOp: ToolExecutor; policy?: ClaudePolicyOptions; signal?: AbortSignal },
 ): Promise<ToolResult> {
@@ -202,7 +202,7 @@ export function createServer(opts: PredexecServerOptions = {}): McpServer {
  * stays for embedded/`createServer`-only uses that bypass the launcher
  * entirely.
  */
-export function silenceStdout(): void {
+function silenceStdout(): void {
   globalThis.console = new Console({ stdout: process.stderr, stderr: process.stderr });
 }
 

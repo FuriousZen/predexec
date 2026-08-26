@@ -46,6 +46,16 @@ export function statsFilePath(env: NodeJS.ProcessEnv = process.env): string {
   return join(dir, "stats.jsonl");
 }
 
+/** Count operations (shell commands + tool ops) across nodes actually visited. */
+function countVisitedOps(plan: PlanTree, result: CoreResult): number {
+  const visited = new Set(result.pathTaken);
+  let ops = 0;
+  for (const node of plan.nodes ?? []) {
+    if (visited.has(node.id)) ops += node.commands?.length ?? 0;
+  }
+  return ops;
+}
+
 /**
  * Conservative "requests saved" estimate: each operation executed inside the
  * walked path would otherwise have been roughly one tool-call round-trip, so a
@@ -55,12 +65,7 @@ export function statsFilePath(env: NodeJS.ProcessEnv = process.env): string {
  */
 export function estimateRequestsSaved(plan: PlanTree, result: CoreResult): number {
   try {
-    const visited = new Set(result.pathTaken);
-    let ops = 0;
-    for (const node of plan.nodes ?? []) {
-      if (visited.has(node.id)) ops += node.commands?.length ?? 0;
-    }
-    return Math.max(0, ops - 1);
+    return Math.max(0, countVisitedOps(plan, result) - 1);
   } catch {
     return 0;
   }
@@ -72,11 +77,7 @@ export function estimateRequestsSaved(plan: PlanTree, result: CoreResult): numbe
  */
 export async function recordRun(plan: PlanTree, result: CoreResult, harness: Harness): Promise<void> {
   try {
-    const visited = new Set(result.pathTaken);
-    let ops = 0;
-    for (const node of plan.nodes ?? []) {
-      if (visited.has(node.id)) ops += node.commands?.length ?? 0;
-    }
+    const ops = countVisitedOps(plan, result);
     const record: StatsRecord = {
       v: 1,
       ts: Date.now(),
@@ -87,7 +88,7 @@ export async function recordRun(plan: PlanTree, result: CoreResult, harness: Har
       ops,
       edgesEvaluated: result.edgesEvaluated,
       edgesMatched: result.edgesMatched,
-      requestsSaved: estimateRequestsSaved(plan, result),
+      requestsSaved: Math.max(0, ops - 1),
     };
     const file = statsFilePath();
     await mkdir(dirname(file), { recursive: true });

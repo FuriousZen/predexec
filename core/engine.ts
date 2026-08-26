@@ -18,7 +18,7 @@
 import { resolve } from "node:path";
 import { evaluateConditionWithDetail } from "./conditions.ts";
 import { READ_ONLY_TOOLS, MUTATING_TOOLS, findDestructiveToken } from "./destructive.ts";
-import { runNode, isToolOp, formatToolOpLabel } from "./runner.ts";
+import { runNode, isToolOp, formatToolOpLabel, TRUNCATION_MARKER } from "./runner.ts";
 import {
   DEFAULT_MAX_DEPTH,
   HIGH_CONFIDENCE_KINDS,
@@ -240,7 +240,7 @@ function transcriptBlock(node: PlanNode, output: NodeOutput): string {
   if (output.stdout) lines.push("stdout:", output.stdout.trimEnd());
   if (output.stderr) lines.push("stderr:", output.stderr.trimEnd());
   const truncated =
-    output.stdout?.includes("…[truncated]") || output.stderr?.includes("…[truncated]");
+    output.stdout?.includes(`${TRUNCATION_MARKER}]`) || output.stderr?.includes(`${TRUNCATION_MARKER}]`);
   if (truncated) {
     const hasReadOps = toolOps.some((op) => op.tool === "read");
     const hasShellCmds = node.commands.some((c) => typeof c === "string");

@@ -1,32 +1,15 @@
 {
+  // Emit config only — everything shared lives in tsconfig.json (extends).
+  "extends": "./tsconfig.json",
   "compilerOptions": {
-    "target": "ES2022",
-    "module": "NodeNext",
-    "moduleResolution": "NodeNext",
-    "lib": ["ES2023"],
-    "types": ["node"],
-    "strict": true,
-    "noUncheckedIndexedAccess": true,
-    "noImplicitOverride": true,
-    "esModuleInterop": true,
-    "skipLibCheck": true,
-    "forceConsistentCasingInFileNames": true,
-    "allowImportingTsExtensions": true,
+    // Source imports use ".ts" specifiers; this rewrite is what makes dist/
+    // valid ESM. Removing it breaks installed users only — the dev checkout
+    // keeps working. Guarded by __tests__/pack.test.ts.
     "rewriteRelativeImportExtensions": true,
     "outDir": "dist",
     "declaration": false,
     "sourceMap": false,
     "removeComments": true,
     "noEmit": false
-  },
-  "include": [
-    ".pi/extension/index.ts",
-    ".opencode/plugins/predexec.ts",
-    "mcp/**/*.ts",
-    "core/**/*.ts",
-    "steering.ts",
-    "stats.ts",
-    "policy.ts",
-    "adapter-runtime.ts"
-  ]
+  }
 }
