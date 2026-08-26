@@ -29,8 +29,8 @@ import { Console } from "node:console";
 import { readFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { McpServer } from "@modelcontextprotocol/server";
+import { serveStdio, type StdioServerHandle } from "@modelcontextprotocol/server/stdio";
 import { z } from "zod";
 import type { ToolExecutor } from "../core/index.ts";
 import { executeAdapterPlan } from "../adapter-runtime.ts";
@@ -149,8 +149,6 @@ export async function runPredexecTool(
 /**
  * Build the MCP server with the single `predexec` tool registered.
  *
- * `inputSchema` is a RAW Zod shape (`{ plan: … }`), not a `z.object(...)`
- * wrapper — registerTool wraps it itself and a pre-wrapped schema is rejected.
  * `z.unknown()` keeps the plan opaque at the boundary on purpose: coercePlan is
  * the validator, and it recovers double-encoded JSON and string shorthands that
  * a strict schema would reject before we ever saw them.
@@ -167,7 +165,7 @@ export function createServer(opts: PredexecServerOptions = {}): McpServer {
     TOOL_NAME,
     {
       description: DESCRIPTION,
-      inputSchema: { plan: z.unknown().describe(PLAN_ARG_DESCRIPTION) },
+      inputSchema: z.object({ plan: z.unknown().describe(PLAN_ARG_DESCRIPTION) }),
     },
     async (args, extra) =>
       runPredexecTool(args.plan, {
@@ -176,7 +174,7 @@ export function createServer(opts: PredexecServerOptions = {}): McpServer {
         policy: opts.policy,
         // The client's cancellation reaches the walk, so an abandoned request
         // does not leave a subtree of commands running.
-        signal: extra.signal,
+        signal: extra.mcpReq?.signal,
       }),
   );
 
@@ -197,8 +195,7 @@ export function silenceStdout(): void {
 }
 
 /** Start the stdio server. Called by bin/predexec-mcp.mjs; never at import time. */
-export async function main(opts: PredexecServerOptions = {}): Promise<void> {
+export async function main(opts: PredexecServerOptions = {}): Promise<StdioServerHandle> {
   silenceStdout();
-  const server = createServer(opts);
-  await server.connect(new StdioServerTransport());
+  return serveStdio(() => createServer(opts));
 }

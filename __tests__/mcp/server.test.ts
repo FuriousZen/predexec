@@ -1,59 +1,47 @@
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { LATEST_PROTOCOL_VERSION } from "@modelcontextprotocol/sdk/types.js";
-import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { InMemoryTransport, LATEST_PROTOCOL_VERSION, type McpServer } from "@modelcontextprotocol/server";
 import { createServer, DESCRIPTION, TOOL_NAME } from "../../mcp/server.ts";
 
 type Json = Record<string, any>;
 
-/**
- * A mock transport, not a spawned client: the server is driven by handing
- * JSON-RPC frames to `onmessage` and capturing what it sends back. That covers
- * the registration path a unit call would skip (schema conversion, argument
- * validation, result serialization) without a child process — and without the
- * real StdioServerTransport writing frames onto vitest's stdout.
- */
-function connectMock(server: McpServer) {
+/** Connect and complete the handshake — the SDK rejects requests sent before `initialize`. */
+async function connected(opts: Parameters<typeof createServer>[0] = {}) {
+  const server = createServer(opts);
+  const [serverTransport, clientTransport] = InMemoryTransport.createLinkedPair();
+  await server.connect(serverTransport);
+  await clientTransport.start();
+
   const pending = new Map<number, (msg: Json) => void>();
   let nextId = 1;
 
-  const transport = {
-    async start() {},
-    async send(message: Json) {
-      const resolve = typeof message.id === "number" ? pending.get(message.id) : undefined;
+  clientTransport.onmessage = (message: Json) => {
+    if (typeof message.id === "number") {
+      const resolve = pending.get(message.id);
       if (resolve) {
         pending.delete(message.id);
         resolve(message);
       }
-    },
-    async close() {},
-    onmessage: undefined as ((m: Json) => void) | undefined,
+    }
   };
 
   const request = (method: string, params?: Json): Promise<Json> => {
     const id = nextId++;
     const answered = new Promise<Json>((resolve) => pending.set(id, resolve));
-    transport.onmessage!({ jsonrpc: "2.0", id, method, ...(params ? { params } : {}) });
+    void clientTransport.send({ jsonrpc: "2.0", id, method, ...(params ? { params } : {}) });
     return answered;
   };
 
-  return { transport, request };
-}
-
-/** Connect and complete the handshake — the SDK rejects requests sent before `initialize`. */
-async function connected(opts: Parameters<typeof createServer>[0] = {}) {
-  const server = createServer(opts);
-  const { transport, request } = connectMock(server);
-  await server.connect(transport as never);
   await request("initialize", {
     protocolVersion: LATEST_PROTOCOL_VERSION,
     capabilities: {},
     clientInfo: { name: "predexec-test", version: "0" },
   });
-  transport.onmessage!({ jsonrpc: "2.0", method: "notifications/initialized" });
-  return { server, request };
+  await clientTransport.send({ jsonrpc: "2.0", method: "notifications/initialized" });
+  return { server, request, clientTransport };
 }
 
 /**
@@ -253,8 +241,7 @@ describe("mcp server — packaging and plugin wiring", () => {
     // Both are runtime imports of the launcher/server path. jiti especially:
     // Node refuses to strip types under node_modules, so an install without it
     // cannot load mcp/server.ts at all.
-    expect(Object.keys(pkg.dependencies)).toContain("@modelcontextprotocol/sdk");
-    expect(Object.keys(pkg.dependencies)).toContain("jiti");
+    expect(Object.keys(pkg.dependencies).sort()).toEqual(["@modelcontextprotocol/server", "jiti", "zod"].sort());
   });
 
   it("the plugin manifest invokes the bin through its OWN package name", () => {
@@ -306,5 +293,91 @@ describe("mcp server — packaging and plugin wiring", () => {
 
     const rootSkillEntries = readdirSync(join(root, "skills")).sort();
     expect(rootSkillEntries).toEqual(["predexec-claude"]);
+  });
+});
+
+describe("mcp server — spawned stdio launcher", () => {
+  it("spawns the entrypoint, completes handshake, lists tools, and executes a depth-0 plan over stdio", async () => {
+    const dir = project();
+    const binPath = join(__dirname, "..", "..", "bin", "predexec-mcp.mjs");
+    const child = spawn(process.execPath, [binPath], {
+      cwd: dir,
+      env: { ...process.env, ...policyOptions.env, CLAUDE_CONFIG_DIR: noSettings },
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+
+    const pending = new Map<number, (msg: Json) => void>();
+    let nextId = 1;
+    let buffer = "";
+    const rawStdoutChunks: string[] = [];
+
+    child.stdout!.setEncoding("utf8");
+    child.stdout!.on("data", (chunk: string) => {
+      rawStdoutChunks.push(chunk);
+      buffer += chunk;
+      const lines = buffer.split("\n");
+      buffer = lines.pop() ?? "";
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        const msg = JSON.parse(line);
+        if (typeof msg.id === "number" && pending.has(msg.id)) {
+          const resolve = pending.get(msg.id)!;
+          pending.delete(msg.id);
+          resolve(msg);
+        }
+      }
+    });
+
+    const request = (method: string, params?: Json): Promise<Json> => {
+      const id = nextId++;
+      const answered = new Promise<Json>((resolve) => pending.set(id, resolve));
+      child.stdin!.write(JSON.stringify({ jsonrpc: "2.0", id, method, ...(params ? { params } : {}) }) + "\n");
+      return answered;
+    };
+
+    const notify = (method: string, params?: Json): void => {
+      child.stdin!.write(JSON.stringify({ jsonrpc: "2.0", method, ...(params ? { params } : {}) }) + "\n");
+    };
+
+    try {
+      const initRes = await request("initialize", {
+        protocolVersion: LATEST_PROTOCOL_VERSION,
+        capabilities: {},
+        clientInfo: { name: "predexec-stdio-test", version: "1" },
+      });
+      expect(initRes.result.serverInfo.name).toBe("predexec");
+
+      notify("notifications/initialized");
+
+      const listRes = await request("tools/list");
+      const tools = listRes.result.tools as Json[];
+      expect(tools).toHaveLength(1);
+      expect(tools[0]!.name).toBe(TOOL_NAME);
+
+      const callRes = await request("tools/call", {
+        name: TOOL_NAME,
+        arguments: {
+          plan: {
+            root: "a",
+            nodes: [{ id: "a", commands: ["echo ran-in-spawned-stdio", { tool: "read", path: "marker.txt" }] }],
+          },
+        },
+      });
+
+      const text = textOf(callRes);
+      expect(text).toContain(`# cwd: ${realpathSync(dir)}`);
+      expect(text).toContain("node a (exit 0)");
+      expect(text).toContain("ran-in-spawned-stdio");
+      expect(text).toContain("hello from predexec");
+      expect(callRes.result.isError).toBeUndefined();
+
+      // STDOUT IS THE PROTOCOL: every newline-separated chunk on stdout must parse as valid JSON-RPC
+      const allLines = rawStdoutChunks.join("").split("\n").filter((l) => l.trim().length > 0);
+      for (const line of allLines) {
+        expect(() => JSON.parse(line)).not.toThrow();
+      }
+    } finally {
+      child.kill("SIGTERM");
+    }
   });
 });

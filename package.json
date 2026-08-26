@@ -59,8 +59,8 @@
     "vitest": "4.1.9"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.30.0",
+    "@modelcontextprotocol/server": "^2.0.0",
     "jiti": "^2.7.0",
-    "zod": "~4.1.8"
+    "zod": "^4.2.0"
   }
 }
