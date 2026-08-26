@@ -53,7 +53,7 @@ export const DESCRIPTION =
   DESCRIPTION_BASE +
   USAGE_LINE +
   RECOVERY_LINE +
-  "Shell commands are checked against your own Claude Code permission rules — a deny OR ask match hard-stops before running, " +
+  "Shell commands are checked against the host's own permission rules — a deny OR ask match hard-stops before running, " +
   "because predexec cannot prompt mid-walk. " +
   STEERING_LINE +
   " " +

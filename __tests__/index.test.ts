@@ -1,8 +1,11 @@
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 // coercePlan is a CORE function; import it from its owning module directly
 // rather than through a harness adapter.
 import { coercePlan } from "../core/coerce.ts";
 import { mapToolResult } from "../.pi/extension/index.ts";
+import { STEERING_MARKERS } from "../steering.ts";
 
 describe("coercePlan — defensive param recovery", () => {
   const good = { root: "a", nodes: [{ id: "a", commands: ["echo hi"] }] };
@@ -126,5 +129,29 @@ describe("mapToolResult — pi/opencode exit-code parity", () => {
   it("read/ls always exit 0 on success (errors throw and are mapped by the caller)", () => {
     expect(mapToolResult("read", "", undefined).exitCode).toBe(0);
     expect(mapToolResult("ls", "No matches found", undefined).exitCode).toBe(0);
+  });
+});
+
+describe("configs/*/AGENTS.md drop-ins — STEERING_MARKERS quorum", () => {
+  // Each host's drop-in block must carry ≥2 of the 3 STEERING_MARKERS (see
+  // steering.ts) so a host that loads it natively (opencode's system-prompt
+  // guard, Codex's native AGENTS.md loading) recognizes routing rules are
+  // already present and skips its own injection. steering.test.ts already
+  // covers opencode's file through systemHasRoutingInstructions; this test
+  // asserts the raw marker count directly (per the task brief) and does so
+  // for both drop-ins side by side so the two files stay in lockstep.
+  const quorumHits = (text: string): number =>
+    STEERING_MARKERS.filter((marker) =>
+      marker.includes(" ")
+        ? text.includes(marker)
+        : new RegExp(`(?:^|\\W)${marker}(?:\\W|$)`).test(text),
+    ).length;
+
+  it.each([
+    ["opencode", join(__dirname, "..", "configs", "opencode", "AGENTS.md")],
+    ["codex", join(__dirname, "..", "configs", "codex", "AGENTS.md")],
+  ])("%s's AGENTS.md carries at least 2 of the 3 STEERING_MARKERS", (_host, path) => {
+    const block = readFileSync(path, "utf8");
+    expect(quorumHits(block)).toBeGreaterThanOrEqual(2);
   });
 });

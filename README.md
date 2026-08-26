@@ -6,13 +6,15 @@ into a tree of deterministic predicates, and an engine walks the tree with **no 
 between levels**. On a request-limited free provider this trades abundant tokens for scarce
 provider requests.
 
-This package ships three adapters, each registering one tool, `predexec`:
+This package ships four adapters, each registering one tool, `predexec`:
 a [pi coding agent](https://www.npmjs.com/package/@earendil-works/pi-coding-agent) extension,
-an [opencode](https://opencode.ai) plugin, and a
-[Claude Code](https://code.claude.com/docs/en/overview) MCP server.
+an [opencode](https://opencode.ai) plugin, a
+[Claude Code](https://code.claude.com/docs/en/overview) MCP server, and a
+[Codex CLI](https://github.com/openai/codex) MCP server — the same stdio server as Claude
+Code's, started with `--host codex` to select Codex's policy reader and stats label.
 See [How it works](#how-it-works) below for the design and current status.
 
-> **Status: read-only.** The pure-TS core and all three adapters are done and unit-tested.
+> **Status: read-only.** The pure-TS core and all four adapters are done and unit-tested.
 > predexec speculates **read-only only** — any write/install/delete hard-stops before running.
 
 ## How it works
@@ -232,6 +234,77 @@ a root `.mcp.json` — a root `.mcp.json` is a live project-scope registration, 
 anyone who merely opened this repo in Claude Code. It shells out to the same `npx` command rather
 than vendoring `node_modules`, so there is no dependency-bundling step.
 
+### Codex CLI
+
+Codex has no in-process tool-registration API either, so predexec reaches it the same way it
+reaches Claude Code: the identical stdio MCP server, `mcp/server.ts`. Only the policy reader and
+stats label differ, and — because Codex clears every `CODEX_*` env var before spawning the
+subprocess (measured; there is no equivalent of `CLAUDE_PROJECT_DIR`), so the server cannot
+detect its host on its own — they're selected explicitly with a flag:
+
+```bash
+codex mcp add predexec -- npx -y --package=predexec predexec-mcp --host codex
+```
+
+`codex mcp add` registers **globally** (`~/.codex/config.toml`) — there's no per-project scope
+flag the way Claude Code has `--scope project`.
+
+**Verify:**
+
+```bash
+codex mcp get predexec --json    # transport.command/args populated, "enabled": true
+npx -y predexec doctor           # shows the registered scope, flags a broken install
+```
+
+**Timeouts.** `startup_timeout_sec` / `tool_timeout_sec` defaults are version-dependent (the
+docs say 10s/60s, the source at the time of writing says 30s/300s) — a long plan tree is safer
+with an explicit value. Add both to `~/.codex/config.toml`:
+
+```toml
+[mcp_servers.predexec]
+command = "npx"
+args = ["-y", "--package=predexec", "predexec-mcp", "--host", "codex"]
+tool_timeout_sec = 120
+```
+
+Codex loads a project's `AGENTS.md` natively. To steer it declaratively, copy the routing
+block into your project's `AGENTS.md`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/FuriousZen/predexec/main/configs/codex/AGENTS.md -o AGENTS.md
+```
+
+Codex concatenates AGENTS.md content (repo root down to your working directory) under a 32 KiB
+combined cap, so keep the block as shipped rather than padding it.
+
+#### Sandbox — read this one
+
+> **Codex runs MCP servers OUTSIDE its sandbox.** Measured directly: under a `read-only`
+> session sandbox, a throwaway probe MCP server still wrote a log line to disk with zero
+> error — the child process was never inside Seatbelt (macOS) / Landlock+bwrap (Linux) at all.
+> **Every shell command a predexec plan runs bypasses Codex's sandbox entirely**, regardless of
+> `sandbox_mode` / the active permission profile, because those govern Codex's *own* shell tool,
+> not an MCP subprocess. predexec's read-only invariant, the `destructive.ts` heuristic, and the
+> fail-closed execpolicy-rules adapter (reads `~/.codex/config.toml` plus
+> `~/.codex/rules/*.rules` / `<repo>/.codex/rules/`) are the **only** containment — there is no
+> OS-level backstop the way Claude Code's sandboxing docs offer. Session-only CLI flags
+> (`--sandbox`, `-a`/`--ask-for-approval`, `--profile`, `--full-auto`) are a config layer that
+> never touches disk, so predexec cannot see or honor them either — parallel to Claude Code's
+> `--allowedTools` gap, except here nothing else is watching. This is not a defect predexec can
+> fix; it is how Codex spawns MCP servers, and it means every predexec-run command deserves the
+> same trust you'd give a command Codex's sandbox wasn't guarding at all.
+>
+> predexec also declares `readOnlyHint: true` on its tool so Codex's per-call approval flow
+> (default `auto`, which otherwise treats an *unannotated* tool as destructive and prompts every
+> call) runs plans without a prompt. That's an approval-UX convenience, not a sandbox, and
+> changes nothing above.
+>
+> One more asymmetry worth knowing: Codex pipes MCP server stderr into its own log store, not
+> the TUI. On the build this was verified against (0.149.1), a deliberately written stderr line
+> did not surface in either the documented log location or its replacement — treat stderr as
+> unrecoverable and rely on the tool's own text result, never diagnostic logging, when a plan
+> fails.
+
 ### A prompt to see it work
 
 A read-only, structurally predictable task — predexec's sweet spot:
@@ -302,10 +375,11 @@ edits are always what's measured.)
 dist/                              compiled ESM JavaScript (emitted by tsconfig.build.json)
 .pi/extension/index.ts             pi adapter — JSON Schema + ctx wiring, delegates to core
 .opencode/plugins/predexec.ts      opencode adapter — zod schema + context wiring, delegates to core
-mcp/                               Claude Code adapter (stdio MCP), delegates to core
-  server.ts                        the MCP server: one `predexec` tool
+mcp/                               Claude Code / Codex adapter (stdio MCP), delegates to core
+  server.ts                        the MCP server: one `predexec` tool (`--host` picks the policy reader)
   tool-ops.ts                      read/grep/find/ls over node:fs (rg/fd accelerate when present)
   policy-claude.ts                 reads your Claude Code permission rules → policyStop
+  policy-codex.ts                  reads Codex's config.toml + execpolicy rules → policyStop, fail-closed
 core/                              PURE TS, zero harness imports (promotable to a standalone package)
   types.ts conditions.ts runner.ts engine.ts destructive.ts coerce.ts index.ts
 steering.ts                        shared steering text/marker (harness-facing; not in core/)
@@ -313,9 +387,10 @@ stats.ts                           request-accounting recorder (append-only JSON
 policy.ts                          opencode permission reader/checker (harness-facing)
 adapter-runtime.ts                 shared adapter execution & stats runtime
 bin/predexec.mjs                   CLI: doctor + stats (node builtins only)
-bin/predexec-mcp.mjs               Claude Code MCP entrypoint (`npx --package=predexec predexec-mcp`)
+bin/predexec-mcp.mjs               Claude Code / Codex MCP entrypoint (`--host codex` selects Codex)
 .pi/skills/predexec/SKILL.md       declarative pi routing skill (loaded via pi.skills)
 skills/predexec-claude/SKILL.md    Claude Code routing skill (shipped with the plugin wrapper)
 .claude-plugin/plugin.json         optional Claude Code plugin wrapper
 configs/opencode/AGENTS.md         drop-in routing block for opencode projects
+configs/codex/AGENTS.md            drop-in routing block for Codex projects
 ```
