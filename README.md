@@ -49,16 +49,16 @@ How completely predexec's design survives contact with each harness. The score i
 quality of the harness — it drops when predexec has to reimplement or approximate something the
 design wants to get natively.
 
-| | **pi** | **opencode** | **Claude Code** |
-| :-- | :-- | :-- | :-- |
-| Integration | in-process extension | in-process plugin | out-of-process **stdio MCP** |
-| Tool registration | native (`pi.extensions`) | native (`plugin` array) | MCP tool — the only route CC offers a third party |
-| `read`/`grep`/`find`/`ls` | the host's **own tool factories** — exact parity | host SDK, with real caps | **own implementation** over `node:fs` (`rg`/`fd` accelerate) |
-| Steering | skill auto-loaded via `pi.skills` | guarded system-prompt push, or `AGENTS.md` | skill via plugin wrapper + tool description |
-| Streaming progress | yes (`onUpdate`) | no | no |
-| Host permission rules | n/a — pi has no per-command rules (project-trust only) | reads `permission.bash`, last-match-wins | **self-enforced** from `settings.json` (host rules don't reach a subprocess) |
-| Published format | compiled ESM (`dist/`) | compiled ESM (`dist/`) | compiled ESM (`dist/`) |
-| **Fit** | **9 / 10** | **7 / 10** | **6 / 10** |
+| | **pi** | **opencode** | **Claude Code** | **Codex** |
+| :-- | :-- | :-- | :-- | :-- |
+| Integration | in-process extension | in-process plugin | out-of-process **stdio MCP** | out-of-process **stdio MCP** (same server as Claude Code) |
+| Tool registration | native (`pi.extensions`) | native (`plugin` array) | MCP tool — the only route CC offers a third party | MCP tool — the only route Codex offers a third party |
+| `read`/`grep`/`find`/`ls` | the host's **own tool factories** — exact parity | host SDK, with real caps | **own implementation** over `node:fs` (`rg`/`fd` accelerate) | same implementation as Claude Code (`mcp/tool-ops.ts` is shared) |
+| Steering | skill auto-loaded via `pi.skills` | guarded system-prompt push, or `AGENTS.md` | skill via plugin wrapper + tool description | `AGENTS.md` native (no plugin wrapper needed) + tool description |
+| Streaming progress | yes (`onUpdate`) | no | no | no |
+| Host permission rules | n/a — pi has no per-command rules (project-trust only) | reads `permission.bash`, last-match-wins | **self-enforced** from `settings.json` (host rules don't reach a subprocess) | **self-enforced** from `config.toml` + execpolicy rules — **no OS sandbox backstop** (MCP servers run outside it entirely, measured) |
+| Published format | compiled ESM (`dist/`) | compiled ESM (`dist/`) | compiled ESM (`dist/`) | compiled ESM (`dist/`) |
+| **Fit** | **9 / 10** | **7 / 10** | **6 / 10** | **5 / 10** |
 
 **pi — 9.** Everything the design wants exists natively: predexec borrows pi's real tool
 implementations, so a plan's `read` is *the* `read`; the routing skill auto-registers; progress
@@ -78,6 +78,19 @@ read/grep/find/ls with its own behavior (`.gitignore` handling, regex dialect, o
 Your `Bash(...)` rules don't reach the subprocess, so predexec re-reads and enforces them
 itself. No streaming progress. What it does keep is the thing that matters: the same `core/`
 engine, the same plan tree, the same hard-stops.
+
+**Codex — 5.** Literally the same `mcp/server.ts` and `mcp/tool-ops.ts` as Claude Code (started
+with `--host codex`), so the same out-of-process costs apply: a second read/grep/find/ls
+implementation, no streaming. Two things make the fit worse than Claude Code's slot. First,
+Codex spawns MCP servers **entirely outside its own sandbox** — measured directly, not
+inferred: a probe server wrote to disk with zero error while the session's own shell tool was
+confined to a `read-only` sandbox — so there is no OS-level backstop at all, only
+`mcp/policy-codex.ts`'s `config.toml`/execpolicy-rules reading and predexec's own
+`destructive.ts` heuristic (see the sandbox warning under [Codex CLI](#codex-cli) below).
+Second, Codex's default per-call approval mode treats an *unannotated* tool as destructive, so
+declaring `readOnlyHint: true` is load-bearing just to run a plan without a prompt, not merely a
+nicety. What's better here: `AGENTS.md` is native to Codex, so declarative steering doesn't need
+a plugin wrapper the way Claude Code's does.
 
 ## Install
 

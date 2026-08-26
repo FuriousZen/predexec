@@ -1,5 +1,5 @@
 /**
- * predexec — Claude Code (MCP) adapter: the stdio server.
+ * predexec — Claude Code / Codex CLI (MCP) adapter: the stdio server.
  *
  * Registers ONE tool, `predexec`, that runs a pre-planned tree of command
  * batches with deterministic branch conditions in a single model round-trip.
@@ -7,16 +7,32 @@
  * only wires the MCP boundary: schema → executeAdapterPlan (../adapter-runtime.ts:
  * coerce → run → record) → transcript.
  *
- * Claude Code exposes no in-process tool-registration API, so unlike the pi
- * extension and the opencode plugin this adapter is a SEPARATE PROCESS with no
- * host APIs at all. Two consequences shape the file:
+ * This ONE server file serves TWO hosts. Neither Claude Code nor Codex exposes
+ * an in-process tool-registration API, so unlike the pi extension and the
+ * opencode plugin this adapter is a SEPARATE PROCESS with no host APIs at all
+ * — for either host. Which host is running it is selected explicitly via
+ * `PredexecServerOptions.host` (the `--host codex` CLI flag), because Codex
+ * clears every `CODEX_*` env var before spawning the subprocess, so there is
+ * no signal to detect it automatically; the default stays `"claude-code"` so
+ * an existing no-flag install behaves byte-for-byte as before this option
+ * existed. Three consequences shape the file:
  *
- *  1. Read/grep/find/ls come from ./tool-ops.ts (node:fs) rather than the host's
- *     own tool factories — a documented parity gap, not parity.
- *  2. The host's `Bash(...)` permission rules do not reach a subprocess, so
- *     ./policy-claude.ts reads Claude Code's settings itself and hard-stops via
- *     the engine's `policyStop` on any deny OR ask match. predexec is strictly
- *     more conservative than the host, never a permission-laundering path.
+ *  1. Read/grep/find/ls come from ./tool-ops.ts (node:fs) rather than either
+ *     host's own tool factories — a documented parity gap, not parity. Shared
+ *     verbatim by both hosts.
+ *  2. Neither host's own command-permission rules reach a subprocess, so this
+ *     file dispatches to a host-specific policy reader — ./policy-claude.ts
+ *     (Claude Code's `settings.json`) or ./policy-codex.ts (Codex's
+ *     `config.toml` + execpolicy rules) — that hard-stops via the engine's
+ *     `policyStop` on any deny/ask/forbid match. predexec is strictly more
+ *     conservative than the host, never a permission-laundering path, on
+ *     either host.
+ *  3. Codex spawns MCP servers OUTSIDE its own sandbox (measured), so on that
+ *     host predexec's own read-only invariant + destructive.ts + the policy
+ *     reader above are the *only* containment — there is no OS-level backstop
+ *     the way Claude Code's sandboxing docs offer. The tool's
+ *     `readOnlyHint: true` annotation matters most for Codex, whose default
+ *     per-call approval mode treats an unannotated tool as destructive.
  *
  * STDOUT IS THE PROTOCOL. Under a stdio transport every byte on stdout must be
  * a JSON-RPC frame; one stray `console.log` corrupts the stream silently, and
