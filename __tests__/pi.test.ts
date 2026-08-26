@@ -11,7 +11,8 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import predexec from "../.pi/extension/index.ts";
+import predexecSource from "../.pi/extension/index.ts";
+import predexecCompiled from "../dist/.pi/extension/index.js";
 
 type Handler = (event: any) => any;
 
@@ -30,7 +31,12 @@ function createFakeApi() {
   return { api: api as any, events, getTool: () => tool as any };
 }
 
-describe("pi extension — registration contract (fake ExtensionAPI)", () => {
+const variants = [
+  { name: "source (.pi/extension/index.ts)", predexec: predexecSource },
+  { name: "compiled (dist/.pi/extension/index.js)", predexec: predexecCompiled },
+];
+
+describe.each(variants)("pi extension ($name) — registration contract (fake ExtensionAPI)", ({ predexec }) => {
   it("registers a `predexec` tool with the expected schema and prompt guidance", () => {
     const { api, events, getTool } = createFakeApi();
     predexec(api);
@@ -44,7 +50,7 @@ describe("pi extension — registration contract (fake ExtensionAPI)", () => {
   });
 });
 
-describe("pi extension — tool.execute", () => {
+describe.each(variants)("pi extension ($name) — tool.execute", ({ predexec }) => {
   it("runs a depth-0 printf plan and reports the transcript, stoppedReason, and path", async () => {
     const { api, getTool } = createFakeApi();
     predexec(api);
@@ -107,7 +113,7 @@ describe("pi extension — tool.execute", () => {
   });
 });
 
-describe("pi extension — tool_result nudge hook", () => {
+describe.each(variants)("pi extension ($name) — tool_result nudge hook", ({ predexec }) => {
   it("appends the batching nudge after a read-only bash command", async () => {
     const { api, events } = createFakeApi();
     predexec(api);

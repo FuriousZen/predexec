@@ -12,7 +12,21 @@
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true,
     "allowImportingTsExtensions": true,
-    "noEmit": true
+    "rewriteRelativeImportExtensions": true,
+    "outDir": "dist",
+    "declaration": false,
+    "sourceMap": false,
+    "removeComments": true,
+    "noEmit": false
   },
-  "include": [".pi/extension/index.ts", ".opencode/plugins/predexec.ts", "core/**/*.ts", "steering.ts", "mcp/**/*.ts", "policy.ts", "stats.ts", "adapter-runtime.ts"]
+  "include": [
+    ".pi/extension/index.ts",
+    ".opencode/plugins/predexec.ts",
+    "mcp/**/*.ts",
+    "core/**/*.ts",
+    "steering.ts",
+    "stats.ts",
+    "policy.ts",
+    "adapter-runtime.ts"
+  ]
 }

@@ -322,7 +322,17 @@ export function checkOpencode(opts = {}) {
     // Loader contract: opencode's readV1Plugin only reads the default export.
     let pluginSrc = "";
     try {
-      pluginSrc = readFileSync(join(dir, ".opencode", "plugins", "predexec.ts"), "utf8");
+      const candidates = [
+        pkg?.main ? join(dir, pkg.main) : null,
+        join(dir, "dist", ".opencode", "plugins", "predexec.js"),
+        join(dir, ".opencode", "plugins", "predexec.ts"),
+      ].filter(Boolean);
+      for (const file of candidates) {
+        if (existsSync(file)) {
+          pluginSrc = readFileSync(file, "utf8");
+          break;
+        }
+      }
     } catch {
       /* handled below */
     }

@@ -234,14 +234,11 @@ describe("mcp server — packaging and plugin wiring", () => {
 
   it("package.json ships every path the MCP adapter loads at runtime", () => {
     const pkg = readJson("package.json");
-    for (const entry of ["mcp", "bin", "core", "skills", ".claude-plugin", "steering.ts", "stats.ts", "adapter-runtime.ts"]) {
+    for (const entry of ["dist", "bin", "skills", ".claude-plugin"]) {
       expect(pkg.files).toContain(entry);
     }
     expect(pkg.bin["predexec-mcp"]).toBe("./bin/predexec-mcp.mjs");
-    // Both are runtime imports of the launcher/server path. jiti especially:
-    // Node refuses to strip types under node_modules, so an install without it
-    // cannot load mcp/server.ts at all.
-    expect(Object.keys(pkg.dependencies).sort()).toEqual(["@modelcontextprotocol/server", "jiti", "zod"].sort());
+    expect(Object.keys(pkg.dependencies).sort()).toEqual(["@modelcontextprotocol/server", "zod"].sort());
   });
 
   it("the plugin manifest invokes the bin through its OWN package name", () => {

@@ -107,12 +107,12 @@ describe("doctor — opencode checks", () => {
   const GOOD_PLUGIN = "export const server = 1;\nexport default { id: 'predexec', server };\n";
   const OLD_PLUGIN = "export const server = 1;\n"; // pre-0.1.1: named export only
 
-  const setupCache = (pluginSrc: string, withZod: boolean) => {
+  const setupCache = (pluginSrc: string, withZod: boolean, main = "dist/.opencode/plugins/predexec.js") => {
     write(
       "cache/predexec@latest/node_modules/predexec/package.json",
-      JSON.stringify({ version: "0.1.3" }),
+      JSON.stringify({ version: "0.1.3", main }),
     );
-    write("cache/predexec@latest/node_modules/predexec/.opencode/plugins/predexec.ts", pluginSrc);
+    write(`cache/predexec@latest/node_modules/predexec/${main}`, pluginSrc);
     if (withZod) {
       write("cache/predexec@latest/node_modules/zod/package.json", JSON.stringify({ version: "4.1.8" }));
     }

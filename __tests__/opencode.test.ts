@@ -5,7 +5,8 @@ import { describe, expect, it } from "vitest";
 // `server` is accessed through the default export (`plugin.server`), not as a
 // named import: that mirrors what current opencode loaders (readV1Plugin)
 // actually read, and stays valid once the named `server` export is dropped.
-import plugin, { createToolExecutor } from "../.opencode/plugins/predexec.ts";
+import pluginSource, { createToolExecutor as createToolExecutorSource } from "../.opencode/plugins/predexec.ts";
+import pluginCompiled, { createToolExecutor as createToolExecutorCompiled } from "../dist/.opencode/plugins/predexec.js";
 import type { ToolOp } from "../core/index.ts";
 
 // read/ls pre-check path existence against the cwd, so mocked-client tests
@@ -15,10 +16,12 @@ writeFileSync(join(repo, "a.ts"), "x");
 mkdirSync(join(repo, "src"));
 writeFileSync(join(repo, "src", "a.ts"), "x");
 
-const run = (client: any, op: ToolOp) =>
-  createToolExecutor(client, repo)(op, { cwd: repo });
+const variants = [
+  { name: "source (.opencode/plugins/predexec.ts)", plugin: pluginSource, createToolExecutor: createToolExecutorSource },
+  { name: "compiled (dist/.opencode/plugins/predexec.js)", plugin: pluginCompiled, createToolExecutor: createToolExecutorCompiled },
+];
 
-describe("opencode plugin — loader contract", () => {
+describe.each(variants)("opencode plugin ($name) — loader contract", ({ plugin }) => {
   // opencode's readV1Plugin loads ONLY the default export and requires
   // { server() }; a named-export-only module is silently skipped.
   it("default-exports { id, server } for current opencode loaders", () => {
@@ -40,7 +43,9 @@ describe("opencode plugin — loader contract", () => {
   });
 });
 
-describe("opencode createToolExecutor — SDK response mapping", () => {
+describe.each(variants)("opencode createToolExecutor ($name) — SDK response mapping", ({ createToolExecutor }) => {
+  const run = (client: any, op: ToolOp) =>
+    createToolExecutor(client, repo)(op, { cwd: repo });
   it("read: passes file content through as stdout", async () => {
     const client = { file: { read: async () => ({ data: { content: "line1\nline2\nline3" } }) } };
     const r = await run(client, { tool: "read", path: "a.ts" });
@@ -118,7 +123,10 @@ describe("opencode createToolExecutor — SDK response mapping", () => {
   });
 });
 
-describe("opencode createToolExecutor — grep/find arg handling", () => {
+describe.each(variants)("opencode createToolExecutor ($name) — grep/find arg handling", ({ createToolExecutor }) => {
+  const run = (client: any, op: ToolOp) =>
+    createToolExecutor(client, repo)(op, { cwd: repo });
+
   const matchRow = (path: string, line: number) => ({
     path: { text: path },
     lines: { text: "const x = 1" },
@@ -205,7 +213,10 @@ describe("opencode createToolExecutor — grep/find arg handling", () => {
   });
 });
 
-describe("opencode createToolExecutor — missing-path pre-check", () => {
+describe.each(variants)("opencode createToolExecutor ($name) — missing-path pre-check", ({ createToolExecutor }) => {
+  const run = (client: any, op: ToolOp) =>
+    createToolExecutor(client, repo)(op, { cwd: repo });
+
   // Without the pre-check, opencode's server hides missing paths: file.read
   // returns empty content with no error (silent false success) and file.list
   // throws an opaque 500. Both must instead fail with the resolved location.
@@ -242,7 +253,7 @@ describe("opencode createToolExecutor — missing-path pre-check", () => {
   });
 });
 
-describe("opencode plugin — host permission policy e2e", () => {
+describe.each(variants)("opencode plugin ($name) — host permission policy e2e", ({ plugin }) => {
   const execute = async (directory: string, plan: unknown) => {
     const hooks = await plugin.server({ client: {} } as any);
     return (hooks as any).tool.predexec.execute(
@@ -283,7 +294,7 @@ describe("opencode plugin — host permission policy e2e", () => {
   });
 });
 
-describe("opencode plugin — prompting surfaces", () => {
+describe.each(variants)("opencode plugin ($name) — prompting surfaces", ({ plugin }) => {
   it("tool description carries the verify-first guideline", async () => {
     const hooks = await plugin.server({ client: {} } as any);
     const def = (hooks as any).tool.predexec;

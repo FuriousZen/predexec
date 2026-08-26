@@ -55,7 +55,7 @@ design wants to get natively.
 | Steering | skill auto-loaded via `pi.skills` | guarded system-prompt push, or `AGENTS.md` | skill via plugin wrapper + tool description |
 | Streaming progress | yes (`onUpdate`) | no | no |
 | Host permission rules | n/a — pi has no per-command rules (project-trust only) | reads `permission.bash`, last-match-wins | **self-enforced** from `settings.json` (host rules don't reach a subprocess) |
-| `.ts` loading | jiti | Bun | jiti |
+| Published format | compiled ESM (`dist/`) | compiled ESM (`dist/`) | compiled ESM (`dist/`) |
 | **Fit** | **9 / 10** | **7 / 10** | **6 / 10** |
 
 **pi — 9.** Everything the design wants exists natively: predexec borrows pi's real tool
@@ -88,7 +88,7 @@ pi install npm:predexec
 That's the whole install. pi fetches the package from npm, runs `npm install --omit=dev`,
 and registers the `predexec` tool from the package's
 `pi.extensions` manifest (plus a terse routing skill from `pi.skills`,
-`skills/predexec/SKILL.md`) — no build step (it's loaded as `.ts` via jiti). Once pi
+`.pi/skills/predexec/SKILL.md`) — runs compiled ESM from `dist/`. Once pi
 starts, the model routes multi-step work through it on its own.
 
 ```bash
@@ -130,7 +130,7 @@ Add predexec to your `opencode.json` (project root, or `~/.config/opencode/openc
 }
 ```
 
-That's the whole install — opencode resolves the plugin from npm, loads `.opencode/plugins/predexec.ts`
+That's the whole install — opencode resolves the plugin from npm, loads `dist/.opencode/plugins/predexec.js`
 in-process via Bun, and registers the `predexec` tool natively. No global install, no wrapper file.
 Restart opencode after editing.
 
@@ -279,14 +279,15 @@ Clone and use pnpm (the project's package manager):
 git clone https://github.com/FuriousZen/predexec && cd predexec
 corepack enable     # makes pnpm available (ships with Node)
 pnpm install
-pnpm test           # vitest — 462 tests
+pnpm run build      # tsc -p tsconfig.build.json -> dist/
+pnpm test           # vitest
 pnpm run typecheck  # tsc --noEmit
 ```
 
-Load your working copy live in pi while iterating — no build, jiti loads the `.ts`:
+Load your working copy live in pi while iterating:
 
 ```bash
-pi -e /path/to/predexec/.pi/extension/index.ts   # or just run `pi` inside the repo (package.json pi.extensions)
+pi -e /path/to/predexec/.pi/extension/index.ts   # or run `pi` inside the repo
 ```
 
 (Inside the devcontainer the checkout is already mounted and the adapter loads from it, so your
@@ -295,6 +296,7 @@ edits are always what's measured.)
 ## Layout
 
 ```
+dist/                              compiled ESM JavaScript (emitted by tsconfig.build.json)
 .pi/extension/index.ts             pi adapter — JSON Schema + ctx wiring, delegates to core
 .opencode/plugins/predexec.ts      opencode adapter — zod schema + context wiring, delegates to core
 mcp/                               Claude Code adapter (stdio MCP), delegates to core
@@ -306,9 +308,10 @@ core/                              PURE TS, zero harness imports (promotable to 
 steering.ts                        shared steering text/marker (harness-facing; not in core/)
 stats.ts                           request-accounting recorder (append-only JSONL; harness-facing)
 policy.ts                          opencode permission reader/checker (harness-facing)
+adapter-runtime.ts                 shared adapter execution & stats runtime
 bin/predexec.mjs                   CLI: doctor + stats (node builtins only)
 bin/predexec-mcp.mjs               Claude Code MCP entrypoint (`npx --package=predexec predexec-mcp`)
-skills/predexec/SKILL.md           declarative pi routing skill (loaded via pi.skills)
+.pi/skills/predexec/SKILL.md       declarative pi routing skill (loaded via pi.skills)
 skills/predexec-claude/SKILL.md    Claude Code routing skill (shipped with the plugin wrapper)
 .claude-plugin/plugin.json         optional Claude Code plugin wrapper
 configs/opencode/AGENTS.md         drop-in routing block for opencode projects
