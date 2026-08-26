@@ -20,6 +20,15 @@
  * `import` line sits textually. It is safe today only because that module is
  * plain node-builtins-only code with no top-level output (verified) — it
  * must stay that way, or gain its own guard, for this guarantee to hold.
+ *
+ * `--host claude-code|codex` (also `--host=codex`) selects the policy adapter
+ * and stats label downstream in mcp/server.ts; default stays "claude-code" so
+ * an existing install with no flag is byte-for-byte unchanged. Codex clears
+ * the subprocess env before spawning an MCP server (measured — no `CODEX_*`
+ * marker reaches us), so host detection is impossible and the registration
+ * command must declare it explicitly. parseHostArg() rejects an unrecognized
+ * value BEFORE the server module (and any transport) is ever touched, so that
+ * failure always lands on stderr with nothing on stdout first.
  */
 
 // stdio MCP: stdout carries protocol frames only. Rebind BEFORE launch()'s
@@ -37,7 +46,42 @@ import { isDirectInvocation } from "./predexec.mjs";
 /** Resolved from this file, so a symlinked bin still finds the compiled entry. */
 const SERVER_URL = new URL("../dist/mcp/server.js", import.meta.url);
 
-export async function launch() {
+const VALID_HOSTS = new Set(["claude-code", "codex"]);
+const USAGE = "usage: predexec-mcp [--host claude-code|codex]";
+
+/**
+ * Parse `--host <value>` / `--host=<value>` out of `argv`, stripping it
+ * before anything else looks at argv (there is nothing else to look at
+ * today, but that is the contract). Returns `{ host }`, defaulting to
+ * "claude-code" when the flag is absent — zero behavior change for every
+ * existing registration. Throws a plain `Error` (message is usage-ready for
+ * stderr) on an unrecognized value; the caller must handle that BEFORE
+ * touching the server module, so an invalid flag never gets far enough to
+ * write anything to stdout.
+ */
+export function parseHostArg(argv) {
+  let host = "claude-code";
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    if (arg === "--host") host = argv[++i];
+    else if (arg.startsWith("--host=")) host = arg.slice("--host=".length);
+  }
+  if (!VALID_HOSTS.has(host)) {
+    throw new Error(`predexec-mcp: invalid --host "${host}" (expected "claude-code" or "codex")\n${USAGE}`);
+  }
+  return { host };
+}
+
+export async function launch(argv = process.argv.slice(2)) {
+  let host;
+  try {
+    ({ host } = parseHostArg(argv));
+  } catch (err) {
+    console.error(err.message);
+    process.exitCode = 1;
+    return;
+  }
+
   let server;
   try {
     server = await import(SERVER_URL.href);
@@ -56,7 +100,7 @@ export async function launch() {
   }
 
   try {
-    await server.main();
+    await server.main({ host });
   } catch (err) {
     // Reaching here means the transport never came up; the client sees an
     // immediate exit, so the reason has to be on stderr for it to be logged.

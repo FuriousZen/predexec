@@ -37,6 +37,7 @@ import type { ToolExecutor } from "../core/index.ts";
 import { executeAdapterPlan } from "../adapter-runtime.ts";
 import { DESCRIPTION_BASE, RECOVERY_LINE, STEERING_LINE, USAGE_LINE, VERIFY_FIRST_LINE, WHEN_SYNTAX_LINE } from "../steering.ts";
 import { createClaudePolicyChecker, readClaudeBashRules, type ClaudePolicyOptions } from "./policy-claude.ts";
+import { createCodexPolicyChecker, readCodexRules, type CodexPolicyOptions } from "./policy-codex.ts";
 import { createToolExecutor } from "./tool-ops.ts";
 
 /** The tool name clients see as `mcp__predexec__predexec`. */
@@ -89,8 +90,22 @@ export interface PredexecServerOptions {
    * tool-ops root and the project dir the permission rules are read from.
    */
   cwd?: string;
-  /** Forwarded to the policy reader (env / managed-settings dir). Tests point it at fixtures. */
-  policy?: ClaudePolicyOptions;
+  /**
+   * Forwarded to the policy reader (env / managed-settings dir for Claude
+   * Code; codexHome / env for Codex). Tests point it at fixtures. Which shape
+   * applies depends on `host`.
+   */
+  policy?: ClaudePolicyOptions | CodexPolicyOptions;
+  /**
+   * Which host is running this server — selects the policy reader AND the
+   * stats harness label. Codex clears the subprocess env before spawning an
+   * MCP server (measured — no `CODEX_*` marker reaches us, so host detection
+   * is impossible here), so the registration command declares the host
+   * explicitly via `--host`. Default stays `"claude-code"`: an existing
+   * install with no flag must behave byte-for-byte as before this option
+   * existed.
+   */
+  host?: "claude-code" | "codex";
 }
 
 const textResult = (text: string, isError = false): ToolResult => ({
@@ -126,16 +141,30 @@ function packageVersion(): string {
  */
 async function runPredexecTool(
   rawPlan: unknown,
-  opts: { cwd: string; executeToolOp: ToolExecutor; policy?: ClaudePolicyOptions; signal?: AbortSignal },
+  opts: {
+    cwd: string;
+    executeToolOp: ToolExecutor;
+    policy?: ClaudePolicyOptions | CodexPolicyOptions;
+    host: "claude-code" | "codex";
+    signal?: AbortSignal;
+  },
 ): Promise<ToolResult> {
   // Re-read the rules per call (a few small JSON reads): a permission edit
   // applies immediately, and an unconfigured host costs a cheap no-op checker.
   // The tool-ops root, by contrast, is fixed once at startup — it is the
   // session boundary, not a preference.
-  const { rules, unreadable } = readClaudeBashRules(opts.cwd, opts.policy ?? {});
-  const checkCommandPolicy = createClaudePolicyChecker(rules, unreadable);
+  const checkCommandPolicy =
+    opts.host === "codex"
+      ? (() => {
+          const { rules, unreadable } = readCodexRules(opts.cwd, (opts.policy as CodexPolicyOptions) ?? {});
+          return createCodexPolicyChecker(rules, unreadable);
+        })()
+      : (() => {
+          const { rules, unreadable } = readClaudeBashRules(opts.cwd, (opts.policy as ClaudePolicyOptions) ?? {});
+          return createClaudePolicyChecker(rules, unreadable);
+        })();
 
-  const result = await executeAdapterPlan(rawPlan, "claude-code", {
+  const result = await executeAdapterPlan(rawPlan, opts.host, {
     cwd: opts.cwd,
     signal: opts.signal,
     executeToolOp: opts.executeToolOp,
@@ -157,6 +186,7 @@ async function runPredexecTool(
  */
 export function createServer(opts: PredexecServerOptions = {}): McpServer {
   const cwd = resolve(opts.cwd ?? process.cwd());
+  const host = opts.host ?? "claude-code";
   // Built once: PATH and the session root do not change mid-process, and the
   // rg/fd lookups inside are per-construction.
   const executeToolOp = createToolExecutor({ cwd });
@@ -181,6 +211,7 @@ export function createServer(opts: PredexecServerOptions = {}): McpServer {
         cwd,
         executeToolOp,
         policy: opts.policy,
+        host,
         // The client's cancellation reaches the walk, so an abandoned request
         // does not leave a subtree of commands running.
         signal: extra.mcpReq?.signal,

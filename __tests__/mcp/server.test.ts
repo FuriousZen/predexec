@@ -1,3 +1,4 @@
+import { spawn } from "node:child_process";
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -397,5 +398,82 @@ describe("mcp server — spawned stdio launcher", () => {
     } finally {
       client.kill();
     }
+  });
+});
+
+describe("mcp server — launcher `--host` flag", () => {
+  it("--host=codex selects the Codex execpolicy adapter: a forbidden rule stops the command, an unmatched one still runs", async () => {
+    // NOTE: the brief's illustrative rule forbids `git push`, but `git push` is
+    // ALSO caught by core/destructive.ts's mutation heuristic (the git
+    // history-mutating-verb blocklist) — and engine.ts checks mutation BEFORE
+    // policy (mutationStop always wins for that exact command, on every host,
+    // policy adapter irrelevant). Proving the CODEX policy path specifically
+    // requires a command the mutation heuristic passes through cleanly, so
+    // this uses `cat` (a declared read-only head) forbidden via the rule
+    // instead — same shape as the sibling Claude Code policy test above
+    // ("cat marker.txt" + a `Bash(cat *)` deny rule).
+    const dir = project();
+    const codexHome = mkdtempSync(join(tmpdir(), "px-codex-home-"));
+    mkdirSync(join(codexHome, "rules"));
+    writeFileSync(join(codexHome, "rules", "deny-cat.rules"), 'prefix_rule(pattern=["cat"], decision="forbidden")\n');
+
+    const binPath = join(__dirname, "..", "..", "bin", "predexec-mcp.mjs");
+    // `--host=codex` (equals form) is exercised here; `--host codex` (two-token
+    // form) is the other accepted spelling per the interface contract.
+    const client = spawnMcpClient(binPath, {
+      cwd: dir,
+      args: ["--host=codex"],
+      env: { CODEX_HOME: codexHome },
+    });
+
+    try {
+      const initRes = await client.request("initialize", {
+        protocolVersion: LATEST_PROTOCOL_VERSION,
+        capabilities: {},
+        clientInfo: { name: "predexec-codex-test", version: "1" },
+      });
+      expect(initRes.result.serverInfo.name).toBe("predexec");
+      client.notify("notifications/initialized");
+
+      const catRes = await client.request("tools/call", {
+        name: TOOL_NAME,
+        arguments: { plan: { root: "a", nodes: [{ id: "a", commands: ["cat marker.txt"] }] } },
+      });
+      const catText = textOf(catRes);
+      expect(catText).toContain("POLICY HARD-STOP (not run)");
+      expect(catText).toContain("cat");
+      // The stop must land BEFORE execution — the file's contents never appear.
+      expect(catText).not.toContain("hello from predexec");
+
+      const okRes = await client.request("tools/call", {
+        name: TOOL_NAME,
+        arguments: { plan: { root: "a", nodes: [{ id: "a", commands: ["printf ok"] }] } },
+      });
+      expect(textOf(okRes)).toContain("ok");
+      expect(okRes.result.isError).toBeUndefined();
+    } finally {
+      client.kill();
+    }
+  });
+
+  it("an unrecognized --host value exits 1 with a usage line on stderr, before any protocol output", async () => {
+    const binPath = join(__dirname, "..", "..", "bin", "predexec-mcp.mjs");
+    const child = spawn(process.execPath, [binPath, "--host", "bogus"], {
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+
+    let stdout = "";
+    let stderr = "";
+    child.stdout!.setEncoding("utf8");
+    child.stderr!.setEncoding("utf8");
+    child.stdout!.on("data", (c: string) => (stdout += c));
+    child.stderr!.on("data", (c: string) => (stderr += c));
+
+    const exitCode = await new Promise<number | null>((resolve) => child.on("exit", resolve));
+
+    expect(exitCode).toBe(1);
+    expect(stderr).toMatch(/usage: predexec-mcp/);
+    expect(stderr).toContain("--host");
+    expect(stdout).toBe("");
   });
 });

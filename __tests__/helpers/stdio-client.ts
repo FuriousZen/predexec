@@ -33,9 +33,9 @@ export interface McpTestClient {
 
 export function spawnMcpClient(
   binPath: string,
-  opts?: { cwd?: string; env?: NodeJS.ProcessEnv; nodeArgs?: string[] },
+  opts?: { cwd?: string; env?: NodeJS.ProcessEnv; nodeArgs?: string[]; args?: string[] },
 ): McpTestClient {
-  const child = spawn(process.execPath, [...(opts?.nodeArgs ?? []), binPath], {
+  const child = spawn(process.execPath, [...(opts?.nodeArgs ?? []), binPath, ...(opts?.args ?? [])], {
     cwd: opts?.cwd,
     env: { ...process.env, ...opts?.env },
     stdio: ["pipe", "pipe", "pipe"],
