@@ -316,6 +316,12 @@ describe("mcp server — spawned stdio launcher", () => {
       const tools = listRes.result.tools as Json[];
       expect(tools).toHaveLength(1);
       expect(tools[0]!.name).toBe(TOOL_NAME);
+      // Codex CLI's per-call approval mode prompts on every call to a tool
+      // lacking `readOnlyHint: true` (unannotated => destructive assumed).
+      // predexec genuinely never writes/installs/deletes, so it must be
+      // annotated read-only over the wire, on this protocol era too.
+      expect(tools[0]!.annotations?.readOnlyHint).toBe(true);
+      expect(tools[0]!.annotations?.destructiveHint).toBeFalsy();
 
       const callRes = await client.request("tools/call", {
         name: TOOL_NAME,
@@ -374,6 +380,10 @@ describe("mcp server — spawned stdio launcher", () => {
       expect(tools).toHaveLength(1);
       expect(tools[0]!.name).toBe(TOOL_NAME);
       expect(tools[0]!.inputSchema.type).toBe("object");
+      // Same annotation contract must survive the legacy (2025-06-18) protocol
+      // era — this is the era Claude Code itself actually opens with.
+      expect(tools[0]!.annotations?.readOnlyHint).toBe(true);
+      expect(tools[0]!.annotations?.destructiveHint).toBeFalsy();
 
       const callRes = await client.request("tools/call", {
         name: TOOL_NAME,

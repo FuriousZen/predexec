@@ -168,6 +168,13 @@ export function createServer(opts: PredexecServerOptions = {}): McpServer {
     {
       description: DESCRIPTION,
       inputSchema: z.object({ plan: z.unknown().describe(PLAN_ARG_DESCRIPTION) }),
+      // predexec is read-only speculation; any mutating node is a hard stop
+      // BEFORE it runs (see the module doc). Declaring that here, not just in
+      // prose, matters beyond Claude Code: Codex CLI's per-call approval mode
+      // prompts on every call to a tool lacking `readOnlyHint: true`
+      // (unannotated => destructive assumed), and also prompts if
+      // `openWorldHint` is set — so it must stay absent, not just false.
+      annotations: { readOnlyHint: true },
     },
     async (args, extra) =>
       runPredexecTool(args.plan, {
