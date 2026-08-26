@@ -3,7 +3,7 @@
  * Adapters import only from here.
  *
  * Narrowed to exactly what the runtime harness adapters (pi, opencode, MCP)
- * and their shared helpers (adapter-runtime.ts, policy.ts, stats.ts) import:
+ * and their shared helpers (adapter-runtime.ts, policy.ts, stats.ts, steering.ts) import:
  * plan execution, plan coercion, destructive-command checking, and
  * command-segment splitting — plus a regex-escaping helper and the
  * plan/result/tool types those functions' signatures require.

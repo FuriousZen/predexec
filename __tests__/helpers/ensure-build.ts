@@ -10,7 +10,7 @@
  * `mkdirSync`, which is atomic even across processes) is what's needed.
  *
  * A lock older than STALE_LOCK_MS is assumed to belong to a crashed/killed
- * process and is stolen rather than waited on forever.
+ * process and is stolen after waiting up to LOCK_TIMEOUT_MS.
  */
 import { execSync } from "node:child_process";
 import { existsSync, mkdirSync, rmSync, statSync } from "node:fs";
@@ -21,7 +21,7 @@ const root = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const LOCK_DIR = join(root, "node_modules", ".predexec-build.lock");
 const STALE_LOCK_MS = 120_000;
 const LOCK_POLL_MS = 100;
-const LOCK_TIMEOUT_MS = 60_000;
+const LOCK_TIMEOUT_MS = 180_000;
 
 function sleepSync(ms: number): void {
   // beforeAll here is synchronous (execSync-based), so polling needs a
@@ -34,6 +34,9 @@ function sleepSync(ms: number): void {
 function acquireLock(): void {
   const deadline = Date.now() + LOCK_TIMEOUT_MS;
   for (;;) {
+    if (Date.now() > deadline) {
+      throw new Error(`ensureBuild: timed out waiting for build lock at ${LOCK_DIR}`);
+    }
     try {
       mkdirSync(LOCK_DIR);
       return;
@@ -56,9 +59,6 @@ function acquireLock(): void {
           // Lost the race to steal it — fall through and retry.
         }
         continue;
-      }
-      if (Date.now() > deadline) {
-        throw new Error(`ensureBuild: timed out waiting for build lock at ${LOCK_DIR}`);
       }
       sleepSync(LOCK_POLL_MS);
     }
