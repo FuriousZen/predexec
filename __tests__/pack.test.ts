@@ -5,6 +5,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { LATEST_PROTOCOL_VERSION } from "@modelcontextprotocol/server";
+import { ensureBuild } from "./helpers/ensure-build.ts";
 
 type Json = Record<string, any>;
 
@@ -16,8 +17,11 @@ describe("packed artifact verification", () => {
   let tarballPath: string;
 
   beforeAll(() => {
-    // Ensure fresh build before packing
-    execSync("npm run build", { cwd: root, stdio: "pipe" });
+    // Ensure fresh build before packing. force:true because packing must be
+    // fresh regardless of mtimes; still takes the cross-process lock because
+    // release-hygiene.test.ts's beforeAll can be building dist/ concurrently
+    // in a separate vitest worker. See helpers/ensure-build.ts.
+    ensureBuild({ force: true });
 
     packDir = mkdtempSync(join(tmpdir(), "px-pack-"));
     extractDir = join(packDir, "extracted");

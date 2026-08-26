@@ -11,12 +11,13 @@
  *    to a throwaway dir for the whole suite, or every run pollutes live stats
  *    (seen as "double-logged" policyStop rows: one per policy test per run).
  */
-import { execFileSync, execSync } from "node:child_process";
-import { existsSync, readFileSync, statSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { beforeAll, describe, expect, it } from "vitest";
+import { ensureBuild } from "./helpers/ensure-build.ts";
 
 describe("release hygiene", () => {
   it("plugin.json version matches package.json", () => {
@@ -32,13 +33,9 @@ describe("release hygiene", () => {
   });
 
   beforeAll(() => {
-    const distMain = "dist/.opencode/plugins/predexec.js";
-    const source = ".opencode/plugins/predexec.ts";
-    const needsBuild =
-      !existsSync(distMain) || statSync(distMain).mtimeMs < statSync(source).mtimeMs;
-    if (needsBuild) {
-      execSync("npm run build", { stdio: "pipe" });
-    }
+    // Serialized across processes: pack.test.ts's beforeAll can run concurrently
+    // in a separate vitest worker and also builds dist/. See ensure-build.ts.
+    ensureBuild();
   });
 
   it("compiled opencode main entry is ESM and exposes default.server (real Node, no vitest interop)", () => {
