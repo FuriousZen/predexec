@@ -1,7 +1,6 @@
 import { describe, expect, it } from "vitest";
-// coercePlan is a CORE function; the pi adapter only re-exports it for
-// backward compat (see .pi/extension/index.ts), so tests exercise the real
-// owning module rather than that alias.
+// coercePlan is a CORE function; import it from its owning module directly
+// rather than through a harness adapter.
 import { coercePlan } from "../core/coerce.ts";
 import { mapToolResult } from "../.pi/extension/index.ts";
 

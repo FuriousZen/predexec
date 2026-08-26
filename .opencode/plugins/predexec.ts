@@ -11,16 +11,16 @@
  * directory-scoped with no glob.
  *
  * Export shape: opencode's plugin loader (readV1Plugin, ≥1.17.x) reads ONLY the
- * default export and requires `{ server() }`; older hosts (and KiloCode) also
- * see the named `server` export. Runtime imports are zod + our own modules only —
- * `@opencode-ai/plugin` is type-only, because npm-installed plugins get
- * production deps only and the host does not provide that package at import time.
+ * default export and requires `{ server() }` — see the bottom of this file.
+ * Runtime imports are zod + our own modules only; `@opencode-ai/plugin` is not
+ * a dependency at all (npm-installed plugins get production deps only, and the
+ * host does not provide that package at import time) — the `Plugin`/`ToolContext`
+ * shapes this file needs are declared locally below.
  */
 
 import { existsSync, statSync } from "node:fs";
 import { isAbsolute, resolve } from "node:path";
 import { z } from "zod";
-import type { Plugin, ToolContext } from "@opencode-ai/plugin";
 import {
   runPlanTree,
   coercePlan,
@@ -41,6 +41,35 @@ const DESCRIPTION =
   "mutationStop/noEdgeMatch is recoverable — read the transcript and resume with bash. Never retry the same plan blindly. " +
   "Shell commands respect your opencode permission rules — deny/ask matches hard-stop before running. " +
   VERIFY_FIRST_LINE;
+
+/**
+ * Local structural stand-ins for the `@opencode-ai/plugin` types this file
+ * touches: the plugin factory's `client` input, the `directory`/`abort`
+ * fields of `ToolContext`, and the three hook keys this plugin returns.
+ * `@opencode-ai/plugin` is not imported at all — see the file header — so
+ * these cover only what this adapter actually uses, not the full host contract.
+ */
+type PluginToolContext = { directory: string; abort: AbortSignal };
+
+type PluginHooks = {
+  tool: {
+    predexec: {
+      description: string;
+      args: Record<string, unknown>;
+      execute(args: { plan: unknown }, context: PluginToolContext): Promise<string>;
+    };
+  };
+  "experimental.chat.system.transform": (
+    input: unknown,
+    output: { system: string[] },
+  ) => Promise<void>;
+  "tool.execute.after": (
+    input: { tool: string; args?: { command?: string } },
+    output: { output: string },
+  ) => Promise<void>;
+};
+
+type Plugin = (input: { client: unknown }) => Promise<PluginHooks>;
 
 /** opencode v1 SDK client (the subset predexec calls). Loosely typed to avoid a hard SDK dep. */
 type OpencodeClient = {
@@ -198,7 +227,7 @@ export function createToolExecutor(client: OpencodeClient, cwd: string): ToolExe
   };
 }
 
-export const server: Plugin = async ({ client }) => ({
+const server: Plugin = async ({ client }) => ({
   tool: {
     predexec: {
       description: DESCRIPTION,
@@ -209,7 +238,7 @@ export const server: Plugin = async ({ client }) => ({
           "Note: grep/find scope by a directory `path` (grep glob/ignoreCase/literal/context are unsupported here and error loudly); read offset/limit and grep/find/ls `limit` are applied client-side.",
         ),
       },
-      async execute(args: { plan: unknown }, context: ToolContext) {
+      async execute(args: { plan: unknown }, context: PluginToolContext) {
         let plan: PlanTree;
         try {
           plan = coercePlan(args.plan);
@@ -260,6 +289,9 @@ export const server: Plugin = async ({ client }) => ({
   },
 });
 
-// What current opencode loaders (readV1Plugin) actually read; the named
-// `server` export above serves older hosts that iterate named exports.
+// What current opencode loaders (readV1Plugin) actually read: ONLY the
+// default export's `{ id, server() }` shape. `server` above is intentionally
+// not a named export — nothing in this codebase's supported loader path reads
+// it that way (see the file header), and tests reach it through this default
+// export (`plugin.server`).
 export default { id: "predexec", server };

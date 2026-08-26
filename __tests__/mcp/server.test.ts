@@ -287,23 +287,24 @@ describe("mcp server — packaging and plugin wiring", () => {
   });
 
   /**
-   * Characterizes the CURRENT (pre-isolation) manifest, not the target state:
-   * `package.json`'s `pi.skills` entries resolve to real directories today, but
-   * the root `skills/` dir still holds BOTH the pi skill (`skills/predexec`)
-   * and the Claude Code plugin skill (`skills/predexec-claude`) — so pi's skill
-   * loader and Claude Code's auto-discovered `skills/` root are not yet
-   * isolated from each other. A later task moves the pi skill under
-   * `.pi/skills/` and updates this same test to assert the isolated form.
+   * The pi skill lives under `.pi/skills/` and the root `skills/` dir (Claude
+   * Code's auto-discovered plugin root) holds ONLY the Claude Code skill — so
+   * pi's skill loader and Claude Code's `skills/` root are isolated from each
+   * other and neither harness receives the other's prompt instructions.
    */
-  it("pi.skills resolves to real directories on disk (current, not-yet-isolated manifest)", () => {
+  it("pi.skills resolves to real directories under .pi/skills, isolated from the Claude Code skills root", () => {
     const pkg = readJson("package.json");
     const skillDirs: string[] = pkg.pi.skills;
     expect(skillDirs.length).toBeGreaterThan(0);
     for (const rel of skillDirs) {
+      expect(rel.replace(/^\.\//, "")).toMatch(/^\.pi\/skills/);
       expect(statSync(join(root, rel)).isDirectory()).toBe(true);
     }
 
+    const piSkillEntries = readdirSync(join(root, ".pi", "skills")).sort();
+    expect(piSkillEntries).toEqual(["predexec"]);
+
     const rootSkillEntries = readdirSync(join(root, "skills")).sort();
-    expect(rootSkillEntries).toEqual(["predexec", "predexec-claude"]);
+    expect(rootSkillEntries).toEqual(["predexec-claude"]);
   });
 });

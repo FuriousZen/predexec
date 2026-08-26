@@ -186,9 +186,6 @@ function createToolExecutor(cwd: string, signal?: AbortSignal) {
 const BASH_NUDGE =
   '[predexec] Batch read-only commands in one predexec call: {"root":"a","nodes":[{"id":"a","commands":["cmd1","cmd2"],"parallel":true}]}';
 
-// coercePlan is now in core/coerce.ts — re-export for backward compat with tests
-export { coercePlan } from "../../core/index.ts";
-
 export default function predexec(pi: ExtensionAPI): void {
   // Routing steering is delivered declaratively via the `predexec` skill
   // (skills/predexec/SKILL.md, registered through package.json `pi.skills`) plus

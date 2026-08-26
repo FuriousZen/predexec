@@ -1,48 +1,17 @@
 /**
  * predexec core — public surface. Pure TS, zero harness imports.
  * Adapters import only from here.
+ *
+ * Narrowed to exactly what the runtime harness adapters (pi, opencode, MCP)
+ * and their shared helpers (policy.ts, stats.ts) import: plan execution,
+ * plan coercion, destructive-command checking, command-segment splitting,
+ * and the plan/result/tool types those functions' signatures require.
+ * Focused tests import evaluator, runner, and validation internals directly
+ * from their owning files (core/conditions.ts, core/runner.ts,
+ * core/engine.ts, core/coerce.ts) instead of through this barrel.
  */
 
-export { runPlanTree, validatePlan } from "./engine.ts";
-export {
-  isDestructiveCommand,
-  findDestructiveToken,
-  splitCommandSegments,
-  effectiveHead,
-} from "./destructive.ts";
-export {
-  evaluateCondition,
-  evaluateConditionWithDetail,
-  parseConditionString,
-  isSafeRegex,
-  type ConditionEvaluation,
-} from "./conditions.ts";
-export { coercePlan, validateConditionObject } from "./coerce.ts";
-export { runNode, isToolOp, formatToolOpLabel, OUTPUT_CAP } from "./runner.ts";
-export {
-  PLAN_TREE_JSON_SCHEMA,
-  PLAN_NODE_JSON_SCHEMA,
-  CONDITION_JSON_SCHEMA,
-} from "./schema.ts";
-export {
-  DEFAULT_MAX_DEPTH,
-  HIGH_CONFIDENCE_KINDS,
-  type NodeId,
-  type ToolOp,
-  type Operation,
-  type PlanNode,
-  type PlanEdge,
-  type Condition,
-  type ConditionKind,
-  type PlanTree,
-  type NodeOutput,
-  type StoppedReason,
-  type CoreResult,
-  type ToolExecutor,
-  type RunOptions,
-  // Callback types referenced by the exported RunOptions — without these an
-  // adapter could not name the shape of the handlers it passes in.
-  type ProgressEvent,
-  type OnProgress,
-  type OnCommandOutput,
-} from "./types.ts";
+export { runPlanTree } from "./engine.ts";
+export { isDestructiveCommand, splitCommandSegments } from "./destructive.ts";
+export { coercePlan } from "./coerce.ts";
+export { type ToolOp, type PlanTree, type CoreResult, type ToolExecutor } from "./types.ts";
