@@ -1,7 +1,7 @@
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { executeAdapterPlan } from "../adapter-runtime.ts";
 import type { Harness } from "../stats.ts";
 
@@ -36,12 +36,14 @@ describe("adapter-runtime — executeAdapterPlan", () => {
     expect(result.transcript).toContain("node a (exit 0)");
     expect(result.transcript).toContain("hello-from-adapter-runtime");
 
-    const statsContent = readFileSync(join(statsDir, "stats.jsonl"), "utf8").trim();
-    const record = JSON.parse(statsContent);
-    expect(record.harness).toBe("pi");
-    expect(record.stoppedReason).toBe("leaf");
-    expect(record.nodes).toBe(1);
-    expect(record.ops).toBe(1);
+    await vi.waitFor(() => {
+      const statsContent = readFileSync(join(statsDir, "stats.jsonl"), "utf8").trim();
+      const record = JSON.parse(statsContent);
+      expect(record.harness).toBe("pi");
+      expect(record.stoppedReason).toBe("leaf");
+      expect(record.nodes).toBe(1);
+      expect(record.ops).toBe(1);
+    });
   });
 
   it("handles double-encoded input (JSON stringified plan)", async () => {
@@ -165,9 +167,11 @@ describe("adapter-runtime — executeAdapterPlan", () => {
 
       await executeAdapterPlan(plan, harness, { cwd: tempDir });
 
-      const statsContent = readFileSync(join(statsDir, "stats.jsonl"), "utf8").trim();
-      const record = JSON.parse(statsContent);
-      expect(record.harness).toBe(harness);
+      await vi.waitFor(() => {
+        const statsContent = readFileSync(join(statsDir, "stats.jsonl"), "utf8").trim();
+        const record = JSON.parse(statsContent);
+        expect(record.harness).toBe(harness);
+      });
     });
   });
 });

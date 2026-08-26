@@ -41,14 +41,16 @@ export async function executeAdapterPlan(
     return errorResult(errText(err));
   }
 
+  let result: CoreResult;
   try {
-    const result = await runPlanTree(plan, options);
-    await recordRun(plan, result, harness);
-    return result;
+    result = await runPlanTree(plan, options);
   } catch (err) {
     return errorResult(
       `predexec: the plan walk failed unexpectedly (${errText(err)}) — this is a predexec bug, not a plan you can fix. ` +
         "Fall back to normal tool calling for this step.",
     );
   }
+
+  void recordRun(plan, result, harness);
+  return result;
 }
