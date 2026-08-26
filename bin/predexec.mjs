@@ -13,7 +13,7 @@ import { readFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, parse as parsePath } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 
 // ── shared ────────────────────────────────────────────────
 
@@ -678,6 +678,154 @@ export function checkClaudeCode(opts = {}) {
 }
 
 /**
+ * Codex CLI: `$CODEX_HOME/config.toml` (default `~/.codex/config.toml`) holds
+ * predexec's registration under `[mcp_servers.predexec]`. Codex's own CLI
+ * exposes `codex mcp get <name> --json` with a stable, measured shape
+ * (CODEX-RESEARCH.md "Measured on this machine": `transport.command` /
+ * `transport.args` / `enabled`) — prefer that when the `codex` binary is
+ * reachable; fall back to a direct parseTomlLite read of config.toml
+ * otherwise, mirroring how this file already reads opencode's config.
+ *
+ * A registration missing `--host codex` in its args is not healthy: without
+ * that flag the predexec MCP server silently falls back to Claude Code's
+ * policy+stats behavior (see steering.ts / mcp/policy-codex.ts), which is a
+ * real but silent misconfiguration — warn (fail) on it, same tier as
+ * `enabled = false` or a config.toml that fails to parse (fail-closed: an
+ * unparseable file can't be confirmed healthy, so it can't be "ok").
+ */
+export function resolveCodexHome(opts = {}) {
+  if (opts.codexHome) return opts.codexHome;
+  const env = opts.env ?? process.env;
+  if (env.CODEX_HOME) return env.CODEX_HOME;
+  const home = opts.home ?? homedir();
+  return join(home, ".codex");
+}
+
+function codexCommandExists(command, env) {
+  if (!command) return false;
+  return command.includes("/") || command.includes("\\") ? existsSync(command) : onPath(command, env);
+}
+
+function codexArgsHaveHostCodex(args) {
+  const idx = args.indexOf("--host");
+  return idx !== -1 && args[idx + 1] === "codex";
+}
+
+export function checkCodex(opts = {}) {
+  const env = opts.env ?? process.env;
+  const codexHome = resolveCodexHome(opts);
+  const codexBin = opts.codexBin ?? "codex";
+  const installed = opts.installed ?? onPath(codexBin, env);
+  const hasCodexHome = existsSync(codexHome);
+
+  if (!installed && !hasCodexHome) {
+    return [{ name: "codex not installed", status: "skip", detail: "no codex on PATH and no ~/.codex" }];
+  }
+
+  const checks = [];
+  const runCodex = (args) => spawnSync(codexBin, args, { encoding: "utf8", env });
+
+  if (installed) {
+    const v = runCodex(["--version"]);
+    const version = v.status === 0 && v.stdout ? v.stdout.trim().split("\n")[0] : null;
+    checks.push(
+      version
+        ? { name: `codex ${version} (on PATH)`, status: "ok" }
+        : { name: "codex: on PATH, but `codex --version` failed", status: "info", detail: (v.stderr || "").trim() || undefined },
+    );
+  }
+
+  // Prefer `codex mcp get --json` when the binary is reachable; fall back to
+  // a direct config.toml parse (below) when it is not, or when the json call
+  // itself didn't yield a usable registration.
+  let registration = null;
+  const configPath = join(codexHome, "config.toml");
+
+  if (installed) {
+    const r = runCodex(["mcp", "get", "predexec", "--json"]);
+    if (r.status === 0 && r.stdout) {
+      try {
+        const data = JSON.parse(r.stdout);
+        registration = {
+          command: data?.transport?.command ?? null,
+          args: Array.isArray(data?.transport?.args) ? data.transport.args : [],
+          enabled: data?.enabled !== false,
+          source: "codex mcp get predexec --json",
+        };
+      } catch {
+        /* malformed json — fall through to the on-disk parse below */
+      }
+    }
+  }
+
+  if (!registration && existsSync(configPath)) {
+    const parsed = parseTomlLite(readFileSync(configPath, "utf8"));
+    if (!parsed.ok) {
+      checks.push({
+        name: `codex config: ${configPath} does not parse`,
+        status: "fail",
+        detail: parsed.error,
+        hint: "fix the TOML syntax in this file — predexec cannot confirm the registration while it fails to parse (fail-closed)",
+      });
+      return checks;
+    }
+    const server = parsed.value?.mcp_servers?.predexec;
+    if (server) {
+      registration = {
+        command: server.command ?? null,
+        args: Array.isArray(server.args) ? server.args : [],
+        enabled: server.enabled !== false,
+        source: configPath,
+      };
+    }
+  }
+
+  if (!registration) {
+    checks.push({
+      name: "codex: installed, predexec not registered",
+      status: "info",
+      // `--package=` is load-bearing (see checkClaudeCode's identical note):
+      // `predexec-mcp` is a bin inside the `predexec` package, not a package
+      // of its own. `--host codex` selects the Codex policy/stats adapter.
+      hint: "run `codex mcp add predexec -- npx -y --package=predexec predexec-mcp --host codex`",
+    });
+    return checks;
+  }
+
+  checks.push({
+    name: `codex mcp registration: "${registration.command} ${registration.args.join(" ")}"`.trim(),
+    status: "ok",
+    detail: registration.source,
+  });
+
+  if (!registration.enabled) {
+    checks.push({
+      name: "codex: predexec registration is disabled (enabled = false)",
+      status: "fail",
+      hint: "set `enabled = true` (or drop the key) in config.toml, or re-run `codex mcp add`",
+    });
+  }
+
+  if (!codexArgsHaveHostCodex(registration.args)) {
+    checks.push({
+      name: "codex: registration is missing --host codex",
+      status: "fail",
+      hint: "append `--host codex` to the registered args — without it predexec silently falls back to Claude Code policy/stats behavior",
+    });
+  }
+
+  if (!codexCommandExists(registration.command, env)) {
+    checks.push({
+      name: `codex: registered command not found: "${registration.command}"`,
+      status: "fail",
+      hint: "the command in this MCP registration does not resolve on this machine — reinstall or fix config.toml",
+    });
+  }
+
+  return checks;
+}
+
+/**
  * Live probe: spawn `opencode serve` on a random high port and poll
  * /experimental/tool/ids for "predexec". The gold check for silent loader skips.
  *
@@ -778,7 +926,7 @@ function printCheck(c) {
 }
 
 async function doctor(args) {
-  const checks = [checkNodeVersion(), ...checkPi(), ...checkOpencode(), ...checkClaudeCode()];
+  const checks = [checkNodeVersion(), ...checkPi(), ...checkOpencode(), ...checkClaudeCode(), ...checkCodex()];
   if (args.includes("--live")) {
     // Only a silent loader skip counts as a failure — see liveProbe.
     const configCheck = checks.find((c) => c.status === "ok" && c.name.startsWith("opencode config:"));

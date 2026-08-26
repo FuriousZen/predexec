@@ -255,7 +255,7 @@ predexec ships a CLI (`bin/predexec.mjs`, node builtins only) for install diagno
 request accounting:
 
 ```bash
-npx -y predexec doctor              # node version + pi / opencode / Claude Code wiring
+npx -y predexec doctor              # node version + pi / opencode / Claude Code / Codex wiring
 npx -y predexec doctor --live       # + spawns opencode and probes tool registration
 npx -y predexec stats               # aggregate recorded runs: ops collapsed, requests saved, edge hit-rate
 ```

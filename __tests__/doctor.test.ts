@@ -1,10 +1,11 @@
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import {
+  checkCodex,
   checkNodeVersion,
   checkClaudeCode,
   checkOpencode,
@@ -402,6 +403,187 @@ describe("doctor — claude code checks", () => {
     const checks = checkClaudeCode(ccOpts({ installed: true }));
     expect(checks[0]!.status).toBe("info");
     expect(checks[0]!.hint).toContain("plugin form");
+  });
+});
+
+describe("doctor — codex checks", () => {
+  const cxOpts = (over: Record<string, unknown> = {}) => ({
+    codexHome: join(tmp, "codex-home"),
+    installed: false,
+    ...over,
+  });
+
+  const GOOD_ARGS = ["-y", "--package=predexec", "predexec-mcp", "--host", "codex"];
+
+  const configToml = (server: Record<string, unknown>) => {
+    const lines = ["[mcp_servers.predexec]"];
+    for (const [k, v] of Object.entries(server)) {
+      if (Array.isArray(v)) lines.push(`${k} = [${v.map((s) => JSON.stringify(s)).join(", ")}]`);
+      else if (typeof v === "string") lines.push(`${k} = ${JSON.stringify(v)}`);
+      else lines.push(`${k} = ${v}`);
+    }
+    return lines.join("\n") + "\n";
+  };
+
+  // A fake `codex` executable for the `codex mcp get --json` path, so the
+  // json-preferred detection branch is exercised through a real spawnSync
+  // call rather than only through the toml fallback. Scenario is selected via
+  // an env var so one script fixture covers several registration shapes.
+  const writeFakeCodex = () => {
+    const path = join(tmp, "fake-codex.mjs");
+    writeFileSync(
+      path,
+      [
+        "#!/usr/bin/env node",
+        "const args = process.argv.slice(2);",
+        "if (args[0] === '--version') { console.log('codex-cli 0.149.1'); process.exit(0); }",
+        "if (args[0] === 'mcp' && args[1] === 'get' && args[2] === 'predexec' && args.includes('--json')) {",
+        "  const scenario = process.env.FAKE_CODEX_SCENARIO || 'ok';",
+        "  if (scenario === 'not-registered') process.exit(1);",
+        "  const out = {",
+        "    name: 'predexec', enabled: scenario !== 'disabled', disabled_reason: null,",
+        "    transport: {",
+        "      type: 'stdio', command: 'npx',",
+        "      args: scenario === 'missing-host' ? ['-y', '--package=predexec', 'predexec-mcp'] : ['-y', '--package=predexec', 'predexec-mcp', '--host', 'codex'],",
+        "      env: null, env_vars: [], cwd: null,",
+        "    },",
+        "  };",
+        "  console.log(JSON.stringify(out));",
+        "  process.exit(0);",
+        "}",
+        "process.exit(1);",
+      ].join("\n"),
+    );
+    chmodSync(path, 0o755);
+    return path;
+  };
+
+  it("reports absent when there is no ~/.codex dir and codex is not on PATH", () => {
+    scratch();
+    expect(checkCodex(cxOpts())[0]!.status).toBe("skip");
+  });
+
+  it("reports not-wired when codexHome exists but config.toml has no predexec entry", () => {
+    scratch();
+    write("codex-home/config.toml", '[mcp_servers.other]\ncommand = "foo"\n');
+    const checks = checkCodex(cxOpts());
+    expect(checks[0]!.status).toBe("info");
+    expect(checks[0]!.hint).toContain("codex mcp add predexec");
+    expect(checks[0]!.hint).toContain("--host codex");
+  });
+
+  it("reports not-wired when codex is on PATH but no config.toml exists at all", () => {
+    scratch();
+    mkdirSync(join(tmp, "codex-home"), { recursive: true });
+    const checks = checkCodex(cxOpts({ installed: true, codexBin: join(tmp, "nonexistent-codex") }));
+    // installed via override, but the (nonexistent) binary can't be spawned —
+    // detection must not throw, and must still land on not-wired since there
+    // is no config.toml to fall back to either.
+    expect(checks.some((c) => c.status === "info" && /not registered/.test(c.name))).toBe(true);
+    expect(checks.every((c) => c.status !== "fail")).toBe(true);
+  });
+
+  it("reports ok for a well-formed --host codex registration parsed from config.toml", () => {
+    scratch();
+    write("codex-home/config.toml", configToml({ command: "npx", args: GOOD_ARGS }));
+    const checks = checkCodex(cxOpts());
+    expect(checks.some((c) => c.status === "ok" && /registration/.test(c.name))).toBe(true);
+    expect(checks.every((c) => c.status !== "fail")).toBe(true);
+  });
+
+  it("warns (fail) when the registration is missing --host codex", () => {
+    scratch();
+    write("codex-home/config.toml", configToml({ command: "npx", args: ["-y", "--package=predexec", "predexec-mcp"] }));
+    const checks = checkCodex(cxOpts());
+    const fail = checks.find((c) => c.status === "fail" && /--host codex/.test(c.name));
+    expect(fail).toBeTruthy();
+    expect(fail!.hint).toContain("--host codex");
+  });
+
+  it("warns (fail) when enabled = false", () => {
+    scratch();
+    write("codex-home/config.toml", configToml({ command: "npx", args: GOOD_ARGS, enabled: false }));
+    const checks = checkCodex(cxOpts());
+    const fail = checks.find((c) => c.status === "fail" && /enabled = false/.test(c.name));
+    expect(fail).toBeTruthy();
+  });
+
+  it("warns (fail), naming the file, when config.toml exists but fails to parse", () => {
+    scratch();
+    write("codex-home/config.toml", "[mcp_servers.predexec\ncommand = \"npx\"\n");
+    const checks = checkCodex(cxOpts());
+    const fail = checks.find((c) => c.status === "fail" && /does not parse/.test(c.name));
+    expect(fail).toBeTruthy();
+    expect(fail!.name).toContain(join(tmp, "codex-home", "config.toml"));
+    expect(fail!.detail).toBeTruthy();
+  });
+
+  it("warns (fail) when the registered command does not resolve on this machine", () => {
+    scratch();
+    write("codex-home/config.toml", configToml({ command: "totally-not-a-real-binary-xyz", args: GOOD_ARGS }));
+    const checks = checkCodex(cxOpts());
+    const fail = checks.find((c) => c.status === "fail" && /not found/.test(c.name));
+    expect(fail).toBeTruthy();
+    expect(fail!.name).toContain("totally-not-a-real-binary-xyz");
+  });
+
+  it("prefers `codex mcp get --json` when the real binary is reachable (fake codex fixture): ok", () => {
+    scratch();
+    mkdirSync(join(tmp, "codex-home"), { recursive: true });
+    const fakeCodex = writeFakeCodex();
+    const checks = checkCodex(
+      cxOpts({
+        installed: true,
+        codexBin: fakeCodex,
+        env: { ...process.env, FAKE_CODEX_SCENARIO: "ok" },
+      }),
+    );
+    expect(checks.some((c) => c.status === "ok" && /codex-cli 0\.149\.1/.test(c.name))).toBe(true);
+    expect(checks.some((c) => c.status === "ok" && /registration/.test(c.name))).toBe(true);
+    expect(checks.every((c) => c.status !== "fail")).toBe(true);
+  });
+
+  it("detects a missing --host codex flag via the json path too", () => {
+    scratch();
+    mkdirSync(join(tmp, "codex-home"), { recursive: true });
+    const fakeCodex = writeFakeCodex();
+    const checks = checkCodex(
+      cxOpts({
+        installed: true,
+        codexBin: fakeCodex,
+        env: { ...process.env, FAKE_CODEX_SCENARIO: "missing-host" },
+      }),
+    );
+    expect(checks.some((c) => c.status === "fail" && /--host codex/.test(c.name))).toBe(true);
+  });
+
+  it("detects enabled = false via the json path too", () => {
+    scratch();
+    mkdirSync(join(tmp, "codex-home"), { recursive: true });
+    const fakeCodex = writeFakeCodex();
+    const checks = checkCodex(
+      cxOpts({
+        installed: true,
+        codexBin: fakeCodex,
+        env: { ...process.env, FAKE_CODEX_SCENARIO: "disabled" },
+      }),
+    );
+    expect(checks.some((c) => c.status === "fail" && /enabled = false/.test(c.name))).toBe(true);
+  });
+
+  it("falls back to not-registered (info) via json when the fake codex reports no such server", () => {
+    scratch();
+    mkdirSync(join(tmp, "codex-home"), { recursive: true });
+    const fakeCodex = writeFakeCodex();
+    const checks = checkCodex(
+      cxOpts({
+        installed: true,
+        codexBin: fakeCodex,
+        env: { ...process.env, FAKE_CODEX_SCENARIO: "not-registered" },
+      }),
+    );
+    expect(checks.some((c) => c.status === "info" && /not registered/.test(c.name))).toBe(true);
+    expect(checks.every((c) => c.status !== "fail")).toBe(true);
   });
 });
 
