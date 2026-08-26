@@ -11,10 +11,12 @@
  *    to a throwaway dir for the whole suite, or every run pollutes live stats
  *    (seen as "double-logged" policyStop rows: one per policy test per run).
  */
-import { readFileSync } from "node:fs";
+import { execFileSync, execSync } from "node:child_process";
+import { existsSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
-import { describe, expect, it } from "vitest";
+import { join, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
+import { beforeAll, describe, expect, it } from "vitest";
 
 describe("release hygiene", () => {
   it("plugin.json version matches package.json", () => {
@@ -27,5 +29,25 @@ describe("release hygiene", () => {
     const dir = process.env.PREDEXEC_STATE_DIR;
     expect(dir, "vitest.config.ts must set test.env.PREDEXEC_STATE_DIR").toBeTruthy();
     expect(dir).not.toBe(join(homedir(), ".local", "state", "predexec"));
+  });
+
+  beforeAll(() => {
+    const distMain = "dist/.opencode/plugins/predexec.js";
+    const source = ".opencode/plugins/predexec.ts";
+    const needsBuild =
+      !existsSync(distMain) || statSync(distMain).mtimeMs < statSync(source).mtimeMs;
+    if (needsBuild) {
+      execSync("npm run build", { stdio: "pipe" });
+    }
+  });
+
+  it("compiled opencode main entry is ESM and exposes default.server (real Node, no vitest interop)", () => {
+    const main = JSON.parse(readFileSync("package.json", "utf8")).main as string;
+    const url = pathToFileURL(resolve(main)).href;
+    // vitest's esbuild CJS interop honors __esModule and hides exactly this class
+    // of breakage (0.3.0 shipped a CJS main that Bun/Node reject) — so assert in
+    // a clean Node subprocess, the way real hosts load it.
+    const script = `const m = await import(${JSON.stringify(url)}); if (typeof m.default?.server !== "function") { console.error("default.server is " + typeof m.default?.server); process.exit(1); }`;
+    execFileSync(process.execPath, ["--input-type=module", "-e", script], { stdio: "pipe" });
   });
 });

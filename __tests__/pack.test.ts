@@ -120,6 +120,16 @@ describe("packed artifact verification", () => {
       expect(content).not.toMatch(/from\s+["']jiti(\/[^"']*)?["']/);
       expect(content).not.toMatch(/import\s*\(\s*["']jiti(\/[^"']*)?["']\s*\)/);
     }
+
+    // The `main` entry specifically must be ESM: a leftover untracked, typeless
+    // .opencode/package.json on the release machine flips tsc's NodeNext emit
+    // to CJS for exactly this file (0.3.0 shipped broken this way — Bun/Node
+    // both reject it at runtime). Assert the compiled artifact itself, not just
+    // absence of .ts/jiti imports.
+    const pkg = JSON.parse(readFileSync(join(extractDir, "package.json"), "utf8"));
+    const mainSrc = readFileSync(join(extractDir, pkg.main), "utf8");
+    expect(mainSrc).toContain("export default");
+    expect(mainSrc).not.toMatch(/\bexports\.default\b/);
   });
 
   it("invokes extracted predexec CLI (doctor & --version)", () => {
