@@ -13,11 +13,13 @@ import {
   isDirectInvocation,
   onPath,
   parseStatsLines,
+  parseTomlLite,
   piPackageSource,
   stripJsonComments,
   summarizeStats,
 } from "../bin/predexec.mjs";
 import { stripJsonComments as policyStripJsonComments } from "../policy.ts";
+import { parseTomlLite as tsParseTomlLite } from "../mcp/toml-lite.ts";
 
 let tmp: string;
 const scratch = () => (tmp = mkdtempSync(join(tmpdir(), "px-doctor-")));
@@ -217,6 +219,38 @@ describe("doctor — opencode checks", () => {
     ];
     for (const fixture of fixtures) {
       expect(stripJsonComments(fixture)).toBe(policyStripJsonComments(fixture));
+    }
+  });
+
+  it("bin/predexec.mjs and mcp/toml-lite.ts carry independent parseTomlLite implementations that must stay in parity", () => {
+    const fixtures = [
+      // realistic ~/.codex/config.toml shape (Task 3 fixture — never the real file)
+      [
+        'model = "gpt-5"',
+        "",
+        "[mcp_servers.predexec]",
+        'command = "npx"',
+        'args = ["-y", "--package=predexec", "predexec-mcp"]',
+        "",
+        '[projects."/Users/alice/dev/app"]',
+        'trust_level = "trusted"',
+        "",
+      ].join("\n"),
+      // quoted dotted header
+      '[a."b.c".d]\nx = 1\n',
+      // comments, blank lines, escapes, every value type
+      '# c\nnote = "a # not a comment"\nkey = "a\\"b\\\\c\\nd\\te"\nlit = \'a\\nb\'\nn = 42\nf = -0.5\nb = true\n',
+      // multi-line array
+      'multi = [\n  "x",\n  "y",\n]\n',
+      // explicit-failure cases
+      'approval_policy = { granular = {} }\n',
+      '[[projects]]\ntrust_level = "trusted"\n',
+      'projects.trust = "trusted"\n',
+      "[a]\nx = 1\nx = 2\n",
+      'key = "unterminated\n',
+    ];
+    for (const fixture of fixtures) {
+      expect(parseTomlLite(fixture)).toEqual(tsParseTomlLite(fixture));
     }
   });
 

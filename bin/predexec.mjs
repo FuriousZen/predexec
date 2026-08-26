@@ -76,6 +76,207 @@ function readJsonc(path) {
   }
 }
 
+/**
+ * Twin of mcp/toml-lite.ts parseTomlLite (kept in sync; asserted by the
+ * parity test in __tests__/doctor.test.ts). Deliberately SMALL, fail-closed
+ * TOML subset reader for `~/.codex/config.toml`: parse the subset
+ * confidently, or return `{ ok: false, error }` naming the offending line —
+ * never a silent wrong parse. Added here in Task 3; consumed by doctor in
+ * Task 6. See mcp/toml-lite.ts for the full subset writeup.
+ */
+class TomlLineError extends Error {
+  constructor(lineNo, message) {
+    super(message);
+    this.lineNo = lineNo;
+  }
+}
+
+const TOML_ESCAPES = { '"': '"', "\\": "\\", n: "\n", t: "\t" };
+
+function tomlFirstUnquotedIndex(line, target) {
+  let q = null;
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i];
+    if (q) {
+      if (q === '"' && c === "\\") i++;
+      else if (c === q) q = null;
+    } else if (c === '"' || c === "'") q = c;
+    else if (c === target) return i;
+  }
+  return -1;
+}
+
+function tomlStripComment(line) {
+  const idx = tomlFirstUnquotedIndex(line, "#");
+  return idx === -1 ? line : line.slice(0, idx);
+}
+
+function tomlParseBasicString(s, pos) {
+  let i = pos + 1;
+  let out = "";
+  for (; i < s.length; i++) {
+    const c = s[i];
+    if (c === "\n") break;
+    if (c === '"') return { value: out, pos: i + 1 };
+    if (c === "\\") {
+      const esc = TOML_ESCAPES[s[i + 1] ?? ""];
+      if (esc === undefined) throw new Error(`unsupported escape sequence "\\${s[i + 1] ?? ""}"`);
+      (out += esc), i++;
+    } else out += c;
+  }
+  throw new Error("unterminated string");
+}
+
+function tomlParseLiteralString(s, pos) {
+  const end = s.indexOf("'", pos + 1);
+  if (end === -1 || s.slice(pos, end).includes("\n")) throw new Error("unterminated string");
+  return { value: s.slice(pos + 1, end), pos: end + 1 };
+}
+
+function tomlParseKeyToken(text) {
+  if (text[0] === '"' || text[0] === "'") {
+    const r = text[0] === '"' ? tomlParseBasicString(text, 0) : tomlParseLiteralString(text, 0);
+    if (r.pos !== text.length) throw new Error(`invalid key "${text}"`);
+    return r.value;
+  }
+  if (/^[A-Za-z0-9_-]+$/.test(text)) return text;
+  throw new Error(`invalid key "${text}"`);
+}
+
+function tomlSplitDottedKey(s) {
+  const parts = [];
+  let cur = "";
+  let q = null;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (q) {
+      cur += c;
+      if (q === '"' && c === "\\") (cur += s[i + 1] ?? ""), i++;
+      else if (c === q) q = null;
+    } else if (c === '"' || c === "'") (q = c), (cur += c);
+    else if (c === ".") (parts.push(cur.trim()), (cur = ""));
+    else cur += c;
+  }
+  parts.push(cur.trim());
+  return parts.map(tomlParseKeyToken);
+}
+
+function tomlArrayIsClosed(text) {
+  let depth = 0;
+  let q = null;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (q) {
+      if (q === '"' && c === "\\") i++;
+      else if (c === q) q = null;
+    } else if (c === '"' || c === "'") q = c;
+    else if (c === "[") depth++;
+    else if (c === "]") depth--;
+  }
+  return depth <= 0;
+}
+
+function tomlParseBareValue(s, pos) {
+  let i = pos;
+  while (i < s.length && !/[\s,\]]/.test(s[i])) i++;
+  const t = s.slice(pos, i);
+  if (t === "true" || t === "false") return { value: t === "true", pos: i };
+  if (/^[+-]?\d+$/.test(t)) return { value: parseInt(t, 10), pos: i };
+  if (/^[+-]?\d+\.\d+([eE][+-]?\d+)?$/.test(t)) return { value: parseFloat(t), pos: i };
+  throw new Error(`unsupported value "${t}"`);
+}
+
+function tomlParseValue(s, pos, insideArray) {
+  while (pos < s.length && /\s/.test(s[pos])) pos++;
+  if (pos >= s.length) throw new Error("missing value");
+  const c = s[pos];
+  if (c === '"') return tomlParseBasicString(s, pos);
+  if (c === "'") return tomlParseLiteralString(s, pos);
+  if (c === "{") throw new Error("inline tables are not supported");
+  if (c === "[") {
+    if (insideArray) throw new Error("nested arrays are not supported");
+    return tomlParseArray(s, pos);
+  }
+  return tomlParseBareValue(s, pos);
+}
+
+function tomlParseArray(s, pos) {
+  let i = pos + 1;
+  const arr = [];
+  for (;;) {
+    while (i < s.length && /\s/.test(s[i])) i++;
+    if (i >= s.length) throw new Error("unterminated array");
+    if (s[i] === "]") return { value: arr, pos: i + 1 };
+    const r = tomlParseValue(s, i, true);
+    arr.push(r.value);
+    i = r.pos;
+    while (i < s.length && /\s/.test(s[i])) i++;
+    if (s[i] === ",") i++;
+    else if (s[i] === "]") return { value: arr, pos: i + 1 };
+    else throw new Error('expected "," or "]" in array');
+  }
+}
+
+function tomlParseFullValue(text) {
+  const r = tomlParseValue(text, 0, false);
+  if (text.slice(r.pos).trim() !== "") throw new Error("unexpected trailing content after value");
+  return r.value;
+}
+
+export function parseTomlLite(text) {
+  try {
+    const lines = text.split(/\r\n|\n/).map(tomlStripComment);
+    const root = {};
+    let current = root;
+    let i = 0;
+    while (i < lines.length) {
+      const lineNo = i + 1;
+      const line = lines[i].trim();
+      i++;
+      if (line === "") continue;
+
+      try {
+        if (line[0] === "[") {
+          if (line[1] === "[") throw new Error('array-of-tables ("[[...]]") are not supported');
+          if (!line.endsWith("]")) throw new Error("malformed table header");
+          let node = root;
+          for (const seg of tomlSplitDottedKey(line.slice(1, -1))) {
+            const existing = node[seg];
+            if (existing === undefined) node[seg] = {};
+            else if (typeof existing !== "object" || Array.isArray(existing))
+              throw new Error(`cannot redefine "${seg}" as a table`);
+            node = node[seg];
+          }
+          current = node;
+          continue;
+        }
+
+        const eq = tomlFirstUnquotedIndex(line, "=");
+        if (eq === -1) throw new Error("expected key = value");
+        const keyText = line.slice(0, eq).trim();
+        if (keyText[0] !== '"' && keyText[0] !== "'" && keyText.includes("."))
+          throw new Error("dotted keys are not supported (use a [table.sub] header instead)");
+        const key = tomlParseKeyToken(keyText);
+
+        let valueText = line.slice(eq + 1).trim();
+        while (valueText[0] === "[" && !tomlArrayIsClosed(valueText)) {
+          if (i >= lines.length) throw new Error("unterminated array");
+          (valueText += "\n" + lines[i]), i++;
+        }
+        const value = tomlParseFullValue(valueText);
+        if (Object.prototype.hasOwnProperty.call(current, key)) throw new Error(`duplicate key "${key}"`);
+        current[key] = value;
+      } catch (e) {
+        throw new TomlLineError(lineNo, e.message);
+      }
+    }
+    return { ok: true, value: root };
+  } catch (e) {
+    if (e instanceof TomlLineError) return { ok: false, error: `line ${e.lineNo}: ${e.message}` };
+    throw e;
+  }
+}
+
 /** PATH lookup with no subprocess — used to tell "harness absent" from "harness unwired". */
 export function onPath(bin, env = process.env) {
   const dirs = (env.PATH || "").split(process.platform === "win32" ? ";" : ":").filter(Boolean);
