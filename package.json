@@ -30,7 +30,8 @@
     "skills",
     "configs",
     ".claude-plugin",
-    "README.md"
+    "README.md",
+    "LICENSE"
   ],
   "pi": {
     "extensions": [

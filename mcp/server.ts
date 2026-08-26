@@ -4,7 +4,8 @@
  * Registers ONE tool, `predexec`, that runs a pre-planned tree of command
  * batches with deterministic branch conditions in a single model round-trip.
  * All real logic lives in ../core (pure TS, zero harness imports); this file
- * only wires the MCP boundary: schema → coercePlan → runPlanTree → transcript.
+ * only wires the MCP boundary: schema → executeAdapterPlan (../adapter-runtime.ts:
+ * coerce → run → record) → transcript.
  *
  * Claude Code exposes no in-process tool-registration API, so unlike the pi
  * extension and the opencode plugin this adapter is a SEPARATE PROCESS with no
@@ -103,6 +104,7 @@ const textResult = (text: string, isError = false): ToolResult => ({
  * to read it must not stop the server from starting, hence the fallback.
  */
 function packageVersion(): string {
+  // Two candidates because the module runs at two depths: mcp/ in the dev checkout, dist/mcp/ when compiled.
   for (const rel of ["../package.json", "../../package.json"]) {
     try {
       const pkgPath = join(dirname(fileURLToPath(import.meta.url)), rel);

@@ -243,8 +243,11 @@ Detect this project's package manager and run its test script.
 The model can plan one tree: probe for a lockfile / read `package.json` scripts, branch on
 what it finds (`fileExists pnpm-lock.yaml`, `jsonPath scripts.test exists`), and run the right
 test command — resolving several branch points in a single round-trip instead of one model
-call per step. Inspect the tool result's `details` (`depthReached`, `pathTaken`,
-`stoppedReason`, `edgesEvaluated`/`edgesMatched`) to see the path the engine walked.
+call per step. On pi and opencode, inspect the tool result's `details` (`depthReached`,
+`pathTaken`, `stoppedReason`, `edgesEvaluated`/`edgesMatched`) to see the path the engine
+walked. The Claude Code MCP adapter returns only the transcript text to the model — `details`
+never reaches it there — so on Claude Code, check the transcript and run `npx -y predexec
+stats` for the same accounting.
 
 ## Doctor & stats
 

@@ -8,6 +8,7 @@
  *   - noEdgeMatch     (no edge matched)        => benign miss, resume the loop
  *   - maxDepth        (depth cap hit)
  *   - mutationStop    (next node mutates)      => hard stop BEFORE the write
+ *   - policyStop      (host would deny/ask)     => hard stop BEFORE the command
  *   - error           (invalid plan)
  *   - aborted         (signal)
  *

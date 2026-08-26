@@ -4,8 +4,10 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 // `server` is accessed through the default export (`plugin.server`), not as a
 // named import: that mirrors what current opencode loaders (readV1Plugin)
-// actually read, and stays valid once the named `server` export is dropped.
+// actually read, and `server` is deliberately not a named export (see the
+// plugin file's footer).
 import pluginSource, { createToolExecutor as createToolExecutorSource } from "../.opencode/plugins/predexec.ts";
+// Requires a prior `pnpm run build` — the compiled variant is asserted against the same contract as the source.
 import pluginCompiled, { createToolExecutor as createToolExecutorCompiled } from "../dist/.opencode/plugins/predexec.js";
 import type { ToolOp } from "../core/index.ts";
 

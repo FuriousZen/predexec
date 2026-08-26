@@ -3,9 +3,9 @@
  *
  * Registers ONE tool, `predexec`, that runs a pre-planned tree of command
  * batches with deterministic branch conditions in a single model round-trip.
- * All real logic lives in ../../core (pure TS, zero harness imports); this file
- * builds the JSON Schema, wires ctx.cwd + signal + onUpdate, and maps native
- * tool ops (read/grep/find/ls) to pi's tool factories.
+ * All real logic lives in ../../core, entered through ../../adapter-runtime.ts;
+ * this file builds the JSON Schema, wires ctx.cwd + signal + onUpdate, and maps
+ * native tool ops (read/grep/find/ls) to pi's tool factories.
  *
  * The pi API type is import-type-only, but the tool factories
  * (createReadTool/etc.) are runtime imports from the host package.
@@ -185,7 +185,7 @@ function createToolExecutor(cwd: string, signal?: AbortSignal) {
 
 export default function predexec(pi: ExtensionAPI): void {
   // Routing steering is delivered declaratively via the `predexec` skill
-  // (skills/predexec/SKILL.md, registered through package.json `pi.skills`) plus
+  // (.pi/skills/predexec/SKILL.md, registered through package.json `pi.skills`) plus
   // the tool's promptSnippet/promptGuidelines below — pi surfaces both natively.
   // No imperative system-prompt mutation here (that coupled to pi's internal
   // wording and broke silently when it changed).
@@ -283,7 +283,7 @@ export default function predexec(pi: ExtensionAPI): void {
           edgesMatched: result.edgesMatched,
         },
         // No `terminate` in the read-only MVP: a read-only leaf usually still
-        // needs the model. Deferred to impl step 4 (gated mutations + success leaves).
+        // needs the model. Deferred until mutation execution lands (gated mutations + success leaves).
       };
     },
   });

@@ -4,14 +4,15 @@
  *
  * This locks in what the pi extension actually hands the host today (tool
  * shape, prompt guidance, the `tool_result` nudge hook, and `tool.execute`'s
- * result shape) so a later simplification pass can trust these tests instead
- * of preserving the current source incidentally.
+ * result shape) for both the source and the compiled dist/ entry, so a
+ * registration-contract change cannot ship silently.
  */
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import predexecSource from "../.pi/extension/index.ts";
+// Requires a prior `pnpm run build` — the compiled variant is asserted against the same contract as the source.
 import predexecCompiled from "../dist/.pi/extension/index.js";
 
 type Handler = (event: any) => any;

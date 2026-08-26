@@ -8,7 +8,7 @@ node_modules
 .vscode/
 .idea/
 
-# build output (none today — core is run as .ts via jiti/vitest)
+# build output — the published artifact (tsc -p tsconfig.build.json); tests build it on demand
 dist/
 *.tsbuildinfo
 

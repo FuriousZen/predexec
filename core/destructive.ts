@@ -13,8 +13,8 @@
  *      (`node -e`, `python -c`, `sh -c`, …), an extra fs-writer-API scan —
  *      the quoted payload is executable there, not data.
  *
- * Deliberately out of scope: allowlist-only inversion (CLAUDE.md wants
- * tests/builds speculating), rsync/tar -x (mode-sensitive parsing).
+ * Deliberately out of scope: allowlist-only inversion (the adapters' `mutates`
+ * guidance wants tests/builds speculating), rsync/tar -x (mode-sensitive parsing).
  */
 
 /** Tool names that are definitively read-only — no regex analysis needed. */

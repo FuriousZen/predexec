@@ -111,7 +111,7 @@ export interface CoreResult {
   fellBack: boolean;
   /** A success leaf that may end the turn (pi `terminate`). Not acted on in the read-only MVP. */
   terminal: boolean;
-  // ── instrumentation (full request-accounting analysis is impl step 2) ──
+  // ── instrumentation (recorded per run by stats.ts; false-hit attribution not yet built) ──
   edgesEvaluated: number;
   edgesMatched: number;
 }

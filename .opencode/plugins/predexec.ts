@@ -3,7 +3,8 @@
  *
  * Registers ONE tool, `predexec`, that runs a pre-planned tree of command
  * batches with deterministic branch conditions in a single model round-trip.
- * All real logic lives in ../../core (pure TS, zero harness imports).
+ * All real logic lives in ../../core, entered through ../../adapter-runtime.ts;
+ * both are pure TS, zero harness imports.
  *
  * Native tool ops (read/grep/find/ls) are wired to opencode's v1 SDK client
  * (file.read / find.text / find.files / file.list). Caveats vs pi: file.read
