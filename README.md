@@ -304,7 +304,7 @@ mcp/                               Claude Code adapter (stdio MCP), delegates to
   tool-ops.ts                      read/grep/find/ls over node:fs (rg/fd accelerate when present)
   policy-claude.ts                 reads your Claude Code permission rules → policyStop
 core/                              PURE TS, zero harness imports (promotable to a standalone package)
-  types.ts conditions.ts runner.ts engine.ts destructive.ts coerce.ts schema.ts index.ts
+  types.ts conditions.ts runner.ts engine.ts destructive.ts coerce.ts index.ts
 steering.ts                        shared steering text/marker (harness-facing; not in core/)
 stats.ts                           request-accounting recorder (append-only JSONL; harness-facing)
 policy.ts                          opencode permission reader/checker (harness-facing)
