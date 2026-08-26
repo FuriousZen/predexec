@@ -343,4 +343,49 @@ describe("mcp server — spawned stdio launcher", () => {
       client.kill();
     }
   });
+
+  /**
+   * Claude Code itself still opens with a 2025-era protocolVersion. Both tests
+   * above only ever exercise LATEST_PROTOCOL_VERSION, so the one path real
+   * users hit was untested (F4) — this pins it against the SDK's `legacy:
+   * 'serve'` default (serveStdio's default), which pins the connection to a
+   * 2025-era instance from the same factory rather than rejecting it.
+   */
+  it("completes the handshake and runs a plan under a legacy (2025-era) protocolVersion", async () => {
+    const dir = project();
+    const binPath = join(__dirname, "..", "..", "bin", "predexec-mcp.mjs");
+    const client = spawnMcpClient(binPath, {
+      cwd: dir,
+      env: { ...policyOptions.env, CLAUDE_CONFIG_DIR: noSettings },
+    });
+
+    try {
+      const initRes = await client.request("initialize", {
+        protocolVersion: "2025-06-18",
+        capabilities: {},
+        clientInfo: { name: "predexec-legacy-test", version: "1" },
+      });
+      expect(initRes.result.protocolVersion).toMatch(/^2025-/);
+
+      client.notify("notifications/initialized");
+
+      const listRes = await client.request("tools/list");
+      const tools = listRes.result.tools as Json[];
+      expect(tools).toHaveLength(1);
+      expect(tools[0]!.name).toBe(TOOL_NAME);
+      expect(tools[0]!.inputSchema.type).toBe("object");
+
+      const callRes = await client.request("tools/call", {
+        name: TOOL_NAME,
+        arguments: {
+          plan: { root: "a", nodes: [{ id: "a", commands: ["printf predexec-legacy-ok"] }] },
+        },
+      });
+
+      expect(textOf(callRes)).toContain("predexec-legacy-ok");
+      expect(callRes.result.isError).toBeUndefined();
+    } finally {
+      client.kill();
+    }
+  });
 });

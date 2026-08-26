@@ -7,9 +7,19 @@
  *
  * STDOUT IS THE PROTOCOL — every diagnostic below goes to stderr. A single line
  * of chatter on stdout corrupts the JSON-RPC frame stream and surfaces to the
- * user as an unrelated parse error, so there is no console.log in this file and
- * `main()` rebinds the global console to stderr before it connects.
+ * user as an unrelated parse error, so there is no console.log in this file.
+ * The global console is rebound to stderr at the TOP of this file, before the
+ * server module (and the MCP SDK it pulls in) is ever imported — import-time
+ * logging from a dependency would otherwise land on stdout unguarded, since
+ * `main()`'s own rebind (see mcp/server.ts's silenceStdout()) runs too late to
+ * cover module init.
  */
+
+// stdio MCP: stdout carries protocol frames only. Rebind BEFORE importing the
+// server graph so import-time logging from any dependency lands on stderr —
+// silenceStdout() inside main() runs too late to guard module init.
+import { Console } from "node:console";
+globalThis.console = new Console({ stdout: process.stderr, stderr: process.stderr });
 
 import { isDirectInvocation } from "./predexec.mjs";
 
@@ -21,7 +31,15 @@ export async function launch() {
   try {
     server = await import(SERVER_URL.href);
   } catch (err) {
-    console.error(`predexec-mcp: failed to load ${SERVER_URL.pathname}: ${err?.message ?? err}`);
+    let message = `predexec-mcp: failed to load ${SERVER_URL.pathname}: ${err?.message ?? err}`;
+    // A dev checkout never commits dist/ (see CLAUDE.md), so this is the one
+    // failure mode a contributor hits routinely rather than a real install
+    // bug — point at the fix instead of leaving them to guess at a bare
+    // ERR_MODULE_NOT_FOUND.
+    if (err?.code === "ERR_MODULE_NOT_FOUND" && err?.url === SERVER_URL.href) {
+      message += ` dist/ is not checked in — run "npm run build" in the predexec checkout first.`;
+    }
+    console.error(message);
     process.exitCode = 1;
     return;
   }

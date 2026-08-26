@@ -192,6 +192,12 @@ export function createServer(opts: PredexecServerOptions = {}): McpServer {
  * way that surfaces as an unrelated parse error. Replacing the whole console
  * rather than patching `log` covers info/debug/dir/table/trace/group as well,
  * which is the difference between a convention and a guarantee.
+ *
+ * `bin/predexec-mcp.mjs` ALSO rebinds the console itself, at the top of the
+ * file before the server module is even imported — that guards import-time
+ * logging from the server graph (the MCP SDK included), which runs before
+ * `main()` is ever called and so is out of reach from here. This copy stays
+ * for embedded/`createServer`-only uses that bypass the launcher entirely.
  */
 export function silenceStdout(): void {
   globalThis.console = new Console({ stdout: process.stderr, stderr: process.stderr });
@@ -200,5 +206,7 @@ export function silenceStdout(): void {
 /** Start the stdio server. Called by bin/predexec-mcp.mjs; never at import time. */
 export async function main(opts: PredexecServerOptions = {}): Promise<StdioServerHandle> {
   silenceStdout();
-  return serveStdio(() => createServer(opts));
+  return serveStdio(() => createServer(opts), {
+    onerror: (err) => console.error("predexec-mcp transport error:", err),
+  });
 }
