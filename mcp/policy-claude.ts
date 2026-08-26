@@ -46,6 +46,16 @@ import { escapeRegExp, splitCommandSegments } from "../core/index.ts";
 
 export type ClaudePolicyAction = "allow" | "ask" | "deny";
 
+/**
+ * The shape every host-policy checker returns to `engine.ts`'s
+ * `checkCommandPolicy` option: the matched rule/pattern text when the host
+ * would deny/ask (predexec hard-stops), or `null` to run. Exported so other
+ * adapters (`policy-codex.ts`) share one verdict type instead of each
+ * inventing its own — a type-only re-statement of what this function already
+ * returned; no behavior change.
+ */
+export type PolicyVerdict = string | null;
+
 export interface ClaudePolicyRule {
   /** The bash-command glob, with `Bash(...)` and the `:*` alias normalized away. */
   pattern: string;
@@ -436,7 +446,7 @@ export function readClaudeBashRules(
 export function createClaudePolicyChecker(
   rules: ClaudePolicyRule[],
   unreadable: string[] = [],
-): (cmd: string) => string | null {
+): (cmd: string) => PolicyVerdict {
   if (unreadable.length > 0) {
     // Name the file and the remedy: without that this reads as a predexec bug
     // rather than a syntax error in the user's own settings.
