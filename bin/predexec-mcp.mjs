@@ -9,15 +9,26 @@
  * of chatter on stdout corrupts the JSON-RPC frame stream and surfaces to the
  * user as an unrelated parse error, so there is no console.log in this file.
  * The global console is rebound to stderr at the TOP of this file, before the
- * server module (and the MCP SDK it pulls in) is ever imported — import-time
- * logging from a dependency would otherwise land on stdout unguarded, since
- * `main()`'s own rebind (see mcp/server.ts's silenceStdout()) runs too late to
- * cover module init.
+ * server module — loaded via the DYNAMIC `import()` in launch() below, which
+ * pulls in the MCP SDK — is ever evaluated: import-time logging from that
+ * dependency graph would otherwise land on stdout unguarded, since `main()`'s
+ * own rebind (see mcp/server.ts's silenceStdout()) runs too late to cover
+ * module init. This ordering guarantee covers only that dynamic import, NOT
+ * `./predexec.mjs` below: ESM evaluates a static import's target module
+ * before any of the importing module's own top-level statements, so
+ * `./predexec.mjs` actually runs before this rebind regardless of where the
+ * `import` line sits textually. It is safe today only because that module is
+ * plain node-builtins-only code with no top-level output (verified) — it
+ * must stay that way, or gain its own guard, for this guarantee to hold.
  */
 
-// stdio MCP: stdout carries protocol frames only. Rebind BEFORE importing the
-// server graph so import-time logging from any dependency lands on stderr —
-// silenceStdout() inside main() runs too late to guard module init.
+// stdio MCP: stdout carries protocol frames only. Rebind BEFORE launch()'s
+// dynamic `import(SERVER_URL.href)` runs, so import-time logging from the
+// server graph (the MCP SDK included) lands on stderr — silenceStdout()
+// inside main() runs too late to guard that module's init. Static imports in
+// this file (`./predexec.mjs`, immediately below) are NOT covered by this
+// ordering: ESM evaluates their top-level code before this rebind executes,
+// import position notwithstanding — they must stay free of top-level output.
 import { Console } from "node:console";
 globalThis.console = new Console({ stdout: process.stderr, stderr: process.stderr });
 

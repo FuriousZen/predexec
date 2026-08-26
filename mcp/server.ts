@@ -194,10 +194,13 @@ export function createServer(opts: PredexecServerOptions = {}): McpServer {
  * which is the difference between a convention and a guarantee.
  *
  * `bin/predexec-mcp.mjs` ALSO rebinds the console itself, at the top of the
- * file before the server module is even imported — that guards import-time
- * logging from the server graph (the MCP SDK included), which runs before
- * `main()` is ever called and so is out of reach from here. This copy stays
- * for embedded/`createServer`-only uses that bypass the launcher entirely.
+ * file before the server module's DYNAMIC `import()` runs — that guards
+ * import-time logging from the server graph (the MCP SDK included), which
+ * executes before `main()` is ever called and so is out of reach from here.
+ * (The launcher's own static imports are not covered by that guarantee and
+ * must stay side-effect-free instead; see the comment there.) This copy
+ * stays for embedded/`createServer`-only uses that bypass the launcher
+ * entirely.
  */
 export function silenceStdout(): void {
   globalThis.console = new Console({ stdout: process.stderr, stderr: process.stderr });
