@@ -1,10 +1,10 @@
-import { spawn } from "node:child_process";
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { InMemoryTransport, LATEST_PROTOCOL_VERSION, type McpServer } from "@modelcontextprotocol/server";
 import { createServer, DESCRIPTION, TOOL_NAME } from "../../mcp/server.ts";
+import { spawnMcpClient } from "../helpers/stdio-client.ts";
 
 type Json = Record<string, any>;
 
@@ -297,61 +297,27 @@ describe("mcp server — spawned stdio launcher", () => {
   it("spawns the entrypoint, completes handshake, lists tools, and executes a depth-0 plan over stdio", async () => {
     const dir = project();
     const binPath = join(__dirname, "..", "..", "bin", "predexec-mcp.mjs");
-    const child = spawn(process.execPath, [binPath], {
+    const client = spawnMcpClient(binPath, {
       cwd: dir,
-      env: { ...process.env, ...policyOptions.env, CLAUDE_CONFIG_DIR: noSettings },
-      stdio: ["pipe", "pipe", "pipe"],
+      env: { ...policyOptions.env, CLAUDE_CONFIG_DIR: noSettings },
     });
-
-    const pending = new Map<number, (msg: Json) => void>();
-    let nextId = 1;
-    let buffer = "";
-    const rawStdoutChunks: string[] = [];
-
-    child.stdout!.setEncoding("utf8");
-    child.stdout!.on("data", (chunk: string) => {
-      rawStdoutChunks.push(chunk);
-      buffer += chunk;
-      const lines = buffer.split("\n");
-      buffer = lines.pop() ?? "";
-      for (const line of lines) {
-        if (!line.trim()) continue;
-        const msg = JSON.parse(line);
-        if (typeof msg.id === "number" && pending.has(msg.id)) {
-          const resolve = pending.get(msg.id)!;
-          pending.delete(msg.id);
-          resolve(msg);
-        }
-      }
-    });
-
-    const request = (method: string, params?: Json): Promise<Json> => {
-      const id = nextId++;
-      const answered = new Promise<Json>((resolve) => pending.set(id, resolve));
-      child.stdin!.write(JSON.stringify({ jsonrpc: "2.0", id, method, ...(params ? { params } : {}) }) + "\n");
-      return answered;
-    };
-
-    const notify = (method: string, params?: Json): void => {
-      child.stdin!.write(JSON.stringify({ jsonrpc: "2.0", method, ...(params ? { params } : {}) }) + "\n");
-    };
 
     try {
-      const initRes = await request("initialize", {
+      const initRes = await client.request("initialize", {
         protocolVersion: LATEST_PROTOCOL_VERSION,
         capabilities: {},
         clientInfo: { name: "predexec-stdio-test", version: "1" },
       });
       expect(initRes.result.serverInfo.name).toBe("predexec");
 
-      notify("notifications/initialized");
+      client.notify("notifications/initialized");
 
-      const listRes = await request("tools/list");
+      const listRes = await client.request("tools/list");
       const tools = listRes.result.tools as Json[];
       expect(tools).toHaveLength(1);
       expect(tools[0]!.name).toBe(TOOL_NAME);
 
-      const callRes = await request("tools/call", {
+      const callRes = await client.request("tools/call", {
         name: TOOL_NAME,
         arguments: {
           plan: {
@@ -369,12 +335,12 @@ describe("mcp server — spawned stdio launcher", () => {
       expect(callRes.result.isError).toBeUndefined();
 
       // STDOUT IS THE PROTOCOL: every newline-separated chunk on stdout must parse as valid JSON-RPC
-      const allLines = rawStdoutChunks.join("").split("\n").filter((l) => l.trim().length > 0);
+      const allLines = client.rawStdoutChunks.join("").split("\n").filter((l) => l.trim().length > 0);
       for (const line of allLines) {
         expect(() => JSON.parse(line)).not.toThrow();
       }
     } finally {
-      child.kill("SIGTERM");
+      client.kill();
     }
   });
 });

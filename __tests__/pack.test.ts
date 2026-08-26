@@ -1,4 +1,4 @@
-import { execSync, spawn } from "node:child_process";
+import { execSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { LATEST_PROTOCOL_VERSION } from "@modelcontextprotocol/server";
 import { ensureBuild } from "./helpers/ensure-build.ts";
+import { spawnMcpClient } from "./helpers/stdio-client.ts";
 
 type Json = Record<string, any>;
 
@@ -150,70 +151,13 @@ describe("packed artifact verification", () => {
     const testDir = mkdtempSync(join(tmpdir(), "px-pack-test-run-"));
     const noSettings = mkdtempSync(join(tmpdir(), "px-pack-nosettings-"));
 
-    const child = spawn(process.execPath, [bin], {
+    const client = spawnMcpClient(bin, {
       cwd: testDir,
-      env: { ...process.env, CLAUDE_CONFIG_DIR: noSettings },
-      stdio: ["pipe", "pipe", "pipe"],
+      env: { CLAUDE_CONFIG_DIR: noSettings },
     });
-
-    const pending = new Map<number, { resolve: (msg: Json) => void; reject: (err: Error) => void }>();
-    let nextId = 1;
-    let buffer = "";
-    let stderr = "";
-
-    child.stderr!.on("data", (chunk: Buffer | string) => {
-      stderr += chunk.toString();
-    });
-
-    child.on("error", (err) => {
-      for (const { reject } of pending.values()) {
-        reject(err);
-      }
-      pending.clear();
-    });
-
-    child.on("exit", (code) => {
-      if (code !== 0 && code !== null) {
-        for (const { reject } of pending.values()) {
-          reject(new Error(`child process exited with code ${code}: ${stderr}`));
-        }
-        pending.clear();
-      }
-    });
-
-    child.stdout!.setEncoding("utf8");
-    child.stdout!.on("data", (chunk: string) => {
-      buffer += chunk;
-      const lines = buffer.split("\n");
-      buffer = lines.pop() ?? "";
-      for (const line of lines) {
-        if (!line.trim()) continue;
-        try {
-          const msg = JSON.parse(line);
-          if (typeof msg.id === "number" && pending.has(msg.id)) {
-            const { resolve } = pending.get(msg.id)!;
-            pending.delete(msg.id);
-            resolve(msg);
-          }
-        } catch {
-          // ignore non-json
-        }
-      }
-    });
-
-    const request = (method: string, params?: Json): Promise<Json> => {
-      const id = nextId++;
-      const answered = new Promise<Json>((resolve, reject) => pending.set(id, { resolve, reject }));
-      child.stdin!.write(JSON.stringify({ jsonrpc: "2.0", id, method, ...(params ? { params } : {}) }) + "\n");
-      return answered;
-    };
-
-    const notify = (method: string, params?: Json): void => {
-      child.stdin!.write(JSON.stringify({ jsonrpc: "2.0", method, ...(params ? { params } : {}) }) + "\n");
-    };
 
     try {
-      const initRes = await request("initialize", {
+      const initRes = await client.request("initialize", {
         protocolVersion: LATEST_PROTOCOL_VERSION,
         capabilities: {},
         clientInfo: { name: "predexec-pack-test", version: "1" },
@@ -221,13 +165,13 @@ describe("packed artifact verification", () => {
       expect(initRes.result.serverInfo.name).toBe("predexec");
       expect(initRes.result.serverInfo.version).toMatch(/^\d+\.\d+\.\d+/);
 
-      notify("notifications/initialized");
+      client.notify("notifications/initialized");
 
-      const listRes = await request("tools/list");
+      const listRes = await client.request("tools/list");
       const tools = listRes.result.tools as Json[];
       expect(tools.some((t) => t.name === "predexec")).toBe(true);
 
-      const callRes = await request("tools/call", {
+      const callRes = await client.request("tools/call", {
         name: "predexec",
         arguments: {
           plan: {
@@ -242,7 +186,7 @@ describe("packed artifact verification", () => {
       expect(text).toContain("hello-from-packed-mcp");
       expect(callRes.result.isError).toBeUndefined();
     } finally {
-      child.kill("SIGTERM");
+      client.kill();
       rmSync(testDir, { recursive: true, force: true });
       rmSync(noSettings, { recursive: true, force: true });
     }
