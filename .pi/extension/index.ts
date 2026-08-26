@@ -18,8 +18,8 @@ import {
   createFindTool,
   createLsTool,
 } from "@earendil-works/pi-coding-agent";
-import { runPlanTree, coercePlan, isDestructiveCommand, type PlanTree, type ToolOp } from "../../core/index.ts";
-import { estimateRequestsSaved, recordRun } from "../../stats.ts";
+import { isDestructiveCommand, type ToolOp } from "../../core/index.ts";
+import { executeAdapterPlan } from "../../adapter-runtime.ts";
 import { VERIFY_FIRST_LINE } from "../../steering.ts";
 
 /**
@@ -217,16 +217,6 @@ export default function predexec(pi: ExtensionAPI): void {
     ],
     parameters: PlanTreeSchema as any,
     async execute(_toolCallId, params: Record<string, unknown>, signal, onUpdate, ctx) {
-      let plan: PlanTree;
-      try {
-        plan = coercePlan(params);
-      } catch (err) {
-        return {
-          content: [{ type: "text" as const, text: (err as Error).message }],
-          details: { stoppedReason: "error", fellBack: true },
-        };
-      }
-
       let lastUpdateAt = 0;
       let pendingTimeout: ReturnType<typeof setTimeout> | undefined;
       let streamedText = "";
@@ -262,7 +252,7 @@ export default function predexec(pi: ExtensionAPI): void {
 
       let done = false;
 
-      const result = await runPlanTree(plan, {
+      const result = await executeAdapterPlan(params, "pi", {
         cwd: ctx.cwd,
         signal,
         executeToolOp,
@@ -284,7 +274,6 @@ export default function predexec(pi: ExtensionAPI): void {
 
       done = true;
       if (pendingTimeout) clearTimeout(pendingTimeout);
-      void recordRun(plan, result, "pi");
       return {
         content: [{ type: "text" as const, text: result.transcript || "(no output)" }],
         details: {
@@ -294,7 +283,6 @@ export default function predexec(pi: ExtensionAPI): void {
           fellBack: result.fellBack,
           edgesEvaluated: result.edgesEvaluated,
           edgesMatched: result.edgesMatched,
-          requestsSaved: estimateRequestsSaved(plan, result),
         },
         // No `terminate` in the read-only MVP: a read-only leaf usually still
         // needs the model. Deferred to impl step 4 (gated mutations + success leaves).

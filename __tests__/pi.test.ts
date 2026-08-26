@@ -67,6 +67,44 @@ describe("pi extension — tool.execute", () => {
     expect(result.details.pathTaken).toEqual(["a"]);
     expect(updates.length).toBeGreaterThan(0);
   });
+
+  it("handles coercion error gracefully returning stoppedReason: error", async () => {
+    const { api, getTool } = createFakeApi();
+    predexec(api);
+    const tool = getTool();
+
+    const cwd = mkdtempSync(join(tmpdir(), "px-pi-"));
+    const result = await tool.execute(
+      "tc2",
+      { bad: "plan" },
+      undefined,
+      () => {},
+      { cwd },
+    );
+
+    expect(result.details.stoppedReason).toBe("error");
+    expect(result.details.fellBack).toBe(true);
+    expect(result.content[0].text).toContain("predexec expected a JSON object with `root`");
+  });
+
+  it("handles engine unexpected error gracefully returning stoppedReason: error", async () => {
+    const { api, getTool } = createFakeApi();
+    predexec(api);
+    const tool = getTool();
+
+    const cwd = mkdtempSync(join(tmpdir(), "px-pi-"));
+    const result = await tool.execute(
+      "tc3",
+      { root: "a", nodes: [{ id: "a", commands: ["echo"] }], cwd: 123 },
+      undefined,
+      () => {},
+      { cwd },
+    );
+
+    expect(result.details.stoppedReason).toBe("error");
+    expect(result.details.fellBack).toBe(true);
+    expect(result.content[0].text).toContain("the plan walk failed unexpectedly");
+  });
 });
 
 describe("pi extension — tool_result nudge hook", () => {

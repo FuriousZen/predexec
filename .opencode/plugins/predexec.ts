@@ -22,15 +22,12 @@ import { existsSync, statSync } from "node:fs";
 import { isAbsolute, resolve } from "node:path";
 import { z } from "zod";
 import {
-  runPlanTree,
-  coercePlan,
   isDestructiveCommand,
-  type PlanTree,
   type ToolOp,
   type ToolExecutor,
 } from "../../core/index.ts";
+import { executeAdapterPlan } from "../../adapter-runtime.ts";
 import { STEERING_LINE, VERIFY_FIRST_LINE, systemHasRoutingInstructions } from "../../steering.ts";
-import { recordRun } from "../../stats.ts";
 import { createPolicyChecker, readOpencodeBashRules } from "../../policy.ts";
 
 const DESCRIPTION =
@@ -239,27 +236,18 @@ const server: Plugin = async ({ client }) => ({
         ),
       },
       async execute(args: { plan: unknown }, context: PluginToolContext) {
-        let plan: PlanTree;
-        try {
-          plan = coercePlan(args.plan);
-        } catch (err) {
-          return (err as Error).message;
-        }
-
         const executeToolOp = createToolExecutor(client as unknown as OpencodeClient, context.directory);
         // Re-read per call (one small JSON read): config edits apply immediately,
         // and an unconfigured host costs a cheap no-op checker.
         const policy = readOpencodeBashRules(context.directory);
         const checkCommandPolicy = createPolicyChecker(policy.rules, policy.unreadable);
 
-        const result = await runPlanTree(plan, {
+        const result = await executeAdapterPlan(args.plan, "opencode", {
           cwd: context.directory,
           signal: context.abort,
           executeToolOp,
           checkCommandPolicy,
         });
-
-        void recordRun(plan, result, "opencode");
 
         return result.transcript || "(no output)";
       },

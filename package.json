@@ -35,6 +35,7 @@
     "steering.ts",
     "stats.ts",
     "policy.ts",
+    "adapter-runtime.ts",
     "README.md"
   ],
   "pi": {

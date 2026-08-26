@@ -14,4 +14,4 @@
 export { runPlanTree } from "./engine.ts";
 export { isDestructiveCommand, splitCommandSegments } from "./destructive.ts";
 export { coercePlan } from "./coerce.ts";
-export { type ToolOp, type PlanTree, type CoreResult, type ToolExecutor } from "./types.ts";
+export { type ToolOp, type PlanTree, type CoreResult, type ToolExecutor, type RunOptions, type ProgressEvent } from "./types.ts";

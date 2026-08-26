@@ -269,6 +269,18 @@ describe("opencode plugin — host permission policy e2e", () => {
     const out = await execute(dir, catPlan);
     expect(out).toContain("node a (exit 0)");
   });
+
+  it("returns a readable coercion error on malformed plan", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "px-oc-policy-"));
+    const out = await execute(dir, { bad: "plan" });
+    expect(out).toContain("predexec expected a JSON object with `root`");
+  });
+
+  it("returns a readable error on engine unexpected failure", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "px-oc-policy-"));
+    const out = await execute(dir, { root: "a", nodes: [{ id: "a", commands: ["echo"] }], cwd: 123 });
+    expect(out).toContain("the plan walk failed unexpectedly");
+  });
 });
 
 describe("opencode plugin — prompting surfaces", () => {

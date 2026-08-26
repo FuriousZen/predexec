@@ -1,8 +1,8 @@
 /**
  * predexec stats — request-accounting recorder.
  *
- * Harness-facing (NOT part of pure `core/`): fs + env access lives here. Both
- * adapters call `recordRun` fire-and-forget after `runPlanTree`; the `predexec`
+ * Harness-facing (NOT part of pure `core/`): fs + env access lives here.
+ * `adapter-runtime.ts` calls `recordRun` after `runPlanTree`; the `predexec`
  * bin (`bin/predexec.mjs`) aggregates the same JSONL for `predexec stats`.
  *
  * Persistence is one JSON object per line, append-only — zero native deps

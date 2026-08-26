@@ -246,7 +246,7 @@ describe("mcp server — packaging and plugin wiring", () => {
 
   it("package.json ships every path the MCP adapter loads at runtime", () => {
     const pkg = readJson("package.json");
-    for (const entry of ["mcp", "bin", "core", "skills", ".claude-plugin", "steering.ts", "stats.ts"]) {
+    for (const entry of ["mcp", "bin", "core", "skills", ".claude-plugin", "steering.ts", "stats.ts", "adapter-runtime.ts"]) {
       expect(pkg.files).toContain(entry);
     }
     expect(pkg.bin["predexec-mcp"]).toBe("./bin/predexec-mcp.mjs");

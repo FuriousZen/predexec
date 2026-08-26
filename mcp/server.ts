@@ -32,8 +32,8 @@ import { fileURLToPath } from "node:url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { coercePlan, runPlanTree, type PlanTree, type ToolExecutor } from "../core/index.ts";
-import { recordRun } from "../stats.ts";
+import type { ToolExecutor } from "../core/index.ts";
+import { executeAdapterPlan } from "../adapter-runtime.ts";
 import { STEERING_LINE, VERIFY_FIRST_LINE } from "../steering.ts";
 import { createClaudePolicyChecker, readClaudeBashRules, type ClaudePolicyOptions } from "./policy-claude.ts";
 import { createToolExecutor } from "./tool-ops.ts";
@@ -100,8 +100,6 @@ const textResult = (text: string, isError = false): ToolResult => ({
   ...(isError ? { isError: true } : {}),
 });
 
-const errText = (e: unknown): string => (e instanceof Error ? e.message : String(e));
-
 /**
  * The package version, for the MCP `serverInfo` a client logs and displays.
  * Read from package.json rather than hard-coded so it cannot drift; a failure
@@ -120,52 +118,32 @@ export function packageVersion(): string {
 /**
  * Run one plan and render it as a tool result.
  *
- * BOTH coercePlan and runPlanTree are wrapped. The sibling adapters wrap only
- * the former, so a plan that survives coercion but trips the engine (e.g. a
- * non-string `cwd`, which nothing validates before `path.resolve` sees it)
- * escapes as a raw TypeError. Inside an MCP server that surfaces as a protocol
- * error with a stack trace, which reads to the model as a broken tool rather
- * than a fixable plan — so it is caught and named here.
+ * Coercion, unexpected errors, execution, and stats recording are all handled
+ * by `executeAdapterPlan`. Validation and unexpected errors return a result
+ * with `stoppedReason: "error"`, flagged as `isError: true` for the client.
  */
 export async function runPredexecTool(
   rawPlan: unknown,
   opts: { cwd: string; executeToolOp: ToolExecutor; policy?: ClaudePolicyOptions; signal?: AbortSignal },
 ): Promise<ToolResult> {
-  let plan: PlanTree;
-  try {
-    plan = coercePlan(rawPlan);
-  } catch (err) {
-    return textResult(errText(err), true);
-  }
+  // Re-read the rules per call (a few small JSON reads): a permission edit
+  // applies immediately, and an unconfigured host costs a cheap no-op checker.
+  // The tool-ops root, by contrast, is fixed once at startup — it is the
+  // session boundary, not a preference.
+  const { rules, unreadable } = readClaudeBashRules(opts.cwd, opts.policy ?? {});
+  const checkCommandPolicy = createClaudePolicyChecker(rules, unreadable);
 
-  try {
-    // Re-read the rules per call (a few small JSON reads): a permission edit
-    // applies immediately, and an unconfigured host costs a cheap no-op checker.
-    // The tool-ops root, by contrast, is fixed once at startup — it is the
-    // session boundary, not a preference.
-    const { rules, unreadable } = readClaudeBashRules(opts.cwd, opts.policy ?? {});
-    const checkCommandPolicy = createClaudePolicyChecker(rules, unreadable);
+  const result = await executeAdapterPlan(rawPlan, "claude-code", {
+    cwd: opts.cwd,
+    signal: opts.signal,
+    executeToolOp: opts.executeToolOp,
+    checkCommandPolicy,
+  });
 
-    const result = await runPlanTree(plan, {
-      cwd: opts.cwd,
-      signal: opts.signal,
-      executeToolOp: opts.executeToolOp,
-      checkCommandPolicy,
-    });
-
-    void recordRun(plan, result, "claude-code");
-
-    // A validation stop is an authoring error, not a walk that ended early —
-    // flag it so the client renders it as a failed call. mutationStop/policyStop/
-    // noEdgeMatch are ordinary, recoverable outcomes and stay non-error.
-    return textResult(result.transcript || "(no output)", result.stoppedReason === "error");
-  } catch (err) {
-    return textResult(
-      `predexec: the plan walk failed unexpectedly (${errText(err)}) — this is a predexec bug, not a plan you can fix. ` +
-        "Fall back to normal tool calling for this step.",
-      true,
-    );
-  }
+  // A validation or execution stop with reason "error" is an authoring/runtime error,
+  // not a walk that ended early — flag it so the client renders it as a failed call.
+  // mutationStop/policyStop/noEdgeMatch are ordinary, recoverable outcomes and stay non-error.
+  return textResult(result.transcript || "(no output)", result.stoppedReason === "error");
 }
 
 /**
