@@ -20,6 +20,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { isDestructiveCommand, OUTPUT_CAP, type ToolOp } from "../../core/index.ts";
 import { TRUNCATION_MARKER } from "../../core/runner.ts";
+import type { ProgressEvent } from "../../core/types.ts";
 import { executeAdapterPlan } from "../../adapter-runtime.ts";
 import { BASH_NUDGE, RECOVERY_LINE, USAGE_LINE, VERIFY_FIRST_LINE } from "../../steering.ts";
 
@@ -269,28 +270,30 @@ export default function predexec(pi: ExtensionAPI): void {
 
       let done = false;
 
+      const progressHandlers = onUpdate
+        ? {
+            onProgress(event: ProgressEvent) {
+              if (done) return;
+              streamedText = appendProgressText("", event.transcript);
+              emitUpdate(streamedText, {
+                nodeId: event.nodeId,
+                depthReached: event.depthReached,
+                pathTaken: event.pathTaken,
+              });
+            },
+            onCommandOutput(data: string) {
+              if (done) return;
+              streamedText = appendProgressText(streamedText, data);
+              scheduleOutputUpdate();
+            },
+          }
+        : {};
+
       const result = await executeAdapterPlan(params, "pi", {
         cwd: ctx.cwd,
         signal,
         executeToolOp,
-        onProgress(event) {
-          if (done) return;
-          streamedText = event.transcript;
-          emitUpdate(event.transcript, {
-            nodeId: event.nodeId,
-            depthReached: event.depthReached,
-            pathTaken: event.pathTaken,
-          });
-        },
-        ...(onUpdate
-          ? {
-              onCommandOutput(data: string) {
-                if (done) return;
-                streamedText = appendProgressText(streamedText, data);
-                scheduleOutputUpdate();
-              },
-            }
-          : {}),
+        ...progressHandlers,
       });
 
       done = true;

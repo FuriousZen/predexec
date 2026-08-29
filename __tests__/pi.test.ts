@@ -13,6 +13,7 @@ import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { OUTPUT_CAP } from "../core/runner.ts";
 import { appendProgressText } from "../.pi/extension/index.ts";
+import * as adapterRuntime from "../adapter-runtime.ts";
 
 const { readToolCwds } = vi.hoisted(() => ({ readToolCwds: [] as string[] }));
 
@@ -179,6 +180,47 @@ describe.each(variants)("pi extension ($name) — tool.execute", ({ predexec }) 
 
     expect(result.details.stoppedReason).toBe("leaf");
     expect(result.content[0].text).toContain("…[truncated");
+  });
+
+  it("caps every cumulative progress snapshot across a multi-node walk", async () => {
+    const { api, getTool } = createFakeApi();
+    predexec(api);
+    const tool = getTool();
+
+    const cwd = mkdtempSync(join(tmpdir(), "px-pi-"));
+    const updates: any[] = [];
+    const nodes = Array.from({ length: 9 }, (_, index) => ({
+      id: `n${index}`,
+      commands: ["node -e 'process.stdout.write(\"x\".repeat(8192))'"],
+      ...(index < 8 ? { edges: [{ when: { kind: "always" }, to: `n${index + 1}` }] } : {}),
+    }));
+    const result = await tool.execute("tc6", { root: "n0", nodes }, undefined, (u: any) => updates.push(u), { cwd });
+
+    expect(result.details.pathTaken).toHaveLength(9);
+    expect(Math.max(...updates.map((u) => u.content[0].text.length))).toBeLessThanOrEqual(OUTPUT_CAP + 64);
+  });
+});
+
+describe("pi extension — progress callback registration", () => {
+  it("does not register progress callbacks when onUpdate is omitted", async () => {
+    const execute = vi.spyOn(adapterRuntime, "executeAdapterPlan");
+    const { api, getTool } = createFakeApi();
+    predexecSource(api);
+    const tool = getTool();
+
+    const cwd = mkdtempSync(join(tmpdir(), "px-pi-"));
+    await tool.execute(
+      "tc7",
+      { root: "a", nodes: [{ id: "a", commands: ["printf hi"] }] },
+      undefined,
+      undefined,
+      { cwd },
+    );
+
+    const options = execute.mock.calls.at(-1)?.[2] as Record<string, unknown>;
+    expect(options.onProgress).toBeUndefined();
+    expect(options.onCommandOutput).toBeUndefined();
+    execute.mockRestore();
   });
 });
 
