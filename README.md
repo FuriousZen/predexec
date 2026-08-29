@@ -239,6 +239,10 @@ less. Two limits worth knowing:
   For OS-level enforcement that binds every process, enable
   [sandboxing](https://code.claude.com/docs/en/sandboxing).
 
+MCP `read`/`grep`/`find`/`ls` paths are checked after symlink resolution and cannot leave the
+session root; dependency symlinks below an exact `node_modules` path segment are the sole
+exception.
+
 #### Plugin form (optional)
 
 The repo also carries a plugin wrapper (`.claude-plugin/plugin.json`) that bundles the MCP

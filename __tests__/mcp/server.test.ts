@@ -90,6 +90,7 @@ describe("mcp server — tool registration", () => {
     expect(plan.description).toContain('"stdout =~ /regex/"');
     expect(plan.description).toContain('"file exists <path>"');
     expect(plan.description).toContain('{tool:"read"');
+    expect(plan.description).toContain("dependency symlinks below node_modules are the sole exception");
   });
 
   it("the description carries the shared steering prose (the only always-on channel here)", async () => {

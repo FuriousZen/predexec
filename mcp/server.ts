@@ -95,7 +95,8 @@ const PLAN_ARG_DESCRIPTION =
   WHEN_SYNTAX_LINE +
   JSON_PATH_SINGLE_OP_LINE + " " +
   "Note: tool ops read the filesystem directly (they are not Claude Code's native Read/Grep), " +
-  "paths may not escape the session root, and grep/find fall back to a pure-Node walk that ignores .gitignore when ripgrep/fd are absent.";
+  "paths may not escape the session root (dependency symlinks below node_modules are the sole exception), " +
+  "and grep/find fall back to a pure-Node walk that ignores .gitignore when ripgrep/fd are absent.";
 
 /**
  * The MCP text result shape. Declared structurally so the SDK's types stay an

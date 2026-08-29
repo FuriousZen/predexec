@@ -31,7 +31,7 @@
 import { execFile } from "node:child_process";
 import { accessSync, constants } from "node:fs";
 import { createReadStream } from "node:fs";
-import { readdir, stat } from "node:fs/promises";
+import { readdir, realpath, stat } from "node:fs/promises";
 import { delimiter, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { promisify } from "node:util";
@@ -195,13 +195,11 @@ export function globToRegExp(glob: string): RegExp {
 }
 
 /**
- * Lexical containment: `abs` must BE the root or sit under it.
+ * Lexical containment precheck: `abs` must BE the root or sit under it.
  *
- * Compared lexically and never through realpath. A worktree's `node_modules` and
- * any pnpm store are symlink farms pointing outside the root, so a realpath
- * check would reject reads the user plainly intended — and on macOS it would
- * also have to reconcile /var → /private/var on one side of the comparison only.
- * The trailing separator is what stops /repo-evil passing for root /repo.
+ * The trailing separator is what stops /repo-evil passing for root /repo. The
+ * existing target is then checked again through realpath, with only a lexical
+ * `node_modules` segment exempted for package-manager dependency symlinks.
  */
 function isWithin(root: string, abs: string): boolean {
   return abs === root || abs.startsWith(root.endsWith(sep) ? root : root + sep);
@@ -230,6 +228,20 @@ async function statOrNull(path: string): Promise<Awaited<ReturnType<typeof stat>
   }
 }
 
+async function realpathOrNull(path: string): Promise<string | null> {
+  try {
+    return await realpath(path);
+  } catch {
+    return null;
+  }
+}
+
+const outsideSymlinkError = (label: string, raw: string, target: string, root: string): OpResult =>
+  fail(
+    label,
+    `"${raw}" symlink resolves outside the predexec root ${root} (resolved target ${target}) — refusing to read outside the session root`,
+  );
+
 /**
  * Resolve an op's optional `path` to an existing target, defaulting to the op's
  * cwd. Missing paths report where they were resolved from: the model needs the
@@ -240,13 +252,36 @@ async function target(
   root: string,
   base: string,
   label: string,
-): Promise<{ abs: string; isDir: boolean; err?: undefined } | { abs?: undefined; isDir?: undefined; err: OpResult }> {
+): Promise<
+  | { abs: string; lexicalAbs: string; isDir: boolean; err?: undefined }
+  | { abs?: undefined; lexicalAbs?: undefined; isDir?: undefined; err: OpResult }
+> {
   const raw = op.path === undefined ? "." : String(op.path);
   const found = locate(root, base, raw, label);
   if (found.err) return { err: found.err };
   const info = await statOrNull(found.abs);
   if (!info) return { err: fail(label, `path not found: ${raw} (resolved against ${base})`) };
-  return { abs: found.abs, isDir: info.isDirectory() };
+  const [realRoot, realTarget] = await Promise.all([realpathOrNull(root), realpathOrNull(found.abs)]);
+  if (!realRoot || !realTarget) return { err: fail(label, `path not found: ${raw} (resolved against ${base})`) };
+  // Package managers intentionally place dependency trees behind symlinks. Keep
+  // that one exception lexical and exact: names such as `node_modules-evil` do
+  // not earn permission to leave the session root.
+  const dependencyPath = relative(root, found.abs).split(sep).includes("node_modules");
+  if (!isWithin(realRoot, realTarget) && !dependencyPath) {
+    return { err: outsideSymlinkError(label, raw, realTarget, root) };
+  }
+  return { abs: realTarget, lexicalAbs: found.abs, isDir: info.isDirectory() };
+}
+
+/**
+ * Keep result paths in the lexical namespace the model supplied, even when
+ * operation I/O uses a canonical realpath (notably macOS /var aliases and
+ * dependency symlinks). This also keeps accelerated and fallback output equal.
+ */
+function displayRel(base: string, operationRoot: string, lexicalRoot: string, abs: string): string {
+  const rel = relative(operationRoot, abs);
+  const lexical = rel && !isAbsolute(rel) ? resolve(lexicalRoot, rel) : lexicalRoot;
+  return relativize(base, lexical);
 }
 
 /**
@@ -310,11 +345,9 @@ async function walkFiles(dir: string, signal?: AbortSignal): Promise<{ files: st
 async function readOp(op: ToolOp, root: string, base: string, signal?: AbortSignal): Promise<OpResult> {
   const raw = String(op.path ?? "");
   if (!raw) return fail("read", "missing required arg `path`");
-  const found = locate(root, base, raw, "read");
+  const found = await target(op, root, base, "read");
   if (found.err) return found.err;
-  const info = await statOrNull(found.abs);
-  if (!info) return fail("read", `path not found: ${raw} (resolved against ${base})`);
-  if (info.isDirectory()) return fail("read", `${raw} is a directory — use {tool:"ls"} to list it`);
+  if (found.isDir) return fail("read", `${raw} is a directory — use {tool:"ls"} to list it`);
 
   const offset = typeof op.offset === "number" ? op.offset : 1;
   const start = Math.max(0, offset - 1);
@@ -451,14 +484,23 @@ async function grepOp(
   const notes: string[] = [];
   let matches: Match[];
   if (rg) {
-    const found = await grepViaRg(rg, pattern, scope.abs, base, { ignoreCase, literal, glob }, signal);
+    const found = await grepViaRg(rg, pattern, scope.abs, scope.lexicalAbs, base, { ignoreCase, literal, glob }, signal);
     if (found.err) return found.err;
     matches = found.matches;
   } else {
     // Only a directory search has a file set to diverge over; on one named file
     // the note would be noise about a decision that was never made.
     if (scope.isDir) notes.push(`grep: ripgrep ${NO_GITIGNORE_NOTE}`);
-    const found = await grepViaNode(pattern, scope.abs, scope.isDir, base, { ignoreCase, literal, glob }, limit, signal);
+    const found = await grepViaNode(
+      pattern,
+      scope.abs,
+      scope.lexicalAbs,
+      scope.isDir,
+      base,
+      { ignoreCase, literal, glob },
+      limit,
+      signal,
+    );
     if (found.err) return found.err;
     if (found.capped) notes.push(walkCapNote("grep"));
     matches = found.matches;
@@ -475,6 +517,7 @@ async function grepViaRg(
   rg: string,
   pattern: string,
   abs: string,
+  lexicalAbs: string,
   base: string,
   flags: { ignoreCase: boolean; literal: boolean; glob?: string },
   signal?: AbortSignal,
@@ -506,7 +549,11 @@ async function grepViaRg(
     if (colon < 0) continue;
     const lineNo = Number(rest.slice(0, colon));
     if (!Number.isInteger(lineNo)) continue;
-    matches.push({ path: relativize(base, line.slice(0, nul)), line: lineNo, text: rest.slice(colon + 1) });
+    matches.push({
+      path: displayRel(base, abs, lexicalAbs, line.slice(0, nul)),
+      line: lineNo,
+      text: rest.slice(colon + 1),
+    });
   }
   // rg walks in its own order; sorting is what makes the accelerated and the
   // fallback paths return byte-identical output for the same file set.
@@ -516,6 +563,7 @@ async function grepViaRg(
 async function grepViaNode(
   pattern: string,
   abs: string,
+  lexicalAbs: string,
   isDir: boolean,
   base: string,
   flags: { ignoreCase: boolean; literal: boolean; glob?: string },
@@ -548,7 +596,7 @@ async function grepViaNode(
   const matches: Match[] = [];
   for (const file of walked.files) {
     if (signal?.aborted) throw new Error("aborted");
-    const rel = relativize(base, file);
+    const rel = displayRel(base, abs, lexicalAbs, file);
     if (globRe && !matchesGlob(globRe, rel, flags.glob!)) continue;
     const pending: Match[] = [];
     try {
@@ -665,7 +713,7 @@ async function findOp(
 
   const limit = positiveInt(op.limit) ?? DEFAULT_FIND_LIMIT;
   const hits = files
-    .map((f) => relativize(base, f))
+    .map((f) => displayRel(base, scope.abs, scope.lexicalAbs, f))
     .filter((rel) => matchesGlob(re, rel, pattern))
     .sort();
   if (hits.length > limit) {

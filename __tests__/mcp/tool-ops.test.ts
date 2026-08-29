@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
@@ -16,6 +16,7 @@ import {
 // and fallback file sets comparable in the parity tests below.
 const root = mkdtempSync(join(tmpdir(), "px-toolops-"));
 const outside = mkdtempSync(join(tmpdir(), "px-outside-"));
+const symlinkRoot = mkdtempSync(join(tmpdir(), "px-symlink-root-"));
 
 const write = (rel: string, content: string | Buffer): void => {
   const path = join(root, rel);
@@ -33,9 +34,22 @@ write("many.txt", Array.from({ length: 20 }, (_, i) => `line ${i + 1}`).join("\n
 mkdirSync(join(root, "emptydir"));
 writeFileSync(join(outside, "secret.txt"), "top secret\n");
 
+let symlinksAvailable = false;
+try {
+  symlinkSync(outside, join(symlinkRoot, "link"), "junction");
+  mkdirSync(join(symlinkRoot, "node_modules"));
+  mkdirSync(join(outside, "pkg"));
+  writeFileSync(join(outside, "pkg", "package.json"), '{"name":"outside-package"}\n');
+  symlinkSync(join(outside, "pkg"), join(symlinkRoot, "node_modules", "pkg"), "junction");
+  symlinksAvailable = true;
+} catch {
+  // Some platforms require elevated privileges for symlink creation.
+}
+
 afterAll(() => {
   rmSync(root, { recursive: true, force: true });
   rmSync(outside, { recursive: true, force: true });
+  rmSync(symlinkRoot, { recursive: true, force: true });
 });
 
 /** Forces the pure-Node path regardless of what is installed on this machine. */
@@ -43,6 +57,7 @@ const NODE_ONLY: Partial<ToolExecutorOptions> = { rgPath: null, fdPath: null };
 
 const run = (op: ToolOp, over: Partial<ToolExecutorOptions> = {}, cwd = root) =>
   createToolExecutor({ cwd: root, ...over })(op, { cwd });
+const runSymlink = (op: ToolOp) => createToolExecutor({ cwd: symlinkRoot })(op, { cwd: symlinkRoot });
 
 const hasRg = findOnPath("rg") !== null;
 const hasFd = findOnPath("fd") !== null;
@@ -153,6 +168,23 @@ describe("mcp tool-ops — path containment", () => {
       expect(r.exitCode, op.tool).toBe(exit);
       expect(r.stderr, op.tool).toContain("outside the predexec root");
     }
+  });
+
+  it.skipIf(!symlinksAvailable)("rejects a symlink that resolves outside the root for read, grep, and ls", async () => {
+    for (const op of [
+      { tool: "read", path: "link/secret.txt" },
+      { tool: "grep", pattern: "top secret", path: "link" },
+      { tool: "ls", path: "link" },
+    ] as ToolOp[]) {
+      const r = await runSymlink(op);
+      expect(r.stderr, op.tool).toContain("symlink resolves outside the predexec root");
+    }
+  });
+
+  it.skipIf(!symlinksAvailable)("allows dependency symlinks below node_modules", async () => {
+    const r = await runSymlink({ tool: "read", path: "node_modules/pkg/package.json" });
+    expect(r.exitCode).toBe(0);
+    expect(r.stdout).toBe('{"name":"outside-package"}\n');
   });
 });
 
