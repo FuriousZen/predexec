@@ -159,6 +159,16 @@ describe("evaluateConditionWithDetail — observed-value explanations", () => {
     ).result).toBe(true);
   });
 
+  it("does not match synthetic truncation-marker text", () => {
+    const incomplete = out({ stdout: "READY\n…[truncated: 20 more chars]", stdoutTruncated: true });
+    const result = evaluateConditionWithDetail(
+      incomplete,
+      { kind: "match", source: "stdout", regex: "truncated" },
+      "/",
+    );
+    expect(result.result).toBe(false);
+  });
+
   it("reports truncated stdout before attempting JSON parsing", () => {
     const incomplete = out({ stdout: '{"ready":true}\n…[truncated]', stdoutTruncated: true });
     const result = evaluateConditionWithDetail(

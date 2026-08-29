@@ -36,6 +36,7 @@ const FILE_RE = /^file\s+(exists|missing)\s+(.+)$/;
  * gap rather than closing it.
  */
 const QUANTIFIED_GROUP_RE = /\(([^)]*)\)\s*(?:[+*]|\{\d)/g;
+const SYNTHETIC_TRUNCATION_MARKER_RE = /…\[truncated(?:: \d+ more chars)?\]/g;
 
 export function isSafeRegex(pattern: string): boolean {
   QUANTIFIED_GROUP_RE.lastIndex = 0;
@@ -197,11 +198,12 @@ export function evaluateConditionWithDetail(
             detail: `${sourceName} ${cond.negate ? "!~" : "=~"} /${cond.regex}/ → false (regex rejected: nested quantifier may not terminate)`,
           };
         }
-        const hit = new RegExp(cond.regex).test(source);
+        const matchSource = sourceTruncated ? source.replace(SYNTHETIC_TRUNCATION_MARKER_RE, "") : source;
+        const hit = new RegExp(cond.regex).test(matchSource);
         const result = cond.negate ? !hit : hit;
         return {
           result,
-          detail: `${sourceName} ${cond.negate ? "!~" : "=~"} /${cond.regex}/ → ${result} (${hit ? "matched" : `no match in ${source.length}-char ${sourceName}`})`,
+          detail: `${sourceName} ${cond.negate ? "!~" : "=~"} /${cond.regex}/ → ${result} (${hit ? "matched" : `no match in ${matchSource.length}-char ${sourceName}`})`,
         };
       }
 
