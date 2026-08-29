@@ -81,3 +81,39 @@ last-match-wins behavior was intentionally left untouched.
 ## Commit
 
 Planned commit message: `refactor: centralize command and plan language mechanics`
+
+## Fix round 1/5
+
+### RED
+
+Added source-and-compiled Pi registration assertions for:
+
+- `maxDepth.maximum === DEFAULT_MAX_DEPTH`, numeric ceiling guidance, and
+  larger-value clamping;
+- cwd guidance naming the session-root containment rule and rejection of
+  absolute/escaping paths;
+- a frozen `PLAN_FIELD_NAMES` projection map.
+
+Before the fix, the focused run failed with `maximum` undefined, missing depth
+guidance, missing cwd containment wording, and the field-name array failing the
+projection-map assertion.
+
+### GREEN and self-review
+
+`PLAN_FIELD_NAMES` is now a frozen object used by Pi's structural schema keys
+and by `PLAN_SHAPE_DESCRIPTION`; it is no longer an unused or competing source
+of truth. `PLAN_CWD_DESCRIPTION` is shared by the canonical plan prose and Pi's
+cwd schema. Pi exposes `maximum: 8` and says values above 8 are clamped while
+preserving its host-specific schema wording elsewhere.
+
+Fix-round verification:
+
+- `./node_modules/.bin/vitest run __tests__/plan-language.test.ts __tests__/pi.test.ts`: 23/23
+- policy/adapter focused tests: 208/208
+- `./node_modules/.bin/vitest run`: 726/726
+- `pnpm run typecheck`: passed
+- `pnpm run build`: passed
+- `pnpm pack --dry-run`: passed
+- `git diff --check`: passed
+
+No ledger or Task 10 files were edited.

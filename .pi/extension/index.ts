@@ -25,8 +25,11 @@ import { executeAdapterPlan } from "../../adapter-runtime.ts";
 import { BASH_NUDGE, JSON_PATH_SINGLE_OP_LINE, RECOVERY_LINE, USAGE_LINE, VERIFY_FIRST_LINE } from "../../steering.ts";
 import {
   CONDITION_KINDS,
+  DEFAULT_MAX_DEPTH,
   MAX_OPERATIONS_PER_NODE,
   MAX_PARALLEL_CONCURRENCY,
+  PLAN_CWD_DESCRIPTION,
+  PLAN_FIELD_NAMES,
   TOOL_OPERATION_NAMES,
 } from "../../plan-language.ts";
 
@@ -74,7 +77,7 @@ const Condition = {
 const PlanEdge = {
   type: "object",
   properties: {
-    when: {
+    [PLAN_FIELD_NAMES.when]: {
       description:
         'Condition as object OR shorthand string. ' +
         'Strings: "exit == 0", "exit != 0", "exit > N", "exit < N", ' +
@@ -82,16 +85,16 @@ const PlanEdge = {
         '"file exists path", "file missing path", "always". ' +
         `Object form (for ${CONDITION_KINDS.join("/")}): see Condition schema. ` + JSON_PATH_SINGLE_OP_LINE,
     },
-    to: { type: "string", description: "Target node id." },
+    [PLAN_FIELD_NAMES.to]: { type: "string", description: "Target node id." },
   },
-  required: ["when", "to"],
+  required: [PLAN_FIELD_NAMES.when, PLAN_FIELD_NAMES.to],
 } as const;
 
 const PlanNode = {
   type: "object",
   properties: {
-    id: { type: "string", description: "Unique node id." },
-    commands: {
+    [PLAN_FIELD_NAMES.id]: { type: "string", description: "Unique node id." },
+    [PLAN_FIELD_NAMES.commands]: {
       type: "array",
       maxItems: MAX_OPERATIONS_PER_NODE,
       items: {
@@ -103,36 +106,40 @@ const PlanNode = {
       },
       description: "Shell commands and/or tool calls. Sequential (stop-on-first-error) unless parallel:true.",
     },
-    parallel: {
+    [PLAN_FIELD_NAMES.parallel]: {
       type: "boolean",
       description: `Run commands concurrently instead of sequentially (capped at ${MAX_PARALLEL_CONCURRENCY}).`,
     },
-    mutates: {
+    [PLAN_FIELD_NAMES.mutates]: {
       type: "boolean",
       description:
         "True ONLY for writes/installs/deletes. Tests/builds/linters/cat/ls/grep are NOT mutating. Mutating nodes hard-stop without running.",
     },
-    edges: {
+    [PLAN_FIELD_NAMES.edges]: {
       type: "array",
       items: PlanEdge,
       description: "Conditions evaluated in order; first match wins. Omit for a leaf.",
     },
   },
-  required: ["id", "commands"],
+  required: [PLAN_FIELD_NAMES.id, PLAN_FIELD_NAMES.commands],
 } as const;
 
 const PlanTreeSchema = {
   type: "object",
   properties: {
-    root: { type: "string", description: "Starting node id." },
-    nodes: { type: "array", items: PlanNode },
-    cwd: {
+    [PLAN_FIELD_NAMES.root]: { type: "string", description: "Starting node id." },
+    [PLAN_FIELD_NAMES.nodes]: { type: "array", items: PlanNode },
+    [PLAN_FIELD_NAMES.cwd]: {
       type: "string",
-      description: "Base dir for commands and fileExists (relative to session cwd).",
+      description: PLAN_CWD_DESCRIPTION,
     },
-    maxDepth: { type: "number", description: "Cap on speculation depth." },
+    [PLAN_FIELD_NAMES.maxDepth]: {
+      type: "number",
+      maximum: DEFAULT_MAX_DEPTH,
+      description: `Cap on speculation depth; values above ${DEFAULT_MAX_DEPTH} are clamped.`,
+    },
   },
-  required: ["root", "nodes"],
+  required: [PLAN_FIELD_NAMES.root, PLAN_FIELD_NAMES.nodes],
 };
 
 const DESCRIPTION =

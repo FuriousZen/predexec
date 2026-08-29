@@ -3,11 +3,23 @@ import {
   CONDITION_KINDS,
   MAX_OPERATIONS_PER_NODE,
   MAX_PARALLEL_CONCURRENCY,
+  PLAN_FIELD_NAMES,
   PLAN_SHAPE_DESCRIPTION,
   TOOL_OPERATION_NAMES,
 } from "../plan-language.ts";
 
 describe("canonical plan language", () => {
+  it("publishes canonical plan field names for schema projections", () => {
+    expect(PLAN_FIELD_NAMES).toMatchObject({
+      root: "root",
+      nodes: "nodes",
+      commands: "commands",
+      cwd: "cwd",
+      maxDepth: "maxDepth",
+    });
+    expect(Object.isFrozen(PLAN_FIELD_NAMES)).toBe(true);
+  });
+
   it("publishes immutable condition and tool vocabularies", () => {
     expect(CONDITION_KINDS).toEqual(["exitCode", "fileExists", "jsonPath", "numeric", "match", "always"]);
     expect(TOOL_OPERATION_NAMES).toEqual(["read", "grep", "find", "ls"]);
