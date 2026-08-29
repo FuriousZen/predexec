@@ -122,3 +122,81 @@ Passed with no whitespace errors.
 - The existing `isSafeRegex` policy remains best-effort and narrow by design;
   it rejects nested open-ended quantifier groups such as `(a+)+` but does not
   claim to prove all JavaScript regexes terminate quickly.
+
+## Fix round 1/5
+
+### RED regressions
+
+Added four regressions before the fix:
+
+- `^$` must match an empty file and the synthetic terminal empty line created
+  by the old `split("\\n")` implementation.
+- LF-only splitting must preserve `\\r` in CRLF and bare-CR text, including
+  read output and grep line text.
+- A binary NUL arriving after the fourth match must still cause the complete
+  file to be refused, even though match processing has stopped at
+  `limit + 1`.
+- An already-aborted read must report its read failure, while an aborted grep
+  must retain the search-not-run exit code `2` and report `aborted`.
+
+Before the fix:
+
+```text
+./node_modules/.bin/vitest run __tests__/mcp/tool-ops.test.ts
+```
+
+`83 tests | 3 failed`: synthetic empty-line search, CR preservation, and
+aborted read. The binary regression initially used a tiny file and passed
+because the NUL shared the first stream chunk; it was strengthened to place the
+NUL after 128 KiB, in a later chunk, before implementation work continued.
+
+### GREEN implementation
+
+- Replaced `node:readline` with an LF-only incremental splitter driven by
+  `createReadStream` and `StringDecoder`. It preserves carriage returns,
+  counts the terminal empty line for empty/final-LF files, and emits the same
+  one-based line sequence as `Buffer.toString("utf8").split("\\n")`.
+- Match callbacks are disabled after `limit + 1`, but the stream continues
+  through every remaining chunk with only the line buffer/counters and NUL
+  flag retained. A binary file therefore cannot become a successful match
+  merely because its NUL occurs after the match cap.
+- Passed `AbortSignal` into read, grep, and context scans and into
+  `createReadStream({signal})`. Abort errors are rethrown instead of being
+  mistaken for unreadable files; executor classification consequently remains
+  read exit `1` and grep exit `2`.
+- Synthetic terminal-line handling now lives in the shared scanner, so read,
+  grep, and context formatting all receive the same LF-split semantics.
+
+Fix-round focused GREEN command:
+
+```text
+./node_modules/.bin/vitest run __tests__/mcp/tool-ops.test.ts
+```
+
+Passed: `1` file, `83/83` tests.
+
+### Fix-round self-review
+
+- The scanner's retained match state remains bounded: pending/current-file and
+  global match collections stop at `limit + 1`; continuing for binary detection
+  does not retain later line text.
+- The scanner's unfinished line buffer can be as large as one physical line,
+  which is required to evaluate that line and is the same unavoidable unit of
+  retention for a line-oriented search. No complete-file array/string is built.
+- The context cache still scales with requested context and returned matches;
+  this is a pre-existing output requirement and remains a minor ledger
+  concern rather than an unrelated scope expansion.
+- `rg` behavior remains unchanged; these signal and LF-splitting corrections
+  apply to the pure-Node path that owns the fallback bounded-read contract.
+
+### Fix-round verification
+
+```text
+./node_modules/.bin/tsc --noEmit
+./node_modules/.bin/tsc -p tsconfig.build.json
+./node_modules/.bin/vitest run
+git diff --check
+```
+
+All passed after the fix round: full suite `19` files / `693` tests, typecheck,
+build, and whitespace check.

@@ -454,6 +454,47 @@ describe("mcp tool-ops — helpers", () => {
 });
 
 describe("mcp tool-ops — bounded fallback scans", () => {
+  it("searches empty files and the synthetic terminal line from LF splitting", async () => {
+    write("empty-grep.txt", "");
+    write("trailing-empty-grep.txt", "one\n");
+    const empty = await run({ tool: "grep", pattern: "^$", path: "empty-grep.txt" }, NODE_ONLY);
+    const trailing = await run({ tool: "grep", pattern: "^$", path: "trailing-empty-grep.txt" }, NODE_ONLY);
+    expect(empty).toMatchObject({ exitCode: 0, stdout: "empty-grep.txt:1:" });
+    expect(trailing).toMatchObject({ exitCode: 0, stdout: "trailing-empty-grep.txt:2:" });
+  });
+
+  it("preserves carriage returns because only LF terminates fallback lines", async () => {
+    write("legacy-lines.txt", Buffer.from("one\r\ntwo\rthree\n", "utf8"));
+    const read = await run({ tool: "read", path: "legacy-lines.txt" }, NODE_ONLY);
+    const grep = await run({ tool: "grep", pattern: "^two\\rthree$", path: "legacy-lines.txt" }, NODE_ONLY);
+    expect(read.stdout).toBe("one\r\ntwo\rthree\n");
+    expect(grep).toMatchObject({ exitCode: 0, stdout: "legacy-lines.txt:2:two\rthree" });
+  });
+
+  it("continues scanning for NUL bytes after the match retention cap", async () => {
+    write(
+      "binary-after-cap.dat",
+      Buffer.concat([Buffer.from("hit\nhit\nhit\nhit\n", "utf8"), Buffer.alloc(128 * 1024, 97), Buffer.from([0])]),
+    );
+    const r = await run({ tool: "grep", pattern: "hit", path: "binary-after-cap.dat", limit: 3 }, NODE_ONLY);
+    expect(r.exitCode).toBe(1);
+    expect(r.stdout).toBe("");
+    expect(r.stderr).not.toContain("match limit reached");
+  });
+
+  it("classifies aborted fallback read and grep as search-not-run where applicable", async () => {
+    write("abort.txt", "ready\n");
+    const executor = createToolExecutor({ cwd: root, ...NODE_ONLY });
+    const controller = new AbortController();
+    controller.abort();
+    const read = await executor({ tool: "read", path: "abort.txt" }, { cwd: root, signal: controller.signal });
+    const grep = await executor({ tool: "grep", pattern: "ready", path: "abort.txt" }, { cwd: root, signal: controller.signal });
+    expect(read.exitCode).toBe(1);
+    expect(read.stderr).toContain("aborted");
+    expect(grep.exitCode).toBe(2);
+    expect(grep.stderr).toContain("aborted");
+  });
+
   it("rejects unsafe regexes with search-not-run exit 2", async () => {
     const path = "unsafe-regex.txt";
     write(path, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n");
