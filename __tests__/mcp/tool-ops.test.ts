@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
@@ -185,6 +185,44 @@ describe("mcp tool-ops — path containment", () => {
     const r = await runSymlink({ tool: "read", path: "node_modules/pkg/package.json" });
     expect(r.exitCode).toBe(0);
     expect(r.stdout).toBe('{"name":"outside-package"}\n');
+  });
+
+  it.skipIf(!symlinksAvailable)("uses the canonical match file for context after a lexical alias is swapped", async () => {
+    const contextRoot = mkdtempSync(join(tmpdir(), "px-context-root-"));
+    const inside = join(contextRoot, "inside");
+    const alias = join(contextRoot, "alias");
+    const outsideContext = join(outside, "context-target");
+    const fakeRg = join(contextRoot, "fake-rg.cjs");
+    mkdirSync(inside);
+    mkdirSync(outsideContext, { recursive: true });
+    writeFileSync(join(inside, "target.txt"), "inside-before\nhit\ninside-after\n");
+    writeFileSync(join(outsideContext, "target.txt"), "outside-before\nhit\noutside-after\n");
+    symlinkSync(inside, alias, "junction");
+    writeFileSync(
+      fakeRg,
+      `#!/usr/bin/env node
+const fs = require("node:fs");
+const path = require("node:path");
+const args = process.argv.slice(2);
+const scope = args.at(-1);
+process.stdout.write(path.join(scope, "target.txt") + "\\0" + "2:hit\\n");
+fs.unlinkSync(${JSON.stringify(alias)});
+fs.symlinkSync(${JSON.stringify(outsideContext)}, ${JSON.stringify(alias)}, "junction");
+`,
+    );
+    chmodSync(fakeRg, 0o755);
+    try {
+      const executor = createToolExecutor({ cwd: contextRoot, rgPath: fakeRg, fdPath: null });
+      const r = await executor(
+        { tool: "grep", pattern: "hit", path: "alias", context: 1 },
+        { cwd: contextRoot },
+      );
+      expect(r.exitCode).toBe(0);
+      expect(r.stdout).toBe("alias/target.txt-1-inside-before\nalias/target.txt:2:hit\nalias/target.txt-3-inside-after");
+    } finally {
+      rmSync(contextRoot, { recursive: true, force: true });
+      rmSync(outsideContext, { recursive: true, force: true });
+    }
   });
 });
 

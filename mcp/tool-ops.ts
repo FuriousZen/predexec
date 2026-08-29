@@ -30,8 +30,7 @@
 
 import { execFile } from "node:child_process";
 import { accessSync, constants } from "node:fs";
-import { createReadStream } from "node:fs";
-import { readdir, realpath, stat } from "node:fs/promises";
+import { open, opendir, realpath, stat } from "node:fs/promises";
 import { delimiter, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { promisify } from "node:util";
@@ -311,7 +310,7 @@ async function runBinary(
 /**
  * Depth-first file walk used whenever rg/fd are absent.
  *
- * Symlinked directories are not descended: `readdir` dirents reflect lstat, so
+ * Symlinked directories are not descended: directory dirents reflect lstat, so
  * `isDirectory()` is false for them. That drops cycle risk for free and matches
  * fd, which also needs an explicit `--follow`.
  */
@@ -321,20 +320,29 @@ async function walkFiles(dir: string, signal?: AbortSignal): Promise<{ files: st
   while (stack.length > 0) {
     if (signal?.aborted) throw new Error("aborted");
     const current = stack.pop()!;
-    let entries;
+    const currentCanonical = await realpathOrNull(current);
+    if (currentCanonical !== current) continue;
+    let handle;
     try {
-      entries = await readdir(current, { withFileTypes: true });
+      // Opening the directory gives this walk a stable directory handle for the
+      // enumeration. The pathname can still be replaced before opendir, so the
+      // caller's realpath check remains the boundary defense.
+      handle = await opendir(current);
     } catch {
       continue; // unreadable dir: skip it rather than failing the whole walk
     }
-    for (const entry of entries) {
-      const abs = join(current, entry.name);
-      if (entry.isDirectory()) {
-        if (!SKIP_DIRS.has(entry.name)) stack.push(abs);
-      } else if (entry.isFile()) {
-        if (files.length >= MAX_WALK_FILES) return { files, capped: true };
-        files.push(abs);
+    try {
+      for await (const entry of handle) {
+        const abs = join(current, entry.name);
+        if (entry.isDirectory()) {
+          if (!SKIP_DIRS.has(entry.name)) stack.push(abs);
+        } else if (entry.isFile()) {
+          if (files.length >= MAX_WALK_FILES) return { files, capped: true };
+          files.push(abs);
+        }
       }
+    } finally {
+      await handle.close().catch(() => undefined);
     }
   }
   return { files, capped: false };
@@ -397,7 +405,17 @@ async function scanTextLines(
   onLine: (line: string, lineNo: number) => boolean | void,
   signal?: AbortSignal,
 ): Promise<TextScan> {
-  const input = createReadStream(path, signal ? { signal } : undefined);
+  if (signal?.aborted) throw new Error("aborted");
+  // `target` and the walk hand us canonical paths. Rechecking here catches a
+  // parent-directory replacement before opening the pathname; O_NOFOLLOW then
+  // protects the final component on platforms that expose it.
+  if ((await realpathOrNull(path)) !== path) throw new Error("target changed during operation");
+  const handle = await open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+  const input = handle.createReadStream({ autoClose: false });
+  const abort = (): void => {
+    input.destroy(new Error("aborted"));
+  };
+  signal?.addEventListener("abort", abort, { once: true });
   let bytes = 0;
   let lastByte = -1;
   let binary = false;
@@ -443,7 +461,9 @@ async function scanTextLines(
     if (signal?.aborted) throw new Error("aborted");
     throw err;
   } finally {
-    if (signal?.aborted) input.destroy();
+    signal?.removeEventListener("abort", abort);
+    input.destroy();
+    await handle.close().catch(() => undefined);
   }
   const finalNewline = bytes > 0 && lastByte === 10;
   return {
@@ -459,6 +479,8 @@ async function scanTextLines(
 interface Match {
   /** Relative to the op's cwd, posix-separated. */
   path: string;
+  /** Canonical path actually scanned; never reconstruct this from `path`. */
+  canonicalPath: string;
   line: number;
   text: string;
 }
@@ -481,21 +503,36 @@ async function grepOp(
   const literal = op.literal === true;
   const glob = op.glob === undefined ? undefined : String(op.glob);
 
+  // Revalidate immediately before handing the target to either the accelerator
+  // or the fallback. This closes the ordinary alias-swap window while the
+  // local options above are being prepared (the remaining pathname race is
+  // documented below).
+  const currentScope = await target(op, root, base, "grep");
+  if (currentScope.err) return currentScope.err;
+
   const notes: string[] = [];
   let matches: Match[];
   if (rg) {
-    const found = await grepViaRg(rg, pattern, scope.abs, scope.lexicalAbs, base, { ignoreCase, literal, glob }, signal);
+    const found = await grepViaRg(
+      rg,
+      pattern,
+      currentScope.abs,
+      currentScope.lexicalAbs,
+      base,
+      { ignoreCase, literal, glob },
+      signal,
+    );
     if (found.err) return found.err;
     matches = found.matches;
   } else {
     // Only a directory search has a file set to diverge over; on one named file
     // the note would be noise about a decision that was never made.
-    if (scope.isDir) notes.push(`grep: ripgrep ${NO_GITIGNORE_NOTE}`);
+    if (currentScope.isDir) notes.push(`grep: ripgrep ${NO_GITIGNORE_NOTE}`);
     const found = await grepViaNode(
       pattern,
-      scope.abs,
-      scope.lexicalAbs,
-      scope.isDir,
+      currentScope.abs,
+      currentScope.lexicalAbs,
+      currentScope.isDir,
       base,
       { ignoreCase, literal, glob },
       limit,
@@ -504,6 +541,13 @@ async function grepOp(
     if (found.err) return found.err;
     if (found.capped) notes.push(walkCapNote("grep"));
     matches = found.matches;
+  }
+
+  for (const match of matches) {
+    const canonical = await realpathOrNull(match.canonicalPath);
+    if (canonical !== match.canonicalPath || !isWithin(currentScope.abs, match.canonicalPath)) {
+      return fail("grep", `search result escaped its validated target: ${match.canonicalPath}`);
+    }
   }
 
   if (matches.length > limit) {
@@ -551,6 +595,7 @@ async function grepViaRg(
     if (!Number.isInteger(lineNo)) continue;
     matches.push({
       path: displayRel(base, abs, lexicalAbs, line.slice(0, nul)),
+      canonicalPath: line.slice(0, nul),
       line: lineNo,
       text: rest.slice(colon + 1),
     });
@@ -602,7 +647,7 @@ async function grepViaNode(
     try {
       const scan = await scanTextLines(file, (text, line) => {
         if (re!.test(text)) {
-          pending.push({ path: rel, line, text });
+          pending.push({ path: rel, canonicalPath: file, line, text });
           if (matches.length + pending.length > limit) return false;
         }
       }, signal);
@@ -633,13 +678,13 @@ async function formatMatches(matches: Match[], base: string, context: number, si
   const cache = new Map<string, { lines: Map<number, string>; total: number }>();
   const blocks: string[] = [];
   for (const m of matches) {
-    let cached = cache.get(m.path);
+    let cached = cache.get(m.canonicalPath);
     if (!cached) {
-      const related = matches.filter((candidate) => candidate.path === m.path);
+      const related = matches.filter((candidate) => candidate.canonicalPath === m.canonicalPath);
       const lines = new Map<number, string>();
       let total = 0;
       try {
-        const scan = await scanTextLines(resolve(base, m.path), (text, line) => {
+        const scan = await scanTextLines(m.canonicalPath, (text, line) => {
           if (related.some((candidate) => Math.abs(line - candidate.line) <= context)) lines.set(line, text);
         }, signal);
         total = scan.totalLines;
@@ -648,7 +693,7 @@ async function formatMatches(matches: Match[], base: string, context: number, si
         total = 0;
       }
       cached = { lines, total };
-      cache.set(m.path, cached);
+      cache.set(m.canonicalPath, cached);
     }
     const from = Math.max(1, m.line - context);
     const to = Math.min(cached.total, m.line + context);
@@ -691,6 +736,12 @@ async function findOp(
     return fail("find", `invalid glob: ${errText(err)}`);
   }
 
+  // Glob compilation is local work between the initial locate and the walk;
+  // close that gap with one final realpath check at the operation boundary.
+  const currentScope = await target(op, root, base, "find");
+  if (currentScope.err) return currentScope.err;
+  if (!currentScope.isDir) return fail("find", `"${String(op.path)}" is a file — find searches a directory`);
+
   const notes: string[] = [];
   let files: string[];
   if (fd) {
@@ -699,21 +750,33 @@ async function findOp(
     // i.e. every name — the pattern is applied afterwards.
     const { stdout, stderr, code } = await runBinary(
       fd,
-      ["--type", "f", "--color", "never", "--hidden", "--exclude", ".git", "--exclude", "node_modules", ".", scope.abs],
+      [
+        "--type",
+        "f",
+        "--color",
+        "never",
+        "--hidden",
+        "--exclude",
+        ".git",
+        "--exclude",
+        "node_modules",
+        ".",
+        currentScope.abs,
+      ],
       signal,
     );
     if (code >= 2) return fail("find", stderr.trim() || `fd exited ${code}`);
     files = stdout.split("\n").filter(Boolean);
   } else {
     notes.push(`find: fd ${NO_GITIGNORE_NOTE}`);
-    const walked = await walkFiles(scope.abs, signal);
+    const walked = await walkFiles(currentScope.abs, signal);
     if (walked.capped) notes.push(walkCapNote("find"));
     files = walked.files;
   }
 
   const limit = positiveInt(op.limit) ?? DEFAULT_FIND_LIMIT;
   const hits = files
-    .map((f) => displayRel(base, scope.abs, scope.lexicalAbs, f))
+    .map((f) => displayRel(base, currentScope.abs, currentScope.lexicalAbs, f))
     .filter((rel) => matchesGlob(re, rel, pattern))
     .sort();
   if (hits.length > limit) {
@@ -730,7 +793,13 @@ async function lsOp(op: ToolOp, root: string, base: string): Promise<OpResult> {
   if (scope.err) return scope.err;
   if (!scope.isDir) return fail("ls", `${String(op.path ?? ".")} is not a directory — use {tool:"read"} for files`);
 
-  const entries = await readdir(scope.abs, { withFileTypes: true });
+  const directory = await opendir(scope.abs);
+  const entries = [];
+  try {
+    for await (const entry of directory) entries.push(entry);
+  } finally {
+    await directory.close().catch(() => undefined);
+  }
   entries.sort((a, b) => a.name.toLowerCase().localeCompare(b.name.toLowerCase()));
 
   const names: string[] = [];

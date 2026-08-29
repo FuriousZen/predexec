@@ -243,6 +243,13 @@ MCP `read`/`grep`/`find`/`ls` paths are checked after symlink resolution and can
 session root; dependency symlinks below an exact `node_modules` path segment are the sole
 exception.
 
+The MCP adapter revalidates canonical paths at operation boundaries, post-validates search result
+paths, uses stable directory handles for local walks/listings, and opens files with `O_NOFOLLOW`
+where the platform exposes that flag. Node does not provide a portable `openat`/`readdirat`
+traversal API, so a malicious concurrent rename/replacement of a parent directory can still
+race a pathname-based open or an `rg`/`fd` accelerator; this is outside the adapter's
+single-process threat model.
+
 #### Plugin form (optional)
 
 The repo also carries a plugin wrapper (`.claude-plugin/plugin.json`) that bundles the MCP

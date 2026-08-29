@@ -101,3 +101,71 @@ Passed with no whitespace errors.
 - The only intentional realpath escape is a target whose lexical relative path
   contains an exact `node_modules` segment. Names such as `node_modules-evil`
   do not qualify.
+
+## Fix round 1/5
+
+### RED regression
+
+Added a deterministic accelerator fixture that emits a match for a canonical
+file under `root/alias`, then swaps the lexical `alias` symlink to an outside
+directory before the executor formats context lines. Before the fix,
+`formatMatches` reconstructed `resolve(base, m.path)`, reopened the swapped
+alias, and returned the outside file's context instead of the scanned file.
+
+```text
+./node_modules/.bin/vitest run __tests__/mcp/tool-ops.test.ts
+```
+
+Observed: `86 tests | 1 failed`; the new test returned `outside-before` and
+`outside-after` where the canonical file required `inside-before` and
+`inside-after`.
+
+### GREEN implementation
+
+- `Match` now carries `canonicalPath` alongside its lexical display path.
+- Both rg and the pure-Node fallback populate that field from the actual path
+  scanned; context formatting groups and reads by `canonicalPath` only.
+- Search results are rejected if an accelerator reports a canonical path outside
+  the validated search scope or if that path no longer resolves canonically
+  before formatting (including context-free results).
+- Revalidation now runs immediately before grep/find operation work after local
+  option/glob preparation.
+- Pure-Node file scans recheck canonicality immediately before opening and use a
+  `FileHandle` stream with `O_NOFOLLOW` where available. Aborted streams retain
+  Task 6's `aborted` classification.
+- Directory walks/listings use `opendir` handles, and recursive walks recheck
+  each canonical directory before opening it; directory symlinks remain
+  un-followed during recursion.
+
+Focused GREEN command and result:
+
+```text
+./node_modules/.bin/vitest run __tests__/mcp/tool-ops.test.ts
+```
+
+Passed: `1` file, `86/86` tests.
+
+### Remaining TOCTOU limitation
+
+Node 22 does not expose a portable `openat`/`readdirat`-style API that lets this
+adapter resolve every path component relative to a directory handle. A parent
+directory can therefore still be renamed/replaced in the small interval between
+the final realpath check and a pathname-based `opendir`/open, and the rg/fd
+accelerators necessarily operate on pathnames. File handles stabilize data once
+opened; canonical-path checks, `O_NOFOLLOW` on the final component, directory
+handles, result-scope validation, and post-open canonical checks reduce the race
+and prevent ordinary alias swaps, but they cannot provide kernel-atomic traversal
+against a malicious concurrent renamer. The README documents this exact
+single-process threat-model boundary.
+
+### Fix-round verification
+
+```text
+./node_modules/.bin/tsc --noEmit
+./node_modules/.bin/tsc -p tsconfig.build.json
+./node_modules/.bin/vitest run
+git diff --check
+```
+
+All passed after the fix round; final counts and commit are recorded in the
+handoff message.
