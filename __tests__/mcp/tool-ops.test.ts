@@ -224,6 +224,22 @@ fs.symlinkSync(${JSON.stringify(outsideContext)}, ${JSON.stringify(alias)}, "jun
       rmSync(outsideContext, { recursive: true, force: true });
     }
   });
+
+  it("rejects an accelerator find result outside the validated search scope", async () => {
+    const fakeFd = join(symlinkRoot, "fake-fd.cjs");
+    writeFileSync(
+      fakeFd,
+      `#!/usr/bin/env node
+process.stdout.write(${JSON.stringify(join(outside, "secret.txt"))} + "\\n");
+`,
+    );
+    chmodSync(fakeFd, 0o755);
+    const executor = createToolExecutor({ cwd: root, rgPath: null, fdPath: fakeFd });
+    const r = await executor({ tool: "find", pattern: "*.txt" }, { cwd: root });
+    expect(r.exitCode).toBe(2);
+    expect(r.stdout).toBe("");
+    expect(r.stderr).toContain("find result escaped its validated target");
+  });
 });
 
 describe("mcp tool-ops — ls", () => {

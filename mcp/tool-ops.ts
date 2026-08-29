@@ -283,6 +283,24 @@ function displayRel(base: string, operationRoot: string, lexicalRoot: string, ab
   return relativize(base, lexical);
 }
 
+/** Validate and canonicalize enumerated find results before exposing them. */
+async function validateFindFiles(
+  files: string[],
+  scope: string,
+): Promise<{ files: string[]; err?: undefined } | { files?: undefined; err: OpResult }> {
+  const canonicalFiles: string[] = [];
+  for (const file of files) {
+    const candidate = isAbsolute(file) ? resolve(file) : resolve(scope, file);
+    const canonical = await realpathOrNull(candidate);
+    const info = canonical ? await statOrNull(canonical) : null;
+    if (!canonical || !isWithin(scope, canonical) || !info?.isFile()) {
+      return { err: fail("find", `find result escaped its validated target: ${file}`) };
+    }
+    canonicalFiles.push(canonical);
+  }
+  return { files: canonicalFiles };
+}
+
 /**
  * Run an accelerator binary, keeping the process's own exit status distinct from
  * "the process never ran". rg encodes real meaning in its exit code (1 = no
@@ -773,6 +791,10 @@ async function findOp(
     if (walked.capped) notes.push(walkCapNote("find"));
     files = walked.files;
   }
+
+  const validated = await validateFindFiles(files, currentScope.abs);
+  if (validated.err) return validated.err;
+  files = validated.files;
 
   const limit = positiveInt(op.limit) ?? DEFAULT_FIND_LIMIT;
   const hits = files

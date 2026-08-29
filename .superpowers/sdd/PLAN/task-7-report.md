@@ -169,3 +169,57 @@ git diff --check
 
 All passed after the fix round; final counts and commit are recorded in the
 handoff message.
+
+## Fix round 2/5
+
+### RED regression
+
+Added a fake `fd` executable that reports an absolute file outside the validated
+find scope. Before the fix, `find` consumed that output directly, matched the
+basename, and returned the outside path with exit `0`. A server-description
+assertion also failed because the client-visible plan guidance made no mention
+of the documented non-atomic parent-directory race.
+
+```text
+./node_modules/.bin/vitest run __tests__/mcp/tool-ops.test.ts __tests__/mcp/server.test.ts
+```
+
+Observed: `3` failures: the malicious find result returned success, the new
+containment limitation prose was absent, and the first fake-fd fixture lived in
+the shared test root and appeared in an existing `ls` assertion. The fixture was
+moved to the isolated temporary root before implementation, leaving normal
+listing/parity fixtures unchanged.
+
+### GREEN implementation
+
+- Added `validateFindFiles`, which resolves relative accelerator output against
+  the canonical search scope, resolves each result through realpath, confirms
+  it remains within that canonical scope, and confirms it is a regular file.
+  Any unsafe result fails closed with find's search-not-run exit code `2`.
+- Fallback walk paths receive the same canonical/scope post-validation, covering
+  parent replacement after enumeration as far as pathname-based Node APIs allow.
+- Valid results continue through the existing lexical display-path mapping, so
+  output remains stable for `/var` aliases and dependency symlink scopes.
+- Added the explicit non-atomic parent-directory limitation to the MCP plan
+  description, matching README wording and avoiding an absolute containment
+  guarantee.
+
+Focused GREEN command and result:
+
+```text
+./node_modules/.bin/vitest run __tests__/mcp/tool-ops.test.ts __tests__/mcp/server.test.ts
+```
+
+Passed: `2` files, `107/107` tests.
+
+### Fix-round verification
+
+```text
+./node_modules/.bin/tsc --noEmit
+./node_modules/.bin/tsc -p tsconfig.build.json
+./node_modules/.bin/vitest run
+git diff --check
+```
+
+All passed after this fix round; final counts and commit are recorded in the
+handoff message.

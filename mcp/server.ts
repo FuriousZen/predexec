@@ -96,6 +96,7 @@ const PLAN_ARG_DESCRIPTION =
   JSON_PATH_SINGLE_OP_LINE + " " +
   "Note: tool ops read the filesystem directly (they are not Claude Code's native Read/Grep), " +
   "paths may not escape the session root (dependency symlinks below node_modules are the sole exception), " +
+  "canonical checks do not provide kernel-atomic protection against concurrent parent-directory replacement, " +
   "and grep/find fall back to a pure-Node walk that ignores .gitignore when ripgrep/fd are absent.";
 
 /**
