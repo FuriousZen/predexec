@@ -181,8 +181,8 @@ const OPAQUE_SUBSHELL_RE = /\$\(|`|<\(|>\(/;
 
 /**
  * Split a compound command into pipeline segments on unquoted `|`, `;`, `&&`,
- * `||`, and bare `&` (but not `>&`/`&&` fd-dup/joins). Exception-safe: any
- * confusion degrades to the whole command as one segment (= status-quo scan).
+ * `||`, newlines, and bare `&` (but not `>&`/`&&` fd-dup/joins). Exception-safe:
+ * any confusion degrades to the whole command as one segment (= status-quo scan).
  */
 export function splitCommandSegments(cmd: string): string[] {
   try {
@@ -194,7 +194,7 @@ export function splitCommandSegments(cmd: string): string[] {
       const ch = cmd[i]!;
       if (ch === "'" && !inDouble) inSingle = !inSingle;
       else if (ch === '"' && !inSingle) inDouble = !inDouble;
-      if (!inSingle && !inDouble && (ch === "|" || ch === ";" || ch === "&")) {
+      if (!inSingle && !inDouble && (ch === "|" || ch === ";" || ch === "&" || ch === "\n" || ch === "\r")) {
         // `2>&1` / `>&2`: an & directly after `>` is an fd dup, not a join.
         if (ch === "&" && cmd[i - 1] === ">") {
           current += ch;
@@ -204,6 +204,8 @@ export function splitCommandSegments(cmd: string): string[] {
         current = "";
         // swallow the second char of `&&` / `||`
         if (cmd[i + 1] === ch) i++;
+        // Treat CRLF as one command separator.
+        if (ch === "\r" && cmd[i + 1] === "\n") i++;
         continue;
       }
       current += ch;
@@ -225,6 +227,31 @@ export function splitCommandSegments(cmd: string): string[] {
  */
 const WRAPPERS = new Set(["time", "nice", "nohup", "command", "xargs", "env"]);
 
+/** Wrapper flags whose next token is a flag value rather than the command. */
+const WRAPPER_OPTIONS_WITH_VALUE: Record<string, Set<string>> = {
+  env: new Set(["-u", "--unset", "-C", "--chdir", "-S", "--split-string"]),
+  nice: new Set(["-n", "--adjustment"]),
+  xargs: new Set([
+    "-E", "-I", "-L", "-n", "-P", "-s", "-a", "--eof", "--end-of-file", "--replace",
+    "--max-lines", "--max-procs", "--max-chars", "--arg-file",
+  ]),
+  command: new Set(),
+  time: new Set(["-f", "--format", "-o", "--output"]),
+  nohup: new Set(),
+};
+
+function wrapperOptionHasAttachedValue(wrapper: string, option: string): boolean {
+  if (wrapper === "env") {
+    return /^-(?:u|C|S).+/.test(option) || /^(?:--unset|--chdir|--split-string)=/.test(option);
+  }
+  if (wrapper === "nice") return /^-n.+/.test(option) || /^--adjustment=/.test(option);
+  if (wrapper === "xargs") {
+    return /^-[EILnPsa].+/.test(option) || /^(?:--eof|--end-of-file|--replace|--max-lines|--max-procs|--max-chars|--arg-file)=/.test(option);
+  }
+  if (wrapper === "time") return /^(?:--format|--output)=/.test(option);
+  return false;
+}
+
 /**
  * Privileged escalation heads. Never speculated on: a privileged command is
  * outside the recoverable read-only zone by definition, and detection would
@@ -237,15 +264,36 @@ const PRIVILEGE_HEADS = new Set(["sudo", "doas", "pkexec"]);
  * and wrapper commands, resolves `/usr/bin/cat` → `cat`. `sudo`/`doas` are
  * returned as-is (never allowlisted). Null when nothing identifiable remains.
  */
-export function effectiveHead(segment: string): string | null {
-  const tokens = segment.trim().split(/\s+/);
-  for (const token of tokens) {
+function effectiveHeadIndex(tokens: string[]): number | null {
+  let wrapper: string | null = null;
+  for (let i = 0; i < tokens.length; i++) {
+    const token = tokens[i]!;
     if (/^\w+=/.test(token)) continue; // env-var prefix
     const base = token.replace(/^.*\//, "");
-    if (WRAPPERS.has(base)) continue; // classify what it runs
-    return base || null;
+    if (WRAPPERS.has(base)) {
+      wrapper = base;
+      continue; // classify what it runs
+    }
+    if (wrapper && token === "--") {
+      wrapper = null;
+      continue;
+    }
+    if (wrapper && token.startsWith("-")) {
+      const optionSet = WRAPPER_OPTIONS_WITH_VALUE[wrapper];
+      if (optionSet?.has(token) && i + 1 < tokens.length && !wrapperOptionHasAttachedValue(wrapper, token)) i++;
+      continue;
+    }
+    return i;
   }
   return null;
+}
+
+export function effectiveHead(segment: string): string | null {
+  const tokens = shellWords(segment);
+  const index = effectiveHeadIndex(tokens);
+  if (index === null) return null;
+  const base = tokens[index]!.replace(/^.*\//, "");
+  return base || null;
 }
 
 /**
@@ -312,16 +360,8 @@ function findGitMutationToken(segment: string): string | null {
   if (effectiveHead(segment) !== "git") return null;
 
   const tokens = shellWords(segment);
-  let gitIndex = 0;
-  while (gitIndex < tokens.length) {
-    const token = tokens[gitIndex]!;
-    if (/^\w+=/.test(token) || WRAPPERS.has(token.replace(/^.*\//, ""))) {
-      gitIndex++;
-      continue;
-    }
-    break;
-  }
-  if (gitIndex >= tokens.length || tokens[gitIndex]!.replace(/^.*\//, "") !== "git") return null;
+  const gitIndex = effectiveHeadIndex(tokens);
+  if (gitIndex === null || gitIndex >= tokens.length || tokens[gitIndex]!.replace(/^.*\//, "") !== "git") return null;
 
   let verbIndex = gitIndex + 1;
   while (verbIndex < tokens.length) {

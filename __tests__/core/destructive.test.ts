@@ -168,6 +168,12 @@ describe("splitCommandSegments", () => {
   it("does not split inside quotes", () => {
     expect(splitCommandSegments(`grep "a|b" f`)).toEqual([`grep "a|b" f`]);
     expect(splitCommandSegments("awk '{print $1; print $2}' f")).toEqual(["awk '{print $1; print $2}' f"]);
+    expect(splitCommandSegments('git grep "one\ntwo" -- README.md')).toEqual(['git grep "one\ntwo" -- README.md']);
+  });
+
+  it("splits newline and CRLF command separators", () => {
+    expect(splitCommandSegments("git status\ngit add file.txt")).toEqual(["git status", "git add file.txt"]);
+    expect(splitCommandSegments("git status\r\ngit add file.txt")).toEqual(["git status", "git add file.txt"]);
   });
 
   it("does not split fd dups (2>&1)", () => {
@@ -238,6 +244,38 @@ describe("mutation classifier — ordinary copy and git verbs", () => {
     "git status | grep 'cp source destination'",
   ])("allows read-only git command with options or quoted patterns: %s", (command) => {
     expect(findDestructiveToken(command)).toBeNull();
+  });
+});
+
+describe("mutation classifier — wrapper options and command separators", () => {
+  it.each([
+    "env -i git add file.txt",
+    "env -- git clone https://example.invalid/repo target",
+    "env -u GIT_CONFIG_NOSYSTEM git fetch origin",
+    "command -p git pull --ff-only",
+    "xargs -n 1 git init scratch",
+  ])("blocks Git mutation behind wrapper options: %s", (command) => {
+    expect(findDestructiveToken(command)).not.toBeNull();
+  });
+
+  it.each([
+    "env -i git status --short",
+    "env -- git diff --stat",
+    "env -u GIT_CONFIG_NOSYSTEM git log -5 --oneline",
+    "command -p git show HEAD:README.md",
+  ])("allows read-only Git behind wrapper options: %s", (command) => {
+    expect(findDestructiveToken(command)).toBeNull();
+  });
+
+  it.each([
+    "git status\ngit add file.txt",
+    "git status\r\ngit add file.txt",
+  ])("blocks a mutating Git command after a newline: %s", (command) => {
+    expect(findDestructiveToken(command)).not.toBeNull();
+  });
+
+  it("keeps quoted newlines inside one read-only command", () => {
+    expect(findDestructiveToken('git grep "status\ngit add file.txt" -- README.md')).toBeNull();
   });
 });
 

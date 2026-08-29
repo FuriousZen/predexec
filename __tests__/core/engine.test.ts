@@ -139,6 +139,21 @@ describe("runPlanTree — traversal & stop reasons", () => {
     }
   });
 
+  it("mutationStop: newline-separated Git mutation stops before runNode", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "predexec-git-"));
+    try {
+      const r = await runPlanTree(
+        { root: "a", nodes: [{ id: "a", commands: ["git status\ngit init scratch"] }] },
+        { cwd: dir },
+      );
+      expect(r.stoppedReason).toBe("mutationStop");
+      expect(r.pathTaken).toEqual([]);
+      expect(existsSync(join(dir, "scratch", ".git"))).toBe(false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("does NOT false-positive on 2>/dev/null or 2>&1", async () => {
     const plan: PlanTree = {
       root: "a",
