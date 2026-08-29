@@ -152,3 +152,9 @@ export interface RunOptions {
 
 /** Engine-level backstop when a plan omits maxDepth. */
 export const DEFAULT_MAX_DEPTH = 8;
+
+/** Maximum number of operations a single node may schedule. */
+export const MAX_OPERATIONS_PER_NODE = 64;
+
+/** Maximum number of operations running concurrently within a parallel node. */
+export const MAX_PARALLEL_CONCURRENCY = 8;

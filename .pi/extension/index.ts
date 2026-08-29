@@ -18,7 +18,8 @@ import {
   createFindTool,
   createLsTool,
 } from "@earendil-works/pi-coding-agent";
-import { isDestructiveCommand, type ToolOp } from "../../core/index.ts";
+import { isDestructiveCommand, OUTPUT_CAP, type ToolOp } from "../../core/index.ts";
+import { TRUNCATION_MARKER } from "../../core/runner.ts";
 import { executeAdapterPlan } from "../../adapter-runtime.ts";
 import { BASH_NUDGE, RECOVERY_LINE, USAGE_LINE, VERIFY_FIRST_LINE } from "../../steering.ts";
 
@@ -133,6 +134,13 @@ const DESCRIPTION =
   VERIFY_FIRST_LINE;
 
 type TextContent = { type: "text"; text: string };
+
+/** Append streamed progress without retaining unbounded command output. */
+export function appendProgressText(current: string, data: string): string {
+  const combined = current + data;
+  if (combined.length <= OUTPUT_CAP) return combined;
+  return `${combined.slice(0, OUTPUT_CAP)}\n${TRUNCATION_MARKER}]`;
+}
 
 /**
  * Map a pi tool result to shell-like output — exported for unit tests.
@@ -274,11 +282,15 @@ export default function predexec(pi: ExtensionAPI): void {
             pathTaken: event.pathTaken,
           });
         },
-        onCommandOutput(data) {
-          if (done) return;
-          streamedText += data;
-          scheduleOutputUpdate();
-        },
+        ...(onUpdate
+          ? {
+              onCommandOutput(data: string) {
+                if (done) return;
+                streamedText = appendProgressText(streamedText, data);
+                scheduleOutputUpdate();
+              },
+            }
+          : {}),
       });
 
       done = true;

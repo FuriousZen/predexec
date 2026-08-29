@@ -115,6 +115,33 @@ describe("runNode", () => {
     expect(r.exitCode).toBe(7); // the failing command's code surfaces
   });
 
+  it("bounds parallel tool execution while preserving command order", async () => {
+    let active = 0;
+    let maxActive = 0;
+    const r = await runNode(
+      {
+        id: "n",
+        parallel: true,
+        commands: Array.from({ length: 24 }, (_, index) => ({ tool: "slow", index })),
+      },
+      {
+        cwd,
+        executeToolOp: async (op) => {
+          active++;
+          maxActive = Math.max(maxActive, active);
+          await new Promise((resolve) => setTimeout(resolve, 5));
+          active--;
+          return { stdout: String(op.index), stderr: "", exitCode: 0 };
+        },
+      },
+    );
+
+    expect(maxActive).toBeLessThanOrEqual(8);
+    expect(r.exitCode).toBe(0);
+    const values = [...r.stdout.matchAll(/\[(\d+)\]\n(\d+)/g)].map((match) => match[2]);
+    expect(values).toEqual(Array.from({ length: 24 }, (_, index) => String(index)));
+  });
+
   it("returns immediately for an already-aborted signal", async () => {
     const r = await runNode({ id: "n", commands: ["echo nope"] }, { cwd, signal: AbortSignal.abort() });
     expect(r.stdout).not.toContain("nope");

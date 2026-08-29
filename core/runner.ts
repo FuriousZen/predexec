@@ -7,6 +7,7 @@
  */
 
 import { spawn } from "node:child_process";
+import { MAX_PARALLEL_CONCURRENCY } from "./types.ts";
 import type { NodeOutput, Operation, PlanNode, RunOptions, ToolOp } from "./types.ts";
 
 /** Per-stream capture cap (chars). Keeps the transcript bounded on noisy commands. */
@@ -52,7 +53,18 @@ async function runSequential(commands: Operation[], opts: RunOptions): Promise<C
 }
 
 async function runParallel(commands: Operation[], opts: RunOptions): Promise<CommandResult[]> {
-  return Promise.all(commands.map((command) => runOneOp(command, opts)));
+  const results = new Array<CommandResult>(commands.length);
+  let next = 0;
+  async function worker(): Promise<void> {
+    while (next < commands.length) {
+      const index = next++;
+      results[index] = await runOneOp(commands[index]!, opts);
+    }
+  }
+  await Promise.all(
+    Array.from({ length: Math.min(MAX_PARALLEL_CONCURRENCY, commands.length) }, () => worker()),
+  );
+  return results;
 }
 
 async function runOneOp(op: Operation, opts: RunOptions): Promise<CommandResult> {

@@ -421,6 +421,15 @@ describe("validatePlan", () => {
     expect(r.stoppedReason).toBe("error");
     expect(r.transcript).toContain("validation failed");
   });
+
+  it("rejects nodes over the 64-operation ceiling", async () => {
+    const r = await runPlanTree(
+      { root: "a", nodes: [{ id: "a", commands: Array.from({ length: 65 }, () => "true") }] },
+      { cwd },
+    );
+    expect(r.stoppedReason).toBe("error");
+    expect(r.transcript).toMatch(/64 operations/);
+  });
 });
 
 describe("runPlanTree — tool operations", () => {

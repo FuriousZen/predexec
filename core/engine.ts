@@ -23,6 +23,7 @@ import { runNode, isToolOp, formatToolOpLabel } from "./runner.ts";
 import {
   DEFAULT_MAX_DEPTH,
   HIGH_CONFIDENCE_KINDS,
+  MAX_OPERATIONS_PER_NODE,
   type CoreResult,
   type NodeOutput,
   type Operation,
@@ -174,6 +175,9 @@ export function validatePlan(plan: PlanTree, byId: Map<string, PlanNode>): strin
     if (!node || typeof node !== "object") return "every node must be an object";
     if (typeof node.id !== "string" || node.id === "") return "every node needs a non-empty string id";
     if (!Array.isArray(node.commands)) return `node "${node.id}" needs a commands array`;
+    if (node.commands.length > MAX_OPERATIONS_PER_NODE) {
+      return `node "${node.id}" exceeds the maximum of ${MAX_OPERATIONS_PER_NODE} operations per node`;
+    }
     if (node.edges !== undefined && !Array.isArray(node.edges)) return `node "${node.id}" edges must be an array`;
     if (byId.has(node.id)) return `duplicate node id "${node.id}"`;
     byId.set(node.id, node);

@@ -11,6 +11,8 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
+import { OUTPUT_CAP } from "../core/runner.ts";
+import { appendProgressText } from "../.pi/extension/index.ts";
 
 const { readToolCwds } = vi.hoisted(() => ({ readToolCwds: [] as string[] }));
 
@@ -53,6 +55,14 @@ const variants = [
   { name: "source (.pi/extension/index.ts)", predexec: predexecSource },
   { name: "compiled (dist/.pi/extension/index.js)", predexec: predexecCompiled },
 ];
+
+describe("pi progress buffering", () => {
+  it("caps accumulated progress text and marks truncation", () => {
+    const text = appendProgressText("", "x".repeat(100_000));
+    expect(text.length).toBeLessThanOrEqual(OUTPUT_CAP + 64);
+    expect(text).toContain("…[truncated");
+  });
+});
 
 describe.each(variants)("pi extension ($name) — registration contract (fake ExtensionAPI)", ({ predexec }) => {
   it("registers a `predexec` tool with the expected schema and prompt guidance", () => {
@@ -148,6 +158,27 @@ describe.each(variants)("pi extension ($name) — tool.execute", ({ predexec }) 
 
     expect(result.details.stoppedReason).toBe("leaf");
     expect(readToolCwds).toEqual([sub]);
+  });
+
+  it("does not accumulate command output when progress updates are omitted", async () => {
+    const { api, getTool } = createFakeApi();
+    predexec(api);
+    const tool = getTool();
+
+    const cwd = mkdtempSync(join(tmpdir(), "px-pi-"));
+    const result = await tool.execute(
+      "tc5",
+      {
+        root: "a",
+        nodes: [{ id: "a", commands: ["node -e 'process.stdout.write(\"x\".repeat(100000))'"] }],
+      },
+      undefined,
+      undefined,
+      { cwd },
+    );
+
+    expect(result.details.stoppedReason).toBe("leaf");
+    expect(result.content[0].text).toContain("…[truncated");
   });
 });
 
