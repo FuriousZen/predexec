@@ -56,7 +56,7 @@ design wants to get natively.
 | `read`/`grep`/`find`/`ls` | the host's **own tool factories** — exact parity | host SDK, with real caps | **own implementation** over `node:fs` (`rg`/`fd` accelerate) | same implementation as Claude Code (`mcp/tool-ops.ts` is shared) |
 | Steering | skill auto-loaded via `pi.skills` | guarded system-prompt push, or `AGENTS.md` | skill via plugin wrapper + tool description | `AGENTS.md` native (no plugin wrapper needed) + tool description |
 | Streaming progress | yes (`onUpdate`) | no | no | no |
-| Host permission rules | n/a — pi has no per-command rules (project-trust only) | reads `permission.bash`, last-match-wins | **self-enforced** from `settings.json` (host rules don't reach a subprocess) | **self-enforced** from `config.toml` + execpolicy rules — **no OS sandbox backstop** (MCP servers run outside it entirely, measured) |
+| Host permission rules | n/a — pi has no per-command rules (project-trust only) | **self-checked** from `permission.bash` plus supported native `read`/`grep`/`glob` rules (with local `list` compatibility), last-match-wins | **self-enforced** from `settings.json`, including mapped native read/search operations via supported `Read`/`Grep`/`Glob` rules (host rules don't reach a subprocess) | **self-enforced** from persisted `config.toml` + execpolicy rules for shell/Bash only — no persisted native file-operation source and **no OS sandbox backstop** (MCP servers run outside it entirely, measured) |
 | Published format | compiled ESM (`dist/`) | compiled ESM (`dist/`) | compiled ESM (`dist/`) | compiled ESM (`dist/`) |
 | **Fit** | **9 / 10** | **7 / 10** | **6 / 10** | **5 / 10** |
 
@@ -70,7 +70,9 @@ no sandbox.
 lost to measured SDK limits that predexec can only report, not fix: grep is **hard-capped at 10
 matches** server-side, `file.read` has no offset/limit and returns trimmed content, and `find` is
 fuzzy where pi's is glob-based. An npm-installed plugin also can't auto-register a skill, so
-steering falls back to a guarded system-prompt push.
+steering falls back to a guarded system-prompt push. In addition to Bash, predexec self-checks
+supported native `read`, `grep`, and `glob` permissions (with the repository's legacy `list`
+compatibility shape retained).
 
 **Claude Code — 6.** It works, and MCP is the only door — but out-of-process costs are real.
 There are no host tool factories, so `mcp/tool-ops.ts` is a second implementation of
@@ -87,6 +89,9 @@ inferred: a probe server wrote to disk with zero error while the session's own s
 confined to a `read-only` sandbox — so there is no OS-level backstop at all, only
 `mcp/policy-codex.ts`'s `config.toml`/execpolicy-rules reading and predexec's own
 `destructive.ts` heuristic (see the sandbox warning under [Codex CLI](#codex-cli) below).
+Its persisted policy checker is intentionally shell/Bash-only: Codex has no persisted native
+file-operation rule source for predexec to mirror, so native read/search operations continue
+through predexec's own read-only and containment guards.
 Second, Codex's default per-call approval mode treats an *unannotated* tool as destructive, so
 declaring `readOnlyHint: true` is load-bearing just to run a plan without a prompt under
 default settings (per Codex's source), not merely a nicety. What's better here: `AGENTS.md` is native to Codex, so declarative steering doesn't need
@@ -235,8 +240,10 @@ less. Two limits worth knowing:
 
 - `--allowedTools` / `--disallowedTools` passed on the CLI are invisible to a subprocess and
   cannot be honored. Put rules you rely on in a settings file.
-- predexec's own `read`/`grep` tool ops don't consult `Read(...)`/`Edit(...)` deny rules yet.
-  For OS-level enforcement that binds every process, enable
+- predexec's MCP `read`/`grep`/`find`/`ls` operations are self-checked against the supported
+  `Read(...)`, `Grep(...)`, and `Glob(...)` rules in Claude settings. Unsupported Claude
+  permission shapes and CLI-only flags cannot be mirrored by the subprocess. For OS-level
+  enforcement that binds every process, enable
   [sandboxing](https://code.claude.com/docs/en/sandboxing).
 
 MCP `read`/`grep`/`find`/`ls` paths are checked after symlink resolution and cannot leave the

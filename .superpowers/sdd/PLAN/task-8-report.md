@@ -99,3 +99,22 @@ maps to `find`. The existing global `*` and scoped `Read(...)`/`Grep(...)`/
 Round-2 evidence: focused policy/adapter/core tests passed (215 tests), the
 full suite passed (715 tests), `./node_modules/.bin/tsc --noEmit` passed,
 `pnpm run build` passed, and `git diff --check` passed.
+
+## Round 3/5 — README policy documentation closure
+
+Updated the harness-support table and Claude, opencode, and Codex limitations
+prose in `README.md`. It now states that Claude mapped native read/search
+operations self-check supported `Read`/`Grep`/`Glob` rules; opencode checks
+supported native `read`/`grep`/`glob` rules plus the local `list` compatibility
+shape in addition to Bash; Codex persisted policy is shell/Bash-only; and Pi's
+policy behavior is unchanged. The stale claim that Claude native read/grep ops
+do not consult `Read(...)` rules was removed without claiming unsupported shapes.
+
+No new test parses README prose: documentation text has no runtime contract or
+stable parser seam, and an exact-string test would make wording refactors brittle
+without increasing policy-behavior coverage. Existing adapter policy tests plus
+the full suite remain the meaningful regression surface.
+
+Round-3 evidence: full suite, typecheck, build, and diff checks passed after the
+README update; focused documentation-relevant adapter tests remain covered by
+the existing policy suites.
