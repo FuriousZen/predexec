@@ -1,8 +1,8 @@
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { runPlanTree, validatePlan } from "../../core/engine.ts";
+import { resolvePlanCwd, runPlanTree, validatePlan } from "../../core/engine.ts";
 import type { PlanNode, PlanTree, ToolOp, RunOptions } from "../../core/types.ts";
 
 const cwd = process.cwd();
@@ -286,6 +286,63 @@ describe("runPlanTree — traversal & stop reasons", () => {
     expect(r.pathTaken).toEqual(["a", "found"]); // fileExists resolved relative to cwd/core
     expect(r.transcript).toContain("/core");
     expect(r.transcript).toContain("IN_CORE");
+  });
+
+  it("rejects an absolute plan cwd before running any command", async () => {
+    let toolCalls = 0;
+    const r = await runPlanTree(
+      { root: "a", cwd: "/tmp", nodes: [{ id: "a", commands: [{ tool: "read", path: "inside.txt" }] }] },
+      {
+        cwd,
+        executeToolOp: async () => {
+          toolCalls++;
+          return { stdout: "unexpected", stderr: "", exitCode: 0 };
+        },
+      },
+    );
+
+    expect(r.stoppedReason).toBe("error");
+    expect(r.transcript).toContain("cwd must be a relative directory inside the session root");
+    expect(r.pathTaken).toEqual([]);
+    expect(toolCalls).toBe(0);
+  });
+
+  it.each(["..", 123 as unknown as string])("rejects an invalid plan cwd (%s) before running any command", async (planCwd) => {
+    let toolCalls = 0;
+    const r = await runPlanTree(
+      { root: "a", cwd: planCwd, nodes: [{ id: "a", commands: [{ tool: "read", path: "inside.txt" }] }] },
+      {
+        cwd,
+        executeToolOp: async () => {
+          toolCalls++;
+          return { stdout: "unexpected", stderr: "", exitCode: 0 };
+        },
+      },
+    );
+
+    expect(r.stoppedReason).toBe("error");
+    expect(r.transcript).toContain("cwd must be a relative directory inside the session root");
+    expect(r.pathTaken).toEqual([]);
+    expect(toolCalls).toBe(0);
+  });
+
+  it("resolves a nested plan cwd inside the session root", async () => {
+    const sessionRoot = mkdtempSync(join(tmpdir(), "predexec-cwd-"));
+    try {
+      const nested = join(sessionRoot, "sub");
+      mkdirSync(nested);
+      const resolved = resolvePlanCwd(sessionRoot, "sub");
+      expect(resolved).toEqual({ cwd: nested });
+
+      const r = await runPlanTree(
+        { root: "a", cwd: "sub", nodes: [{ id: "a", commands: ["pwd"] }] },
+        { cwd: sessionRoot },
+      );
+      expect(r.stoppedReason).toBe("leaf");
+      expect(r.transcript).toContain(nested);
+    } finally {
+      rmSync(sessionRoot, { recursive: true, force: true });
+    }
   });
 
   it("transcript: surfaces a cwd header and does NOT echo the raw command", async () => {

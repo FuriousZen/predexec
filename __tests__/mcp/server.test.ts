@@ -147,11 +147,7 @@ describe("mcp server — failures return a result instead of throwing", () => {
     expect(textOf(response)).toContain("predexec expected a JSON object with `root`");
   });
 
-  it("a plan that trips the ENGINE is caught too, not just one that trips coercion", async () => {
-    // coercePlan does not type-check `cwd`, so a non-string one reaches
-    // path.resolve() inside runPlanTree and throws a TypeError. The sibling
-    // adapters wrap only coercePlan, so this escapes there; here it must come
-    // back as a named result.
+  it("a plan with an invalid cwd is returned as a named error result", async () => {
     const { request } = await connected({ cwd: project(), policy: policyOptions });
 
     const response = await callPredexec(request, {
@@ -162,8 +158,7 @@ describe("mcp server — failures return a result instead of throwing", () => {
 
     expect(response.error).toBeUndefined();
     expect(response.result.isError).toBe(true);
-    expect(textOf(response)).toContain("the plan walk failed unexpectedly");
-    expect(textOf(response)).toContain("Fall back to normal tool calling");
+    expect(textOf(response)).toContain("cwd must be a relative directory inside the session root");
   });
 
   it("an invalid plan structure is reported as an error result, not a bare transcript", async () => {

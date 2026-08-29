@@ -156,15 +156,26 @@ export function mapToolResult(
   return { stdout, stderr: "", exitCode: noResults ? 1 : 0 };
 }
 
+type PiTool = { execute: (id: string, params: any, signal?: AbortSignal) => Promise<{ content: { type: string; text?: string }[]; details?: unknown }> };
+
 function createToolExecutor(cwd: string, signal?: AbortSignal) {
-  const tools: Record<string, { execute: (id: string, params: any, signal?: AbortSignal) => Promise<{ content: { type: string; text?: string }[]; details?: unknown }> }> = {
-    read: createReadTool(cwd),
-    grep: createGrepTool(cwd),
-    find: createFindTool(cwd),
-    ls: createLsTool(cwd),
+  const toolMaps = new Map<string, Record<string, PiTool>>();
+
+  const toolsFor = (effectiveCwd: string): Record<string, PiTool> => {
+    const existing = toolMaps.get(effectiveCwd);
+    if (existing) return existing;
+    const tools = {
+      read: createReadTool(effectiveCwd),
+      grep: createGrepTool(effectiveCwd),
+      find: createFindTool(effectiveCwd),
+      ls: createLsTool(effectiveCwd),
+    };
+    toolMaps.set(effectiveCwd, tools);
+    return tools;
   };
 
   return async (op: ToolOp, opts: { cwd: string; signal?: AbortSignal }) => {
+    const tools = toolsFor(opts.cwd ?? cwd);
     const tool = tools[op.tool];
     if (!tool) {
       return { stdout: "", stderr: `unknown tool: ${op.tool}`, exitCode: 1 };

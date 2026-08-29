@@ -10,7 +10,24 @@
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+
+const { readToolCwds } = vi.hoisted(() => ({ readToolCwds: [] as string[] }));
+
+vi.mock("@earendil-works/pi-coding-agent", () => {
+  const createTool = () => ({
+    execute: async () => ({ content: [{ type: "text", text: "inside" }] }),
+  });
+  return {
+    createReadTool: (cwd: string) => {
+      readToolCwds.push(cwd);
+      return createTool();
+    },
+    createGrepTool: createTool,
+    createFindTool: createTool,
+    createLsTool: createTool,
+  };
+});
 import predexecSource from "../.pi/extension/index.ts";
 // Requires a prior `pnpm run build` — the compiled variant is asserted against the same contract as the source.
 import predexecCompiled from "../dist/.pi/extension/index.js";
@@ -110,7 +127,27 @@ describe.each(variants)("pi extension ($name) — tool.execute", ({ predexec }) 
 
     expect(result.details.stoppedReason).toBe("error");
     expect(result.details.fellBack).toBe(true);
-    expect(result.content[0].text).toContain("the plan walk failed unexpectedly");
+    expect(result.content[0].text).toContain("cwd must be a relative directory inside the session root");
+  });
+
+  it("constructs native read tools at the effective plan cwd", async () => {
+    readToolCwds.length = 0;
+    const { api, getTool } = createFakeApi();
+    predexec(api);
+    const tool = getTool();
+
+    const cwd = mkdtempSync(join(tmpdir(), "px-pi-"));
+    const sub = join(cwd, "sub");
+    const result = await tool.execute(
+      "tc4",
+      { root: "a", cwd: "sub", nodes: [{ id: "a", commands: [{ tool: "read", path: "inside.txt" }] }] },
+      undefined,
+      () => {},
+      { cwd },
+    );
+
+    expect(result.details.stoppedReason).toBe("leaf");
+    expect(readToolCwds).toEqual([sub]);
   });
 });
 

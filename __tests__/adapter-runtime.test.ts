@@ -85,11 +85,11 @@ describe("adapter-runtime — executeAdapterPlan", () => {
     expect(result.transcript).toContain("predexec expected a JSON object with `root`");
   });
 
-  it("recovers from engine-level unexpected error into stoppedReason: 'error' without throwing", async () => {
+  it("recovers from invalid plan cwd into stoppedReason: 'error' without throwing", async () => {
     const plan = {
       root: "a",
       nodes: [{ id: "a", commands: ["echo test"] }],
-      cwd: 5 as any, // non-string cwd causes path.resolve to throw inside runPlanTree
+      cwd: 5 as any, // invalid plan cwd is rejected before any command runs
     };
 
     const result = await executeAdapterPlan(plan, "claude-code", { cwd: tempDir });
@@ -99,8 +99,7 @@ describe("adapter-runtime — executeAdapterPlan", () => {
     expect(result.terminal).toBe(false);
     expect(result.pathTaken).toEqual([]);
     expect(result.depthReached).toBe(0);
-    expect(result.transcript).toContain("the plan walk failed unexpectedly");
-    expect(result.transcript).toContain("Fall back to normal tool calling for this step.");
+    expect(result.transcript).toContain("cwd must be a relative directory inside the session root");
   });
 
   it("stats failure remains non-fatal to plan execution", async () => {
@@ -138,7 +137,7 @@ describe("adapter-runtime — executeAdapterPlan", () => {
       expect(result.transcript).toContain("could not parse `plan`");
     });
 
-    it.each(harnesses)("returns identical error contract on unexpected engine failure for harness %s", async (harness) => {
+    it.each(harnesses)("returns identical error contract on invalid plan cwd for harness %s", async (harness) => {
       const plan = {
         root: "a",
         nodes: [{ id: "a", commands: ["echo hi"] }],
@@ -156,7 +155,7 @@ describe("adapter-runtime — executeAdapterPlan", () => {
         edgesEvaluated: 0,
         edgesMatched: 0,
       });
-      expect(result.transcript).toContain("the plan walk failed unexpectedly");
+      expect(result.transcript).toContain("cwd must be a relative directory inside the session root");
     });
 
     it.each(harnesses)("records stats tagged with the respective harness %s", async (harness) => {

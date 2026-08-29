@@ -289,10 +289,10 @@ describe.each(variants)("opencode plugin ($name) — host permission policy e2e"
     expect(out).toContain("predexec expected a JSON object with `root`");
   });
 
-  it("returns a readable error on engine unexpected failure", async () => {
+  it("returns a readable error on invalid plan cwd", async () => {
     const dir = mkdtempSync(join(tmpdir(), "px-oc-policy-"));
     const out = await execute(dir, { root: "a", nodes: [{ id: "a", commands: ["echo"] }], cwd: 123 });
-    expect(out).toContain("the plan walk failed unexpectedly");
+    expect(out).toContain("cwd must be a relative directory inside the session root");
   });
 });
 

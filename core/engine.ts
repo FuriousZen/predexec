@@ -16,7 +16,7 @@
  * transcript + pathTaken as an ordinary result and the agent resumes.
  */
 
-import { resolve } from "node:path";
+import { isAbsolute, relative, resolve, sep } from "node:path";
 import { evaluateConditionWithDetail } from "./conditions.ts";
 import { READ_ONLY_TOOLS, MUTATING_TOOLS, findDestructiveToken } from "./destructive.ts";
 import { runNode, isToolOp, formatToolOpLabel } from "./runner.ts";
@@ -40,7 +40,11 @@ export async function runPlanTree(plan: PlanTree, opts: RunOptions): Promise<Cor
     return result([], 0, "error", `plan validation failed: ${validationError}`, 0, 0);
   }
 
-  const effectiveCwd = plan.cwd ? resolve(opts.cwd, plan.cwd) : opts.cwd;
+  const cwdResult = resolvePlanCwd(opts.cwd, plan.cwd);
+  if ("error" in cwdResult) {
+    return result([], 0, "error", cwdResult.error, 0, 0);
+  }
+  const effectiveCwd = cwdResult.cwd;
   const runOpts: RunOptions = { ...opts, cwd: effectiveCwd };
 
   // maxDepth is model-authored, so it is a ceiling to enforce, not a number to
@@ -139,6 +143,19 @@ export async function runPlanTree(plan: PlanTree, opts: RunOptions): Promise<Cor
     current = next;
     depth++;
   }
+}
+
+export function resolvePlanCwd(sessionRoot: string, planCwd?: string): { cwd: string } | { error: string } {
+  if (planCwd === undefined) return { cwd: sessionRoot };
+  if (typeof planCwd !== "string" || planCwd === "" || isAbsolute(planCwd)) {
+    return { error: "cwd must be a relative directory inside the session root" };
+  }
+  const cwd = resolve(sessionRoot, planCwd);
+  const rel = relative(sessionRoot, cwd);
+  if (rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
+    return { error: "cwd must be a relative directory inside the session root" };
+  }
+  return { cwd };
 }
 
 /**

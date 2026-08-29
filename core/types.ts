@@ -75,8 +75,9 @@ export interface PlanTree {
   root: NodeId;
   nodes: PlanNode[];
   /**
-   * Base working directory for ALL commands and `fileExists` checks. Relative
-   * paths resolve against the session cwd. Set this once instead of prefixing
+   * Base working directory for ALL commands and `fileExists` checks. Must be a
+   * non-empty relative directory inside the session cwd; the engine validates
+   * this at runtime before any command runs. Set this once instead of prefixing
    * every command with `cd`.
    */
   cwd?: string;
