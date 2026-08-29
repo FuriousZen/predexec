@@ -78,6 +78,8 @@ describe.each(variants)("pi extension ($name) — registration contract (fake Ex
     expect(tool.parameters.properties.nodes.items.properties.commands.maxItems).toBe(MAX_OPERATIONS_PER_NODE);
     expect(tool.parameters.properties.maxDepth.maximum).toBe(DEFAULT_MAX_DEPTH);
     expect(tool.parameters.properties.maxDepth.description).toContain(String(DEFAULT_MAX_DEPTH));
+    expect(tool.parameters.properties.maxDepth.description).toContain("rejected");
+    expect(tool.parameters.properties.maxDepth.description).not.toContain("clamped");
     expect(tool.parameters.properties.cwd.description).toContain("inside the session root");
     expect(tool.parameters.properties.cwd.description).toContain("absolute");
     for (const kind of CONDITION_KINDS) {

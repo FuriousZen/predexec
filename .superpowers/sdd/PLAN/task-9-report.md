@@ -26,7 +26,7 @@ Created the two modules and ran the parity tests: **11/11 passed**. The
 focused policy/adapter run then passed **239/239**, and the final focused
 adapter run passed **123/123** after adding registration-surface assertions.
 
-The full suite passed **726/726 tests**.
+The full suite passed **727/727 tests**.
 
 ## What changed
 
@@ -60,7 +60,7 @@ shared policy behavior.
 
 - `./node_modules/.bin/vitest run __tests__/command-inspection.test.ts __tests__/plan-language.test.ts`: 11/11
 - Focused policy and adapter tests: 239/239, then 123/123 with registration assertions
-- `./node_modules/.bin/vitest run`: 726/726
+- `./node_modules/.bin/vitest run`: 727/727
 - `pnpm run typecheck`: passed
 - `pnpm run build`: passed
 - `pnpm pack --dry-run`: passed; packed dist contains both new compiled modules
@@ -88,8 +88,7 @@ Planned commit message: `refactor: centralize command and plan language mechanic
 
 Added source-and-compiled Pi registration assertions for:
 
-- `maxDepth.maximum === DEFAULT_MAX_DEPTH`, numeric ceiling guidance, and
-  larger-value clamping;
+- `maxDepth.maximum === DEFAULT_MAX_DEPTH` and numeric ceiling guidance;
 - cwd guidance naming the session-root containment rule and rejection of
   absolute/escaping paths;
 - a frozen `PLAN_FIELD_NAMES` projection map.
@@ -103,16 +102,42 @@ projection-map assertion.
 `PLAN_FIELD_NAMES` is now a frozen object used by Pi's structural schema keys
 and by `PLAN_SHAPE_DESCRIPTION`; it is no longer an unused or competing source
 of truth. `PLAN_CWD_DESCRIPTION` is shared by the canonical plan prose and Pi's
-cwd schema. Pi exposes `maximum: 8` and says values above 8 are clamped while
+cwd schema. Pi exposes `maximum: 8` and says values above 8 are rejected while
 preserving its host-specific schema wording elsewhere.
 
 Fix-round verification:
 
 - `./node_modules/.bin/vitest run __tests__/plan-language.test.ts __tests__/pi.test.ts`: 23/23
 - policy/adapter focused tests: 208/208
-- `./node_modules/.bin/vitest run`: 726/726
+- `./node_modules/.bin/vitest run`: 727/727
 - `pnpm run typecheck`: passed
 - `pnpm run build`: passed
+- `pnpm pack --dry-run`: passed
+- `git diff --check`: passed
+
+No ledger or Task 10 files were edited.
+
+## Fix round 2/5
+
+### RED
+
+Added source-and-compiled Pi schema assertions requiring the maxDepth
+description to say `rejected` and not `clamped`. Before the fix, both schema
+projections failed because the description claimed values above 8 were
+clamped despite `maximum: 8` validation.
+
+### GREEN and self-review
+
+Pi now says `maximum 8` and that values above 8 are rejected by the schema.
+Core engine clamping was not changed; callers that bypass the Pi schema retain
+the existing runtime behavior.
+
+Fix-round verification:
+
+- `./node_modules/.bin/vitest run __tests__/pi.test.ts __tests__/plan-language.test.ts`: 23/23
+- `pnpm run typecheck`: passed
+- `pnpm run build`: passed
+- `./node_modules/.bin/vitest run`: 727/727
 - `pnpm pack --dry-run`: passed
 - `git diff --check`: passed
 

@@ -136,7 +136,7 @@ const PlanTreeSchema = {
     [PLAN_FIELD_NAMES.maxDepth]: {
       type: "number",
       maximum: DEFAULT_MAX_DEPTH,
-      description: `Cap on speculation depth; values above ${DEFAULT_MAX_DEPTH} are clamped.`,
+      description: `Cap on speculation depth; maximum ${DEFAULT_MAX_DEPTH}. Values above ${DEFAULT_MAX_DEPTH} are rejected by this schema.`,
     },
   },
   required: [PLAN_FIELD_NAMES.root, PLAN_FIELD_NAMES.nodes],
