@@ -262,6 +262,13 @@ describe("runPlanTree — traversal & stop reasons", () => {
     expect(r.transcript).not.toContain("$ echo body-output"); // command not double-emitted
   });
 
+  it("renders truncation warning from completeness flags, not marker text", async () => {
+    const markerText = "echo '…[truncated]'";
+    const r = await runPlanTree({ root: "a", nodes: [{ id: "a", commands: [markerText] }] }, { cwd });
+    expect(r.transcript).toContain("…[truncated]");
+    expect(r.transcript).not.toContain("⚠ Output truncated");
+  });
+
   it("aborted: returns aborted when the signal is already set", async () => {
     const plan: PlanTree = { root: "a", nodes: [{ id: "a", commands: ["echo hi"] }] };
     const r = await runPlanTree(plan, { cwd, signal: AbortSignal.abort() });

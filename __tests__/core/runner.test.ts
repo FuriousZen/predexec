@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { runNode, isToolOp, formatToolOpLabel } from "../../core/runner.ts";
+import { runNode, isToolOp, formatToolOpLabel, OUTPUT_CAP } from "../../core/runner.ts";
 import type { ToolOp, RunOptions } from "../../core/types.ts";
 
 const cwd = process.cwd();
@@ -69,6 +69,19 @@ describe("runNode — tool ops", () => {
     expect(r.exitCode).toBe(1);
     expect(r.stderr).toContain("no tool executor");
   });
+
+  it("marks truncation when a tool returns more than the output cap", async () => {
+    const r = await runNode(
+      { id: "n", commands: [{ tool: "read", path: "huge.txt" }] },
+      {
+        cwd,
+        executeToolOp: async () => ({ stdout: "x".repeat(OUTPUT_CAP + 1), stderr: "", exitCode: 0 }),
+      },
+    );
+    expect(r.stdout).toContain("…[truncated");
+    expect(r.stdoutTruncated).toBe(true);
+    expect(r.stderrTruncated).toBe(false);
+  });
 });
 
 describe("runNode", () => {
@@ -105,5 +118,15 @@ describe("runNode", () => {
   it("returns immediately for an already-aborted signal", async () => {
     const r = await runNode({ id: "n", commands: ["echo nope"] }, { cwd, signal: AbortSignal.abort() });
     expect(r.stdout).not.toContain("nope");
+  });
+
+  it("marks truncation when a later chunk arrives after an exact OUTPUT_CAP prefix", async () => {
+    const q = String.fromCharCode(39);
+    const script = 'process.stdout.write("x".repeat(8192)); setTimeout(() => process.stdout.write("TAIL"), 30)';
+    const r = await runNode({ id: "n", commands: [`node -e ${q}${script}${q}`] }, { cwd });
+    expect(r.stdout).toContain("…[truncated");
+    expect(r.stdout).not.toContain("TAIL");
+    expect(r.stdoutTruncated).toBe(true);
+    expect(r.stderrTruncated).toBe(false);
   });
 });

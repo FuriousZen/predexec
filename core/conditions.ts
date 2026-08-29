@@ -143,6 +143,9 @@ export function evaluateConditionWithDetail(
 
       case "jsonPath": {
         const label = `jsonPath ${cond.path} ${cond.op}${cond.op === "exists" ? "" : ` ${showValue(cond.value)}`}`;
+        if (output.stdoutTruncated) {
+          return { result: false, detail: `${label} → false (stdout was truncated; JSON may be incomplete)` };
+        }
         let data: unknown;
         try {
           data = JSON.parse(output.stdout) as unknown;
@@ -161,6 +164,9 @@ export function evaluateConditionWithDetail(
 
       case "numeric": {
         const label = `numeric /${cond.extract}/ ${OP_SYM[cond.op] ?? cond.op} ${cond.value}`;
+        if (output.stdoutTruncated) {
+          return { result: false, detail: `${label} → false (stdout was truncated; number may be outside retained output)` };
+        }
         if (!isSafeRegex(cond.extract)) {
           return { result: false, detail: `${label} → false (extract regex rejected: nested quantifier may not terminate)` };
         }
@@ -178,6 +184,13 @@ export function evaluateConditionWithDetail(
       case "match": {
         const sourceName = cond.source === "stderr" ? "stderr" : "stdout";
         const source = cond.source === "stderr" ? output.stderr : output.stdout;
+        const sourceTruncated = cond.source === "stderr" ? output.stderrTruncated : output.stdoutTruncated;
+        if (cond.negate && sourceTruncated) {
+          return {
+            result: false,
+            detail: `${sourceName} !~ /${cond.regex}/ → false (${sourceName} was truncated; absence cannot be established)`,
+          };
+        }
         if (!isSafeRegex(cond.regex)) {
           return {
             result: false,

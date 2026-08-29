@@ -20,6 +20,8 @@ interface CommandResult {
   stdout: string;
   stderr: string;
   exitCode: number;
+  stdoutTruncated: boolean;
+  stderrTruncated: boolean;
 }
 
 export function isToolOp(op: Operation): op is ToolOp {
@@ -28,7 +30,7 @@ export function isToolOp(op: Operation): op is ToolOp {
 
 export async function runNode(node: PlanNode, opts: RunOptions): Promise<NodeOutput> {
   if (node.commands.length === 0) {
-    return { stdout: "", stderr: "", exitCode: 0 };
+    return { stdout: "", stderr: "", exitCode: 0, stdoutTruncated: false, stderrTruncated: false };
   }
 
   const results: CommandResult[] = node.parallel
@@ -56,24 +58,40 @@ async function runParallel(commands: Operation[], opts: RunOptions): Promise<Com
 async function runOneOp(op: Operation, opts: RunOptions): Promise<CommandResult> {
   if (typeof op === "string") return runShell(op, opts);
   if (isToolOp(op)) return runToolOp(op, opts);
-  return { command: "unknown", stdout: "", stderr: "invalid operation: expected string or {tool, ...}", exitCode: 1 };
+  return {
+    command: "unknown",
+    stdout: "",
+    stderr: "invalid operation: expected string or {tool, ...}",
+    exitCode: 1,
+    stdoutTruncated: false,
+    stderrTruncated: false,
+  };
 }
 
 async function runToolOp(op: ToolOp, opts: RunOptions): Promise<CommandResult> {
   const label = formatToolOpLabel(op);
   if (!opts.executeToolOp) {
-    return { command: label, stdout: "", stderr: "no tool executor provided for tool operations", exitCode: 1 };
+    return {
+      command: label,
+      stdout: "",
+      stderr: "no tool executor provided for tool operations",
+      exitCode: 1,
+      stdoutTruncated: false,
+      stderrTruncated: false,
+    };
   }
   try {
     const result = await opts.executeToolOp(op, { cwd: opts.cwd, signal: opts.signal });
-    const stdout = result.stdout.length > OUTPUT_CAP ? `${result.stdout.slice(0, OUTPUT_CAP)}\n${TRUNCATION_MARKER}]` : result.stdout;
-    const stderr = result.stderr.length > OUTPUT_CAP ? `${result.stderr.slice(0, OUTPUT_CAP)}\n${TRUNCATION_MARKER}]` : result.stderr;
+    const stdoutTruncated = result.stdout.length > OUTPUT_CAP;
+    const stderrTruncated = result.stderr.length > OUTPUT_CAP;
+    const stdout = stdoutTruncated ? `${result.stdout.slice(0, OUTPUT_CAP)}\n${TRUNCATION_MARKER}]` : result.stdout;
+    const stderr = stderrTruncated ? `${result.stderr.slice(0, OUTPUT_CAP)}\n${TRUNCATION_MARKER}]` : result.stderr;
     if (stdout) opts.onCommandOutput?.(stdout);
     if (stderr) opts.onCommandOutput?.(stderr);
-    return { command: label, stdout, stderr, exitCode: result.exitCode };
+    return { command: label, stdout, stderr, exitCode: result.exitCode, stdoutTruncated, stderrTruncated };
   } catch (err) {
     const msg = (err as Error).message ?? String(err);
-    return { command: label, stdout: "", stderr: msg, exitCode: 1 };
+    return { command: label, stdout: "", stderr: msg, exitCode: 1, stdoutTruncated: false, stderrTruncated: false };
   }
 }
 
@@ -87,6 +105,8 @@ function runShell(command: string, opts: RunOptions): Promise<CommandResult> {
   return new Promise<CommandResult>((resolvePromise) => {
     let stdout = "";
     let stderr = "";
+    let stdoutTruncated = false;
+    let stderrTruncated = false;
     let settled = false;
 
     const child = spawn(command, {
@@ -98,23 +118,37 @@ function runShell(command: string, opts: RunOptions): Promise<CommandResult> {
     const finish = (exitCode: number) => {
       if (settled) return;
       settled = true;
-      resolvePromise({ command, stdout, stderr, exitCode });
+      resolvePromise({
+        command,
+        stdout: stdoutTruncated ? `${stdout}\n${TRUNCATION_MARKER}]` : stdout,
+        stderr: stderrTruncated ? `${stderr}\n${TRUNCATION_MARKER}]` : stderr,
+        exitCode,
+        stdoutTruncated,
+        stderrTruncated,
+      });
     };
 
     child.stdout?.on("data", (d: Buffer) => {
       const s = d.toString();
-      if (stdout.length < OUTPUT_CAP) stdout += s;
+      const remaining = OUTPUT_CAP - stdout.length;
+      if (remaining > 0) stdout += s.slice(0, remaining);
+      if (s.length > remaining) stdoutTruncated = true;
       opts.onCommandOutput?.(s);
     });
     child.stderr?.on("data", (d: Buffer) => {
       const s = d.toString();
-      if (stderr.length < OUTPUT_CAP) stderr += s;
+      const remaining = OUTPUT_CAP - stderr.length;
+      if (remaining > 0) stderr += s.slice(0, remaining);
+      if (s.length > remaining) stderrTruncated = true;
       opts.onCommandOutput?.(s);
     });
 
     child.on("error", (err: NodeJS.ErrnoException) => {
       // Spawn failure or abort kill. Surface as a non-zero exit so edges can react.
-      if (stderr.length < OUTPUT_CAP) stderr += `${err.message}\n`;
+      const message = `${err.message}\n`;
+      const remaining = OUTPUT_CAP - stderr.length;
+      if (remaining > 0) stderr += message.slice(0, remaining);
+      if (message.length > remaining) stderrTruncated = true;
       finish(typeof err.errno === "number" ? err.errno : 1);
     });
 
@@ -125,15 +159,23 @@ function runShell(command: string, opts: RunOptions): Promise<CommandResult> {
 }
 
 function aggregate(results: CommandResult[]): NodeOutput {
-  const stdout = joinLabeled(results, (r) => r.stdout);
-  const stderr = joinLabeled(results, (r) => r.stderr);
+  const joinedStdout = joinLabeled(results, (r) => r.stdout);
+  const joinedStderr = joinLabeled(results, (r) => r.stderr);
+  const cappedStdout = cap(joinedStdout.text);
+  const cappedStderr = cap(joinedStderr.text);
   // exitCode = the failing command's code (stop-on-first-error left it last) or the last command's.
   const failed = results.find((r) => r.exitCode !== 0);
   const last = results[results.length - 1];
   const exitCode = failed ? failed.exitCode : (last?.exitCode ?? 0);
   // joinLabeled already budgets per command; the outer cap is a final backstop
   // for the (rare) case where the per-command floor sums above OUTPUT_CAP.
-  return { stdout: cap(stdout), stderr: cap(stderr), exitCode };
+  return {
+    stdout: cappedStdout.text,
+    stderr: cappedStderr.text,
+    exitCode,
+    stdoutTruncated: joinedStdout.truncated || cappedStdout.truncated || results.some((r) => r.stdoutTruncated),
+    stderrTruncated: joinedStderr.truncated || cappedStderr.truncated || results.some((r) => r.stderrTruncated),
+  };
 }
 
 /**
@@ -150,23 +192,30 @@ function aggregate(results: CommandResult[]): NodeOutput {
  * Per-command budgets keep every command represented, and an explicit marker
  * tells the model which ones were shortened rather than leaving it to infer.
  */
-function joinLabeled(results: CommandResult[], pick: (r: CommandResult) => string): string {
-  if (results.length === 1) return cap(pick(results[0]!));
+function joinLabeled(results: CommandResult[], pick: (r: CommandResult) => string): { text: string; truncated: boolean } {
+  if (results.length === 1) return { text: cap(pick(results[0]!)).text, truncated: false };
 
   const budget = Math.max(256, Math.floor(OUTPUT_CAP / results.length));
-  return results
+  let truncated = false;
+  const text = results
     .map((r, i) => {
       const text = pick(r);
       if (!text) return "";
       // Index label, not the full command: the command is already in the plan
       // (tool-call args), so echoing it back double-counts it in context.
-      return `[${i + 1}]\n${cap(text, budget)}`;
+      const capped = cap(text, budget);
+      truncated ||= capped.truncated;
+      return `[${i + 1}]\n${capped.text}`;
     })
     .filter(Boolean)
     .join("\n");
+  return { text, truncated };
 }
 
-function cap(text: string, limit = OUTPUT_CAP): string {
-  if (text.length <= limit) return text;
-  return `${text.slice(0, limit)}\n${TRUNCATION_MARKER}: ${text.length - limit} more chars]`;
+function cap(text: string, limit = OUTPUT_CAP): { text: string; truncated: boolean } {
+  if (text.length <= limit) return { text, truncated: false };
+  return {
+    text: `${text.slice(0, limit)}\n${TRUNCATION_MARKER}: ${text.length - limit} more chars]`,
+    truncated: true,
+  };
 }

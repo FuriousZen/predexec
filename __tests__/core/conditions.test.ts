@@ -5,7 +5,14 @@ import { describe, expect, it } from "vitest";
 import { evaluateConditionWithDetail, parseConditionString } from "../../core/conditions.ts";
 import type { Condition, NodeOutput } from "../../core/types.ts";
 
-const out = (o: Partial<NodeOutput>): NodeOutput => ({ stdout: "", stderr: "", exitCode: 0, ...o });
+const out = (o: Partial<NodeOutput>): NodeOutput => ({
+  stdout: "",
+  stderr: "",
+  exitCode: 0,
+  stdoutTruncated: false,
+  stderrTruncated: false,
+  ...o,
+});
 
 /** Local thin-wrapper helper standing in for the (removed) core export. */
 const evaluateCondition = (output: NodeOutput, cond: Condition, cwd: string): boolean =>
@@ -117,6 +124,53 @@ describe("parseConditionString", () => {
 });
 
 describe("evaluateConditionWithDetail — observed-value explanations", () => {
+  it("does not establish absence or a number from truncated output", () => {
+    const incomplete = {
+      stdout: "all good\n…[truncated]",
+      stderr: "",
+      exitCode: 0,
+      stdoutTruncated: true,
+      stderrTruncated: false,
+    };
+    expect(evaluateConditionWithDetail(
+      incomplete,
+      { kind: "match", source: "stdout", regex: "ERROR", negate: true },
+      "/",
+    )).toMatchObject({ result: false });
+    expect(evaluateConditionWithDetail(
+      incomplete,
+      { kind: "numeric", source: "stdout", extract: "(\\d+)", op: "eq", value: 0 },
+      "/",
+    )).toMatchObject({ result: false });
+  });
+
+  it("allows a positive match observed before truncation", () => {
+    const incomplete = {
+      stdout: "READY\n…[truncated]",
+      stderr: "",
+      exitCode: 0,
+      stdoutTruncated: true,
+      stderrTruncated: false,
+    };
+    expect(evaluateConditionWithDetail(
+      incomplete,
+      { kind: "match", source: "stdout", regex: "READY" },
+      "/",
+    ).result).toBe(true);
+  });
+
+  it("reports truncated stdout before attempting JSON parsing", () => {
+    const incomplete = out({ stdout: '{"ready":true}\n…[truncated]', stdoutTruncated: true });
+    const result = evaluateConditionWithDetail(
+      incomplete,
+      { kind: "jsonPath", source: "stdout", path: "ready", op: "exists" },
+      "/",
+    );
+    expect(result.result).toBe(false);
+    expect(result.detail).toContain("stdout was truncated");
+    expect(result.detail).not.toContain("not valid JSON");
+  });
+
   it("exitCode states the observed exit", () => {
     const r = evaluateConditionWithDetail(out({ exitCode: 1 }), { kind: "exitCode", op: "eq", value: 0 }, "/");
     expect(r.result).toBe(false);

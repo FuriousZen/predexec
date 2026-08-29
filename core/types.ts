@@ -90,6 +90,8 @@ export interface NodeOutput {
   stderr: string;
   /** The failing command's exit code (stop-on-first-error) or the last command's. */
   exitCode: number;
+  stdoutTruncated: boolean;
+  stderrTruncated: boolean;
 }
 
 export type StoppedReason =
