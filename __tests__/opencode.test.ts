@@ -10,6 +10,7 @@ import pluginSource, { createToolExecutor as createToolExecutorSource } from "..
 // Requires a prior `pnpm run build` — the compiled variant is asserted against the same contract as the source.
 import pluginCompiled, { createToolExecutor as createToolExecutorCompiled } from "../dist/.opencode/plugins/predexec.js";
 import type { ToolOp } from "../core/index.ts";
+import { PLAN_SHAPE_DESCRIPTION } from "../plan-language.ts";
 
 // read/ls pre-check path existence against the cwd, so mocked-client tests
 // need a real directory with the paths their ops name.
@@ -330,5 +331,6 @@ describe.each(variants)("opencode plugin ($name) — prompting surfaces", ({ plu
     expect(desc).toContain('"stdout =~ /regex/"');
     expect(desc).toContain('"file exists <path>"');
     expect(desc).toContain('"always"');
+    expect(desc).toContain(PLAN_SHAPE_DESCRIPTION);
   });
 });

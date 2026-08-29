@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { InMemoryTransport, LATEST_PROTOCOL_VERSION, type McpServer } from "@modelcontextprotocol/server";
 import { createServer, DESCRIPTION, TOOL_NAME } from "../../mcp/server.ts";
+import { PLAN_SHAPE_DESCRIPTION } from "../../plan-language.ts";
 import { spawnMcpClient } from "../helpers/stdio-client.ts";
 
 type Json = Record<string, any>;
@@ -89,6 +90,7 @@ describe("mcp server — tool registration", () => {
     expect(plan.description).toContain('"exit == 0"');
     expect(plan.description).toContain('"stdout =~ /regex/"');
     expect(plan.description).toContain('"file exists <path>"');
+    expect(plan.description).toContain(PLAN_SHAPE_DESCRIPTION);
     expect(plan.description).toContain('{tool:"read"');
     expect(plan.description).toContain("dependency symlinks below node_modules are the sole exception");
     expect(plan.description).toContain("do not provide kernel-atomic protection against concurrent parent-directory replacement");

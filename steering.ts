@@ -8,6 +8,7 @@
  */
 
 import { escapeRegExp } from "./core/index.ts";
+export { JSON_PATH_SINGLE_OP_LINE } from "./plan-language.ts";
 
 /** The one-line routing rule opencode injects when the host prompt lacks it. */
 export const STEERING_LINE =
@@ -59,9 +60,6 @@ export const BASH_NUDGE =
 export const WHEN_SYNTAX_LINE =
   'when: "always" | "exit == 0" (ops ==,!=,<,>) | "stdout =~ /regex/" (also stderr, !~) | ' +
   '"file exists <path>" / "file missing <path>", or a {kind,...} condition object. ';
-
-/** JSON-path conditions require an unambiguous single-operation JSON source. */
-export const JSON_PATH_SINGLE_OP_LINE = "jsonPath edges require a one-operation source node.";
 
 /**
  * Speculate-only-on-verified-facts guideline, appended to both adapters' tool

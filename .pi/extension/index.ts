@@ -23,6 +23,12 @@ import { TRUNCATION_MARKER } from "../../core/runner.ts";
 import type { ProgressEvent } from "../../core/types.ts";
 import { executeAdapterPlan } from "../../adapter-runtime.ts";
 import { BASH_NUDGE, JSON_PATH_SINGLE_OP_LINE, RECOVERY_LINE, USAGE_LINE, VERIFY_FIRST_LINE } from "../../steering.ts";
+import {
+  CONDITION_KINDS,
+  MAX_OPERATIONS_PER_NODE,
+  MAX_PARALLEL_CONCURRENCY,
+  TOOL_OPERATION_NAMES,
+} from "../../plan-language.ts";
 
 /**
  * Condition is modelled as a single loose object (discriminated by `kind`)
@@ -37,7 +43,7 @@ const Condition = {
   properties: {
     kind: {
       type: "string",
-      enum: ["exitCode", "fileExists", "jsonPath", "numeric", "match", "always"],
+      enum: [...CONDITION_KINDS],
       description: "exitCode/fileExists/jsonPath/numeric = high-confidence; match = low-confidence (read-only children only); always = unconditional.",
     },
     op: {
@@ -74,7 +80,7 @@ const PlanEdge = {
         'Strings: "exit == 0", "exit != 0", "exit > N", "exit < N", ' +
         '"stdout =~ /regex/", "stderr =~ /regex/", "stdout !~ /regex/", ' +
         '"file exists path", "file missing path", "always". ' +
-        "Object form (for jsonPath/numeric): see Condition schema. " + JSON_PATH_SINGLE_OP_LINE,
+        `Object form (for ${CONDITION_KINDS.join("/")}): see Condition schema. ` + JSON_PATH_SINGLE_OP_LINE,
     },
     to: { type: "string", description: "Target node id." },
   },
@@ -87,18 +93,19 @@ const PlanNode = {
     id: { type: "string", description: "Unique node id." },
     commands: {
       type: "array",
+      maxItems: MAX_OPERATIONS_PER_NODE,
       items: {
         description:
           "Shell command (string) or tool call (object with 'tool' key). " +
-          "Read-only tools: read ({tool,path,offset?,limit?}), grep ({tool,pattern,path?,glob?,ignoreCase?}), " +
-          "find ({tool,pattern,path?}), ls ({tool,path?}). " +
+          `Read-only tools: ${TOOL_OPERATION_NAMES[0]} ({tool,path,offset?,limit?}), ${TOOL_OPERATION_NAMES[1]} ({tool,pattern,path?,glob?,ignoreCase?}), ` +
+          `${TOOL_OPERATION_NAMES[2]} ({tool,pattern,path?}), ${TOOL_OPERATION_NAMES[3]} ({tool,path?}). ` +
           "Mutating tools (hard-stop): edit, write.",
       },
       description: "Shell commands and/or tool calls. Sequential (stop-on-first-error) unless parallel:true.",
     },
     parallel: {
       type: "boolean",
-      description: "Run commands concurrently instead of sequentially.",
+      description: `Run commands concurrently instead of sequentially (capped at ${MAX_PARALLEL_CONCURRENCY}).`,
     },
     mutates: {
       type: "boolean",

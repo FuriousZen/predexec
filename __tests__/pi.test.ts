@@ -13,6 +13,7 @@ import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { OUTPUT_CAP } from "../core/runner.ts";
 import { appendProgressText } from "../.pi/extension/index.ts";
+import { CONDITION_KINDS, MAX_OPERATIONS_PER_NODE } from "../plan-language.ts";
 import * as adapterRuntime from "../adapter-runtime.ts";
 
 const { readToolCwds } = vi.hoisted(() => ({ readToolCwds: [] as string[] }));
@@ -74,6 +75,10 @@ describe.each(variants)("pi extension ($name) — registration contract (fake Ex
     expect(tool.name).toBe("predexec");
     expect(tool.parameters.type).toBe("object");
     expect(tool.parameters.properties.nodes.type).toBe("array");
+    expect(tool.parameters.properties.nodes.items.properties.commands.maxItems).toBe(MAX_OPERATIONS_PER_NODE);
+    for (const kind of CONDITION_KINDS) {
+      expect(tool.parameters.properties.nodes.items.properties.edges.items.properties.when.description).toContain(kind);
+    }
     expect(tool.promptGuidelines.join("\n")).toContain("mutationStop/noEdgeMatch");
     expect(events.has("tool_result")).toBe(true);
   });

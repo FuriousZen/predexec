@@ -1,0 +1,27 @@
+import { describe, expect, it } from "vitest";
+import {
+  CONDITION_KINDS,
+  MAX_OPERATIONS_PER_NODE,
+  MAX_PARALLEL_CONCURRENCY,
+  PLAN_SHAPE_DESCRIPTION,
+  TOOL_OPERATION_NAMES,
+} from "../plan-language.ts";
+
+describe("canonical plan language", () => {
+  it("publishes immutable condition and tool vocabularies", () => {
+    expect(CONDITION_KINDS).toEqual(["exitCode", "fileExists", "jsonPath", "numeric", "match", "always"]);
+    expect(TOOL_OPERATION_NAMES).toEqual(["read", "grep", "find", "ls"]);
+    expect(Object.isFrozen(CONDITION_KINDS)).toBe(true);
+    expect(Object.isFrozen(TOOL_OPERATION_NAMES)).toBe(true);
+  });
+
+  it("teaches the complete bounded plan shape", () => {
+    for (const condition of CONDITION_KINDS) expect(PLAN_SHAPE_DESCRIPTION).toContain(condition);
+    for (const tool of TOOL_OPERATION_NAMES) expect(PLAN_SHAPE_DESCRIPTION).toContain(`tool:"${tool}"`);
+    expect(PLAN_SHAPE_DESCRIPTION).toContain(String(MAX_OPERATIONS_PER_NODE));
+    expect(PLAN_SHAPE_DESCRIPTION).toContain(String(MAX_PARALLEL_CONCURRENCY));
+    expect(PLAN_SHAPE_DESCRIPTION).toContain("relative");
+    expect(PLAN_SHAPE_DESCRIPTION).toContain("one-operation");
+    expect(PLAN_SHAPE_DESCRIPTION).toContain("mutates");
+  });
+});

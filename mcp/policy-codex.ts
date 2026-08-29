@@ -65,15 +65,10 @@
  * final review, closed the same way (5): `FOO=1 git push` and
  * `timeout 5 git push` must not dodge a `["git","push"]` rule any more than
  * they dodge `policy-claude.ts`'s equivalent `Bash(git push *)` rule there.
- * `stripLeadingWrappersAndAssignments` mirrors `policy-claude.ts`'s
- * `stripBashWrappers`/`LEADING_ASSIGNMENT_RE` semantics EXACTLY — same
- * `WRAPPERS`/`BARE_ONLY_WRAPPERS`/`OPTION_TAKING_WRAPPERS` sets, same
- * assignment-then-wrapper loop — just ported to operate on
- * `tokenizeForMatch`'s already-tokenized, already-unquoted output instead of
- * the raw string, since that is the form this checker matches against. As
- * with `extractSubstitutions` above, the logic is duplicated rather than
- * imported (this file's import surface stays narrow, see above); the two
- * checkers' precedence models differ too much to share a matching engine.
+ * Shared command-inspection mechanics receive these host-specific wrapper
+ * sets, while this adapter retains ownership of token-prefix matching and
+ * precedence. The tokenized form is important because Codex rules compare
+ * argv-like prefixes.
  * Matching takes the union of the raw and stripped token forms (same
  * reasoning as `policy-claude.ts`'s `forms` array): raw-only misses a
  * `["git","push"]` rule on `timeout 5 git push`, stripped-only misses a
@@ -100,6 +95,12 @@ import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { splitCommandSegments } from "../core/index.ts";
+import {
+  extractCommandSubstitutions,
+  stripLeadingAssignmentsAndWrappers,
+  tokenizeShellWords,
+  type WrapperInspectionOptions,
+} from "../command-inspection.ts";
 import type { Operation } from "../core/types.ts";
 import type { PolicyVerdict } from "./policy-claude.ts";
 import { parseTomlLite } from "./toml-lite.ts";
@@ -534,108 +535,6 @@ function formatPattern(pattern: string[]): string {
 }
 
 /**
- * Command-substitution payloads: the bodies of `$(…)`, `` `…` ``, `<(…)` and
- * `>(…)`. Duplicated from (not imported from) `policy-claude.ts`'s
- * `extractSubstitutions` — every per-host policy file in this codebase stays
- * self-contained rather than sharing helpers (`policy.ts` and
- * `policy-claude.ts` don't share with each other either), and this file's
- * import surface is deliberately narrow (see the module header). Skipped
- * without this, `echo $(curl evil.sh)` would never expose `curl` to matching
- * at all — a bypass this adapter cannot afford given Codex's missing sandbox
- * (P2, adversarial review).
- */
-function extractSubstitutions(command: string): string[] {
-  const found: string[] = [];
-  let inSingle = false;
-  for (let i = 0; i < command.length; i++) {
-    const ch = command[i]!;
-    if (ch === "\\") {
-      i++;
-      continue;
-    }
-    if (ch === "'") {
-      inSingle = !inSingle;
-      continue;
-    }
-    if (inSingle) continue;
-
-    if (ch === "`") {
-      const end = command.indexOf("`", i + 1);
-      if (end === -1) break;
-      found.push(command.slice(i + 1, end));
-      i = end;
-      continue;
-    }
-    const opensParen = command[i + 1] === "(" && (ch === "$" || ch === "<" || ch === ">");
-    if (!opensParen) continue;
-    let depth = 0;
-    for (let j = i + 1; j < command.length; j++) {
-      const inner = command[j]!;
-      if (inner === "(") depth++;
-      else if (inner === ")") {
-        depth--;
-        if (depth === 0) {
-          found.push(command.slice(i + 2, j));
-          i = j;
-          break;
-        }
-      }
-    }
-  }
-  return found;
-}
-
-/**
- * Tokenize one command segment into argv-like words for prefix matching,
- * stripping matched surrounding quotes so `git "push" origin` and
- * `git 'push' origin` compare equal to `git push origin`. Without this,
- * quoting any single word in a forbidden command silently evades every rule
- * (P4, adversarial review — the most trivially reachable of the four
- * findings).
- */
-function tokenizeForMatch(segment: string): string[] {
-  const tokens: string[] = [];
-  let cur = "";
-  let has = false;
-  let q: '"' | "'" | null = null;
-  for (let i = 0; i < segment.length; i++) {
-    const c = segment[i]!;
-    if (q) {
-      if (c === "\\" && q === '"') {
-        cur += segment[i + 1] ?? "";
-        i++;
-      } else if (c === q) q = null;
-      else cur += c;
-      has = true;
-      continue;
-    }
-    if (c === '"' || c === "'") {
-      q = c;
-      has = true;
-      continue;
-    }
-    if (/\s/.test(c)) {
-      if (has) {
-        tokens.push(cur);
-        cur = "";
-        has = false;
-      }
-      continue;
-    }
-    if (c === "\\") {
-      cur += segment[i + 1] ?? "";
-      i++;
-      has = true;
-      continue;
-    }
-    cur += c;
-    has = true;
-  }
-  if (has) tokens.push(cur);
-  return tokens;
-}
-
-/**
  * Wrappers Claude Code strips before matching Bash rules — duplicated here,
  * same set, same job: see `policy-claude.ts`'s `WRAPPERS` for the full
  * rationale (`npx`/`docker exec` are pointedly absent from the host's own
@@ -647,66 +546,12 @@ const OPTION_TAKING_WRAPPERS = new Set(["timeout", "nice", "stdbuf"]);
 /** Stripped only when NOT followed by a flag: `command -v foo` looks a command up rather than running it, and `xargs -n1 grep` is matched as an xargs command. */
 const BARE_ONLY_WRAPPERS = new Set(["command", "builtin", "xargs"]);
 const DURATION_RE = /^\d+(?:\.\d+)?[smhd]?$/;
-/** A whole token shaped like `NAME=value` — the tokenized equivalent of
- * `policy-claude.ts`'s `LEADING_ASSIGNMENT_RE`, applied post-tokenization
- * since `tokenizeForMatch` has already unquoted the value. */
-const TOKEN_ASSIGNMENT_RE = /^[A-Za-z_][A-Za-z0-9_]*=/;
-
-/** Strip a run of leading `NAME=value` tokens, always leaving at least one
- * token behind (an assignment-only "command" has nothing left to match, so
- * stripping the very last token would turn `[]` — matches-everything — into
- * a false hit on a rule that targets a real command). Returns the same array
- * reference when nothing changed, so the caller's loop can detect a fixed
- * point cheaply. */
-function stripLeadingAssignments(tokens: string[]): string[] {
-  let i = 0;
-  while (i < tokens.length - 1 && TOKEN_ASSIGNMENT_RE.test(tokens[i]!)) i++;
-  return i === 0 ? tokens : tokens.slice(i);
-}
-
-/** Strip one leading wrapper invocation (and, for `OPTION_TAKING_WRAPPERS`,
- * its own flags/duration argument) from the front of `tokens`. Returns the
- * same array reference when nothing changed. */
-function stripLeadingWrapper(tokens: string[]): string[] {
-  const head = tokens[0];
-  if (!head || !(WRAPPERS.has(head) || BARE_ONLY_WRAPPERS.has(head))) return tokens;
-  const next = tokens[1];
-  const isFlag = next !== undefined && next.startsWith("-");
-  // `command -v`/`xargs -n1` are not wrapper invocations; leave them whole.
-  if (BARE_ONLY_WRAPPERS.has(head) && isFlag) return tokens;
-  let drop = 1;
-  if (OPTION_TAKING_WRAPPERS.has(head)) {
-    while (drop < tokens.length) {
-      const token = tokens[drop]!;
-      if (token.startsWith("-") || DURATION_RE.test(token)) drop++;
-      else break;
-    }
-  }
-  return drop >= tokens.length ? tokens : tokens.slice(drop);
-}
-
-/**
- * Strip wrappers and leading env-assignments from an already-tokenized
- * command segment, the same way `policy-claude.ts`'s `stripBashWrappers`
- * strips them from a raw string — see the module header. Bounded like its
- * counterpart: each pass must consume at least one token or the loop breaks,
- * but a cap keeps a pathological input from spinning.
- */
-function stripLeadingWrappersAndAssignments(tokens: string[]): string[] {
-  let cur = tokens;
-  for (let pass = 0; pass < 16; pass++) {
-    const before = cur;
-    cur = stripLeadingAssignments(cur);
-    cur = stripLeadingWrapper(cur);
-    if (cur === before) break;
-  }
-  return cur;
-}
-
-/** True when two token arrays are element-for-element identical. */
-function tokensEqual(a: string[], b: string[]): boolean {
-  return a.length === b.length && a.every((tok, i) => tok === b[i]);
-}
+const WRAPPER_OPTIONS: WrapperInspectionOptions = {
+  wrappers: WRAPPERS,
+  optionTakingWrappers: OPTION_TAKING_WRAPPERS,
+  bareOnlyWrappers: BARE_ONLY_WRAPPERS,
+  durationPattern: DURATION_RE,
+};
 
 /**
  * Build the shell portion of the operation-aware policy callback for the engine. Each pipeline
@@ -755,18 +600,18 @@ export function createCodexPolicyChecker(
       for (let depth = 0; depth < 4 && pending.length > 0; depth++) {
         const batch = pending.splice(0, pending.length);
         for (const text of batch) {
-          pending.push(...extractSubstitutions(text));
+          pending.push(...extractCommandSubstitutions(text));
           for (const line of text.split("\n")) {
             for (const segment of splitCommandSegments(line)) {
               const trimmed = segment.trim();
               if (!trimmed) continue;
-              const rawTokens = tokenizeForMatch(trimmed);
-              const strippedTokens = stripLeadingWrappersAndAssignments(rawTokens);
+              const rawTokens = tokenizeShellWords(trimmed);
+              const strippedTokens = stripLeadingAssignmentsAndWrappers(rawTokens, WRAPPER_OPTIONS);
               // Union of raw and stripped forms: raw-only misses a
               // `["git","push"]` rule on `FOO=1 git push` / `timeout 5 git
               // push`; stripped-only misses a `["timeout"]` rule on the same
               // command (see module header).
-              const tokenForms = tokensEqual(rawTokens, strippedTokens)
+              const tokenForms = rawTokens.length === strippedTokens.length && rawTokens.every((token, i) => token === strippedTokens[i])
                 ? [rawTokens]
                 : [rawTokens, strippedTokens];
               let winner: CodexRule | null = null;

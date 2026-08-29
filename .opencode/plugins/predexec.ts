@@ -31,7 +31,6 @@ import { executeAdapterPlan } from "../../adapter-runtime.ts";
 import {
   BASH_NUDGE,
   DESCRIPTION_BASE,
-  JSON_PATH_SINGLE_OP_LINE,
   RECOVERY_LINE,
   STEERING_LINE,
   USAGE_LINE,
@@ -39,6 +38,8 @@ import {
   WHEN_SYNTAX_LINE,
   systemHasRoutingInstructions,
 } from "../../steering.ts";
+import { PLAN_SHAPE_DESCRIPTION } from "../../plan-language.ts";
+// PLAN_SHAPE_DESCRIPTION includes JSON_PATH_SINGLE_OP_LINE for the plan argument.
 import { createPolicyChecker, readOpencodeBashRules, readOpencodeOperationRules } from "../../policy.ts";
 
 const DESCRIPTION =
@@ -239,9 +240,8 @@ const server: Plugin = async ({ client }) => ({
       description: DESCRIPTION,
       args: {
         plan: z.any().describe(
-          'Plan tree object: {root, nodes:[{id, commands:[<shell string> | {tool:"read",path,offset?,limit?} | {tool:"grep",pattern,path?} | {tool:"find",pattern,path?} | {tool:"ls",path?}], parallel?, edges?:[{when,to}]}], cwd?, maxDepth?}. ' +
+          PLAN_SHAPE_DESCRIPTION +
           WHEN_SYNTAX_LINE +
-          JSON_PATH_SINGLE_OP_LINE + " " +
           "Note: grep/find scope by a directory `path` (grep glob/ignoreCase/literal/context are unsupported here and error loudly); read offset/limit and grep/find/ls `limit` are applied client-side.",
         ),
       },

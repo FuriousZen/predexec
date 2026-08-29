@@ -53,13 +53,14 @@ import type { ToolExecutor } from "../core/index.ts";
 import { executeAdapterPlan } from "../adapter-runtime.ts";
 import {
   DESCRIPTION_BASE,
-  JSON_PATH_SINGLE_OP_LINE,
   RECOVERY_LINE,
   STEERING_LINE,
   USAGE_LINE,
   VERIFY_FIRST_LINE,
   WHEN_SYNTAX_LINE,
 } from "../steering.ts";
+import { PLAN_SHAPE_DESCRIPTION } from "../plan-language.ts";
+// PLAN_SHAPE_DESCRIPTION includes JSON_PATH_SINGLE_OP_LINE for the MCP schema.
 import {
   createClaudeOperationPolicyChecker,
   createClaudePolicyChecker,
@@ -104,11 +105,8 @@ const CODEX_DESCRIPTION =
  * itself, so offset/limit/glob/ignoreCase/literal/context are all honored here.
  */
 const PLAN_ARG_DESCRIPTION =
-  'Plan tree object: {root, nodes:[{id, commands:[<shell string> | {tool:"read",path,offset?,limit?} | ' +
-  '{tool:"grep",pattern,path?,glob?,ignoreCase?,literal?,context?,limit?} | {tool:"find",pattern,path?,limit?} | ' +
-  '{tool:"ls",path?,limit?}], parallel?, edges?:[{when,to}]}], cwd?, maxDepth?}. ' +
+  PLAN_SHAPE_DESCRIPTION +
   WHEN_SYNTAX_LINE +
-  JSON_PATH_SINGLE_OP_LINE + " " +
   "Note: tool ops read the filesystem directly (they are not Claude Code's native Read/Grep), " +
   "paths may not escape the session root (dependency symlinks below node_modules are the sole exception), " +
   "canonical checks do not provide kernel-atomic protection against concurrent parent-directory replacement, " +
