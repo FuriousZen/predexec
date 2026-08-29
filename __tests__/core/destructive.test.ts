@@ -252,6 +252,7 @@ describe("mutation classifier — wrapper options and command separators", () =>
     "env -i git add file.txt",
     "env -- git clone https://example.invalid/repo target",
     "env -u GIT_CONFIG_NOSYSTEM git fetch origin",
+    "env -S \"git add file.txt\"",
     "command -p git pull --ff-only",
     "xargs -n 1 git init scratch",
   ])("blocks Git mutation behind wrapper options: %s", (command) => {
@@ -262,6 +263,7 @@ describe("mutation classifier — wrapper options and command separators", () =>
     "env -i git status --short",
     "env -- git diff --stat",
     "env -u GIT_CONFIG_NOSYSTEM git log -5 --oneline",
+    "env -S \"git status --short\"",
     "command -p git show HEAD:README.md",
   ])("allows read-only Git behind wrapper options: %s", (command) => {
     expect(findDestructiveToken(command)).toBeNull();

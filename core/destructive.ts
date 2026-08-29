@@ -291,7 +291,10 @@ function effectiveHeadIndex(tokens: string[]): number | null {
 export function effectiveHead(segment: string): string | null {
   const tokens = shellWords(segment);
   const index = effectiveHeadIndex(tokens);
-  if (index === null) return null;
+  if (index === null) {
+    const splitString = envSplitStringPayload(tokens);
+    return splitString === null ? null : effectiveHead(splitString);
+  }
   const base = tokens[index]!.replace(/^.*\//, "");
   return base || null;
 }
@@ -338,6 +341,30 @@ function shellWords(command: string): string[] {
   return words;
 }
 
+/** Return the command string consumed by env's `-S`/`--split-string` option. */
+function envSplitStringPayload(tokens: string[]): string | null {
+  let envSeen = false;
+  for (let i = 0; i < tokens.length; i++) {
+    const token = tokens[i]!;
+    const base = token.replace(/^.*\//, "");
+    if (!envSeen) {
+      if (base === "env") envSeen = true;
+      continue;
+    }
+    if (token === "--") return null;
+    if (token === "-S" || token === "--split-string") return tokens[i + 1] ?? null;
+    if (token.startsWith("-S") && token.length > 2) return token.slice(2);
+    if (token.startsWith("--split-string=") && token.length > 15) return token.slice(15);
+    if (WRAPPER_OPTIONS_WITH_VALUE.env?.has(token)) {
+      i++;
+      continue;
+    }
+    if (token.startsWith("-")) continue;
+    return null;
+  }
+  return null;
+}
+
 function isGitReadOnlySubform(tokens: string[], verbIndex: number): boolean {
   const verb = tokens[verbIndex];
   const subform = tokens[verbIndex + 1];
@@ -357,11 +384,15 @@ function isGitReadOnlySubform(tokens: string[], verbIndex: number): boolean {
  * only in this verb position; their values are never treated as commands.
  */
 function findGitMutationToken(segment: string): string | null {
-  if (effectiveHead(segment) !== "git") return null;
-
   const tokens = shellWords(segment);
-  const gitIndex = effectiveHeadIndex(tokens);
-  if (gitIndex === null || gitIndex >= tokens.length || tokens[gitIndex]!.replace(/^.*\//, "") !== "git") return null;
+  const index = effectiveHeadIndex(tokens);
+  if (index === null) {
+    const splitString = envSplitStringPayload(tokens);
+    return splitString === null ? null : findDestructiveToken(splitString);
+  }
+
+  const gitIndex = index;
+  if (tokens[gitIndex]!.replace(/^.*\//, "") !== "git") return null;
 
   let verbIndex = gitIndex + 1;
   while (verbIndex < tokens.length) {
