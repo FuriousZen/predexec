@@ -202,6 +202,45 @@ describe("findDestructiveToken — token reporting", () => {
   });
 });
 
+describe("mutation classifier — ordinary copy and git verbs", () => {
+  it.each([
+    "cp source.txt destination.txt",
+    "cp -- source.txt destination.txt",
+    "git add file.txt",
+    "git clone https://example.invalid/repo target",
+    "git fetch origin",
+    "git pull --ff-only",
+    "git init scratch",
+  ])("blocks mutating command: %s", (command) => {
+    expect(findDestructiveToken(command)).not.toBeNull();
+  });
+
+  it.each([
+    "git status --short",
+    "git diff --stat",
+    "git log -5 --oneline",
+    "git show HEAD:README.md",
+    "git rev-parse --show-toplevel",
+    "git branch --list",
+    "git tag --list",
+    "git remote -v",
+    "git config --get user.name",
+  ])("allows read-only git command: %s", (command) => {
+    expect(findDestructiveToken(command)).toBeNull();
+  });
+
+  it.each([
+    "git -C /repo status",
+    "git -c core.pager=cat diff",
+    "git --git-dir /repo/.git log -5",
+    "git --no-pager show HEAD:README.md",
+    'git grep "rm -rf /" -- README.md',
+    "git status | grep 'cp source destination'",
+  ])("allows read-only git command with options or quoted patterns: %s", (command) => {
+    expect(findDestructiveToken(command)).toBeNull();
+  });
+});
+
 describe("isDestructiveCommand — bypasses found in the 2026-08 audit", () => {
   // Each of these returned null before the fix. Grouped by the tier that failed.
   const bypasses: Record<string, string[]> = {

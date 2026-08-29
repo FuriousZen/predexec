@@ -1,3 +1,6 @@
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { runPlanTree, validatePlan } from "../../core/engine.ts";
 import type { PlanNode, PlanTree, ToolOp, RunOptions } from "../../core/types.ts";
@@ -118,6 +121,22 @@ describe("runPlanTree — traversal & stop reasons", () => {
     const r = await runPlanTree(plan, { cwd });
     expect(r.stoppedReason).toBe("mutationStop");
     expect(r.pathTaken).toEqual([]); // never ran
+  });
+
+  it("mutationStop: ordinary cp stops before runNode creates the destination", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "predexec-cp-"));
+    try {
+      writeFileSync(join(dir, "source.txt"), "source\n");
+      const r = await runPlanTree(
+        { root: "a", nodes: [{ id: "a", commands: ["cp source.txt destination.txt"] }] },
+        { cwd: dir },
+      );
+      expect(r.stoppedReason).toBe("mutationStop");
+      expect(r.pathTaken).toEqual([]);
+      expect(existsSync(join(dir, "destination.txt"))).toBe(false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it("does NOT false-positive on 2>/dev/null or 2>&1", async () => {

@@ -55,7 +55,7 @@ const REDIRECT_RE = /(?<!=)>(?!\s*\/dev\/null|[&=])/;
 
 /**
  * Word blocklist: file removers/movers/creators, process killers, `cp -`,
- * `sed -i` / `sort -o` anywhere in their segment, `tee`, `wget` (unless stdout
+ * `cp`, `sed -i` / `sort -o` anywhere in their segment, `tee`, `wget` (unless stdout
  * mode `-O-`/`-qO-`), `curl` with a file-output flag (`-o`/`-O`, incl.
  * clustered), `find -delete`, `crontab` (unless `-l` list), package-manager
  * installs/removes, and history-mutating git verbs.
@@ -65,7 +65,7 @@ const WORD_RE = new RegExp(
     // file removers/movers/creators, process killers
     /\b(rm|rmdir|mv|dd|mkfs|chmod|chown|truncate|touch|mkdir|ln|shred|unlink|tee)\b/,
     /\b(kill|pkill|killall)\b/,
-    /\bcp\s+-/,
+    /\bcp\b/,
     /\bsed\b[^|;&]*?\s-i\b/,
     /\bsort\b[^|;&]*?\s-o\b/,
     // `install` as a command (coreutils install copies+chmods); not `npm install`,
@@ -101,6 +101,25 @@ const WORD_RE = new RegExp(
     .map((r) => r.source)
     .join("|"),
 );
+
+/** Git verbs whose ordinary invocation is read-only. */
+const READ_ONLY_GIT_VERBS = new Set([
+  "status", "diff", "log", "show", "rev-parse", "ls-files", "ls-tree",
+  "grep", "blame", "describe", "shortlog", "name-rev", "for-each-ref",
+]);
+
+/** Git global options which consume the following argument as their value. */
+const GIT_GLOBAL_OPTIONS_WITH_VALUE = new Set([
+  "-C", "-c", "--git-dir", "--work-tree", "--namespace", "--super-prefix", "--config-env",
+]);
+
+/** Git global options which do not consume an additional argument. */
+const GIT_GLOBAL_OPTIONS = new Set([
+  "-p", "-P", "--paginate", "--no-pager", "--no-replace-objects", "--no-lazy-fetch",
+  "--no-optional-locks", "--no-advice", "--no-sparse", "--literal-pathspecs",
+  "--glob-pathspecs", "--noglob-pathspecs", "--icase-pathspecs", "--exec-path",
+  "--html-path", "--man-path", "--info-path", "--version", "--help",
+]);
 
 /**
  * Command heads that only ever read (absent an exception below). Membership
@@ -230,6 +249,118 @@ export function effectiveHead(segment: string): string | null {
 }
 
 /**
+ * Split a command into shell words for Git's option/verb inspection. This is
+ * intentionally narrower than a shell parser: quotes and escapes are kept
+ * together so a quoted search pattern cannot become a false Git verb.
+ */
+function shellWords(command: string): string[] {
+  const words: string[] = [];
+  let current = "";
+  let quote: "'" | '"' | null = null;
+  let escaped = false;
+
+  for (const ch of command) {
+    if (escaped) {
+      current += ch;
+      escaped = false;
+      continue;
+    }
+    if (ch === "\\" && quote !== "'") {
+      escaped = true;
+      continue;
+    }
+    if (quote) {
+      if (ch === quote) quote = null;
+      else current += ch;
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      quote = ch;
+    } else if (/\s/.test(ch)) {
+      if (current) {
+        words.push(current);
+        current = "";
+      }
+    } else {
+      current += ch;
+    }
+  }
+  if (escaped) current += "\\";
+  if (current) words.push(current);
+  return words;
+}
+
+function isGitReadOnlySubform(tokens: string[], verbIndex: number): boolean {
+  const verb = tokens[verbIndex];
+  const subform = tokens[verbIndex + 1];
+  if (verb === "branch") return subform === "-l" || subform === "--list" || subform === "-v";
+  if (verb === "tag") return subform === "-l" || subform === "--list";
+  if (verb === "stash") return subform === "list" || subform === "show";
+  if (verb === "config") {
+    return subform === "--get" || subform?.startsWith("--get-") || subform === "--list" || subform === "-l";
+  }
+  if (verb === "remote") return subform === "-v" || subform === "show";
+  return false;
+}
+
+/**
+ * Return a mutation token for a Git segment whose verb is not allowlisted, or
+ * null for an established read-only verb/subform. Global options are skipped
+ * only in this verb position; their values are never treated as commands.
+ */
+function findGitMutationToken(segment: string): string | null {
+  if (effectiveHead(segment) !== "git") return null;
+
+  const tokens = shellWords(segment);
+  let gitIndex = 0;
+  while (gitIndex < tokens.length) {
+    const token = tokens[gitIndex]!;
+    if (/^\w+=/.test(token) || WRAPPERS.has(token.replace(/^.*\//, ""))) {
+      gitIndex++;
+      continue;
+    }
+    break;
+  }
+  if (gitIndex >= tokens.length || tokens[gitIndex]!.replace(/^.*\//, "") !== "git") return null;
+
+  let verbIndex = gitIndex + 1;
+  while (verbIndex < tokens.length) {
+    const option = tokens[verbIndex]!;
+    if (option === "--") {
+      verbIndex++;
+      break;
+    }
+    if (GIT_GLOBAL_OPTIONS_WITH_VALUE.has(option)) {
+      verbIndex += 2;
+      continue;
+    }
+    if (
+      option.startsWith("--git-dir=") ||
+      option.startsWith("--work-tree=") ||
+      option.startsWith("--namespace=") ||
+      option.startsWith("--super-prefix=") ||
+      option.startsWith("--config-env=") ||
+      option.startsWith("--exec-path=") ||
+      (option.startsWith("-C") && option.length > 2) ||
+      (option.startsWith("-c") && option.length > 2)
+    ) {
+      verbIndex++;
+      continue;
+    }
+    if (GIT_GLOBAL_OPTIONS.has(option)) {
+      verbIndex++;
+      continue;
+    }
+    break;
+  }
+
+  const verb = tokens[verbIndex];
+  if (!verb) return "git";
+  if (READ_ONLY_GIT_VERBS.has(verb) || isGitReadOnlySubform(tokens, verbIndex)) return null;
+  return `git ${verb}`;
+}
+
+/**
  * In-place edit flags: `perl -i`, `perl -pi -e`, `ruby -i -pe` rewrite their
  * input files directly. There is no redirect and no blocklisted word, so
  * nothing else in the pipeline catches them.
@@ -262,12 +393,20 @@ export function findDestructiveToken(cmd: string): string | null {
     if (head && PRIVILEGE_HEADS.has(head)) return head;
   }
 
+  // Git is allowlist-oriented at the verb position. Inspect it before the
+  // generic scan so read-only Git search patterns remain data, not commands.
+  const gitTokens = segments.map(findGitMutationToken);
+  for (const token of gitTokens) {
+    if (token) return token;
+  }
+
   // Safe tier: every head is a pure reader, no exception fires, and there is
   // no subshell content we can't attribute. Word-scan skipped.
   const allSafe =
     !OPAQUE_SUBSHELL_RE.test(cmd) &&
     heads.every((head, i) => {
-      if (head === null || !READ_ONLY_HEADS.has(head)) return false;
+      const gitReadOnly = head === "git" && gitTokens[i] === null;
+      if (head === null || (!READ_ONLY_HEADS.has(head) && !gitReadOnly)) return false;
       const exception = HEAD_EXCEPTIONS[head];
       return !exception || !exception.test(segments[i]!);
     });
