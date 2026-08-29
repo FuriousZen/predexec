@@ -60,6 +60,12 @@ describe("stats — estimateRequestsSaved", () => {
     expect(estimateRequestsSaved(plan([{ id: "a", commands: ["c1"] }]), result())).toBe(0);
   });
 
+  it("counts operations on every visit through a legal cycle", () => {
+    const p = plan([{ id: "a", commands: ["c1", "c2"] }]);
+    const r = result({ pathTaken: ["a", "a", "a"], depthReached: 2 });
+    expect(estimateRequestsSaved(p, r)).toBe(5);
+  });
+
   it("clamps at zero and never throws on malformed plans", () => {
     expect(estimateRequestsSaved(plan([{ id: "a", commands: [] }]), result())).toBe(0);
     expect(estimateRequestsSaved({} as PlanTree, result())).toBe(0);

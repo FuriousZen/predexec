@@ -60,6 +60,9 @@ export const WHEN_SYNTAX_LINE =
   'when: "always" | "exit == 0" (ops ==,!=,<,>) | "stdout =~ /regex/" (also stderr, !~) | ' +
   '"file exists <path>" / "file missing <path>", or a {kind,...} condition object. ';
 
+/** JSON-path conditions require an unambiguous single-operation JSON source. */
+export const JSON_PATH_SINGLE_OP_LINE = "jsonPath edges require a one-operation source node.";
+
 /**
  * Speculate-only-on-verified-facts guideline, appended to both adapters' tool
  * descriptions. Born from a live failure: a model built a 4-node tree on an

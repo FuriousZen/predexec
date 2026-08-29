@@ -48,12 +48,8 @@ export function statsFilePath(env: NodeJS.ProcessEnv = process.env): string {
 
 /** Count operations (shell commands + tool ops) across nodes actually visited. */
 function countVisitedOps(plan: PlanTree, result: CoreResult): number {
-  const visited = new Set(result.pathTaken);
-  let ops = 0;
-  for (const node of plan.nodes ?? []) {
-    if (visited.has(node.id)) ops += node.commands?.length ?? 0;
-  }
-  return ops;
+  const byId = new Map((plan.nodes ?? []).map((node) => [node.id, node]));
+  return result.pathTaken.reduce((ops, id) => ops + (byId.get(id)?.commands.length ?? 0), 0);
 }
 
 /**

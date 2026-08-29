@@ -22,7 +22,7 @@ import { isDestructiveCommand, OUTPUT_CAP, type ToolOp } from "../../core/index.
 import { TRUNCATION_MARKER } from "../../core/runner.ts";
 import type { ProgressEvent } from "../../core/types.ts";
 import { executeAdapterPlan } from "../../adapter-runtime.ts";
-import { BASH_NUDGE, RECOVERY_LINE, USAGE_LINE, VERIFY_FIRST_LINE } from "../../steering.ts";
+import { BASH_NUDGE, JSON_PATH_SINGLE_OP_LINE, RECOVERY_LINE, USAGE_LINE, VERIFY_FIRST_LINE } from "../../steering.ts";
 
 /**
  * Condition is modelled as a single loose object (discriminated by `kind`)
@@ -74,7 +74,7 @@ const PlanEdge = {
         'Strings: "exit == 0", "exit != 0", "exit > N", "exit < N", ' +
         '"stdout =~ /regex/", "stderr =~ /regex/", "stdout !~ /regex/", ' +
         '"file exists path", "file missing path", "always". ' +
-        "Object form (for jsonPath/numeric): see Condition schema.",
+        "Object form (for jsonPath/numeric): see Condition schema. " + JSON_PATH_SINGLE_OP_LINE,
     },
     to: { type: "string", description: "Target node id." },
   },

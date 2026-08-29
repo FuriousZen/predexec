@@ -5,7 +5,8 @@ import { describe, expect, it } from "vitest";
 // rather than through a harness adapter.
 import { coercePlan } from "../core/coerce.ts";
 import { mapToolResult } from "../.pi/extension/index.ts";
-import { STEERING_MARKERS } from "../steering.ts";
+import { JSON_PATH_SINGLE_OP_LINE, STEERING_MARKERS } from "../steering.ts";
+
 
 describe("coercePlan — defensive param recovery", () => {
   const good = { root: "a", nodes: [{ id: "a", commands: ["echo hi"] }] };
@@ -153,5 +154,18 @@ describe("configs/*/AGENTS.md drop-ins — STEERING_MARKERS quorum", () => {
   ])("%s's AGENTS.md carries at least 2 of the 3 STEERING_MARKERS", (_host, path) => {
     const block = readFileSync(path, "utf8");
     expect(quorumHits(block)).toBeGreaterThanOrEqual(2);
+  });
+});
+
+describe("adapter plan authoring guidance", () => {
+  it("teaches the single-operation jsonPath rule in every adapter", () => {
+    for (const path of [
+      join(__dirname, "..", ".pi", "extension", "index.ts"),
+      join(__dirname, "..", "mcp", "server.ts"),
+      join(__dirname, "..", ".opencode", "plugins", "predexec.ts"),
+    ]) {
+      expect(readFileSync(path, "utf8"), path).toContain("JSON_PATH_SINGLE_OP_LINE");
+    }
+    expect(JSON_PATH_SINGLE_OP_LINE).toBe("jsonPath edges require a one-operation source node.");
   });
 });

@@ -430,6 +430,47 @@ describe("validatePlan", () => {
     expect(r.stoppedReason).toBe("error");
     expect(r.transcript).toMatch(/64 operations/);
   });
+
+  it("rejects a multi-operation node feeding a jsonPath edge before execution", async () => {
+    const plan: PlanTree = {
+      root: "a",
+      nodes: [
+        {
+          id: "a",
+          commands: ["true", `printf '{"ok":true}'`],
+          edges: [{ when: { kind: "jsonPath", path: "ok", op: "exists" }, to: "b" }],
+        },
+        { id: "b", commands: ["echo reached"] },
+      ],
+    };
+
+    const r = await runPlanTree(plan, { cwd });
+
+    expect(r.stoppedReason).toBe("error");
+    expect(r.pathTaken).toEqual([]);
+    expect(r.transcript).toContain("jsonPath edges require a one-operation source node.");
+    expect(r.transcript).not.toContain("node a (exit");
+  });
+
+  it("allows a one-operation node feeding a jsonPath edge", async () => {
+    const plan: PlanTree = {
+      root: "a",
+      nodes: [
+        {
+          id: "a",
+          commands: [`printf '{"ok":true}'`],
+          edges: [{ when: { kind: "jsonPath", path: "ok", op: "exists" }, to: "b" }],
+        },
+        { id: "b", commands: ["echo reached"] },
+      ],
+    };
+
+    const r = await runPlanTree(plan, { cwd });
+
+    expect(r.stoppedReason).toBe("leaf");
+    expect(r.pathTaken).toEqual(["a", "b"]);
+    expect(r.transcript).toContain("reached");
+  });
 });
 
 describe("runPlanTree — tool operations", () => {

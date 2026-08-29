@@ -51,7 +51,15 @@ import { serveStdio, type StdioServerHandle } from "@modelcontextprotocol/server
 import { z } from "zod";
 import type { ToolExecutor } from "../core/index.ts";
 import { executeAdapterPlan } from "../adapter-runtime.ts";
-import { DESCRIPTION_BASE, RECOVERY_LINE, STEERING_LINE, USAGE_LINE, VERIFY_FIRST_LINE, WHEN_SYNTAX_LINE } from "../steering.ts";
+import {
+  DESCRIPTION_BASE,
+  JSON_PATH_SINGLE_OP_LINE,
+  RECOVERY_LINE,
+  STEERING_LINE,
+  USAGE_LINE,
+  VERIFY_FIRST_LINE,
+  WHEN_SYNTAX_LINE,
+} from "../steering.ts";
 import { createClaudePolicyChecker, readClaudeBashRules, type ClaudePolicyOptions } from "./policy-claude.ts";
 import { createCodexPolicyChecker, readCodexRules, type CodexPolicyOptions } from "./policy-codex.ts";
 import { createToolExecutor } from "./tool-ops.ts";
@@ -85,6 +93,7 @@ const PLAN_ARG_DESCRIPTION =
   '{tool:"grep",pattern,path?,glob?,ignoreCase?,literal?,context?,limit?} | {tool:"find",pattern,path?,limit?} | ' +
   '{tool:"ls",path?,limit?}], parallel?, edges?:[{when,to}]}], cwd?, maxDepth?}. ' +
   WHEN_SYNTAX_LINE +
+  JSON_PATH_SINGLE_OP_LINE + " " +
   "Note: tool ops read the filesystem directly (they are not Claude Code's native Read/Grep), " +
   "paths may not escape the session root, and grep/find fall back to a pure-Node walk that ignores .gitignore when ripgrep/fd are absent.";
 

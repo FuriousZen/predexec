@@ -193,6 +193,9 @@ export function validatePlan(plan: PlanTree, byId: Map<string, PlanNode>): strin
       }
       const target = byId.get(edge.to);
       if (!target) return `edge from "${node.id}" points at missing node "${edge.to}"`;
+      if (edge.when.kind === "jsonPath" && node.commands.length !== 1) {
+        return "jsonPath edges require a one-operation source node.";
+      }
       if (!HIGH_CONFIDENCE_KINDS.has(edge.when.kind) && target.mutates) {
         return `low-confidence edge (${edge.when.kind}) from "${node.id}" may not gate mutating node "${edge.to}"`;
       }

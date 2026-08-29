@@ -31,6 +31,7 @@ import { executeAdapterPlan } from "../../adapter-runtime.ts";
 import {
   BASH_NUDGE,
   DESCRIPTION_BASE,
+  JSON_PATH_SINGLE_OP_LINE,
   RECOVERY_LINE,
   STEERING_LINE,
   USAGE_LINE,
@@ -240,6 +241,7 @@ const server: Plugin = async ({ client }) => ({
         plan: z.any().describe(
           'Plan tree object: {root, nodes:[{id, commands:[<shell string> | {tool:"read",path,offset?,limit?} | {tool:"grep",pattern,path?} | {tool:"find",pattern,path?} | {tool:"ls",path?}], parallel?, edges?:[{when,to}]}], cwd?, maxDepth?}. ' +
           WHEN_SYNTAX_LINE +
+          JSON_PATH_SINGLE_OP_LINE + " " +
           "Note: grep/find scope by a directory `path` (grep glob/ignoreCase/literal/context are unsupported here and error loudly); read offset/limit and grep/find/ls `limit` are applied client-side.",
         ),
       },
