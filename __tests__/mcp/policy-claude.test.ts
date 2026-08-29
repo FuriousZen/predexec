@@ -133,6 +133,24 @@ describe("Claude native operation policy", () => {
     expect(check({ tool: "find", path: ".", pattern: "*.ts" })).toBe("*");
     expect(check({ tool: "ls", path: "." })).toBe("*");
   });
+
+  it("applies bare Read, Grep, and Glob denies to all corresponding native uses", () => {
+    const check = createClaudeOperationPolicyChecker(parseClaudeOperationRules(
+      '{"permissions":{"deny":["Read","Grep","Glob"]}}',
+    ));
+    expect(check({ tool: "read", path: "README.md" })).toBe("*");
+    expect(check({ tool: "ls", path: "." })).toBe("*");
+    expect(check({ tool: "grep", path: "src", pattern: "TODO" })).toBe("*");
+    expect(check({ tool: "find", path: ".", pattern: "*.ts" })).toBe("*");
+  });
+
+  it("mirrors Claude's broad bare Read rule for native search operations", () => {
+    const check = createClaudeOperationPolicyChecker(parseClaudeOperationRules(
+      '{"permissions":{"deny":["Read"]}}',
+    ));
+    expect(check({ tool: "grep", path: "src", pattern: "TODO" })).toBe("*");
+    expect(check({ tool: "find", path: ".", pattern: "*.ts" })).toBe("*");
+  });
 });
 
 describe("createClaudePolicyChecker — glob semantics", () => {

@@ -85,3 +85,17 @@ pattern). Local adapter contract and fixture tests in
 `__tests__/policy.test.ts` and `__tests__/opencode.test.ts` pin those mappings;
 the legacy `list` alias is explicitly local compatibility rather than an
 official-only claim.
+
+## Round 2/5 — Claude bare tool permissions
+
+RED regressions were added for bare `Read`, `Grep`, and `Glob` entries in
+`permissions.deny`. Before the fix, all three parsed as no native rule and the
+corresponding native operations passed. GREEN now maps bare `Read` to all
+`read`/`ls` operations and, matching Claude's documented best-effort behavior,
+to native `grep`/`find` as well; bare `Grep` maps to `grep`, and bare `Glob`
+maps to `find`. The existing global `*` and scoped `Read(...)`/`Grep(...)`/
+`Glob(...)` mappings and Bash precedence behavior are unchanged.
+
+Round-2 evidence: focused policy/adapter/core tests passed (215 tests), the
+full suite passed (715 tests), `./node_modules/.bin/tsc --noEmit` passed,
+`pnpm run build` passed, and `git diff --check` passed.

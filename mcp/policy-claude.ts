@@ -67,6 +67,8 @@ export interface ClaudeOperationPolicyRule {
   tool: "read" | "grep" | "find" | "*";
   pattern: string;
   action: ClaudePolicyAction;
+  /** Bare Read is documented as also applying to Claude's built-in search tools. */
+  broadRead?: boolean;
 }
 
 export interface ClaudePolicyOptions {
@@ -196,7 +198,11 @@ export function parseClaudeOperationRules(settingsText: string): ClaudeOperation
       if (typeof entry !== "string") continue;
       const open = entry.indexOf("(");
       if (open === -1) {
-        if (entry.trim() === "*") out.push({ tool: "*", pattern: "*", action });
+        const bare = entry.trim();
+        if (bare === "*") out.push({ tool: "*", pattern: "*", action });
+        else if (bare === "Read") out.push({ tool: "read", pattern: "*", action, broadRead: true });
+        else if (bare === "Grep") out.push({ tool: "grep", pattern: "*", action });
+        else if (bare === "Glob") out.push({ tool: "find", pattern: "*", action });
         continue;
       }
       if (open < 1 || !entry.endsWith(")")) continue;
@@ -510,7 +516,8 @@ export function createClaudeOperationPolicyChecker(
       target.startsWith("./") ? [target, `${target}/`, target.slice(2), `${target.slice(2)}/`] : [target, `${target}/`, `./${target}`, `./${target}/`],
     );
     for (const rule of compiled) {
-      if ((rule.tool === mapped || rule.tool === "*") && targets.some((target) => rule.regex.test(target))) return rule.pattern;
+      const broadRead = rule.broadRead && (mapped === "grep" || mapped === "find");
+      if ((rule.tool === mapped || rule.tool === "*" || broadRead) && targets.some((target) => rule.regex.test(target))) return rule.pattern;
     }
     return null;
   };
