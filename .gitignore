@@ -1,4 +1,5 @@
 node_modules/
+.worktrees/
 # also match a node_modules *symlink* (agent worktrees link to the main install)
 node_modules
 *.log
