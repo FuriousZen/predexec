@@ -88,6 +88,23 @@ describe("opencode operation policy", () => {
     expect(check({ tool: "grep", path: "secrets/key" })).toBeNull();
     expect(check({ tool: "list", path: "private/x" })).toBeNull();
   });
+
+  it("supports documented global, scalar-tool, and glob permission shapes", () => {
+    expect(parseOperationPermissions(JSON.stringify({ permission: "deny" }))).toEqual([
+      { tool: "*", pattern: "*", action: "deny" },
+    ]);
+    expect(parseOperationPermissions(JSON.stringify({ permission: { "*": "ask", read: "deny", glob: { "private/**": "deny" } } }))).toEqual([
+      { tool: "*", pattern: "*", action: "ask" },
+      { tool: "read", pattern: "*", action: "deny" },
+      { tool: "glob", pattern: "private/**", action: "deny" },
+    ]);
+    const check = createPolicyChecker(parseOperationPermissions(JSON.stringify({
+      permission: { "*": "allow", glob: { "private/**": "deny" }, read: "deny", grep: "deny" },
+    })));
+    expect(check({ tool: "read", path: "README.md" })).toBe("*");
+    expect(check({ tool: "find", pattern: "private/**", path: "." })).toBe("private/**");
+    expect(check({ tool: "grep", pattern: "TODO", path: "." })).toBe("*");
+  });
 });
 
 describe("readOpencodeBashRules — global first, project last (last-wins)", () => {
@@ -211,7 +228,7 @@ describe("engine — policyStop", () => {
     };
     const r = await runPlanTree(plan, {
       cwd,
-      checkCommandPolicy: (cmd) => (cmd.startsWith("echo") ? "echo *" : null),
+      checkOperationPolicy: (operation) => typeof operation === "string" && operation.startsWith("echo") ? "echo *" : null,
     });
     expect(r.stoppedReason).toBe("policyStop");
     expect(r.fellBack).toBe(true);
@@ -221,14 +238,18 @@ describe("engine — policyStop", () => {
     expect(r.transcript).not.toContain("node a (exit");
   });
 
-  it("checks {tool:'bash'} ops but not native read-only tool ops", async () => {
+  it("checks {tool:'bash'} and native operations through one policy seam", async () => {
     const bashPlan: PlanTree = {
       root: "a",
       nodes: [{ id: "a", commands: [{ tool: "bash", command: "cat .env" }] }],
     };
     const seen: string[] = [];
-    const check = (cmd: string) => (seen.push(cmd), cmd.includes(".env") ? "cat *" : null);
-    const r = await runPlanTree(bashPlan, { cwd, checkCommandPolicy: check });
+    const check = (operation: import("../core/types.ts").Operation) => {
+      const cmd = typeof operation === "string" ? operation : operation.command;
+      seen.push(cmd);
+      return cmd?.includes(".env") ? "cat *" : null;
+    };
+    const r = await runPlanTree(bashPlan, { cwd, checkOperationPolicy: check });
     expect(r.stoppedReason).toBe("policyStop");
     expect(seen).toEqual(["cat .env"]);
 
@@ -238,10 +259,10 @@ describe("engine — policyStop", () => {
     };
     const r2 = await runPlanTree(toolPlan, {
       cwd,
-      checkCommandPolicy: () => "*",
+      checkOperationPolicy: () => "*",
       executeToolOp: async () => ({ stdout: "f", stderr: "", exitCode: 0 }),
     });
-    expect(r2.stoppedReason).toBe("leaf"); // tool ops are not shell commands
+    expect(r2.stoppedReason).toBe("policyStop");
   });
 
   it("no policy callback => unchanged behavior", async () => {

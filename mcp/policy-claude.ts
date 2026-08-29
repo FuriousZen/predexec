@@ -49,7 +49,7 @@ export type ClaudePolicyAction = "allow" | "ask" | "deny";
 
 /**
  * The shape every host-policy checker returns to `engine.ts`'s
- * `checkCommandPolicy` option: the matched rule/pattern text when the host
+ * `checkOperationPolicy` option: the matched rule/pattern text when the host
  * would deny/ask (predexec hard-stops), or `null` to run. Exported so other
  * adapters (`policy-codex.ts`) share one verdict type instead of each
  * inventing its own — a type-only re-statement of what this function already
@@ -64,7 +64,7 @@ export interface ClaudePolicyRule {
 }
 
 export interface ClaudeOperationPolicyRule {
-  tool: "read" | "grep" | "find";
+  tool: "read" | "grep" | "find" | "*";
   pattern: string;
   action: ClaudePolicyAction;
 }
@@ -195,11 +195,15 @@ export function parseClaudeOperationRules(settingsText: string): ClaudeOperation
     for (const entry of entries) {
       if (typeof entry !== "string") continue;
       const open = entry.indexOf("(");
+      if (open === -1) {
+        if (entry.trim() === "*") out.push({ tool: "*", pattern: "*", action });
+        continue;
+      }
       if (open < 1 || !entry.endsWith(")")) continue;
       const hostTool = entry.slice(0, open).trim();
       const pattern = entry.slice(open + 1, -1).trim();
-      if (!pattern || !["Read", "Grep", "Glob"].includes(hostTool)) continue;
-      const tool: ClaudeOperationPolicyRule["tool"] = hostTool === "Read" ? "read" : hostTool === "Grep" ? "grep" : "find";
+      if (!pattern || !["Read", "Grep", "Glob", "*"].includes(hostTool)) continue;
+      const tool: ClaudeOperationPolicyRule["tool"] = hostTool === "Read" ? "read" : hostTool === "Grep" ? "grep" : hostTool === "Glob" ? "find" : "*";
       out.push({ tool, pattern, action });
     }
   }
@@ -445,12 +449,12 @@ export function readClaudeBashRules(
   const unreadable: string[] = [];
   const seen = new Set<string>();
   for (const path of claudeSettingsPaths(projectDir, opts)) {
-    if (seen.has(path) || !existsSync(path)) continue;
+    if (seen.has(path)) continue;
     seen.add(path);
     try {
       rules.push(...parseClaudeBashRules(readFileSync(path, "utf8")));
-    } catch {
-      unreadable.push(path);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") unreadable.push(path);
     }
   }
   return { rules, unreadable };
@@ -464,12 +468,12 @@ export function readClaudeOperationRules(
   const unreadable: string[] = [];
   const seen = new Set<string>();
   for (const path of claudeSettingsPaths(projectDir, opts)) {
-    if (seen.has(path) || !existsSync(path)) continue;
+    if (seen.has(path)) continue;
     seen.add(path);
     try {
       rules.push(...parseClaudeOperationRules(readFileSync(path, "utf8")));
-    } catch {
-      unreadable.push(path);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") unreadable.push(path);
     }
   }
   return { rules, unreadable };
@@ -506,14 +510,14 @@ export function createClaudeOperationPolicyChecker(
       target.startsWith("./") ? [target, `${target}/`, target.slice(2), `${target.slice(2)}/`] : [target, `${target}/`, `./${target}`, `./${target}/`],
     );
     for (const rule of compiled) {
-      if (rule.tool === mapped && targets.some((target) => rule.regex.test(target))) return rule.pattern;
+      if ((rule.tool === mapped || rule.tool === "*") && targets.some((target) => rule.regex.test(target))) return rule.pattern;
     }
     return null;
   };
 }
 
 /**
- * Build the `checkCommandPolicy` callback for the engine.
+ * Build the Bash portion of the operation-aware policy callback for the engine.
  *
  * Returns the matched pattern when a deny or ask rule catches any part of the
  * command, else null. Allow rules are ignored entirely — under Claude Code's

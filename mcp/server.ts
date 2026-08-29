@@ -89,6 +89,15 @@ export const DESCRIPTION =
   " " +
   VERIFY_FIRST_LINE;
 
+const CODEX_DESCRIPTION =
+  DESCRIPTION_BASE +
+  USAGE_LINE +
+  RECOVERY_LINE +
+  "Shell and {tool:\"bash\"} operations are checked against persisted Codex execpolicy rules — a forbidden or prompt match hard-stops before running. Codex has no persisted native file-operation policy source, so native file operations are not host-policy mapped by predexec. " +
+  STEERING_LINE +
+  " " +
+  VERIFY_FIRST_LINE;
+
 /**
  * Arg-level teaching, mirroring the opencode plugin's. The tool-op arg list is
  * this adapter's, not opencode's: ./tool-ops.ts implements read/grep/find/ls
@@ -192,11 +201,7 @@ async function runPredexecTool(
           const { rules, unreadable } = readCodexRules(opts.cwd, (opts.policy as CodexPolicyOptions) ?? {});
           const checkShell = createCodexPolicyChecker(rules, unreadable);
           return (operation: import("../core/types.ts").Operation) =>
-            typeof operation === "string"
-              ? checkShell(operation)
-              : operation.tool === "bash" && typeof operation.command === "string"
-                ? checkShell(operation.command)
-                : null;
+            checkShell(operation);
         })()
       : (() => {
           const policyOpts = (opts.policy as ClaudePolicyOptions) ?? {};
@@ -240,7 +245,7 @@ export function createServer(opts: PredexecServerOptions = {}): McpServer {
   server.registerTool(
     TOOL_NAME,
     {
-      description: DESCRIPTION,
+      description: host === "codex" ? CODEX_DESCRIPTION : DESCRIPTION,
       inputSchema: z.object({ plan: z.unknown().describe(PLAN_ARG_DESCRIPTION) }),
       // predexec is read-only speculation; any mutating node is a hard stop
       // BEFORE it runs (see the module doc). Declaring that here, not just in

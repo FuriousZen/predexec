@@ -100,6 +100,7 @@ import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { splitCommandSegments } from "../core/index.ts";
+import type { Operation } from "../core/types.ts";
 import type { PolicyVerdict } from "./policy-claude.ts";
 import { parseTomlLite } from "./toml-lite.ts";
 
@@ -708,7 +709,7 @@ function tokensEqual(a: string[], b: string[]): boolean {
 }
 
 /**
- * Build the `checkCommandPolicy` callback for the engine. Each pipeline
+ * Build the shell portion of the operation-aware policy callback for the engine. Each pipeline
  * segment (via core's `splitCommandSegments`, same as policy.ts/
  * policy-claude.ts) is judged independently, so a compound
  * `git status && git push origin main` cannot smuggle the push past a
@@ -731,16 +732,24 @@ function tokensEqual(a: string[], b: string[]): boolean {
 export function createCodexPolicyChecker(
   rules: CodexRule[],
   unreadable: string[] = [],
-): (cmd: string) => PolicyVerdict {
+): (operation: Operation) => PolicyVerdict {
   if (unreadable.length > 0) {
     const why =
       `cannot read your Codex execpolicy configuration (${unreadable[0]} is not valid) — ` +
       `predexec stops rather than run commands your policy might forbid or prompt on; fix that file to continue`;
-    return () => why;
+    return (operation: Operation) => {
+      if (typeof operation === "string") return why;
+      if (operation.tool === "bash" && typeof operation.command === "string") return why;
+      return null;
+    };
   }
   if (rules.length === 0) return () => null;
 
-  return (cmd: string) => {
+  return (operation: Operation) => {
+    const cmd = typeof operation === "string"
+      ? operation
+      : operation.tool === "bash" && typeof operation.command === "string" ? operation.command : null;
+    if (cmd === null) return null;
     try {
       const pending = [cmd];
       for (let depth = 0; depth < 4 && pending.length > 0; depth++) {

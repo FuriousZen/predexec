@@ -78,18 +78,9 @@ export async function runPlanTree(plan: PlanTree, opts: RunOptions): Promise<Cor
     // Host-policy hard-stop: check every operation before running any item in
     // this node. Predexec cannot prompt mid-walk, so it never runs a node with
     // a deny/ask match.
-    const checkOperationPolicy: OperationPolicyChecker | undefined =
-      opts.checkOperationPolicy ??
-      (opts.checkCommandPolicy
-        ? (operation) =>
-            typeof operation === "string"
-              ? opts.checkCommandPolicy!(operation)
-              : operation.tool === "bash" && typeof operation.command === "string"
-                ? opts.checkCommandPolicy!(operation.command)
-                : null
-        : undefined);
+    const checkOperationPolicy: OperationPolicyChecker | undefined = opts.checkOperationPolicy;
     if (checkOperationPolicy) {
-      const violation = findPolicyViolation(current, checkOperationPolicy);
+      const violation = findPolicyViolation(current, checkOperationPolicy, opts.cwd, effectiveCwd);
       if (violation) {
         blocks.push(policyBlock(current, violation));
         return result(pathTaken, depth, "policyStop", blocks.join("\n\n"), edgesEvaluated, edgesMatched);
@@ -253,14 +244,33 @@ function checkToolOpDestructive(op: ToolOp): string | null {
 function findPolicyViolation(
   node: PlanNode,
   check: OperationPolicyChecker,
+  sessionRoot: string,
+  effectiveCwd: string,
 ): { index: number; command: string; rule: string } | null {
   let violation: { index: number; command: string; rule: string } | null = null;
   for (let i = 0; i < node.commands.length; i++) {
     const op = node.commands[i]!;
-    const rule = check(op);
+    const checked = normalizePolicyOperation(op, sessionRoot, effectiveCwd);
+    const rule = check(checked);
     if (rule && !violation) violation = { index: i, command: isToolOp(op) ? formatToolOpLabel(op) : op, rule };
   }
   return violation;
+}
+
+/** Map native relative targets to the session-root namespace used by hosts. */
+function normalizePolicyOperation(operation: Operation, sessionRoot: string, effectiveCwd: string): Operation {
+  if (typeof operation === "string" || operation.tool === "bash") return operation;
+  const prefix = relative(sessionRoot, effectiveCwd).replaceAll(sep, "/");
+  if (!prefix || prefix === ".") return operation;
+  const withPrefix = (value: unknown): unknown => {
+    if (typeof value !== "string" || isAbsolute(value)) return value;
+    const clean = value.replace(/^\.\//, "");
+    return clean === "." || clean === "" ? prefix : `${prefix}/${clean}`;
+  };
+  const normalized: ToolOp = { ...operation };
+  if ("path" in operation) normalized.path = withPrefix(operation.path);
+  if (operation.tool === "find" && "pattern" in operation) normalized.pattern = withPrefix(operation.pattern);
+  return normalized;
 }
 
 function transcriptBlock(node: PlanNode, output: NodeOutput): string {
@@ -314,10 +324,14 @@ function policyBlock(
   node: PlanNode,
   violation: { index: number; command: string; rule: string },
 ): string {
+  const native = violation.command.startsWith("read:") || violation.command.startsWith("grep:") ||
+    violation.command.startsWith("find:") || violation.command.startsWith("ls:");
   return [
     `## node ${node.id} — POLICY HARD-STOP (not run)`,
     `Blocked by host permission rule '${violation.rule}' on operation ${violation.index + 1}: ${violation.command}`,
-    "Run this via the host bash tool instead — it enforces/prompts per the host's permission config.",
+    native
+      ? "Use the host's native file/search tool instead — it enforces/prompts per the host's permission config."
+      : "Run this via the host bash tool instead — it enforces/prompts per the host's permission config.",
   ].join("\n");
 }
 

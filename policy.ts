@@ -5,7 +5,7 @@
  * steering.ts/stats.ts. Closes the policy-bypass hole: predexec spawns shell
  * strings directly, so without this a user's opencode `permission.bash` rules
  * (deny/ask) never see them. The opencode adapter builds a checker per tool
- * call and passes it as `RunOptions.checkCommandPolicy`; the engine hard-stops
+ * call and passes it as `RunOptions.checkOperationPolicy`; the engine hard-stops
  * (`policyStop`) BEFORE running a matched command.
  *
  * Both `deny` AND `ask` stop: predexec cannot prompt mid-walk, and silently
@@ -40,7 +40,7 @@ import type { Operation } from "./core/types.ts";
 export type PolicyAction = "allow" | "ask" | "deny";
 
 export interface PolicyRule {
-  tool?: "read" | "grep" | "list";
+  tool?: "read" | "grep" | "glob" | "list" | "*";
   pattern: string;
   action: PolicyAction;
 }
@@ -120,13 +120,22 @@ export function parseBashPermission(configText: string): PolicyRule[] {
 export function parseOperationPermissions(configText: string): PolicyRule[] {
   const config = JSON.parse(stripJsonComments(configText)) as { permission?: unknown };
   const permission = config?.permission;
-  if (typeof permission !== "object" || permission === null || Array.isArray(permission)) return [];
   const out: PolicyRule[] = [];
-  for (const tool of ["read", "grep", "list"] as const) {
-    const entries = (permission as Record<string, unknown>)[tool];
-    if (typeof entries !== "object" || entries === null || Array.isArray(entries)) continue;
+  const add = (tool: PolicyRule["tool"], entries: unknown): void => {
+    if (isAction(entries)) {
+      out.push({ tool, pattern: "*", action: entries });
+      return;
+    }
+    if (typeof entries !== "object" || entries === null || Array.isArray(entries)) return;
     for (const [pattern, action] of Object.entries(entries as Record<string, unknown>)) {
       if (isAction(action)) out.push({ tool, pattern, action });
+    }
+  };
+  if (isAction(permission)) {
+    add("*", permission);
+  } else if (typeof permission === "object" && permission !== null && !Array.isArray(permission)) {
+    for (const [tool, entries] of Object.entries(permission as Record<string, unknown>)) {
+      if (tool === "read" || tool === "grep" || tool === "glob" || tool === "list" || tool === "*") add(tool, entries);
     }
   }
   return out;
@@ -175,11 +184,10 @@ export function readOpencodeBashRules(
   const rules: PolicyRule[] = [];
   const unreadable: string[] = [];
   for (const path of opencodeConfigPaths(projectDir, env)) {
-    if (!existsSync(path)) continue;
     try {
       rules.push(...parseBashPermission(readFileSync(path, "utf8")));
-    } catch {
-      unreadable.push(path);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") unreadable.push(path);
     }
   }
   return { rules, unreadable };
@@ -192,11 +200,10 @@ export function readOpencodeOperationRules(
   const rules: PolicyRule[] = [];
   const unreadable: string[] = [];
   for (const path of opencodeConfigPaths(projectDir, env)) {
-    if (!existsSync(path)) continue;
     try {
       rules.push(...parseOperationPermissions(readFileSync(path, "utf8")));
-    } catch {
-      unreadable.push(path);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") unreadable.push(path);
     }
   }
   return { rules, unreadable };
@@ -219,7 +226,7 @@ function patternToRegex(pattern: string): RegExp | null {
 }
 
 /**
- * Build the `checkCommandPolicy` callback for the engine.
+ * Build the operation-aware policy callback for the engine.
  *
  * Each pipeline segment is judged independently, so a compound
  * `git status && git push` cannot smuggle the push past a `git push *` rule.
@@ -272,15 +279,18 @@ export function createPolicyChecker(
   return (operation: Operation): string | null => {
     if (typeof operation === "string") return checkBash(operation);
     if (operation.tool === "bash" && typeof operation.command === "string") return checkBash(operation.command);
-    const policyTool = operation.tool === "read" ? "read" : operation.tool === "grep" ? "grep" :
-      operation.tool === "ls" || operation.tool === "find" ? "list" : null;
-    if (!policyTool) return null;
-    const target = typeof operation.path === "string" ? operation.path :
-      typeof operation.pattern === "string" ? operation.pattern : ".";
+    const policyTools: PolicyRule["tool"][] = operation.tool === "read" ? ["read"] :
+      operation.tool === "grep" ? ["grep"] : operation.tool === "ls" ? ["list"] :
+        operation.tool === "find" ? ["glob", "list"] : [];
+    if (policyTools.length === 0) return null;
+    const target = operation.tool === "grep" || operation.tool === "find"
+      ? (typeof operation.pattern === "string" ? operation.pattern : ".")
+      : typeof operation.path === "string" ? operation.path :
+        typeof operation.pattern === "string" ? operation.pattern : ".";
     const candidates = target.startsWith("./") ? [target, target.slice(2)] : [target, `./${target}`];
     let winner: (PolicyRule & { regex: RegExp }) | null = null;
     for (const rule of compiled) {
-      if (rule.tool !== policyTool) continue;
+      if (rule.tool !== "*" && !policyTools.includes(rule.tool)) continue;
       if (candidates.some((candidate) => rule.regex.test(candidate))) winner = rule;
     }
     return winner && winner.action !== "allow" ? winner.pattern : null;

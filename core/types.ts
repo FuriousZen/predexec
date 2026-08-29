@@ -150,8 +150,6 @@ export interface RunOptions {
    * cannot prompt mid-walk → policyStop hard-stop before running), null to run.
    */
   checkOperationPolicy?: OperationPolicyChecker;
-  /** @deprecated Use checkOperationPolicy. Kept for adapter compatibility. */
-  checkCommandPolicy?: (cmd: string) => string | null;
 }
 
 /** Engine-level backstop when a plan omits maxDepth. */

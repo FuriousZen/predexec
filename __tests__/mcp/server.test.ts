@@ -106,6 +106,14 @@ describe("mcp server — tool registration", () => {
     // us, so the description has to say predexec enforces them itself.
     expect(description).toContain("hard-stops before running");
   });
+
+  it("describes Codex as shell-only for persisted policy enforcement", async () => {
+    const { request } = await connected({ cwd: project(), host: "codex", policy: { codexHome: noSettings } });
+    const listed = await request("tools/list");
+    const description = (listed.result.tools as Json[])[0]!.description as string;
+    expect(description).toContain("no persisted native file-operation policy source");
+    expect(description).not.toContain("mapped file operations are checked");
+  });
 });
 
 describe("mcp server — running a plan", () => {
@@ -190,6 +198,36 @@ describe("mcp server — Claude Code permission policy", () => {
     expect(text).toContain("read:.env");
     expect(text).toContain("'./.env'");
     expect(text).not.toContain("secret");
+  });
+
+  it("matches native Read rules in session-root-relative paths under plan cwd", async () => {
+    const dir = project();
+    mkdirSync(join(dir, "sub"));
+    writeFileSync(join(dir, "sub", ".env"), "nested secret\n");
+    mkdirSync(join(dir, ".claude"));
+    writeFileSync(join(dir, ".claude", "settings.json"), '{"permissions":{"deny":["Read(./sub/.env)"]}}');
+    const { request } = await connected({ cwd: dir, policy: policyOptions });
+    const response = await callPredexec(request, {
+      root: "a",
+      cwd: "sub",
+      nodes: [{ id: "a", commands: [{ tool: "read", path: ".env" }] }],
+    });
+    const text = textOf(response);
+    expect(text).toContain("POLICY HARD-STOP (not run)");
+    expect(text).not.toContain("nested secret");
+  });
+
+  it("uses native recovery guidance instead of advising a host bash tool", async () => {
+    const dir = project();
+    mkdirSync(join(dir, ".claude"));
+    writeFileSync(join(dir, ".claude", "settings.json"), '{"permissions":{"deny":["Read(./.env)"]}}');
+    const { request } = await connected({ cwd: dir, policy: policyOptions });
+    const text = textOf(await callPredexec(request, {
+      root: "a",
+      nodes: [{ id: "a", commands: [{ tool: "read", path: ".env" }] }],
+    }));
+    expect(text).toContain("native file/search tool");
+    expect(text).not.toContain("host bash tool");
   });
 
   it("a deny rule in .claude/settings.json produces a policyStop before the command runs", async () => {

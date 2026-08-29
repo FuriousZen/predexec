@@ -125,6 +125,14 @@ describe("Claude native operation policy", () => {
     expect(check({ tool: "find", path: "./private", pattern: "*" })).toBe("./private/**");
     expect(check({ tool: "read", path: "README.md" })).toBeNull();
   });
+
+  it("applies a global Claude deny to native operations", () => {
+    const check = createClaudeOperationPolicyChecker(parseClaudeOperationRules('{"permissions":{"deny":["*"]}}'));
+    expect(check({ tool: "read", path: "README.md" })).toBe("*");
+    expect(check({ tool: "grep", path: ".", pattern: "TODO" })).toBe("*");
+    expect(check({ tool: "find", path: ".", pattern: "*.ts" })).toBe("*");
+    expect(check({ tool: "ls", path: "." })).toBe("*");
+  });
 });
 
 describe("createClaudePolicyChecker — glob semantics", () => {
@@ -431,7 +439,7 @@ describe("engine — policyStop through the Claude checker", () => {
     };
     const r = await runPlanTree(plan, {
       cwd: process.cwd(),
-      checkCommandPolicy: createClaudePolicyChecker(rules),
+      checkOperationPolicy: createClaudePolicyChecker(rules),
     });
     expect(r.stoppedReason).toBe("policyStop");
     expect(r.pathTaken).toEqual([]); // never ran
@@ -443,7 +451,7 @@ describe("engine — policyStop through the Claude checker", () => {
     const plan: PlanTree = { root: "a", nodes: [{ id: "a", commands: ["echo hi"] }] };
     const r = await runPlanTree(plan, {
       cwd: process.cwd(),
-      checkCommandPolicy: createClaudePolicyChecker(rules),
+      checkOperationPolicy: createClaudePolicyChecker(rules),
     });
     expect(r.stoppedReason).toBe("leaf");
   });
