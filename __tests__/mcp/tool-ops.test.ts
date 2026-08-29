@@ -2,7 +2,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
-import type { ToolOp } from "../../core/index.ts";
+import { isSafeRegex, type ToolOp } from "../../core/index.ts";
 import {
   createToolExecutor,
   findOnPath,
@@ -425,6 +425,11 @@ describe("mcp tool-ops — executor contract", () => {
 });
 
 describe("mcp tool-ops — helpers", () => {
+  it("screens nested quantifiers before fallback regex construction", () => {
+    expect(isSafeRegex("(a+)+$"), "nested quantifier must be unsafe").toBe(false);
+    expect(isSafeRegex("a+$"), "ordinary quantifier remains usable").toBe(true);
+  });
+
   it("globToRegExp handles the documented subset", () => {
     expect(globToRegExp("*.ts").test("a.ts")).toBe(true);
     expect(globToRegExp("*.ts").test("src/a.ts")).toBe(false); // `*` stops at a separator
@@ -445,5 +450,42 @@ describe("mcp tool-ops — helpers", () => {
     expect(findOnPath("px-definitely-not-a-real-binary")).toBeNull();
     // `node` is running this test, so it is on PATH by construction.
     expect(findOnPath(process.platform === "win32" ? "node.exe" : "node")).toContain("node");
+  });
+});
+
+describe("mcp tool-ops — bounded fallback scans", () => {
+  it("rejects unsafe regexes with search-not-run exit 2", async () => {
+    const path = "unsafe-regex.txt";
+    write(path, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n");
+    const r = await run({ tool: "grep", pattern: "(a+)+$", path }, NODE_ONLY);
+    expect(r.exitCode).toBe(2);
+    expect(r.stdout).toBe("");
+    expect(r.stderr).toContain("unsafe pattern");
+  });
+
+  it("returns lexically ordered matches and stops at the first over-limit match", async () => {
+    write("bounded/z-last.txt", "hit\n");
+    write("bounded/a-first.txt", "hit\n");
+    write("bounded/m-middle.txt", "hit\n");
+    write("bounded/n-fourth.txt", "hit\n");
+    write("bounded/z-after-limit.txt", "hit\n");
+
+    const r = await run({ tool: "grep", pattern: "hit", path: "bounded", limit: 3 }, NODE_ONLY);
+    expect(r.exitCode).toBe(0);
+    expect(r.stdout).toBe([
+      "bounded/a-first.txt:1:hit",
+      "bounded/m-middle.txt:1:hit",
+      "bounded/n-fourth.txt:1:hit",
+    ].join("\n"));
+    expect(r.stderr).toContain("3 match limit reached");
+  });
+
+  it("preserves offset and continuation output for large streamed text reads", async () => {
+    const lines = Array.from({ length: 12000 }, (_, i) => `line-${i + 1}`);
+    write("large-stream.txt", `${lines.join("\n")}\n`);
+    const r = await run({ tool: "read", path: "large-stream.txt", offset: 2, limit: 2 });
+    expect(r.exitCode).toBe(0);
+    expect(r.stdout).toBe("line-2\nline-3");
+    expect(r.stderr).toBe("read: showing lines 2-3 of 12001 in large-stream.txt — use offset=4 to continue");
   });
 });

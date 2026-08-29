@@ -16,7 +16,7 @@ export { runPlanTree } from "./engine.ts";
 export { OUTPUT_CAP } from "./runner.ts";
 export { isDestructiveCommand, splitCommandSegments } from "./destructive.ts";
 export { coercePlan } from "./coerce.ts";
-export { escapeRegExp } from "./conditions.ts";
+export { escapeRegExp, isSafeRegex } from "./conditions.ts";
 export {
   MAX_OPERATIONS_PER_NODE,
   MAX_PARALLEL_CONCURRENCY,

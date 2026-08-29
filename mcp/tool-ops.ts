@@ -30,10 +30,12 @@
 
 import { execFile } from "node:child_process";
 import { accessSync, constants } from "node:fs";
-import { readdir, readFile, stat } from "node:fs/promises";
+import { createReadStream } from "node:fs";
+import { readdir, stat } from "node:fs/promises";
+import { createInterface } from "node:readline";
 import { delimiter, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { promisify } from "node:util";
-import { escapeRegExp, type ToolExecutor, type ToolOp } from "../core/index.ts";
+import { escapeRegExp, isSafeRegex, type ToolExecutor, type ToolOp } from "../core/index.ts";
 
 /** The shell-like shape the core engine branches on (see core/runner.ts). */
 interface OpResult {
@@ -314,31 +316,89 @@ async function readOp(op: ToolOp, root: string, base: string): Promise<OpResult>
   if (!info) return fail("read", `path not found: ${raw} (resolved against ${base})`);
   if (info.isDirectory()) return fail("read", `${raw} is a directory — use {tool:"ls"} to list it`);
 
-  const buf = await readFile(found.abs);
-  if (buf.includes(0)) {
-    return fail("read", `${raw} looks like a binary file — this adapter reads text only`);
-  }
-
-  const lines = buf.toString("utf8").split("\n");
-  const total = lines.length;
   const offset = typeof op.offset === "number" ? op.offset : 1;
   const start = Math.max(0, offset - 1);
+  const limit = positiveInt(op.limit) ?? DEFAULT_READ_LINES;
+  const retained: string[] = [];
+  const scan = await scanTextLines(found.abs, (line, lineNo) => {
+    if (lineNo > start && lineNo <= start + limit) retained.push(line);
+  });
+  if (scan.binary) {
+    return fail("read", `${raw} looks like a binary file — this adapter reads text only`);
+  }
+  const total = scan.totalLines;
   // An out-of-range offset returns empty stdout if it is allowed to clamp, and
   // empty stdout is indistinguishable from an empty file to a negated `match`.
   if (start >= total) return fail("read", `offset ${offset} is past the end of ${raw} (${total} lines)`);
   const end = Math.min(start + (positiveInt(op.limit) ?? DEFAULT_READ_LINES), total);
+  // readline does not emit the synthetic empty line after a final newline;
+  // add it only when the requested range includes that line, matching split("\n").
+  if (scan.finalNewline && end > scan.contentLines && start < total && start <= scan.contentLines) retained.push("");
 
   // Notices go to stderr, never stdout: a `numeric` edge extracting from stdout
   // would happily read the number out of "showing lines 1-2000 of 5000". A
   // caller-supplied `limit` that stops short of EOF is still truncation and
   // still gets the notice — silence there reads to the model as "whole file".
   return {
-    stdout: lines.slice(start, end).join("\n"),
+    stdout: retained.join("\n"),
     stderr:
       end < total
         ? `read: showing lines ${start + 1}-${end} of ${total} in ${raw} — use offset=${end + 1} to continue`
         : "",
     exitCode: 0,
+  };
+}
+
+interface TextScan {
+  totalLines: number;
+  contentLines: number;
+  finalNewline: boolean;
+  binary: boolean;
+}
+
+/**
+ * Consume UTF-8 text incrementally. Callers decide which lines to retain; the
+ * scan itself keeps only counters and the final-byte/NUL state. Returning the
+ * synthetic trailing line separately preserves split("\n") behavior without
+ * retaining the complete file in memory.
+ */
+async function scanTextLines(
+  path: string,
+  onLine: (line: string, lineNo: number) => boolean | void,
+  signal?: AbortSignal,
+): Promise<TextScan> {
+  const input = createReadStream(path);
+  let bytes = 0;
+  let lastByte = -1;
+  let binary = false;
+  input.on("data", (chunk: Buffer | string) => {
+    const buf = typeof chunk === "string" ? Buffer.from(chunk) : chunk;
+    bytes += buf.length;
+    if (buf.length > 0) lastByte = buf[buf.length - 1]!;
+    if (buf.includes(0)) binary = true;
+  });
+  const lines = createInterface({ input, crlfDelay: Infinity });
+  let contentLines = 0;
+  let stopped = false;
+  try {
+    for await (const line of lines) {
+      if (signal?.aborted) throw new Error("aborted");
+      contentLines += 1;
+      if (onLine(String(line), contentLines) === false) {
+        stopped = true;
+        break;
+      }
+    }
+  } finally {
+    lines.close();
+    if (stopped || signal?.aborted) input.destroy();
+  }
+  const finalNewline = !stopped && bytes > 0 && lastByte === 10;
+  return {
+    contentLines,
+    finalNewline,
+    totalLines: contentLines + (finalNewline ? 1 : contentLines === 0 ? 1 : 0),
+    binary,
   };
 }
 
@@ -379,7 +439,7 @@ async function grepOp(
     // Only a directory search has a file set to diverge over; on one named file
     // the note would be noise about a decision that was never made.
     if (scope.isDir) notes.push(`grep: ripgrep ${NO_GITIGNORE_NOTE}`);
-    const found = await grepViaNode(pattern, scope.abs, scope.isDir, base, { ignoreCase, literal, glob }, signal);
+    const found = await grepViaNode(pattern, scope.abs, scope.isDir, base, { ignoreCase, literal, glob }, limit, signal);
     if (found.err) return found.err;
     if (found.capped) notes.push(walkCapNote("grep"));
     matches = found.matches;
@@ -440,11 +500,15 @@ async function grepViaNode(
   isDir: boolean,
   base: string,
   flags: { ignoreCase: boolean; literal: boolean; glob?: string },
+  limit: number,
   signal?: AbortSignal,
 ): Promise<
   { matches: Match[]; capped: boolean; err?: undefined } | { matches?: undefined; capped?: undefined; err: OpResult }
 > {
   let re: RegExp;
+  if (!flags.literal && !isSafeRegex(pattern)) {
+    return { err: fail("grep", "unsafe pattern: nested quantifier may not terminate") };
+  }
   try {
     const source = flags.literal ? escapeRegExp(pattern) : pattern;
     re = new RegExp(source, flags.ignoreCase ? "i" : "");
@@ -461,22 +525,27 @@ async function grepViaNode(
   }
 
   const walked = isDir ? await walkFiles(abs, signal) : { files: [abs], capped: false };
+  walked.files.sort();
   const matches: Match[] = [];
   for (const file of walked.files) {
     if (signal?.aborted) throw new Error("aborted");
     const rel = relativize(base, file);
     if (globRe && !matchesGlob(globRe, rel, flags.glob!)) continue;
-    let buf: Buffer;
+    const pending: Match[] = [];
     try {
-      buf = await readFile(file);
+      const scan = await scanTextLines(file, (text, line) => {
+        if (re!.test(text)) {
+          pending.push({ path: rel, line, text });
+          if (matches.length + pending.length > limit) return false;
+        }
+      }, signal);
+      if (scan.binary) continue;
+      matches.push(...pending);
     } catch {
       continue; // unreadable file: skip it, the same way rg does
     }
-    if (buf.includes(0)) continue; // binary — rg skips these too
-    const lines = buf.toString("utf8").split("\n");
-    for (let i = 0; i < lines.length; i++) {
-      const text = lines[i]!;
-      if (re.test(text)) matches.push({ path: rel, line: i + 1, text });
+    if (matches.length > limit) {
+      break;
     }
   }
   return { matches: sortMatches(matches), capped: walked.capped };
@@ -493,25 +562,35 @@ const sortMatches = (matches: Match[]): Match[] =>
 async function formatMatches(matches: Match[], base: string, context: number): Promise<string> {
   if (context === 0) return matches.map((m) => `${m.path}:${m.line}:${m.text}`).join("\n");
 
-  const cache = new Map<string, string[]>();
+  const cache = new Map<string, { lines: Map<number, string>; total: number }>();
   const blocks: string[] = [];
   for (const m of matches) {
-    let lines = cache.get(m.path);
-    if (!lines) {
+    let cached = cache.get(m.path);
+    if (!cached) {
+      const related = matches.filter((candidate) => candidate.path === m.path);
+      const lines = new Map<number, string>();
+      let total = 0;
       try {
-        lines = (await readFile(resolve(base, m.path), "utf8")).split("\n");
+        const scan = await scanTextLines(resolve(base, m.path), (text, line) => {
+          if (related.some((candidate) => Math.abs(line - candidate.line) <= context)) lines.set(line, text);
+        });
+        total = scan.totalLines;
+        if (scan.finalNewline && related.some((candidate) => scan.contentLines + 1 - candidate.line <= context)) {
+          lines.set(scan.contentLines + 1, "");
+        }
       } catch {
-        lines = [];
+        total = 0;
       }
-      cache.set(m.path, lines);
+      cached = { lines, total };
+      cache.set(m.path, cached);
     }
     const from = Math.max(1, m.line - context);
-    const to = Math.min(lines.length, m.line + context);
+    const to = Math.min(cached.total, m.line + context);
     const block: string[] = [];
     for (let n = from; n <= to; n++) {
       // rg's convention: `:` separates a match line, `-` a context line.
       const mark = n === m.line ? ":" : "-";
-      block.push(`${m.path}${mark}${n}${mark}${lines[n - 1] ?? ""}`);
+      block.push(`${m.path}${mark}${n}${mark}${cached.lines.get(n) ?? ""}`);
     }
     blocks.push(block.join("\n"));
   }
