@@ -18,6 +18,8 @@ export interface ToolOp {
 
 /** A single step in a node's batch: a shell command (string) or a tool call (object). */
 export type Operation = string | ToolOp;
+/** Adapter-provided host-policy check for every operation in a node batch. */
+export type OperationPolicyChecker = (operation: Operation) => string | null;
 
 export interface PlanNode {
   id: NodeId;
@@ -143,10 +145,12 @@ export interface RunOptions {
   /** Callback to execute tool operations ({tool, ...args}). Required when plan contains tool ops. */
   executeToolOp?: ToolExecutor;
   /**
-   * Adapter-provided host-policy check for shell commands. Returns the matched
+   * Adapter-provided host-policy check for every operation. Returns the matched
    * rule/pattern when the HOST would deny or prompt for the command (predexec
    * cannot prompt mid-walk → policyStop hard-stop before running), null to run.
    */
+  checkOperationPolicy?: OperationPolicyChecker;
+  /** @deprecated Use checkOperationPolicy. Kept for adapter compatibility. */
   checkCommandPolicy?: (cmd: string) => string | null;
 }
 

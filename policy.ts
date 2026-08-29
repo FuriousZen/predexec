@@ -35,10 +35,12 @@ import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, parse as parsePath } from "node:path";
 import { escapeRegExp, splitCommandSegments } from "./core/index.ts";
+import type { Operation } from "./core/types.ts";
 
 export type PolicyAction = "allow" | "ask" | "deny";
 
 export interface PolicyRule {
+  tool?: "read" | "grep" | "list";
   pattern: string;
   action: PolicyAction;
 }
@@ -114,6 +116,22 @@ export function parseBashPermission(configText: string): PolicyRule[] {
   return [];
 }
 
+/** Parse opencode's documented native read/search/list permission maps. */
+export function parseOperationPermissions(configText: string): PolicyRule[] {
+  const config = JSON.parse(stripJsonComments(configText)) as { permission?: unknown };
+  const permission = config?.permission;
+  if (typeof permission !== "object" || permission === null || Array.isArray(permission)) return [];
+  const out: PolicyRule[] = [];
+  for (const tool of ["read", "grep", "list"] as const) {
+    const entries = (permission as Record<string, unknown>)[tool];
+    if (typeof entries !== "object" || entries === null || Array.isArray(entries)) continue;
+    for (const [pattern, action] of Object.entries(entries as Record<string, unknown>)) {
+      if (isAction(action)) out.push({ tool, pattern, action });
+    }
+  }
+  return out;
+}
+
 /** Config files opencode reads, nearest-last so project overrides global. */
 export function opencodeConfigPaths(projectDir: string, env: NodeJS.ProcessEnv = process.env): string[] {
   const configHome = env.XDG_CONFIG_HOME || join(homedir(), ".config");
@@ -167,6 +185,23 @@ export function readOpencodeBashRules(
   return { rules, unreadable };
 }
 
+export function readOpencodeOperationRules(
+  projectDir: string,
+  env: NodeJS.ProcessEnv = process.env,
+): { rules: PolicyRule[]; unreadable: string[] } {
+  const rules: PolicyRule[] = [];
+  const unreadable: string[] = [];
+  for (const path of opencodeConfigPaths(projectDir, env)) {
+    if (!existsSync(path)) continue;
+    try {
+      rules.push(...parseOperationPermissions(readFileSync(path, "utf8")));
+    } catch {
+      unreadable.push(path);
+    }
+  }
+  return { rules, unreadable };
+}
+
 /**
  * Convert an opencode permission pattern to an anchored regex.
  * `*` matches zero or more characters, `?` exactly one
@@ -198,27 +233,32 @@ function patternToRegex(pattern: string): RegExp | null {
 export function createPolicyChecker(
   rules: PolicyRule[],
   unreadable: string[] = [],
-): (cmd: string) => string | null {
+): (operation: Operation) => string | null {
   if (unreadable.length > 0) {
     // Name the file and the remedy: without that this reads as a predexec bug
     // rather than a syntax error in the user's own config.
     const why =
       `cannot read your opencode permission rules (${unreadable[0]} is not valid JSON/JSONC) — ` +
       `predexec stops rather than run commands your policy might forbid; fix that file to continue`;
-    return () => why;
+    return (operation: Operation) => {
+      if (typeof operation === "string") return why;
+      if (operation.tool === "bash" || operation.tool === "read" || operation.tool === "grep" || operation.tool === "find" || operation.tool === "ls") return why;
+      return null;
+    };
   }
   if (rules.length === 0) return () => null;
   const compiled = rules
     .map((rule) => ({ ...rule, regex: patternToRegex(rule.pattern) }))
     .filter((rule): rule is PolicyRule & { regex: RegExp } => rule.regex !== null);
 
-  return (cmd: string) => {
+  const checkBash = (cmd: string): string | null => {
     try {
       for (const segment of splitCommandSegments(cmd)) {
         const trimmed = segment.trim();
         let winner: (PolicyRule & { regex: RegExp }) | null = null;
         // Last match wins — keep scanning rather than breaking on first hit.
         for (const rule of compiled) {
+          if (rule.tool) continue;
           if (rule.regex.test(trimmed)) winner = rule;
         }
         if (winner && winner.action !== "allow") return winner.pattern;
@@ -228,4 +268,23 @@ export function createPolicyChecker(
       return null;
     }
   };
+
+  return (operation: Operation): string | null => {
+    if (typeof operation === "string") return checkBash(operation);
+    if (operation.tool === "bash" && typeof operation.command === "string") return checkBash(operation.command);
+    const policyTool = operation.tool === "read" ? "read" : operation.tool === "grep" ? "grep" :
+      operation.tool === "ls" || operation.tool === "find" ? "list" : null;
+    if (!policyTool) return null;
+    const target = typeof operation.path === "string" ? operation.path :
+      typeof operation.pattern === "string" ? operation.pattern : ".";
+    const candidates = target.startsWith("./") ? [target, target.slice(2)] : [target, `./${target}`];
+    let winner: (PolicyRule & { regex: RegExp }) | null = null;
+    for (const rule of compiled) {
+      if (rule.tool !== policyTool) continue;
+      if (candidates.some((candidate) => rule.regex.test(candidate))) winner = rule;
+    }
+    return winner && winner.action !== "allow" ? winner.pattern : null;
+  };
 }
+
+export const createOperationPolicyChecker = createPolicyChecker;

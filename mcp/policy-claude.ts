@@ -43,6 +43,7 @@ import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { homedir, platform } from "node:os";
 import { dirname, join, parse as parsePath } from "node:path";
 import { escapeRegExp, splitCommandSegments } from "../core/index.ts";
+import type { Operation } from "../core/types.ts";
 
 export type ClaudePolicyAction = "allow" | "ask" | "deny";
 
@@ -58,6 +59,12 @@ export type PolicyVerdict = string | null;
 
 export interface ClaudePolicyRule {
   /** The bash-command glob, with `Bash(...)` and the `:*` alias normalized away. */
+  pattern: string;
+  action: ClaudePolicyAction;
+}
+
+export interface ClaudeOperationPolicyRule {
+  tool: "read" | "grep" | "find";
   pattern: string;
   action: ClaudePolicyAction;
 }
@@ -174,6 +181,29 @@ export function parseClaudeBashRules(settingsText: string): ClaudePolicyRule[] {
     }
   }
   return rules;
+}
+
+/** Parse the documented Claude native Read, Grep, and Glob permission entries. */
+export function parseClaudeOperationRules(settingsText: string): ClaudeOperationPolicyRule[] {
+  const settings = JSON.parse(settingsText) as { permissions?: unknown };
+  const permissions = settings?.permissions;
+  if (typeof permissions !== "object" || permissions === null || Array.isArray(permissions)) return [];
+  const out: ClaudeOperationPolicyRule[] = [];
+  for (const action of ACTIONS) {
+    const entries = (permissions as Record<string, unknown>)[action];
+    if (!Array.isArray(entries)) continue;
+    for (const entry of entries) {
+      if (typeof entry !== "string") continue;
+      const open = entry.indexOf("(");
+      if (open < 1 || !entry.endsWith(")")) continue;
+      const hostTool = entry.slice(0, open).trim();
+      const pattern = entry.slice(open + 1, -1).trim();
+      if (!pattern || !["Read", "Grep", "Glob"].includes(hostTool)) continue;
+      const tool: ClaudeOperationPolicyRule["tool"] = hostTool === "Read" ? "read" : hostTool === "Grep" ? "grep" : "find";
+      out.push({ tool, pattern, action });
+    }
+  }
+  return out;
 }
 
 /**
@@ -426,6 +456,62 @@ export function readClaudeBashRules(
   return { rules, unreadable };
 }
 
+export function readClaudeOperationRules(
+  projectDir: string,
+  opts: ClaudePolicyOptions = {},
+): { rules: ClaudeOperationPolicyRule[]; unreadable: string[] } {
+  const rules: ClaudeOperationPolicyRule[] = [];
+  const unreadable: string[] = [];
+  const seen = new Set<string>();
+  for (const path of claudeSettingsPaths(projectDir, opts)) {
+    if (seen.has(path) || !existsSync(path)) continue;
+    seen.add(path);
+    try {
+      rules.push(...parseClaudeOperationRules(readFileSync(path, "utf8")));
+    } catch {
+      unreadable.push(path);
+    }
+  }
+  return { rules, unreadable };
+}
+
+export function createClaudeOperationPolicyChecker(
+  rules: ClaudeOperationPolicyRule[],
+  unreadable: string[] = [],
+): (operation: Operation) => PolicyVerdict {
+  if (unreadable.length > 0) {
+    const why =
+      `cannot read your Claude Code permission rules (${unreadable[0]} is not valid JSON) — ` +
+      `predexec stops rather than run operations your policy might forbid or prompt on; fix that file to continue`;
+    return (operation: Operation) => {
+      if (typeof operation === "object" && (operation.tool === "read" || operation.tool === "ls" || operation.tool === "grep" || operation.tool === "find")) return why;
+      return null;
+    };
+  }
+  const compiled = rules
+    .filter((rule) => rule.action !== "allow")
+    .map((rule) => ({ ...rule, regex: patternToRegex(rule.pattern) }))
+    .filter((rule): rule is ClaudeOperationPolicyRule & { regex: RegExp } => rule.regex !== null)
+    .sort((a, b) => (a.action === b.action ? 0 : a.action === "deny" ? -1 : 1));
+  return (operation: Operation) => {
+    if (typeof operation === "string" || operation.tool === "bash") return null;
+    const mapped = operation.tool === "read" || operation.tool === "ls"
+      ? "read"
+      : operation.tool === "grep" ? "grep"
+        : operation.tool === "find" ? "find" : null;
+    if (!mapped) return null;
+    const rawTargets = [operation.path, operation.pattern].filter((v): v is string => typeof v === "string");
+    if (rawTargets.length === 0) rawTargets.push(".");
+    const targets = rawTargets.flatMap((target) =>
+      target.startsWith("./") ? [target, `${target}/`, target.slice(2), `${target.slice(2)}/`] : [target, `${target}/`, `./${target}`, `./${target}/`],
+    );
+    for (const rule of compiled) {
+      if (rule.tool === mapped && targets.some((target) => rule.regex.test(target))) return rule.pattern;
+    }
+    return null;
+  };
+}
+
 /**
  * Build the `checkCommandPolicy` callback for the engine.
  *
@@ -446,7 +532,7 @@ export function readClaudeBashRules(
 export function createClaudePolicyChecker(
   rules: ClaudePolicyRule[],
   unreadable: string[] = [],
-): (cmd: string) => PolicyVerdict {
+): (cmd: string | Operation) => PolicyVerdict {
   if (unreadable.length > 0) {
     // Name the file and the remedy: without that this reads as a predexec bug
     // rather than a syntax error in the user's own settings.
@@ -466,7 +552,11 @@ export function createClaudePolicyChecker(
     .sort((a, b) => (a.action === b.action ? 0 : a.action === "deny" ? -1 : 1));
   if (compiled.length === 0) return () => null;
 
-  return (cmd: string) => {
+  return (input: string | Operation) => {
+    const cmd = typeof input === "string"
+      ? input
+      : input.tool === "bash" && typeof input.command === "string" ? input.command : null;
+    if (cmd === null) return null;
     try {
       // Substitution bodies are judged as commands too, and are themselves
       // rescanned (capped) so nesting cannot hide one level deeper.

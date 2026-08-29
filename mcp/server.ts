@@ -60,7 +60,13 @@ import {
   VERIFY_FIRST_LINE,
   WHEN_SYNTAX_LINE,
 } from "../steering.ts";
-import { createClaudePolicyChecker, readClaudeBashRules, type ClaudePolicyOptions } from "./policy-claude.ts";
+import {
+  createClaudeOperationPolicyChecker,
+  createClaudePolicyChecker,
+  readClaudeBashRules,
+  readClaudeOperationRules,
+  type ClaudePolicyOptions,
+} from "./policy-claude.ts";
 import { createCodexPolicyChecker, readCodexRules, type CodexPolicyOptions } from "./policy-codex.ts";
 import { createToolExecutor } from "./tool-ops.ts";
 
@@ -77,7 +83,7 @@ export const DESCRIPTION =
   DESCRIPTION_BASE +
   USAGE_LINE +
   RECOVERY_LINE +
-  "Shell commands are checked against the host's own permission rules — a deny OR ask match hard-stops before running, " +
+  "Shell and mapped file operations are checked against the host's own permission rules — a deny OR ask match hard-stops before running, " +
   "because predexec cannot prompt mid-walk. " +
   STEERING_LINE +
   " " +
@@ -180,22 +186,33 @@ async function runPredexecTool(
   // applies immediately, and an unconfigured host costs a cheap no-op checker.
   // The tool-ops root, by contrast, is fixed once at startup — it is the
   // session boundary, not a preference.
-  const checkCommandPolicy =
+  const checkOperationPolicy =
     opts.host === "codex"
       ? (() => {
           const { rules, unreadable } = readCodexRules(opts.cwd, (opts.policy as CodexPolicyOptions) ?? {});
-          return createCodexPolicyChecker(rules, unreadable);
+          const checkShell = createCodexPolicyChecker(rules, unreadable);
+          return (operation: import("../core/types.ts").Operation) =>
+            typeof operation === "string"
+              ? checkShell(operation)
+              : operation.tool === "bash" && typeof operation.command === "string"
+                ? checkShell(operation.command)
+                : null;
         })()
       : (() => {
-          const { rules, unreadable } = readClaudeBashRules(opts.cwd, (opts.policy as ClaudePolicyOptions) ?? {});
-          return createClaudePolicyChecker(rules, unreadable);
+          const policyOpts = (opts.policy as ClaudePolicyOptions) ?? {};
+          const bash = readClaudeBashRules(opts.cwd, policyOpts);
+          const native = readClaudeOperationRules(opts.cwd, policyOpts);
+          const checkBash = createClaudePolicyChecker(bash.rules, bash.unreadable);
+          const checkNative = createClaudeOperationPolicyChecker(native.rules, native.unreadable);
+          return (operation: import("../core/types.ts").Operation) =>
+            typeof operation === "string" || operation.tool === "bash" ? checkBash(operation) : checkNative(operation);
         })();
 
   const result = await executeAdapterPlan(rawPlan, opts.host, {
     cwd: opts.cwd,
     signal: opts.signal,
     executeToolOp: opts.executeToolOp,
-    checkCommandPolicy,
+    checkOperationPolicy,
   });
 
   // A validation or execution stop with reason "error" is an authoring/runtime error,

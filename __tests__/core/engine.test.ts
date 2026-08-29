@@ -368,6 +368,49 @@ describe("runPlanTree — traversal & stop reasons", () => {
   });
 });
 
+describe("runPlanTree — operation-wide policy", () => {
+  it("checks every operation before any executor runs and formats native policy stops", async () => {
+    const seen: unknown[] = [];
+    let executed = false;
+    const plan: PlanTree = {
+      root: "a",
+      nodes: [{ id: "a", commands: [{ tool: "read", path: ".env" }, "echo should-not-run"] }],
+    };
+    const r = await runPlanTree(plan, {
+      cwd,
+      executeToolOp: async () => {
+        executed = true;
+        return { stdout: "", stderr: "", exitCode: 0 };
+      },
+      checkOperationPolicy: (operation) => {
+        seen.push(operation);
+        return typeof operation === "object" && operation.tool === "read" ? "Read(./.env)" : null;
+      },
+    });
+    expect(seen).toEqual([{ tool: "read", path: ".env" }, "echo should-not-run"]);
+    expect(executed).toBe(false);
+    expect(r.stoppedReason).toBe("policyStop");
+    expect(r.transcript).toContain("read:.env");
+    expect(r.transcript).toContain("'Read(./.env)'");
+  });
+
+  it("passes shell strings and bash objects to the operation checker", async () => {
+    const seen: unknown[] = [];
+    const r = await runPlanTree(
+      { root: "a", nodes: [{ id: "a", commands: ["echo hi", { tool: "bash", command: "printf ok" }] }] },
+      {
+        cwd,
+        checkOperationPolicy: (operation) => {
+          seen.push(operation);
+          return null;
+        },
+      },
+    );
+    expect(r.stoppedReason).toBe("leaf");
+    expect(seen).toEqual(["echo hi", { tool: "bash", command: "printf ok" }]);
+  });
+});
+
 describe("validatePlan", () => {
   const v = (plan: PlanTree) => validatePlan(plan, new Map<string, PlanNode>());
 

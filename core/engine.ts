@@ -27,6 +27,7 @@ import {
   type CoreResult,
   type NodeOutput,
   type Operation,
+  type OperationPolicyChecker,
   type PlanNode,
   type PlanTree,
   type RunOptions,
@@ -74,10 +75,21 @@ export async function runPlanTree(plan: PlanTree, opts: RunOptions): Promise<Cor
       return result(pathTaken, depth, "mutationStop", blocks.join("\n\n"), edgesEvaluated, edgesMatched);
     }
 
-    // Host-policy hard-stop: the host would deny or prompt for this command;
-    // predexec cannot prompt mid-walk, so it never runs it.
-    if (opts.checkCommandPolicy) {
-      const violation = findPolicyViolation(current, opts.checkCommandPolicy);
+    // Host-policy hard-stop: check every operation before running any item in
+    // this node. Predexec cannot prompt mid-walk, so it never runs a node with
+    // a deny/ask match.
+    const checkOperationPolicy: OperationPolicyChecker | undefined =
+      opts.checkOperationPolicy ??
+      (opts.checkCommandPolicy
+        ? (operation) =>
+            typeof operation === "string"
+              ? opts.checkCommandPolicy!(operation)
+              : operation.tool === "bash" && typeof operation.command === "string"
+                ? opts.checkCommandPolicy!(operation.command)
+                : null
+        : undefined);
+    if (checkOperationPolicy) {
+      const violation = findPolicyViolation(current, checkOperationPolicy);
       if (violation) {
         blocks.push(policyBlock(current, violation));
         return result(pathTaken, depth, "policyStop", blocks.join("\n\n"), edgesEvaluated, edgesMatched);
@@ -240,20 +252,15 @@ function checkToolOpDestructive(op: ToolOp): string | null {
  */
 function findPolicyViolation(
   node: PlanNode,
-  check: (cmd: string) => string | null,
+  check: OperationPolicyChecker,
 ): { index: number; command: string; rule: string } | null {
+  let violation: { index: number; command: string; rule: string } | null = null;
   for (let i = 0; i < node.commands.length; i++) {
     const op = node.commands[i]!;
-    const cmd = isToolOp(op)
-      ? op.tool === "bash" && typeof op.command === "string"
-        ? op.command
-        : null
-      : op;
-    if (cmd === null) continue;
-    const rule = check(cmd);
-    if (rule) return { index: i, command: cmd, rule };
+    const rule = check(op);
+    if (rule && !violation) violation = { index: i, command: isToolOp(op) ? formatToolOpLabel(op) : op, rule };
   }
-  return null;
+  return violation;
 }
 
 function transcriptBlock(node: PlanNode, output: NodeOutput): string {
@@ -309,7 +316,7 @@ function policyBlock(
 ): string {
   return [
     `## node ${node.id} — POLICY HARD-STOP (not run)`,
-    `Blocked by host permission rule '${violation.rule}' on command ${violation.index + 1}: ${violation.command}`,
+    `Blocked by host permission rule '${violation.rule}' on operation ${violation.index + 1}: ${violation.command}`,
     "Run this via the host bash tool instead — it enforces/prompts per the host's permission config.",
   ].join("\n");
 }

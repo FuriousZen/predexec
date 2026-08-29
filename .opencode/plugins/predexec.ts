@@ -39,13 +39,13 @@ import {
   WHEN_SYNTAX_LINE,
   systemHasRoutingInstructions,
 } from "../../steering.ts";
-import { createPolicyChecker, readOpencodeBashRules } from "../../policy.ts";
+import { createPolicyChecker, readOpencodeBashRules, readOpencodeOperationRules } from "../../policy.ts";
 
 const DESCRIPTION =
   DESCRIPTION_BASE +
   USAGE_LINE +
   RECOVERY_LINE +
-  "Shell commands respect your opencode permission rules — deny/ask matches hard-stop before running. " +
+  "Shell and mapped file operations respect your opencode permission rules — deny/ask matches hard-stop before running. " +
   VERIFY_FIRST_LINE;
 
 /**
@@ -249,14 +249,18 @@ const server: Plugin = async ({ client }) => ({
         const executeToolOp = createToolExecutor(client as unknown as OpencodeClient, context.directory);
         // Re-read per call (one small JSON read): config edits apply immediately,
         // and an unconfigured host costs a cheap no-op checker.
-        const policy = readOpencodeBashRules(context.directory);
-        const checkCommandPolicy = createPolicyChecker(policy.rules, policy.unreadable);
+        const bashPolicy = readOpencodeBashRules(context.directory);
+        const nativePolicy = readOpencodeOperationRules(context.directory);
+        const checkBash = createPolicyChecker(bashPolicy.rules, bashPolicy.unreadable);
+        const checkNative = createPolicyChecker(nativePolicy.rules, nativePolicy.unreadable);
+        const checkOperationPolicy = (operation: import("../../core/types.ts").Operation) =>
+          typeof operation === "string" || operation.tool === "bash" ? checkBash(operation) : checkNative(operation);
 
         const result = await executeAdapterPlan(args.plan, "opencode", {
           cwd: context.directory,
           signal: context.abort,
           executeToolOp,
-          checkCommandPolicy,
+          checkOperationPolicy,
         });
 
         return result.transcript || "(no output)";

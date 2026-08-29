@@ -21,6 +21,8 @@ export {
   MAX_OPERATIONS_PER_NODE,
   MAX_PARALLEL_CONCURRENCY,
   type ToolOp,
+  type Operation,
+  type OperationPolicyChecker,
   type PlanTree,
   type CoreResult,
   type ToolExecutor,

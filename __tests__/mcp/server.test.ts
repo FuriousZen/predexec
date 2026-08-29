@@ -174,6 +174,24 @@ describe("mcp server — failures return a result instead of throwing", () => {
 });
 
 describe("mcp server — Claude Code permission policy", () => {
+  it("a native Read deny rule stops before predexec reads the file", async () => {
+    const dir = project();
+    writeFileSync(join(dir, ".env"), "secret\n");
+    mkdirSync(join(dir, ".claude"));
+    writeFileSync(join(dir, ".claude", "settings.json"), '{"permissions":{"deny":["Read(./.env)"]}}');
+    const { request } = await connected({ cwd: dir, policy: policyOptions });
+
+    const response = await callPredexec(request, {
+      root: "a",
+      nodes: [{ id: "a", commands: [{ tool: "read", path: ".env" }] }],
+    });
+    const text = textOf(response);
+    expect(text).toContain("POLICY HARD-STOP (not run)");
+    expect(text).toContain("read:.env");
+    expect(text).toContain("'./.env'");
+    expect(text).not.toContain("secret");
+  });
+
   it("a deny rule in .claude/settings.json produces a policyStop before the command runs", async () => {
     const dir = project();
     mkdirSync(join(dir, ".claude"));

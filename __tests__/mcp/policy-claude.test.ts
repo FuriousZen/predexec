@@ -5,7 +5,9 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   claudeSettingsPaths,
   createClaudePolicyChecker,
+  createClaudeOperationPolicyChecker,
   parseClaudeBashRules,
+  parseClaudeOperationRules,
   readClaudeBashRules,
   stripBashWrappers,
 } from "../../mcp/policy-claude.ts";
@@ -94,6 +96,34 @@ describe("parseClaudeBashRules — settings shapes", () => {
     // opencode's .jsonc.
     expect(() => parseClaudeBashRules("{not json")).toThrow();
     expect(() => parseClaudeBashRules('{ // nope\n"permissions":{}}')).toThrow();
+  });
+});
+
+describe("Claude native operation policy", () => {
+  it("maps documented Read, Grep, and Glob entries to native operations", () => {
+    const text = JSON.stringify({
+      permissions: {
+        deny: ["Read(./.env)", "Grep(./secrets/**)"],
+        ask: ["Glob(./private/**)"],
+      },
+    });
+    expect(parseClaudeOperationRules(text)).toEqual([
+      { tool: "read", pattern: "./.env", action: "deny" },
+      { tool: "grep", pattern: "./secrets/**", action: "deny" },
+      { tool: "find", pattern: "./private/**", action: "ask" },
+    ]);
+  });
+
+  it("stops matching native operations while unrelated paths pass", () => {
+    const check = createClaudeOperationPolicyChecker([
+      { tool: "read", pattern: "./.env", action: "deny" },
+      { tool: "grep", pattern: "./secrets/**", action: "deny" },
+      { tool: "find", pattern: "./private/**", action: "ask" },
+    ]);
+    expect(check({ tool: "read", path: "./.env" })).toBe("./.env");
+    expect(check({ tool: "grep", path: "./secrets/key", pattern: "key" })).toBe("./secrets/**");
+    expect(check({ tool: "find", path: "./private", pattern: "*" })).toBe("./private/**");
+    expect(check({ tool: "read", path: "README.md" })).toBeNull();
   });
 });
 

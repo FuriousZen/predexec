@@ -2,7 +2,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { createPolicyChecker, parseBashPermission, readOpencodeBashRules } from "../policy.ts";
+import { createPolicyChecker, parseBashPermission, parseOperationPermissions, readOpencodeBashRules } from "../policy.ts";
 import { runPlanTree } from "../core/engine.ts";
 import type { PlanTree } from "../core/types.ts";
 
@@ -52,6 +52,41 @@ describe("parseBashPermission — opencode config shapes", () => {
       { pattern: "*", action: "deny" },
       { pattern: "git *", action: "allow" },
     ]);
+  });
+});
+
+describe("opencode operation policy", () => {
+  it("parses documented read, grep, and list permission entries", () => {
+    expect(
+      parseOperationPermissions(
+        JSON.stringify({
+          permission: {
+            read: { ".env": "deny", "*": "allow" },
+            grep: { "secrets/**": "ask", "*": "allow" },
+            list: { "private/**": "deny", "*": "allow" },
+          },
+        }),
+      ),
+    ).toEqual([
+      { tool: "read", pattern: ".env", action: "deny" },
+      { tool: "read", pattern: "*", action: "allow" },
+      { tool: "grep", pattern: "secrets/**", action: "ask" },
+      { tool: "grep", pattern: "*", action: "allow" },
+      { tool: "list", pattern: "private/**", action: "deny" },
+      { tool: "list", pattern: "*", action: "allow" },
+    ]);
+  });
+
+  it("checks native operations with opencode last-match-wins", () => {
+    const check = createPolicyChecker([
+      { tool: "read", pattern: ".env", action: "deny" },
+      { tool: "read", pattern: "*", action: "allow" },
+      { tool: "grep", pattern: "secrets/**", action: "ask" },
+      { tool: "grep", pattern: "*", action: "allow" },
+    ]);
+    expect(check({ tool: "read", path: ".env" })).toBeNull();
+    expect(check({ tool: "grep", path: "secrets/key" })).toBeNull();
+    expect(check({ tool: "list", path: "private/x" })).toBeNull();
   });
 });
 

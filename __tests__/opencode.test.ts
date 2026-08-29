@@ -275,6 +275,14 @@ describe.each(variants)("opencode plugin ($name) — host permission policy e2e"
     expect(out).not.toContain("node a (exit");
   });
 
+  it("a project opencode.json read rule hard-stops a native read operation", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "px-oc-policy-"));
+    writeFileSync(join(dir, "opencode.json"), '{"permission":{"read":{"*":"allow",".env":"deny"}}}');
+    const out = await execute(dir, { root: "a", nodes: [{ id: "a", commands: [{ tool: "read", path: ".env" }] }] });
+    expect(out).toContain("POLICY HARD-STOP (not run)");
+    expect(out).toContain("read:.env");
+  });
+
   it("without a permission block the same plan runs normally", async () => {
     const dir = mkdtempSync(join(tmpdir(), "px-oc-policy-"));
     writeFileSync(join(dir, "opencode.json"), "{}");
