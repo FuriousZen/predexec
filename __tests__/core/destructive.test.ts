@@ -103,6 +103,27 @@ describe("safe tier — pure-reader heads skip the word scan", () => {
     expect(isDestructiveCommand("cat `rm x`")).toBe(true);
   });
 
+  it.each([
+    "if true; then mkdir /tmp/x; fi",
+    "if false; then :; elif true; then mkdir /tmp/x; fi",
+    "if true; then :; else mkdir /tmp/x; fi",
+    "while true; do mkdir /tmp/x; done",
+    "until false; do mkdir /tmp/x; done",
+    "for item in one two; do mkdir /tmp/x; done",
+    "echo $(if true; then mkdir /tmp/x; fi)",
+    "case x in a) if true; then mkdir /tmp/x; fi ;; esac",
+  ])("finds mutation after non-leading reserved words: %s", (command) => {
+    expect(findDestructiveToken(command)).toContain("mkdir");
+  });
+
+  it.each([
+    "case x in orphan ;; a) echo ok ;; esac",
+    "case x in a) echo ok ;; orphan ;; esac",
+    "case x in a) echo ok ;; orphan esac",
+  ])("fails closed for orphan case text: %s", (command) => {
+    expect(findDestructiveToken(command)).toBe("complex shell syntax");
+  });
+
   it("head exceptions force the full scan: sed -i, sort -o, awk system(), find -exec rm", () => {
     expect(isDestructiveCommand("sed -i s/a/b/ f")).toBe(true);
     expect(isDestructiveCommand("sort -o f f")).toBe(true);

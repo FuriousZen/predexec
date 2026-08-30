@@ -479,3 +479,77 @@ matching tests. Malformed first/middle/last branches and unmatched executable
 groups now fail closed instead of silently omitting bodies. Generated `dist/`
 output remains ignored and unstaged; no runtime dependency, ledger, or release
 metadata changed.
+
+## Extended integration fix round 7 — terminal control clauses and complete case coverage
+
+This user-authorized extension started from `5a415c352e00bdba6f5052a768d25f6d494c64d1`.
+It addresses two remaining Important findings: terminal commands after
+non-leading reserved words were not exposed to Claude/Codex policy matching,
+and orphan text in a `case` body could be silently omitted while the parser
+reported complete. No ledger edit, version bump, publish, push, merge, or
+release-artifact staging was performed.
+
+### RED evidence
+
+Before production changes, the focused regressions were run with:
+
+```text
+./node_modules/.bin/vitest run __tests__/command-inspection.test.ts __tests__/core/destructive.test.ts __tests__/mcp/policy-claude.test.ts __tests__/mcp/policy-codex.test.ts
+```
+
+Result: exit 1; **17 tests failed, 388 passed**. The failures reproduced
+missed `mkdir` commands after `then`/`do`/`else` in if/while/until/for,
+substitution-wrapped and case-nested controls, and all three orphan-case
+coverage positions.
+
+### GREEN implementation
+
+- The shared inspector now splits quote/escape-aware top-level command
+  separators and control operators, repeatedly strips reserved prefixes, and
+  emits only newly exposed terminal clauses. Ordinary commands are not
+  re-queued, which keeps traversal bounded and prevents self-loops; case
+  terminators remain attached to case constructs for structural validation.
+- Case extraction now advances a cursor across every non-whitespace range,
+  requiring each range to contain a pattern, branch body, and `;;`, `;&`, or
+  `;;&` terminator. Orphan text before the first branch, between branches, or
+  before `esac` marks the full inspection incomplete. Quoted delimiters,
+  nested parentheses, empty bodies, alternation, and multiline branches stay
+  valid.
+- Core mutation inspection and both Claude/Codex policy adapters consume the
+  shared bounded traversal; regressions cover if/elif/else, while/until,
+  for/do, substitutions, nested groups, case branches, benign quoted words,
+  and fail-closed malformed cases. Adapter-specific parsing and precedence
+  were not changed.
+
+### GREEN verification
+
+Focused security suites passed **500/500 tests**:
+
+```text
+./node_modules/.bin/vitest run __tests__/command-inspection.test.ts __tests__/core/destructive.test.ts __tests__/core/engine.test.ts __tests__/mcp/policy-claude.test.ts __tests__/mcp/policy-codex.test.ts
+```
+
+Additional required checks all passed:
+
+```text
+./node_modules/.bin/tsc --noEmit
+pnpm run build
+./node_modules/.bin/vitest run
+./node_modules/.bin/vitest run __tests__/release-hygiene.test.ts __tests__/pack.test.ts
+git diff --check
+```
+
+Typecheck/build succeeded; the full suite passed **906/906 tests**; and the
+release/pack suite passed **9/9 tests**, including packed-install CLI/MCP smoke
+checks. Generated `dist/` output remained ignored and unstaged.
+
+### Self-review
+
+The shared traversal retains source order in emitted clauses, preserves quoted
+keywords and case delimiters, carries completeness through the existing depth,
+command, and character budgets, and deduplicates without recursive mutation.
+Case cursor coverage fails closed on executable/non-whitespace orphan ranges
+while preserving valid branch forms. Changes are limited to the shared
+inspection seam, core/policy regressions, and this report; no adapter re-parser,
+policy precedence, wrapper vocabulary, runtime dependency, ledger, or release
+metadata changed.

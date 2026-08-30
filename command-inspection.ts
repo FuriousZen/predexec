@@ -270,12 +270,12 @@ export function tokenizeShellWords(segment: string): string[] {
 }
 
 /**
- * Extract the executable-looking clause from one shell-control segment.
- * `splitCommandSegments` already separates command terminators; this small
- * seam removes syntax words which otherwise hide the first command in a
- * group (`{ git ...`, `if git ...`, `then git ...`). It intentionally only
- * strips a leading, quote-aware token sequence and returns no result when it
- * cannot identify one, leaving callers' conservative fallback intact.
+ * Extract executable terminal clauses from shell-control syntax. Separators
+ * and reserved words can occur between the control construct and its body
+ * (`if true; then mkdir ...; fi`), so this is deliberately a recursive seam:
+ * split quote-aware top-level clauses, then remove all leading reserved words
+ * from each clause. Nested substitutions/groups/cases are returned separately
+ * and queued by `inspectCommandSubstitutionTree`.
  */
 export function extractShellCommandClauses(segment: string): string[] {
   return inspectShellCommandClauses(segment).clauses;
@@ -303,30 +303,119 @@ export function inspectShellCommandClauses(segment: string): ShellClauseInspecti
           findUnquotedWord(segment, "esac") !== -1),
     };
   }
-  const tokens = tokenizeShellWords(segment);
-  if (tokens.length === 0) return { clauses: groups.bodies, complete: groups.complete };
-  if (tokens[0] === "coproc") {
-    let start = 1;
-    // Bash permits `coproc NAME { commands; }` as well as `coproc commands`.
-    if (tokens[start] && tokens[start] !== "{" && tokens[start + 1] === "{") start++;
-    if (tokens[start] === "{") start++;
-    if (start >= tokens.length) return { clauses: groups.bodies, complete: false };
-    const body = tokens.slice(start).join(" ").replace(/}\s*$/, "").trim();
-    return body
-      ? { clauses: uniqueClauses([body, ...groups.bodies]), complete: groups.complete }
-      : { clauses: groups.bodies, complete: false };
+  const clauses: string[] = [];
+  const parts = splitShellControlClauses(segment);
+  const exposeAllParts = parts.length > 1;
+  for (const part of parts) {
+    const tokens = tokenizeShellWords(part);
+    if (tokens.length === 0) continue;
+    if (tokens[0] === "coproc") {
+      let start = 1;
+      // Bash permits `coproc NAME { commands; }` as well as `coproc commands`.
+      if (tokens[start] && tokens[start] !== "{" && tokens[start + 1] === "{") start++;
+      if (tokens[start] === "{") start++;
+      const body = tokens.slice(start).join(" ").replace(/}\s*$/, "").trim();
+      if (body) clauses.push(body);
+      continue;
+    }
+    if (SHELL_RESERVED_WORDS.has(tokens[0]!)) {
+      const executable = stripReservedPrefix(tokens);
+      if (executable) clauses.push(executable);
+    } else if (exposeAllParts) {
+      // A compound command's ordinary parts are terminal clauses too. A
+      // single ordinary part is already represented by the current tree node;
+      // omitting it there is the recursion guard for direct callers.
+      clauses.push(part);
+    }
   }
-  const reserved = new Set([
-    "{", "}", "(", ")", "!", "if", "then", "elif", "else", "fi",
-    "while", "until", "do", "done", "for", "select", "function", "coproc",
-  ]);
+  return { clauses: uniqueClauses([...clauses, ...groups.bodies]), complete: groups.complete };
+}
+
+const SHELL_RESERVED_WORDS = new Set([
+  "{", "}", "(", ")", "!", "if", "then", "elif", "else", "fi",
+  "while", "until", "do", "done", "for", "select", "function", "coproc",
+]);
+
+function stripReservedPrefix(tokens: readonly string[]): string | null {
   let index = 0;
-  while (index < tokens.length && reserved.has(tokens[index]!)) index++;
-  if (tokens[0] === "case") return { clauses: groups.bodies, complete: false };
-  if (tokens[0] === "function" && index < tokens.length && !reserved.has(tokens[index]!)) index++;
-  while (index < tokens.length && reserved.has(tokens[index]!)) index++;
-  if (index === 0 || index >= tokens.length) return { clauses: groups.bodies, complete: groups.complete };
-  return { clauses: uniqueClauses([tokens.slice(index).join(" "), ...groups.bodies]), complete: groups.complete };
+  while (index < tokens.length && SHELL_RESERVED_WORDS.has(tokens[index]!)) index++;
+  // `function name { ... }` has a function name between reserved words.
+  if (tokens[0] === "function" && index < tokens.length && !SHELL_RESERVED_WORDS.has(tokens[index]!)) index++;
+  while (index < tokens.length && SHELL_RESERVED_WORDS.has(tokens[index]!)) index++;
+  return index < tokens.length ? tokens.slice(index).join(" ") : null;
+}
+
+/** Split shell control separators without splitting quoted/nested syntax. */
+function splitShellControlClauses(command: string): string[] {
+  const clauses: string[] = [];
+  let current = "";
+  let quote: "'" | '"' | null = null;
+  let parenDepth = 0;
+  let braceDepth = 0;
+  for (let i = 0; i < command.length; i++) {
+    const ch = command[i]!;
+    if (ch === "\\") {
+      current += ch + (command[i + 1] ?? "");
+      i++;
+      continue;
+    }
+    if (quote) {
+      current += ch;
+      if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      quote = ch;
+      current += ch;
+      continue;
+    }
+    if (ch === "(") {
+      parenDepth++;
+      current += ch;
+      continue;
+    }
+    if (ch === ")" && parenDepth > 0) {
+      parenDepth--;
+      current += ch;
+      continue;
+    }
+    if (ch === "{") {
+      braceDepth++;
+      current += ch;
+      continue;
+    }
+    if (ch === "}" && braceDepth > 0) {
+      braceDepth--;
+      current += ch;
+      continue;
+    }
+    const separator = parenDepth === 0 && braceDepth === 0 &&
+      (ch === ";" || ch === "\n" || ch === "\r" || ch === "|" ||
+        (ch === "&" && command[i - 1] !== ">"));
+    if (separator) {
+      // `;;`, `;&`, and `;;&` are case-branch terminators, not generic
+      // command separators. Keep them with the case construct so its parser
+      // can validate branch coverage and extract complete bodies.
+      if (ch === ";" && (command[i + 1] === ";" || command[i + 1] === "&")) {
+        current += ch + command[i + 1];
+        i++;
+        if (command[i] === "&") {
+          current += command[i + 1] ?? "";
+          if (command[i + 1] === "&") i++;
+        }
+        continue;
+      }
+      if (current.trim()) clauses.push(current.trim());
+      current = "";
+      if ((ch === "\r" && command[i + 1] === "\n") ||
+          (ch === "&" && command[i + 1] === "&") ||
+          (ch === "|" && command[i + 1] === "|")) i++;
+      continue;
+    }
+    current += ch;
+  }
+  if (current.trim()) clauses.push(current.trim());
+  return clauses;
 }
 
 /** Extract executable bodies from a complete `case ... in ... esac` command. */
@@ -340,12 +429,39 @@ function extractCaseBranchBodies(segment: string): { bodies: string[]; complete:
   if (end === -1) return { bodies: [], complete: false };
   const body = segment.slice(bodyStart, bodyStart + end);
   const clauses: string[] = [];
-  let branchStart = 0;
-  let patternEnd = -1;
-  let groupDepth = 0;
+  let cursor = 0;
   let complete = true;
+  while (cursor < body.length) {
+    while (cursor < body.length && /\s/.test(body[cursor]!)) cursor++;
+    if (cursor >= body.length) break;
+
+    // Every non-whitespace range must begin a pattern and end in an
+    // unquoted, balanced `)`. Orphan text such as `orphan ;;` is not a
+    // pattern; consume it only to continue finding later branches, while
+    // retaining the fail-closed completeness result.
+    const patternEnd = findCasePatternEnd(body, cursor);
+    if (patternEnd === -1) {
+      complete = false;
+      break;
+    }
+    const branchStart = patternEnd + 1;
+    const terminator = findCaseBranchTerminator(body, branchStart);
+    if (terminator === null) {
+      complete = false;
+      break;
+    }
+    if (terminator.malformed) complete = false;
+    const clause = body.slice(branchStart, terminator.bodyEnd).trim();
+    if (clause) clauses.push(clause);
+    cursor = terminator.next;
+  }
+  return { bodies: clauses, complete };
+}
+
+function findCasePatternEnd(body: string, start: number): number {
   let quote: "'" | '"' | null = null;
-  for (let i = 0; i < body.length; i++) {
+  let depth = 0;
+  for (let i = start; i < body.length; i++) {
     const ch = body[i]!;
     if (ch === "\\") {
       i++;
@@ -360,36 +476,55 @@ function extractCaseBranchBodies(segment: string): { bodies: string[]; complete:
       continue;
     }
     if (ch === "(") {
-      if (patternEnd !== -1) groupDepth++;
+      depth++;
       continue;
     }
     if (ch === ")") {
-      if (groupDepth > 0) groupDepth--;
-      else if (patternEnd === -1) {
-        patternEnd = i;
-        branchStart = i + 1;
-      } else {
-        complete = false;
-      }
+      if (depth > 0) depth--;
+      else return i;
+    }
+    // A branch terminator before a pattern close proves this range is orphan
+    // text, not a valid pattern. This also prevents silently skipping it.
+    if (depth === 0 && ch === ";" && (body[i + 1] === ";" || body[i + 1] === "&")) return -1;
+  }
+  return -1;
+}
+
+function findCaseBranchTerminator(body: string, start: number): { bodyEnd: number; next: number; malformed: boolean } | null {
+  let quote: "'" | '"' | null = null;
+  let depth = 0;
+  let malformed = false;
+  for (let i = start; i < body.length; i++) {
+    const ch = body[i]!;
+    if (ch === "\\") {
+      i++;
       continue;
     }
-    const isTerminator = groupDepth === 0 && ch === ";" &&
-      (body[i + 1] === ";" || body[i + 1] === "&");
-    if (isTerminator && patternEnd !== -1) {
-      const clause = body.slice(branchStart, i).trim();
-      if (clause) clauses.push(clause);
-      i++;
-      if (body[i] === ";" || body[i] === "&") i++;
-      patternEnd = -1;
-      branchStart = i;
+    if (quote) {
+      if (ch === quote) quote = null;
+      continue;
     }
+    if (ch === "'" || ch === '"') {
+      quote = ch;
+      continue;
+    }
+    if (ch === "(") {
+      depth++;
+      continue;
+    }
+    if (ch === ")") {
+      if (depth > 0) depth--;
+      else malformed = true;
+      continue;
+    }
+    if (depth !== 0 || ch !== ";") continue;
+    const next = body[i + 1];
+    if (next !== ";" && next !== "&") continue;
+    let end = i + 2;
+    if (next === ";" && body[end] === "&") end++;
+    return { bodyEnd: i, next: end, malformed };
   }
-  if (quote !== null || groupDepth !== 0 || patternEnd !== -1) complete = false;
-  if (patternEnd !== -1) {
-    const clause = body.slice(branchStart).trim();
-    if (clause) clauses.push(clause);
-  }
-  return { bodies: clauses, complete };
+  return null;
 }
 
 function uniqueClauses(clauses: string[]): string[] {

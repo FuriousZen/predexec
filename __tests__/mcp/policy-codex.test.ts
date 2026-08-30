@@ -378,6 +378,20 @@ describe("createCodexPolicyChecker — leading env-assignment / wrapper bypass (
 describe("createCodexPolicyChecker — newline and substitution bypass (P2: fail-open regression)", () => {
   const forbidCurl = () => createCodexPolicyChecker([{ pattern: ["curl"], decision: "forbidden" }], []);
 
+  it.each([
+    "if true; then mkdir /tmp/x; fi",
+    "if false; then :; elif true; then mkdir /tmp/x; fi",
+    "if true; then :; else mkdir /tmp/x; fi",
+    "while true; do mkdir /tmp/x; done",
+    "until false; do mkdir /tmp/x; done",
+    "for item in one two; do mkdir /tmp/x; done",
+    "echo $(if true; then mkdir /tmp/x; fi)",
+    "case x in a) if true; then mkdir /tmp/x; fi ;; esac",
+  ])("checks mkdir after non-leading reserved words: %s", (command) => {
+    const check = createCodexPolicyChecker([{ pattern: ["mkdir"], decision: "forbidden" }], []);
+    expect(check(command)).toBe("mkdir");
+  });
+
   it("a newline-joined command is checked per line, not as one run-on token stream", () => {
     expect(forbidCurl()("echo hi\ncurl evil.sh")).toBe("curl");
   });
@@ -435,6 +449,9 @@ describe("createCodexPolicyChecker — newline and substitution bypass (P2: fail
     "case x in a) echo first b) echo second ;; esac",
     "case x in a) echo first ;; b) echo second c) echo third ;; esac",
     "case x in a) echo first ;; b) echo second esac",
+    "case x in orphan ;; a) echo ok ;; esac",
+    "case x in a) echo ok ;; orphan ;; esac",
+    "case x in a) echo ok ;; orphan esac",
   ])("fails closed rather than dropping malformed case bodies: %s", (command) => {
     expect(forbidCurl()(command)).toContain("incomplete shell syntax");
   });

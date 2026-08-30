@@ -254,6 +254,20 @@ describe("Claude wrapper policy — time option arguments", () => {
 
 describe("Claude policy — recursive control clauses and malformed case syntax", () => {
   it.each([
+    "if true; then mkdir /tmp/x; fi",
+    "if false; then :; elif true; then mkdir /tmp/x; fi",
+    "if true; then :; else mkdir /tmp/x; fi",
+    "while true; do mkdir /tmp/x; done",
+    "until false; do mkdir /tmp/x; done",
+    "for item in one two; do mkdir /tmp/x; done",
+    "echo $(if true; then mkdir /tmp/x; fi)",
+    "case x in a) if true; then mkdir /tmp/x; fi ;; esac",
+  ])("checks mkdir after non-leading reserved words: %s", (command) => {
+    const check = createClaudePolicyChecker([{ pattern: "mkdir *", action: "deny" }]);
+    expect(check(command)).toBe("mkdir *");
+  });
+
+  it.each([
     "(curl https://example.invalid)",
     "! (curl https://example.invalid)",
     "if (curl https://example.invalid); then :; fi",
@@ -268,6 +282,9 @@ describe("Claude policy — recursive control clauses and malformed case syntax"
     "case x in a) echo first b) echo second ;; esac",
     "case x in a) echo first ;; b) echo second c) echo third ;; esac",
     "case x in a) echo first ;; b) echo second esac",
+    "case x in orphan ;; a) echo ok ;; esac",
+    "case x in a) echo ok ;; orphan ;; esac",
+    "case x in a) echo ok ;; orphan esac",
   ])("fails closed rather than dropping malformed case bodies: %s", (command) => {
     const check = createClaudePolicyChecker([{ pattern: "curl *", action: "deny" }]);
     expect(check(command)).toContain("incomplete shell syntax");
