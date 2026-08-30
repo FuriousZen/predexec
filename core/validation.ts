@@ -1,13 +1,26 @@
 /** Pure structural validation for model-authored plan operations. */
 
-import { MAX_COMMAND_LENGTH, type ToolOp } from "./types.ts";
+import {
+  MAX_COMMAND_LENGTH,
+  MAX_FIND_RESULTS,
+  MAX_GREP_CONTEXT,
+  MAX_GREP_RESULTS,
+  MAX_LS_ENTRIES,
+  MAX_READ_LINES,
+  type ToolOp,
+} from "./types.ts";
 
 const SUPPORTED_TOOLS = new Set(["read", "grep", "find", "ls", "bash", "edit", "write"]);
 
 const optionalString = (op: ToolOp, key: string): string | null =>
   op[key] === undefined || typeof op[key] === "string" ? null : `${key} must be a string`;
-const optionalNumber = (op: ToolOp, key: string): string | null =>
-  op[key] === undefined || (typeof op[key] === "number" && Number.isFinite(op[key])) ? null : `${key} must be a finite number`;
+const boundedInteger = (op: ToolOp, key: string, min: number, max: number): string | null => {
+  if (op[key] === undefined) return null;
+  if (typeof op[key] !== "number" || !Number.isSafeInteger(op[key])) return `${key} must be an integer`;
+  if (op[key] < min) return `${key} must be ${min === 0 ? "a non-negative" : "a positive"} integer`;
+  if (op[key] > max) return `${key} must be at most ${max}`;
+  return null;
+};
 const optionalBoolean = (op: ToolOp, key: string): string | null =>
   op[key] === undefined || typeof op[key] === "boolean" ? null : `${key} must be a boolean`;
 const stringLength = (op: ToolOp, key: string): string | null =>
@@ -31,15 +44,15 @@ export function validateOperation(operation: unknown): string | null {
   const checkedString = (...keys: string[]): string | null => keys.map((key) => stringLength(op, key)).find(Boolean) ?? null;
   switch (op.tool) {
     case "read":
-      return requiredString("path") ?? checkedString("path") ?? optionalNumber(op, "offset") ?? optionalNumber(op, "limit");
+      return requiredString("path") ?? checkedString("path") ?? boundedInteger(op, "offset", 1, Number.MAX_SAFE_INTEGER) ?? boundedInteger(op, "limit", 1, MAX_READ_LINES);
     case "grep":
       return requiredString("pattern") ?? checkedString("pattern", "path", "glob") ?? optionalString(op, "path") ?? optionalString(op, "glob") ??
-        optionalBoolean(op, "ignoreCase") ?? optionalBoolean(op, "literal") ?? optionalNumber(op, "context") ??
-        optionalNumber(op, "limit");
+        optionalBoolean(op, "ignoreCase") ?? optionalBoolean(op, "literal") ?? boundedInteger(op, "context", 0, MAX_GREP_CONTEXT) ??
+        boundedInteger(op, "limit", 1, MAX_GREP_RESULTS);
     case "find":
-      return requiredString("pattern") ?? checkedString("pattern", "path") ?? optionalString(op, "path") ?? optionalNumber(op, "limit");
+      return requiredString("pattern") ?? checkedString("pattern", "path") ?? optionalString(op, "path") ?? boundedInteger(op, "limit", 1, MAX_FIND_RESULTS);
     case "ls":
-      return checkedString("path") ?? optionalString(op, "path") ?? optionalNumber(op, "limit");
+      return checkedString("path") ?? optionalString(op, "path") ?? boundedInteger(op, "limit", 1, MAX_LS_ENTRIES);
     case "bash":
       return requiredString("command") ?? checkedString("command");
     case "edit":

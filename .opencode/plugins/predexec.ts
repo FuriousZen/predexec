@@ -24,6 +24,7 @@ import { isAbsolute, resolve } from "node:path";
 import { z } from "zod";
 import {
   isDestructiveCommand,
+  validateOperation,
   type ToolOp,
   type ToolExecutor,
 } from "../../core/index.ts";
@@ -118,6 +119,12 @@ export function createToolExecutor(client: OpencodeClient, cwd: string): ToolExe
         ? null
         : { stdout: "", stderr: `path not found: ${p} (resolved against ${directory})`, exitCode: 1 };
     const fail = (label: string, e: unknown) => ({ stdout: "", stderr: `${label}: ${errText(e)}`, exitCode: 1 });
+    const requiredArgMissing =
+      (op.tool === "read" && op.path === undefined) ||
+      ((op.tool === "grep" || op.tool === "find") && op.pattern === undefined);
+    const supportedTool = ["read", "grep", "find", "ls", "bash", "edit", "write"].includes(op.tool);
+    const validationError = supportedTool && !requiredArgMissing ? validateOperation(op) : null;
+    if (validationError) return fail(String(op.tool), `invalid operation: ${validationError}`);
     // grep/find scope by DIRECTORY in opencode's v1 SDK. Honor an op's `path`
     // by resolving it into the query directory; a FILE path fails loudly — the
     // silent alternative (searching the whole repo) is false-hit fuel for edges.

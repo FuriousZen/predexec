@@ -4,7 +4,16 @@ import { describe, expect, it } from "vitest";
 // coercePlan is a CORE function; import it from its owning module directly
 // rather than through a harness adapter.
 import { coercePlan } from "../core/coerce.ts";
-import { MAX_CONDITION_LENGTH, MAX_CONDITION_TOTAL_LENGTH, MAX_NODE_ID_LENGTH } from "../core/types.ts";
+import {
+  MAX_CONDITION_LENGTH,
+  MAX_CONDITION_TOTAL_LENGTH,
+  MAX_FIND_RESULTS,
+  MAX_GREP_CONTEXT,
+  MAX_GREP_RESULTS,
+  MAX_LS_ENTRIES,
+  MAX_NODE_ID_LENGTH,
+  MAX_READ_LINES,
+} from "../core/types.ts";
 import { mapToolResult } from "../.pi/extension/index.ts";
 import { JSON_PATH_SINGLE_OP_LINE, STEERING_MARKERS } from "../steering.ts";
 
@@ -44,6 +53,16 @@ describe("coercePlan — defensive param recovery", () => {
   it("rejects an oversized plan before walking or parsing its nodes", () => {
     const nodes = Array.from({ length: 300 }, (_, index) => ({ id: `n${index}`, commands: [] }));
     expect(() => coercePlan({ root: "n0", nodes })).toThrow(/nodes.*maximum|too many/i);
+  });
+
+  it.each([
+    ["read limit", { tool: "read", path: "file.txt", limit: MAX_READ_LINES + 1 }],
+    ["grep limit", { tool: "grep", pattern: "x", limit: MAX_GREP_RESULTS + 1 }],
+    ["find limit", { tool: "find", pattern: "*.ts", limit: MAX_FIND_RESULTS + 1 }],
+    ["ls limit", { tool: "ls", limit: MAX_LS_ENTRIES + 1 }],
+    ["grep context", { tool: "grep", pattern: "x", context: MAX_GREP_CONTEXT + 1 }],
+  ])("rejects an over-ceiling %s before execution", (_label, operation) => {
+    expect(() => coercePlan({ root: "a", nodes: [{ id: "a", commands: [operation] }] })).toThrow(/maximum|at most/);
   });
 
   it("coerces string edge conditions into objects", () => {

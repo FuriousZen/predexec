@@ -9,7 +9,14 @@ import { describe, expect, it } from "vitest";
 import pluginSource, { createToolExecutor as createToolExecutorSource } from "../.opencode/plugins/predexec.ts";
 // Requires a prior `pnpm run build` — the compiled variant is asserted against the same contract as the source.
 import pluginCompiled, { createToolExecutor as createToolExecutorCompiled } from "../dist/.opencode/plugins/predexec.js";
-import type { ToolOp } from "../core/index.ts";
+import {
+  MAX_FIND_RESULTS,
+  MAX_GREP_CONTEXT,
+  MAX_GREP_RESULTS,
+  MAX_LS_ENTRIES,
+  MAX_READ_LINES,
+  type ToolOp,
+} from "../core/index.ts";
 import { PLAN_SHAPE_DESCRIPTION } from "../plan-language.ts";
 
 // read/ls pre-check path existence against the cwd, so mocked-client tests
@@ -60,6 +67,48 @@ describe.each(variants)("opencode createToolExecutor ($name) — SDK response ma
     const r = await run(client, { tool: "read", path: "a.ts", offset: 2, limit: 2 });
     expect(r.stdout).toBe("l2\nl3");
     expect(r.exitCode).toBe(0);
+  });
+
+  it("accepts exact shared ceilings and rejects over-ceiling direct calls before SDK work", async () => {
+    const calls: string[] = [];
+    const client = {
+      file: {
+        read: async () => (calls.push("read"), { data: { content: "line" } }),
+        list: async () => (calls.push("ls"), { data: [{ name: "entry" }] }),
+      },
+      find: {
+        text: async () => (calls.push("grep"), { data: [{ path: { text: "a.ts" }, lines: { text: "x" }, line_number: 1 }] }),
+        files: async () => (calls.push("find"), { data: ["a.ts"] }),
+      },
+    };
+    const executor = createToolExecutor(client as any, repo);
+    for (const operation of [
+      { tool: "read", path: "a.ts", limit: MAX_READ_LINES },
+      { tool: "grep", pattern: "x", limit: MAX_GREP_RESULTS },
+      { tool: "find", pattern: "*.ts", limit: MAX_FIND_RESULTS },
+      { tool: "ls", path: ".", limit: MAX_LS_ENTRIES },
+      { tool: "grep", pattern: "x", context: MAX_GREP_CONTEXT },
+    ]) {
+      expect((await executor(operation, { cwd: repo })).stderr).not.toContain("at most");
+    }
+    // OpenCode's native grep does not support context; the exact-bound context
+    // is rejected as an unsupported host feature, but remains below predexec's
+    // shared ceiling and therefore does not reach the SDK.
+    expect(calls).toEqual(["read", "grep", "find", "ls"]);
+
+    calls.length = 0;
+    for (const operation of [
+      { tool: "read", path: "a.ts", limit: MAX_READ_LINES + 1 },
+      { tool: "grep", pattern: "x", limit: MAX_GREP_RESULTS + 1 },
+      { tool: "find", pattern: "*.ts", limit: MAX_FIND_RESULTS + 1 },
+      { tool: "ls", path: ".", limit: MAX_LS_ENTRIES + 1 },
+      { tool: "grep", pattern: "x", context: MAX_GREP_CONTEXT + 1 },
+    ]) {
+      const result = await executor(operation, { cwd: repo });
+      expect(result.exitCode).toBe(1);
+      expect(result.stderr).toContain("at most");
+    }
+    expect(calls).toEqual([]);
   });
 
   it("read: forwards path + cwd to the SDK query", async () => {

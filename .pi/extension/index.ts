@@ -18,7 +18,7 @@ import {
   createFindTool,
   createLsTool,
 } from "@earendil-works/pi-coding-agent";
-import { isDestructiveCommand, OUTPUT_CAP, type ToolOp } from "../../core/index.ts";
+import { isDestructiveCommand, OUTPUT_CAP, validateOperation, type ToolOp } from "../../core/index.ts";
 import { TRUNCATION_MARKER } from "../../core/runner.ts";
 import type { ProgressEvent } from "../../core/types.ts";
 import { executeAdapterPlan } from "../../adapter-runtime.ts";
@@ -30,6 +30,7 @@ import {
   MAX_PARALLEL_CONCURRENCY,
   PLAN_CWD_DESCRIPTION,
   PLAN_FIELD_NAMES,
+  RESOURCE_LIMIT_DESCRIPTION,
   TOOL_OPERATION_NAMES,
 } from "../../plan-language.ts";
 
@@ -100,8 +101,9 @@ const PlanNode = {
       items: {
         description:
           "Shell command (string) or tool call (object with 'tool' key). " +
-          `Read-only tools: ${TOOL_OPERATION_NAMES[0]} ({tool,path,offset?,limit?}), ${TOOL_OPERATION_NAMES[1]} ({tool,pattern,path?,glob?,ignoreCase?}), ` +
-          `${TOOL_OPERATION_NAMES[2]} ({tool,pattern,path?}), ${TOOL_OPERATION_NAMES[3]} ({tool,path?}). ` +
+          `Read-only tools: ${TOOL_OPERATION_NAMES[0]} ({tool,path,offset?,limit?}), ${TOOL_OPERATION_NAMES[1]} ({tool,pattern,path?,glob?,ignoreCase?,literal?,context?,limit?}), ` +
+          `${TOOL_OPERATION_NAMES[2]} ({tool,pattern,path?,limit?}), ${TOOL_OPERATION_NAMES[3]} ({tool,path?,limit?}). ` +
+          RESOURCE_LIMIT_DESCRIPTION + " " +
           "Mutating tools (hard-stop): edit, write.",
       },
       description: "Shell commands and/or tool calls. Sequential (stop-on-first-error) unless parallel:true.",
@@ -203,6 +205,8 @@ function createToolExecutor(cwd: string, signal?: AbortSignal) {
   };
 
   return async (op: ToolOp, opts: { cwd: string; signal?: AbortSignal }) => {
+    const validationError = validateOperation(op);
+    if (validationError) return { stdout: "", stderr: `invalid operation: ${validationError}`, exitCode: 1 };
     const tools = toolsFor(opts.cwd ?? cwd);
     const tool = tools[op.tool];
     if (!tool) {

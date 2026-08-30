@@ -34,7 +34,7 @@ import { open, opendir, realpath, stat } from "node:fs/promises";
 import { delimiter, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { promisify } from "node:util";
-import { escapeRegExp, isSafeRegex, type ToolExecutor, type ToolOp } from "../core/index.ts";
+import { escapeRegExp, isSafeRegex, validateOperation, type ToolExecutor, type ToolOp } from "../core/index.ts";
 
 /** The shell-like shape the core engine branches on (see core/runner.ts). */
 interface OpResult {
@@ -1010,6 +1010,12 @@ export function createToolExecutor(opts: ToolExecutorOptions): ToolExecutor {
 
   return async (op: ToolOp, runOpts: { cwd: string; signal?: AbortSignal }): Promise<OpResult> => {
     const label = String(op.tool);
+    const requiredArgMissing =
+      (op.tool === "read" && op.path === undefined) ||
+      ((op.tool === "grep" || op.tool === "find") && op.pattern === undefined);
+    const supportedTool = ["read", "grep", "find", "ls", "bash", "edit", "write"].includes(op.tool);
+    const validationError = supportedTool && !requiredArgMissing ? validateOperation(op) : null;
+    if (validationError) return fail(label, `invalid operation: ${validationError}`);
     const base = resolve(runOpts.cwd);
     // The engine folds plan.cwd into RunOptions.cwd before we see it, so a plan
     // that points its cwd out of the session shows up here as an escaping base.

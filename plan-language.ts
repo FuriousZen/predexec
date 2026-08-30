@@ -8,6 +8,12 @@ import {
   MAX_NODE_ID_LENGTH,
   MAX_CONDITION_LENGTH,
   MAX_CONDITION_TOTAL_LENGTH,
+  MAX_READ_LINES,
+  MAX_SEARCH_RESULTS,
+  MAX_GREP_RESULTS,
+  MAX_FIND_RESULTS,
+  MAX_LS_ENTRIES,
+  MAX_GREP_CONTEXT,
 } from "./core/types.ts";
 
 export const CONDITION_KINDS = Object.freeze([
@@ -38,6 +44,10 @@ export const PLAN_FIELD_NAMES = Object.freeze({
 export const JSON_PATH_SINGLE_OP_LINE = "jsonPath edges require a one-operation source node.";
 export const PLAN_CWD_DESCRIPTION =
   "Base dir for commands and fileExists: a relative directory inside the session root; absolute or escaping paths are rejected.";
+export const RESOURCE_LIMIT_DESCRIPTION =
+  `Native operation ceilings: read limit at most ${MAX_READ_LINES} lines; grep/find limit at most ${MAX_SEARCH_RESULTS} results; ` +
+  `ls limit at most ${MAX_LS_ENTRIES} entries; grep context at most ${MAX_GREP_CONTEXT} lines per side. ` +
+  "Limits and offsets are positive integers; grep context may be zero. Omitted values use adapter defaults.";
 
 export {
   DEFAULT_MAX_DEPTH,
@@ -49,6 +59,12 @@ export {
   MAX_NODE_ID_LENGTH,
   MAX_CONDITION_LENGTH,
   MAX_CONDITION_TOTAL_LENGTH,
+  MAX_READ_LINES,
+  MAX_SEARCH_RESULTS,
+  MAX_GREP_RESULTS,
+  MAX_FIND_RESULTS,
+  MAX_LS_ENTRIES,
+  MAX_GREP_CONTEXT,
 };
 
 /** Canonical facts shared by model-facing plan descriptions. */
@@ -61,4 +77,4 @@ export const PLAN_SHAPE_DESCRIPTION =
   `maxDepth is capped at ${DEFAULT_MAX_DEPTH}; plans have at most ${MAX_PLAN_NODES} nodes and ${MAX_PLAN_EDGES} edges; ` +
   `commands and string arguments are capped at ${MAX_COMMAND_LENGTH} characters. ` +
   `Condition strings and paths are capped at ${MAX_CONDITION_LENGTH} characters per field and ${MAX_CONDITION_TOTAL_LENGTH} characters in aggregate; ` +
-  `${PLAN_CWD_DESCRIPTION} ${JSON_PATH_SINGLE_OP_LINE} `;
+  `${PLAN_CWD_DESCRIPTION} ${RESOURCE_LIMIT_DESCRIPTION} ${JSON_PATH_SINGLE_OP_LINE} `;

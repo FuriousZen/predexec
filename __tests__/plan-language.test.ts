@@ -7,6 +7,7 @@ import {
   MAX_PARALLEL_CONCURRENCY,
   PLAN_FIELD_NAMES,
   PLAN_SHAPE_DESCRIPTION,
+  RESOURCE_LIMIT_DESCRIPTION,
   TOOL_OPERATION_NAMES,
 } from "../plan-language.ts";
 
@@ -39,5 +40,10 @@ describe("canonical plan language", () => {
     expect(PLAN_SHAPE_DESCRIPTION).toContain("mutates");
     expect(PLAN_SHAPE_DESCRIPTION).toContain(`${MAX_CONDITION_LENGTH} characters per field`);
     expect(PLAN_SHAPE_DESCRIPTION).toContain(`${MAX_CONDITION_TOTAL_LENGTH} characters in aggregate`);
+    expect(PLAN_SHAPE_DESCRIPTION).toContain(RESOURCE_LIMIT_DESCRIPTION);
+    expect(RESOURCE_LIMIT_DESCRIPTION).toContain("read limit at most 10000");
+    expect(RESOURCE_LIMIT_DESCRIPTION).toContain("grep/find limit at most 1000");
+    expect(RESOURCE_LIMIT_DESCRIPTION).toContain("ls limit at most 5000");
+    expect(RESOURCE_LIMIT_DESCRIPTION).toContain("grep context at most 100");
   });
 });

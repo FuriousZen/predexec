@@ -6,6 +6,7 @@
  */
 
 import { conditionStringBudget, isSafeRegex, parseConditionString } from "./conditions.ts";
+import { validateOperation } from "./validation.ts";
 import {
   MAX_COMMAND_LENGTH,
   MAX_NODE_ID_LENGTH,
@@ -156,7 +157,8 @@ function validatePlanBudget(plan: PlanTree): string | null {
       return `node id exceeds the maximum length of ${MAX_NODE_ID_LENGTH} characters`;
     }
     if (Array.isArray(node.commands)) {
-      for (const operation of node.commands) {
+      for (let index = 0; index < node.commands.length; index++) {
+        const operation = node.commands[index];
         if (typeof operation === "string" && operation.length > MAX_COMMAND_LENGTH) {
           return `command exceeds the maximum length of ${MAX_COMMAND_LENGTH} characters`;
         }
@@ -167,6 +169,8 @@ function validatePlanBudget(plan: PlanTree): string | null {
             }
           }
         }
+        const operationError = validateOperation(operation);
+        if (operationError) return `node "${String(node.id)}" operation ${index + 1} invalid: ${operationError}`;
       }
     }
     if (Array.isArray(node.edges)) {

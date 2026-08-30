@@ -181,3 +181,13 @@ export const MAX_NODE_ID_LENGTH = 256;
 export const MAX_CONDITION_LENGTH = 8 * 1024;
 /** Maximum aggregate length of condition payloads and edge targets in one plan. */
 export const MAX_CONDITION_TOTAL_LENGTH = 256 * 1024;
+/** Maximum lines a native read operation may request. */
+export const MAX_READ_LINES = 10_000;
+/** Shared maximum result count for native grep and find operations. */
+export const MAX_SEARCH_RESULTS = 1_000;
+export const MAX_GREP_RESULTS = MAX_SEARCH_RESULTS;
+export const MAX_FIND_RESULTS = MAX_SEARCH_RESULTS;
+/** Maximum directory entries a native ls operation may retain. */
+export const MAX_LS_ENTRIES = 5_000;
+/** Maximum context lines on either side of a native grep match. */
+export const MAX_GREP_CONTEXT = 100;

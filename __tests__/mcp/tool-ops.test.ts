@@ -2,7 +2,15 @@ import { chmodSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, w
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
-import { isSafeRegex, type ToolOp } from "../../core/index.ts";
+import {
+  isSafeRegex,
+  MAX_FIND_RESULTS,
+  MAX_GREP_CONTEXT,
+  MAX_GREP_RESULTS,
+  MAX_LS_ENTRIES,
+  MAX_READ_LINES,
+  type ToolOp,
+} from "../../core/index.ts";
 import {
   createToolExecutor,
   findOnPath,
@@ -64,6 +72,30 @@ const hasRg = findOnPath("rg") !== null;
 const hasFd = findOnPath("fd") !== null;
 
 describe("mcp tool-ops — read", () => {
+  it("accepts exact shared ceilings and rejects over-ceiling direct calls", async () => {
+    const exact = [
+      [{ tool: "read", path: "a.txt", limit: MAX_READ_LINES }, ""],
+      [{ tool: "grep", path: "a.txt", pattern: "alpha", limit: MAX_GREP_RESULTS }, ""],
+      [{ tool: "find", pattern: "*.txt", limit: MAX_FIND_RESULTS }, ""],
+      [{ tool: "ls", limit: MAX_LS_ENTRIES }, ""],
+      [{ tool: "grep", path: "a.txt", pattern: "alpha", context: MAX_GREP_CONTEXT }, ""],
+    ] as const;
+    for (const [operation] of exact) expect((await run(operation as ToolOp)).exitCode).not.toBe(1);
+
+    const over = [
+      { tool: "read", path: "a.txt", limit: MAX_READ_LINES + 1 },
+      { tool: "grep", pattern: "alpha", limit: MAX_GREP_RESULTS + 1 },
+      { tool: "find", pattern: "*.txt", limit: MAX_FIND_RESULTS + 1 },
+      { tool: "ls", limit: MAX_LS_ENTRIES + 1 },
+      { tool: "grep", pattern: "alpha", context: MAX_GREP_CONTEXT + 1 },
+    ];
+    for (const operation of over) {
+      const result = await run(operation);
+      expect(result.exitCode).toBeGreaterThan(0);
+      expect(result.stderr).toContain("at most");
+    }
+  });
+
   it("returns the whole file on stdout with exit 0", async () => {
     const r = await run({ tool: "read", path: "a.txt" });
     expect(r).toEqual({ stdout: "alpha\nbeta\ngamma\n", stderr: "", exitCode: 0 });

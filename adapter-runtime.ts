@@ -38,7 +38,7 @@ export async function executeAdapterPlan(
   try {
     plan = coercePlan(rawPlan);
   } catch (err) {
-    return errorResult(errText(err));
+    return errorResult(`plan validation failed: ${errText(err)}`);
   }
 
   let result: CoreResult;
