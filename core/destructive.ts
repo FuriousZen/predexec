@@ -191,6 +191,12 @@ const GIT_READ_ONLY_GLOBAL_OPTIONS = new Set([
   "--exec-path", "--html-path", "--man-path", "--info-path", "--version", "--help",
 ]);
 
+/** Git configuration keys whose values can invoke a process while reading. */
+const GIT_COMMAND_CONFIG_KEY_RE = /^(?:core\.pager(?:\..*)?|pager(?:\..*)?|diff\..*(?:external|textconv)|filter(?:\..*)?|core\.(?:sshcommand|gitproxy)|credential\.helper(?:\..*)?)$/i;
+
+/** Shell builtins that evaluate or replace command text rather than reading it. */
+const SHELL_COMMAND_CONTROL_HEADS = new Set(["eval", "source", ".", "exec"]);
+
 /**
  * Command heads that only ever read (absent an exception below). Membership
  * buys ONE thing: skipping the word-scan, so quoted writer words in their
@@ -1988,17 +1994,94 @@ function envSplitStringPayload(tokens: string[]): string | null {
   return null;
 }
 
+function gitReadOnlySubformOption(
+  token: string,
+  allowed: Set<string>,
+  valueOptions: Set<string>,
+): { known: boolean; consumesNext: boolean } {
+  if (!token.startsWith("-")) return { known: true, consumesNext: false };
+  const equals = token.indexOf("=");
+  const name = equals < 0 ? token : token.slice(0, equals);
+  if (!allowed.has(name)) return { known: false, consumesNext: false };
+  return { known: true, consumesNext: equals < 0 && valueOptions.has(name) };
+}
+
+/**
+ * Read-only Git subforms are argv grammars, not prefixes. A later action or
+ * option must invalidate the allowlist; after `--`, every token is data.
+ * Unknown options fail closed because this intentionally covers only the
+ * narrow display/query forms used by the classifier.
+ */
 function isGitReadOnlySubform(tokens: string[], verbIndex: number): boolean {
   const verb = tokens[verbIndex];
   const subform = tokens[verbIndex + 1];
-  if (verb === "branch") return subform === "-l" || subform === "--list" || subform === "-v";
-  if (verb === "tag") return subform === "-l" || subform === "--list";
-  if (verb === "stash") return subform === "list" || subform === "show";
-  if (verb === "config") {
-    return subform === "--get" || subform?.startsWith("--get-") || subform === "--list" || subform === "-l";
+  let allowed: Set<string>;
+  let values: Set<string>;
+  let bareActions: Set<string>;
+  if (verb === "branch" && (subform === "-l" || subform === "--list" || subform === "-v" || subform === "-vv")) {
+    allowed = new Set(["-l", "--list", "-v", "-vv", "--contains", "--no-contains", "--merged", "--no-merged", "--points-at", "--sort", "--format", "--column", "--no-column", "--color", "--no-color"]);
+    values = new Set(["--contains", "--no-contains", "--merged", "--no-merged", "--points-at", "--sort", "--format", "--color"]);
+    bareActions = new Set();
+  } else if (verb === "tag" && (subform === "-l" || subform === "--list")) {
+    allowed = new Set(["-l", "--list", "--contains", "--no-contains", "--merged", "--no-merged", "--points-at", "--sort", "--format", "--column", "--no-column", "--color", "--no-color"]);
+    values = new Set(["--contains", "--no-contains", "--merged", "--no-merged", "--points-at", "--sort", "--format", "--color"]);
+    bareActions = new Set();
+  } else if (verb === "stash" && (subform === "list" || subform === "show")) {
+    allowed = new Set(["list", "show", "-p", "--patch", "--stat", "--summary", "--name-only", "--name-status", "--oneline", "--format", "--pretty", "--include-untracked", "--no-include-untracked"]);
+    values = new Set(["--format", "--pretty"]);
+    bareActions = new Set(["drop", "pop", "apply", "clear", "branch", "push", "create", "store"]);
+  } else if (verb === "config" && (subform === "--get" || subform?.startsWith("--get-") || subform === "--list" || subform === "-l")) {
+    allowed = new Set(["--get", "--get-all", "--get-regexp", "--get-urlmatch", "--list", "-l", "--show-origin", "--show-scope", "--show-names", "--name-only", "--includes", "--null", "--fixed-value", "--type", "--default", "--local", "--global", "--system", "--file", "--blob"]);
+    values = new Set(["--type", "--default", "--file", "--blob"]);
+    bareActions = new Set();
+  } else if (verb === "remote" && (subform === "-v" || subform === "show")) {
+    allowed = new Set(["-v", "show", "-n", "--no-query", "--get-url"]);
+    values = new Set();
+    bareActions = new Set(["add", "remove", "rename", "set-head", "set-branches", "set-url", "prune", "update"]);
+  } else {
+    return false;
   }
-  if (verb === "remote") return subform === "-v" || subform === "show";
-  return false;
+
+  for (let i = verbIndex + 1; i < tokens.length; i++) {
+    const token = tokens[i]!;
+    if (token === "--") return true;
+    if (!token.startsWith("-")) {
+      if (bareActions.has(token)) return false;
+      continue;
+    }
+    const parsed = gitReadOnlySubformOption(token, allowed, values);
+    if (!parsed.known) {
+      return false;
+    }
+    if (parsed.consumesNext) {
+      if (i + 1 >= tokens.length || tokens[i + 1] === "--" || tokens[i + 1]!.startsWith("-")) return false;
+      i++;
+    }
+  }
+  return true;
+}
+
+function gitConfigOptionMutation(tokens: string[], index: number): { token: string | null; consumed: number } {
+  const option = tokens[index]!;
+  const separate = option === "-c" || option === "--config-env";
+  const raw = separate ? tokens[index + 1] : option.startsWith("-c") ? option.slice(2) : option.startsWith("--config-env=") ? option.slice("--config-env=".length) : null;
+  if (!raw) return { token: option, consumed: separate ? 1 : 0 };
+  const key = raw.split("=", 1)[0]!.trim();
+  if (!key || GIT_COMMAND_CONFIG_KEY_RE.test(key)) return { token: option, consumed: separate ? 1 : 0 };
+  return { token: null, consumed: separate ? 1 : 0 };
+}
+
+function gitReadOnlyOptionMutation(tokens: string[], start: number): string | null {
+  for (let i = start; i < tokens.length; i++) {
+    const token = tokens[i]!;
+    if (token === "--") return null;
+    if (token === "--ext-diff" || token === "--textconv" || token === "--paginate" || token === "-p" ||
+      /^--open-files-in-pager(?:=|$)/.test(token) || /^--output(?:=|$)/.test(token) || /^-[^-]*o(?:.|$)/.test(token)) {
+      return token;
+    }
+    if (token === "--no-ext-diff" || token === "--no-textconv") continue;
+  }
+  return null;
 }
 
 /**
@@ -2025,8 +2108,21 @@ function findGitMutationToken(segment: string): string | null {
       verbIndex++;
       break;
     }
+    if (option === "-p" || option === "--paginate") return `git ${option}`;
     if (GIT_GLOBAL_OPTIONS_WITH_VALUE.has(option)) {
-      verbIndex += 2;
+      if (option === "-c" || option === "--config-env") {
+        const config = gitConfigOptionMutation(tokens, verbIndex);
+        if (config.token) return `git ${config.token}`;
+        verbIndex += 2;
+      } else {
+        verbIndex += 2;
+      }
+      continue;
+    }
+    if (option.startsWith("--config-env=") || (option.startsWith("-c") && option.length > 2)) {
+      const config = gitConfigOptionMutation(tokens, verbIndex);
+      if (config.token) return `git ${config.token}`;
+      verbIndex++;
       continue;
     }
     if (
@@ -2034,9 +2130,7 @@ function findGitMutationToken(segment: string): string | null {
       option.startsWith("--work-tree=") ||
       option.startsWith("--namespace=") ||
       option.startsWith("--super-prefix=") ||
-      option.startsWith("--config-env=") ||
-      (option.startsWith("-C") && option.length > 2) ||
-      (option.startsWith("-c") && option.length > 2)
+      (option.startsWith("-C") && option.length > 2)
     ) {
       verbIndex++;
       continue;
@@ -2066,7 +2160,11 @@ function findGitMutationToken(segment: string): string | null {
 
   const verb = tokens[verbIndex];
   if (!verb) return readOnlyGlobalQuery ? null : "git";
-  if (READ_ONLY_GIT_VERBS.has(verb) || isGitReadOnlySubform(tokens, verbIndex)) return null;
+  if (READ_ONLY_GIT_VERBS.has(verb)) {
+    const optionMutation = gitReadOnlyOptionMutation(tokens, verbIndex + 1);
+    return optionMutation ? `git ${optionMutation}` : null;
+  }
+  if (isGitReadOnlySubform(tokens, verbIndex)) return null;
   return `git ${verb}`;
 }
 
@@ -2193,6 +2291,11 @@ function findDestructiveTokenInternal(cmd: string, depth: number): string | null
   // Privileged escalation is never speculated on, whatever it wraps.
   for (const head of heads) {
     if (head && PRIVILEGE_HEADS.has(head)) return head;
+    // These shell builtins execute caller-provided command text or source a
+    // file. Their static arguments are not evidence of read-only behavior;
+    // this check also runs on recursively extracted -c/control/function
+    // clauses, while quoted words remain data because they are not heads.
+    if (head && SHELL_COMMAND_CONTROL_HEADS.has(head)) return head;
   }
 
   // Git is allowlist-oriented at the verb position. Inspect it before the

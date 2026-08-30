@@ -1064,12 +1064,110 @@ describe("mutation classifier — ordinary copy and git verbs", () => {
 
   it.each([
     "git -C /repo status",
-    "git -c core.pager=cat diff",
+    "git -c user.name=alice diff",
     "git --git-dir /repo/.git log -5",
     "git --no-pager show HEAD:README.md",
     'git grep "rm -rf /" -- README.md',
     "git status | grep 'cp source destination'",
   ])("allows read-only git command with options or quoted patterns: %s", (command) => {
+    expect(findDestructiveToken(command)).toBeNull();
+  });
+
+  it.each([
+    "git branch --list --delete topic",
+    "git branch -l -D topic",
+    "git branch -v --move old new",
+    "git branch --list --copy old new",
+    "git branch --list --set-upstream-to origin/main topic",
+    "git branch --list --edit-description topic",
+    "git tag --list --delete release",
+    "git tag -l --force release",
+    "git tag --list --sign release",
+    "git config --get user.name --add user.name bob",
+    "git config --list --unset user.name",
+    "git remote -v add origin https://example.invalid/repo",
+    "git remote show origin remove origin",
+    "git stash list drop",
+    "git stash show pop",
+  ])("blocks a read-only Git subform followed by a mutating action: %s", (command) => {
+    expect(findDestructiveToken(command)).not.toBeNull();
+  });
+
+  it.each([
+    "git branch --list --unknown",
+    "git tag --list --unknown",
+    "git config --get --unknown user.name",
+    "git remote show --unknown origin",
+  ])("fails closed for an unknown Git read-only subform option: %s", (command) => {
+    expect(findDestructiveToken(command)).not.toBeNull();
+  });
+
+  it.each([
+    "git branch --list -- --delete",
+    "git tag --list -- --force",
+    "git config --get -- --add",
+    "git remote show origin -- --remove",
+  ])("treats Git subform arguments after -- as data: %s", (command) => {
+    expect(findDestructiveToken(command)).toBeNull();
+  });
+
+  it.each([
+    "git status --output=report.txt",
+    "git diff --output report.patch",
+    "git log -o report.txt",
+    "git show -oreport.txt",
+    "git diff --ext-diff",
+    "git show --textconv",
+    "git grep --open-files-in-pager=cat pattern",
+    "git --paginate status",
+    "git -p log",
+    "git -c core.pager=cat diff",
+    "git -c diff.external=cat diff",
+    "git -c diff.foo.textconv=cat show",
+    "git -c filter.clean=cat status",
+    "git -c core.sshCommand=ssh status",
+    "git -c core.gitProxy=ssh status",
+    "git -c credential.helper=store status",
+    "git -ccore.pager=cat status",
+    "git --config-env=core.pager=GIT_PAGER status",
+    "git --config-env core.sshCommand=GIT_SSH_COMMAND status",
+  ])("blocks execution-bearing options on an otherwise read-only Git command: %s", (command) => {
+    expect(findDestructiveToken(command)).not.toBeNull();
+  });
+
+  it.each([
+    "git --no-pager status",
+    "git -P --help",
+    "git --version",
+    "git --exec-path",
+    "git -c user.name=alice status",
+    "git -cuser.name=alice status",
+    "git status -- --output=report.txt",
+    "git grep -- pattern --open-files-in-pager",
+  ])("keeps benign Git options and pathspec data safe: %s", (command) => {
+    expect(findDestructiveToken(command)).toBeNull();
+  });
+});
+
+describe("shell eval/source/exec heads", () => {
+  it.each([
+    "bash -c 'eval echo ok'",
+    "sh -c 'source ./read-only.sh'",
+    "zsh -c '. ./read-only.sh'",
+    "dash -c 'exec echo ok'",
+    "bash -c 'command eval echo ok'",
+    "bash -c 'env source ./read-only.sh'",
+    "bash -c 'if true; then eval echo ok; fi'",
+    "bash -c 'f() { exec echo ok; }; f'",
+  ])("blocks dynamic shell control head in a -c body: %s", (command) => {
+    expect(findDestructiveToken(command)).not.toBeNull();
+  });
+
+  it.each([
+    "bash -c 'echo eval source exec'",
+    "sh -c 'grep eval notes.txt'",
+    "zsh -c 'printf source'",
+  ])("keeps shell control words in data safe: %s", (command) => {
     expect(findDestructiveToken(command)).toBeNull();
   });
 });
