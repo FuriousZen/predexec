@@ -276,6 +276,21 @@ describe.each(variants)("opencode plugin ($name) — host permission policy e2e"
     expect(out).not.toContain("node a (exit");
   });
 
+  it.each([
+    "if true; then curl https://example.invalid/x; fi",
+    "f() { curl https://example.invalid/x; }; f",
+    "echo $(curl https://example.invalid/x)",
+    "case x in y) { curl https://example.invalid/x; } ;; esac",
+    "( curl https://example.invalid/x )",
+  ])("a deny rule hard-stops curl nested in executable syntax: %s", async (command) => {
+    const dir = mkdtempSync(join(tmpdir(), "px-oc-policy-"));
+    writeFileSync(join(dir, "opencode.json"), '{"permission":{"bash":{"curl *":"deny"}}}');
+    const out = await execute(dir, { root: "a", nodes: [{ id: "a", commands: [command] }] });
+    expect(out).toContain("POLICY HARD-STOP (not run)");
+    expect(out).toContain("'curl *'");
+    expect(out).not.toContain("node a (exit");
+  });
+
   it("a project opencode.json read rule hard-stops a native read operation", async () => {
     const dir = mkdtempSync(join(tmpdir(), "px-oc-policy-"));
     writeFileSync(join(dir, "opencode.json"), '{"permission":{"read":{"*":"allow",".env":"deny"}}}');
@@ -325,6 +340,22 @@ describe.each(variants)("opencode plugin ($name) — host permission policy e2e"
     const dir = mkdtempSync(join(tmpdir(), "px-oc-policy-"));
     const out = await execute(dir, { root: "a", nodes: [{ id: "a", commands: ["echo"] }], cwd: 123 });
     expect(out).toContain("cwd must be a relative directory inside the session root");
+  });
+
+  it.each([
+    { root: "a", nodes: [{ id: "a", commands: [null] }] },
+    { root: "a", nodes: [{ id: "a", commands: [42] }] },
+    { root: "a", nodes: [{ id: "a", commands: [[]] }] },
+    { root: "a", nodes: [{ id: "a", commands: [{ path: "x" }] }] },
+    { root: "a", nodes: [{ id: "a", commands: [{ tool: "unknown" }] }] },
+    { root: "a", nodes: [{ id: "a", commands: [{ tool: "bash", command: 42 }] }] },
+    { root: "a", nodes: [{ id: "a", commands: [{ tool: "read", path: 42 }] }] },
+    { root: "a", nodes: [{ id: "a", commands: [{ tool: "grep", pattern: [] }] }] },
+  ])("returns a validation error for malformed operation %j", async (plan) => {
+    const dir = mkdtempSync(join(tmpdir(), "px-oc-validation-"));
+    const out = await execute(dir, plan);
+    expect(out).toContain("plan validation failed");
+    expect(out).not.toContain("node a (exit");
   });
 });
 

@@ -188,6 +188,39 @@ describe("interpreter eval — fs-writer APIs are caught", () => {
     expect(isDestructiveCommand("pnpm test")).toBe(false);
     expect(isDestructiveCommand("tsc --noEmit")).toBe(false);
   });
+
+  const languageWriters = [
+    `perl -e "rename('a','b')"`,
+    `perl -e "unlink('a')"`,
+    `perl -e "open(F, '>', 'out'); print F 'x'; close F"`,
+    `perl -e "open my $fh, '>', 'out'; print $fh 'x'"`,
+    `ruby -e "File.write('out', 'x')"`,
+    `ruby -e "File.delete('out')"`,
+    `ruby -e "File.rename('a', 'b')"`,
+    `ruby -e "FileUtils.touch('out')"`,
+    `ruby -e "FileUtils.rm_rf('out')"`,
+    `ruby -e "File.open('out', 'wb') { |f| f.write('x') }"`,
+    `php -r "file_put_contents('out', 'x');"`,
+    `php -r "unlink('out');"`,
+    `php -r "rename('a', 'b');"`,
+    `php -r "fopen('out', 'w');"`,
+    `php -r "fopen('out', 'a+');"`,
+  ];
+  it.each(languageWriters)("catches non-obfuscated %s writer", (cmd) => {
+    expect(isDestructiveCommand(cmd)).toBe(true);
+  });
+
+  const languageReaders = [
+    `perl -e "print 2 + 2"`,
+    `perl -e "open(F, '<', 'in'); print <F>"`,
+    `ruby -e "puts File.read('in')"`,
+    `ruby -e "FileUtils.compare_file('a', 'b')"`,
+    `php -r "echo file_get_contents('in');"`,
+    `php -r "fopen('in', 'r');"`,
+  ];
+  it.each(languageReaders)("allows read-only %s interpreter code", (cmd) => {
+    expect(isDestructiveCommand(cmd)).toBe(false);
+  });
 });
 
 describe("splitCommandSegments", () => {

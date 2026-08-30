@@ -216,6 +216,35 @@ describe("createPolicyChecker — matching & precedence", () => {
     const check = createPolicyChecker([{ pattern: "ok *", action: "deny" }]);
     expect(check("ok then")).toBe("ok *");
   });
+
+  it.each([
+    "if true; then curl https://example.invalid/x; fi",
+    "f() { curl https://example.invalid/x; }; f",
+    "echo $(curl https://example.invalid/x)",
+    "case x in y) { curl https://example.invalid/x; } ;; esac",
+    "( curl https://example.invalid/x )",
+  ])("inspects nested executable bodies: %s", (command) => {
+    const check = createPolicyChecker([{ pattern: "curl *", action: "deny" }]);
+    expect(check(command)).toBe("curl *");
+  });
+
+  it("retains last-match-wins across nested clauses", () => {
+    const check = createPolicyChecker([
+      { pattern: "curl *", action: "deny" },
+      { pattern: "curl https://example.invalid/*", action: "allow" },
+    ]);
+    expect(check("if true; then curl https://example.invalid/x; fi")).toBeNull();
+  });
+
+  it("fails closed for incomplete executable bodies", () => {
+    const check = createPolicyChecker([]);
+    expect(check("echo $(curl https://example.invalid/x")).toContain("incomplete shell syntax");
+  });
+
+  it("fails closed when executable-body inspection exceeds its depth budget", () => {
+    const deep = `echo ${"$(".repeat(40)}printf ok${")".repeat(40)}`;
+    expect(createPolicyChecker([])(deep)).toContain("incomplete shell syntax");
+  });
 });
 
 describe("engine — policyStop", () => {

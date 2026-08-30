@@ -34,7 +34,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, parse as parsePath } from "node:path";
-import { escapeRegExp, splitCommandSegments } from "./core/index.ts";
+import { escapeRegExp, inspectCommandSubstitutionTree, splitCommandSegments } from "./core/index.ts";
 import type { Operation } from "./core/types.ts";
 
 export type PolicyAction = "allow" | "ask" | "deny";
@@ -253,22 +253,27 @@ export function createPolicyChecker(
       return null;
     };
   }
-  if (rules.length === 0) return () => null;
   const compiled = rules
     .map((rule) => ({ ...rule, regex: patternToRegex(rule.pattern) }))
     .filter((rule): rule is PolicyRule & { regex: RegExp } => rule.regex !== null);
 
   const checkBash = (cmd: string): string | null => {
     try {
-      for (const segment of splitCommandSegments(cmd)) {
-        const trimmed = segment.trim();
-        let winner: (PolicyRule & { regex: RegExp }) | null = null;
-        // Last match wins — keep scanning rather than breaking on first hit.
-        for (const rule of compiled) {
-          if (rule.tool) continue;
-          if (rule.regex.test(trimmed)) winner = rule;
+      const inspected = inspectCommandSubstitutionTree(cmd);
+      if (!inspected.complete) {
+        return "incomplete shell syntax (policy inspection exceeded its bounded executable-body budget)";
+      }
+      for (const inspectedCommand of inspected.commands) {
+        for (const segment of splitCommandSegments(inspectedCommand)) {
+          const trimmed = segment.trim();
+          let winner: (PolicyRule & { regex: RegExp }) | null = null;
+          // Last match wins — keep scanning rather than breaking on first hit.
+          for (const rule of compiled) {
+            if (rule.tool) continue;
+            if (rule.regex.test(trimmed)) winner = rule;
+          }
+          if (winner && winner.action !== "allow") return winner.pattern;
         }
-        if (winner && winner.action !== "allow") return winner.pattern;
       }
       return null;
     } catch {

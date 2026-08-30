@@ -20,6 +20,7 @@ import { isAbsolute, relative, resolve, sep } from "node:path";
 import { evaluateConditionWithDetail } from "./conditions.ts";
 import { READ_ONLY_TOOLS, MUTATING_TOOLS, findDestructiveToken } from "./destructive.ts";
 import { runNode, isToolOp, formatToolOpLabel } from "./runner.ts";
+import { validateOperation } from "./validation.ts";
 import {
   DEFAULT_MAX_DEPTH,
   HIGH_CONFIDENCE_KINDS,
@@ -182,6 +183,10 @@ export function validatePlan(plan: PlanTree, byId: Map<string, PlanNode>): strin
       return `node "${node.id}" exceeds the maximum of ${MAX_OPERATIONS_PER_NODE} operations per node`;
     }
     if (node.edges !== undefined && !Array.isArray(node.edges)) return `node "${node.id}" edges must be an array`;
+    for (let index = 0; index < node.commands.length; index++) {
+      const operationError = validateOperation(node.commands[index]);
+      if (operationError) return `node "${node.id}" operation ${index + 1} invalid: ${operationError}`;
+    }
     if (byId.has(node.id)) return `duplicate node id "${node.id}"`;
     byId.set(node.id, node);
   }

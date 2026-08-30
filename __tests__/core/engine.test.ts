@@ -140,6 +140,27 @@ describe("runPlanTree — traversal & stop reasons", () => {
   });
 
   it.each([
+    `perl -e "rename('a','b')"`,
+    `ruby -e "File.write('out', 'x')"`,
+    `php -r "file_put_contents('out', 'x');"`,
+    `php -r "fopen('out', 'w');"`,
+  ])("mutationStop: interpreter writer %s never executes", async (command) => {
+    const dir = mkdtempSync(join(tmpdir(), "predexec-interpreter-"));
+    try {
+      const r = await runPlanTree(
+        { root: "a", nodes: [{ id: "a", commands: [command] }] },
+        { cwd: dir },
+      );
+      expect(r.stoppedReason).toBe("mutationStop");
+      expect(r.pathTaken).toEqual([]);
+      expect(existsSync(join(dir, "out"))).toBe(false);
+      expect(existsSync(join(dir, "b"))).toBe(false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
     "/usr/bin/time -o timing.log printf hi",
     "time --output timing.log printf hi",
     "time -ofile printf hi",
@@ -691,13 +712,14 @@ describe("runPlanTree — tool operations", () => {
     expect(r.stoppedReason).toBe("mutationStop");
   });
 
-  it("hard-stops on unknown tool (safe default)", async () => {
+  it("rejects unknown tool during structural validation", async () => {
     const plan: PlanTree = {
       root: "a",
       nodes: [{ id: "a", commands: [{ tool: "deploy", target: "prod" }] }],
     };
     const r = await runPlanTree(plan, opts);
-    expect(r.stoppedReason).toBe("mutationStop");
+    expect(r.stoppedReason).toBe("error");
+    expect(r.transcript).toContain("unknown tool");
   });
 
   it("read/grep/find/ls tool ops pass destructive check", async () => {

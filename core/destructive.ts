@@ -176,6 +176,26 @@ const EVAL_WRITER_RE =
   /\bfs\.\w*[Ww]rite\w*|writeFile\w*|appendFile\w*|rmSync|unlinkSync|mkdirSync|renameSync|rmdirSync|cpSync|createWriteStream|truncateSync|chmodSync|symlinkSync|os\.(remove|unlink|rename|mkdir|rmdir|makedirs)|shutil\.|write_text|write_bytes|open\([^)]*['"][wa]/;
 
 /**
+ * Language-specific eval scanners. Keep these as small API vocabularies rather
+ * than one broad regex: read-only snippets such as File.read, fopen(...,"r"),
+ * and Perl open(...,"<") must remain in the safe tier.
+ */
+const PERL_WRITER_PATTERNS = [
+  /\b(?:rename|unlink|truncate|sysopen)\s*\(/,
+  /\bopen(?:\s*\([^)]*|\s+[^;\n]*?)['"](?:>>?|\+>|\|>)['"]/,
+  /\bprint\s+[A-Za-z_$][\w$]*\s+/,
+];
+const RUBY_WRITER_PATTERNS = [
+  /\bFile\.(?:write|binwrite|delete|unlink|rename|truncate|symlink|link|utime)\s*\(/,
+  /\bFileUtils\.(?:touch|cp|mv|rm|rm_rf|remove|mkdir|mkdir_p|chmod|chown|ln|ln_s)\s*\(/,
+  /\bFile\.open\s*\([^)]*,[^)]*['"](?:w|a|x|c)(?:b|\+|b\+|\+b)?['"]|\bFile\.open\s*\([^)]*,[^)]*['"]r\+(?:b)?['"]|\bFile\.open\s*\([^)]*,[^)]*['"]r\+b['"]/
+];
+const PHP_WRITER_PATTERNS = [
+  /\b(?:file_put_contents|unlink|rename|mkdir|rmdir|touch|fwrite|ftruncate)\s*\(/,
+  /\bfopen\s*\([^)]*,\s*['"][^'"]*(?:w|a|x|c|\+)[^'"]*['"]/,
+];
+
+/**
  * awk/gawk writes that never leave the program text: `awk 'BEGIN{print >
  * "/etc/passwd"}'`. Scanned against the RAW segment, because the redirect check
  * runs on sanitized text where quoted angles are deliberately dropped, and the
@@ -599,9 +619,20 @@ const INPLACE_EDIT_RE = /\s-\w*i(\.\w+)?\b/;
 function isEvalInvocation(head: string, segment: string): boolean {
   // `-p`/`-n`/`--print` are eval flags too: `node -p 'require("fs").rmSync(…)'`
   // executes exactly like `-e`, and clustered forms (`perl -pi -e`) are common.
+  if (head === "php") return /\s(?:-\w*r\w*|--run)\b/.test(segment);
   if (EVAL_INTERPRETERS.has(head)) return /\s(-\w*[ecnp]\w*|--eval|--print)\b/.test(segment);
   if (EVAL_SHELLS.has(head)) return /\s-c\b/.test(segment);
   return false;
+}
+
+function findInterpreterWriter(head: string, segment: string): string | null {
+  const patterns = head === "perl" ? PERL_WRITER_PATTERNS :
+    head === "ruby" ? RUBY_WRITER_PATTERNS : head === "php" ? PHP_WRITER_PATTERNS : [];
+  for (const pattern of patterns) {
+    const match = pattern.exec(segment);
+    if (match) return match[0].trim();
+  }
+  return null;
 }
 
 /**
@@ -718,6 +749,8 @@ function findDestructiveTokenInternal(cmd: string, depth: number): string | null
     }
     if (EVAL_INTERPRETERS.has(head) && INPLACE_EDIT_RE.test(segment)) return "-i";
     if (isEvalInvocation(head, segment)) {
+      const languageWriter = findInterpreterWriter(head, segment);
+      if (languageWriter) return languageWriter;
       const writer = EVAL_WRITER_RE.exec(segment);
       if (writer) return writer[0].trim();
     }
