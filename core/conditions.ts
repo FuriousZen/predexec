@@ -26,31 +26,232 @@ const FILE_RE = /^file\s+(exists|missing)\s+(.+)$/;
 /**
  * Reject regexes prone to catastrophic backtracking.
  *
- * Best-effort and deliberately narrow: it rejects a quantified group whose body
- * ENDS open-ended — `(a+)+`, `([a-z]+)+`, `(\w+\s*)+`, `(\d+){2,}` — the shape
- * behind essentially every practical ReDoS. A body ending in a fixed atom is
- * anchored and allowed, so ordinary matchers like `(?:\d+\.)+\d+` still work.
- *
- * It does NOT catch quantified overlapping alternation like `(a|a)+`. A real
- * fix needs a timeout the JS RegExp engine does not offer, so this narrows the
- * gap rather than closing it.
+ * The screen is intentionally conservative: it rejects a quantified group
+ * whose body ends open-ended — `(a+)+`, `([a-z]+)+`, `(\w+\s*)+` — and a
+ * quantified alternation whose branches can consume the same prefix. The
+ * latter is the ambiguity behind patterns such as `(a|aa)+` and `(a|a?)+`.
+ * A body ending in a fixed atom is still allowed, so ordinary matchers like
+ * `(?:\d+\.)+\d+` remain usable.
  */
-const QUANTIFIED_GROUP_RE = /\(([^)]*)\)\s*(?:[+*]|\{\d)/g;
 const SYNTHETIC_TRUNCATION_MARKER_RE = /…\[truncated(?:: \d+ more chars)?\]/g;
 
+type RegexCharSet = Set<string> | "any" | "unknown";
+
+interface RegexAtom {
+  first: RegexCharSet;
+  optional: boolean;
+  quantifiedOpenEnded: boolean;
+}
+
+interface RegexSequence {
+  atoms: RegexAtom[];
+  nullable: boolean;
+  first: RegexCharSet;
+  endsOpenEnded: boolean;
+}
+
+const ASCII_DIGITS = new Set("0123456789");
+const ASCII_WORD = new Set("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz");
+const ASCII_SPACE = new Set("\t\n\r \f\v");
+
+function unionCharSets(a: RegexCharSet, b: RegexCharSet): RegexCharSet {
+  if (a === "any" || b === "any") return "any";
+  if (a === "unknown" || b === "unknown") return "unknown";
+  return new Set([...a, ...b]);
+}
+
+function charSetsOverlap(a: RegexCharSet, b: RegexCharSet): boolean {
+  if (a === "any" || b === "any" || a === "unknown" || b === "unknown") return true;
+  for (const ch of a) if (b.has(ch)) return true;
+  return false;
+}
+
+function matchingParen(pattern: string, open: number): number {
+  let depth = 0;
+  let inClass = false;
+  for (let i = open; i < pattern.length; i++) {
+    const ch = pattern[i]!;
+    if (ch === "\\") {
+      i += 1;
+      continue;
+    }
+    if (ch === "[") inClass = true;
+    else if (ch === "]") inClass = false;
+    else if (!inClass && ch === "(") depth += 1;
+    else if (!inClass && ch === ")" && --depth === 0) return i;
+  }
+  return -1;
+}
+
+function splitAlternatives(body: string): string[] {
+  const alternatives: string[] = [];
+  let start = 0;
+  let depth = 0;
+  let inClass = false;
+  for (let i = 0; i < body.length; i++) {
+    const ch = body[i]!;
+    if (ch === "\\") {
+      i += 1;
+      continue;
+    }
+    if (ch === "[") inClass = true;
+    else if (ch === "]") inClass = false;
+    else if (!inClass && ch === "(") depth += 1;
+    else if (!inClass && ch === ")") depth = Math.max(0, depth - 1);
+    else if (!inClass && depth === 0 && ch === "|") {
+      alternatives.push(body.slice(start, i));
+      start = i + 1;
+    }
+  }
+  alternatives.push(body.slice(start));
+  return alternatives;
+}
+
+function escapeSet(ch: string): RegexCharSet {
+  if (ch === "d") return ASCII_DIGITS;
+  if (ch === "D") return "any";
+  if (ch === "w") return ASCII_WORD;
+  if (ch === "W") return "any";
+  if (ch === "s") return ASCII_SPACE;
+  if (ch === "S" || ch === "p" || ch === "P") return "any";
+  return new Set(ch);
+}
+
+function classSet(body: string): RegexCharSet {
+  if (body.startsWith("^") || body.includes("\\p{") || body.includes("\\P{")) return "any";
+  const chars = new Set<string>();
+  for (let i = 0; i < body.length; i++) {
+    let current: RegexCharSet;
+    if (body[i] === "\\") current = escapeSet(body[++i] ?? "");
+    else current = new Set(body[i]);
+    if (current === "any" || current === "unknown") return current;
+    if (body[i + 1] === "-" && i + 2 < body.length && current.size === 1) {
+      const from = [...current][0]!;
+      const to = body[i + 2]!;
+      for (let code = from.charCodeAt(0); code <= to.charCodeAt(0); code++) chars.add(String.fromCharCode(code));
+      i += 2;
+      continue;
+    }
+    for (const ch of current) chars.add(ch);
+  }
+  return chars;
+}
+
+function readQuantifier(source: string, start: number): { next: number; optional: boolean; openEnded: boolean } {
+  const ch = source[start];
+  if (ch === "+" || ch === "*") return { next: start + 1, optional: ch === "*", openEnded: true };
+  if (ch === "?") return { next: start + 1, optional: true, openEnded: false };
+  if (ch !== "{") return { next: start, optional: false, openEnded: false };
+  const end = source.indexOf("}", start + 1);
+  if (end < 0) return { next: start, optional: false, openEnded: false };
+  const quantifier = source.slice(start + 1, end);
+  const min = Number.parseInt(quantifier.split(",", 1)[0] ?? "", 10);
+  return { next: end + 1, optional: min === 0, openEnded: quantifier.endsWith(",") };
+}
+
+function parseSequence(source: string): RegexSequence {
+  const atoms: RegexAtom[] = [];
+  let nullable = true;
+  let first: RegexCharSet = new Set();
+  let firstCanContinue = true;
+  for (let i = 0; i < source.length;) {
+    const ch = source[i]!;
+    if (ch === "|") break;
+    if (ch === "^" || ch === "$") {
+      i += 1;
+      continue;
+    }
+    let atomFirst: RegexCharSet;
+    let nestedNullable = false;
+    let nestedEndsOpenEnded = false;
+    if (ch === "\\") {
+      atomFirst = escapeSet(source[i + 1] ?? "");
+      i += 2;
+    } else if (ch === "[") {
+      let end = i + 1;
+      while (end < source.length) {
+        if (source[end] === "\\") end += 2;
+        else if (source[end] === "]") break;
+        else end += 1;
+      }
+      atomFirst = end < source.length ? classSet(source.slice(i + 1, end)) : "unknown";
+      i = end < source.length ? end + 1 : source.length;
+    } else if (ch === "(") {
+      const end = matchingParen(source, i);
+      if (end < 0) {
+        atomFirst = "unknown";
+        i = source.length;
+      } else {
+        const prefix = source.slice(i + 1, end).match(/^\?(?::|[=!]|<[=!]?[^>]*>)/)?.[0] ?? "";
+        const nested = parseAlternativesSequence(source.slice(i + 1 + prefix.length, end));
+        atomFirst = nested.first;
+        nestedNullable = nested.nullable;
+        nestedEndsOpenEnded = nested.endsOpenEnded;
+        i = end + 1;
+      }
+    } else {
+      atomFirst = ch === "." ? "any" : new Set(ch);
+      i += 1;
+    }
+    const quantifier = readQuantifier(source, i);
+    i = quantifier.next;
+    const optional = quantifier.optional || nestedNullable;
+    atoms.push({ first: atomFirst, optional, quantifiedOpenEnded: quantifier.openEnded || nestedEndsOpenEnded });
+    if (firstCanContinue) {
+      first = unionCharSets(first, atomFirst);
+      firstCanContinue = optional;
+    }
+    if (!optional) nullable = false;
+  }
+  return { atoms, nullable, first, endsOpenEnded: atoms.at(-1)?.quantifiedOpenEnded ?? false };
+}
+
+function parseAlternativesSequence(body: string): RegexSequence {
+  const alternatives = splitAlternatives(body);
+  let first: RegexCharSet = new Set();
+  let nullable = false;
+  let endsOpenEnded = false;
+  for (const alternative of alternatives) {
+    const shape = parseSequence(alternative);
+    first = unionCharSets(first, shape.first);
+    nullable ||= shape.nullable;
+    endsOpenEnded ||= shape.endsOpenEnded;
+  }
+  return { atoms: [], nullable, first, endsOpenEnded };
+}
+
+function ambiguousAlternation(body: string): boolean {
+  const alternatives = splitAlternatives(body);
+  if (alternatives.length < 2) return false;
+  const shapes = alternatives.map((alternative) => parseSequence(alternative));
+  if (shapes.some((shape) => shape.nullable)) return true;
+  for (let left = 0; left < shapes.length; left++) {
+    for (let right = left + 1; right < shapes.length; right++) {
+      const a = shapes[left]!.atoms;
+      const b = shapes[right]!.atoms;
+      const common = Math.min(a.length, b.length);
+      let sharedPrefix = true;
+      for (let i = 0; i < common; i++) {
+        if (!charSetsOverlap(a[i]!.first, b[i]!.first)) {
+          sharedPrefix = false;
+          break;
+        }
+      }
+      if (sharedPrefix && common > 0) return true;
+    }
+  }
+  return false;
+}
+
 export function isSafeRegex(pattern: string): boolean {
-  QUANTIFIED_GROUP_RE.lastIndex = 0;
-  for (let m = QUANTIFIED_GROUP_RE.exec(pattern); m; m = QUANTIFIED_GROUP_RE.exec(pattern)) {
-    const body = (m[1] ?? "").replace(/^\?[:=!]|^\?<[=!]?[^>]*>/, "");
-    // Unsafe only when the repeated body ITSELF ends open-ended — `(a+)+`,
-    // `([a-z]+)+`, `(\w+\s*)+`. Then each outer repetition can split the same
-    // input many ways and the engine explores all of them.
-    //
-    // A body ending in a fixed atom is anchored and safe: in `(?:\d+\.)+` every
-    // iteration must consume a literal `.`, so there is nothing to backtrack
-    // over. Rejecting those would turn ordinary version/path matchers into
-    // permanently-false edges.
-    if (/[+*]$|\{\d+,\}$/.test(body)) return false;
+  for (let i = 0; i < pattern.length; i++) {
+    if (pattern[i] !== "(" || pattern[i - 1] === "\\") continue;
+    const end = matchingParen(pattern, i);
+    if (end < 0) continue;
+    const quantifier = readQuantifier(pattern, end + 1);
+    if (quantifier.next === end + 1 || !quantifier.openEnded && pattern[end + 1] !== "+" && pattern[end + 1] !== "*") continue;
+    const body = pattern.slice(i + 1, end).replace(/^\?(?::|[=!]|<[=!]?[^>]*>)/, "");
+    if (/(?:[+*]|\{\d+,\})\s*$/.test(body) || ambiguousAlternation(body)) return false;
   }
   return true;
 }

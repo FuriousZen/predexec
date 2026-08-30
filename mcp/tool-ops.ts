@@ -51,6 +51,8 @@ const DEFAULT_GREP_LIMIT = 100;
 const DEFAULT_FIND_LIMIT = 100;
 const DEFAULT_LS_LIMIT = 500;
 const DEFAULT_READ_LINES = 2000;
+/** Do not retain an unbounded unterminated line while streaming fallback text. */
+const MAX_TEXT_LINE_BYTES = 64 * 1024;
 
 /** Ceiling on the pure-Node walk. An unbounded walk on a huge tree reads as a hang. */
 const MAX_WALK_FILES = 20_000;
@@ -385,6 +387,9 @@ async function readOp(op: ToolOp, root: string, base: string, signal?: AbortSign
   if (scan.binary) {
     return fail("read", `${raw} looks like a binary file — this adapter reads text only`);
   }
+  if (scan.oversized) {
+    return fail("read", `${raw}: line exceeds the ${MAX_TEXT_LINE_BYTES} byte fallback scan limit`);
+  }
   const total = scan.totalLines;
   // An out-of-range offset returns empty stdout if it is allowed to clamp, and
   // empty stdout is indistinguishable from an empty file to a negated `match`.
@@ -410,6 +415,7 @@ interface TextScan {
   contentLines: number;
   finalNewline: boolean;
   binary: boolean;
+  oversized: boolean;
 }
 
 /**
@@ -437,8 +443,10 @@ async function scanTextLines(
   let bytes = 0;
   let lastByte = -1;
   let binary = false;
+  let oversized = false;
   const decoder = new StringDecoder("utf8");
   let pending = "";
+  let pendingBytes = 0;
   let contentLines = 0;
   let callbackActive = true;
   const dispatch = (line: string): void => {
@@ -446,20 +454,38 @@ async function scanTextLines(
     if (callbackActive && onLine(line, contentLines) === false) callbackActive = false;
   };
   const consume = (text: string): void => {
+    // Once the caller has enough lines, discard the remainder rather than
+    // retaining an irrelevant unterminated line. NUL detection still happens
+    // on the raw chunks above, which keeps binary refusal truthful.
     if (!callbackActive) return;
-    pending += text;
     let start = 0;
     while (true) {
-      const newline = pending.indexOf("\n", start);
-      if (newline < 0) break;
-      dispatch(pending.slice(start, newline));
-      start = newline + 1;
-      if (!callbackActive) {
+      const newline = text.indexOf("\n", start);
+      if (newline < 0) {
+        const tail = text.slice(start);
+        pending += tail;
+        pendingBytes += Buffer.byteLength(tail, "utf8");
+        if (pendingBytes > MAX_TEXT_LINE_BYTES) {
+          oversized = true;
+          pending = "";
+          pendingBytes = 0;
+        }
+        return;
+      }
+      const line = text.slice(start, newline);
+      pending += line;
+      pendingBytes += Buffer.byteLength(line, "utf8");
+      if (pendingBytes > MAX_TEXT_LINE_BYTES) {
+        oversized = true;
         pending = "";
         return;
       }
+      dispatch(pending);
+      pending = "";
+      pendingBytes = 0;
+      start = newline + 1;
+      if (!callbackActive) return;
     }
-    if (start > 0) pending = pending.slice(start);
   };
   try {
     for await (const chunk of input) {
@@ -469,10 +495,11 @@ async function scanTextLines(
       if (buf.length > 0) lastByte = buf[buf.length - 1]!;
       if (buf.includes(0)) binary = true;
       consume(decoder.write(buf));
+      if (oversized) break;
     }
-    consume(decoder.end());
-    if (pending.length > 0) dispatch(pending);
-    if (bytes === 0 || lastByte === 10) {
+    if (!oversized) consume(decoder.end());
+    if (!oversized && pending.length > 0) dispatch(pending);
+    if (!oversized && (bytes === 0 || lastByte === 10)) {
       if (callbackActive && onLine("", contentLines + 1) === false) callbackActive = false;
     }
   } catch (err) {
@@ -489,6 +516,7 @@ async function scanTextLines(
     finalNewline,
     totalLines: contentLines + (finalNewline ? 1 : contentLines === 0 ? 1 : 0),
     binary,
+    oversized,
   };
 }
 
@@ -603,17 +631,36 @@ async function grepViaRg(
   }
 
   const matches: Match[] = [];
-  for (const line of stdout.split("\n")) {
-    const nul = line.indexOf("\0");
-    if (nul < 0) continue; // rg's out-of-band notices (e.g. binary files) have no NUL — skip, don't mis-parse
-    const rest = line.slice(nul + 1);
+  // A NUL terminates the filename; a newline before that NUL is therefore part
+  // of the filename, not a record boundary. Parse the two delimiters as a
+  // state machine instead of splitting on newlines first.
+  let cursor = 0;
+  while (cursor < stdout.length) {
+    const nul = stdout.indexOf("\0", cursor);
+    if (nul < 0) break; // rg's out-of-band notices have no NUL — ignore them
+    const recordEnd = stdout.indexOf("\n", nul + 1);
+    if (recordEnd < 0) break;
+    let filename = stdout.slice(cursor, nul);
+    // A diagnostic without a NUL can precede a valid record in stdout. Since rg
+    // receives the absolute scope as its search target, recover the scoped
+    // filename while still preserving embedded newlines in that filename.
+    if (!filename.startsWith(abs)) {
+      const scoped = filename.lastIndexOf(abs);
+      if (scoped < 0) {
+        cursor = recordEnd + 1;
+        continue;
+      }
+      filename = filename.slice(scoped);
+    }
+    const rest = stdout.slice(nul + 1, recordEnd);
     const colon = rest.indexOf(":");
+    cursor = recordEnd + 1;
     if (colon < 0) continue;
     const lineNo = Number(rest.slice(0, colon));
     if (!Number.isInteger(lineNo)) continue;
     matches.push({
-      path: displayRel(base, abs, lexicalAbs, line.slice(0, nul)),
-      canonicalPath: line.slice(0, nul),
+      path: displayRel(base, abs, lexicalAbs, filename),
+      canonicalPath: filename,
       line: lineNo,
       text: rest.slice(colon + 1),
     });
@@ -670,6 +717,9 @@ async function grepViaNode(
         }
       }, signal);
       if (scan.binary) continue;
+      if (scan.oversized) {
+        return { err: fail("grep", `${rel}: line exceeds the ${MAX_TEXT_LINE_BYTES} byte fallback scan limit`) };
+      }
       matches.push(...pending);
     } catch (err) {
       if (signal?.aborted) throw err;
@@ -810,35 +860,60 @@ async function findOp(
 
 // ── ls ──────────────────────────────────────────────────────────────────────
 
+interface ListedEntry {
+  name: string;
+  isDir: boolean;
+}
+
+const compareEntryNames = (a: ListedEntry, b: ListedEntry): number => {
+  const lowerA = a.name.toLowerCase();
+  const lowerB = b.name.toLowerCase();
+  if (lowerA < lowerB) return -1;
+  if (lowerA > lowerB) return 1;
+  if (a.name < b.name) return -1;
+  if (a.name > b.name) return 1;
+  return 0;
+};
+
+/** Keep only the lexicographically smallest capacity entries while walking. */
+function retainSortedEntry(entries: ListedEntry[], entry: ListedEntry, capacity: number): void {
+  let low = 0;
+  let high = entries.length;
+  while (low < high) {
+    const middle = Math.floor((low + high) / 2);
+    if (compareEntryNames(entries[middle]!, entry) <= 0) low = middle + 1;
+    else high = middle;
+  }
+  if (low >= capacity) return;
+  entries.splice(low, 0, entry);
+  if (entries.length > capacity) entries.pop();
+}
+
 async function lsOp(op: ToolOp, root: string, base: string): Promise<OpResult> {
   const scope = await target(op, root, base, "ls");
   if (scope.err) return scope.err;
   if (!scope.isDir) return fail("ls", `${String(op.path ?? ".")} is not a directory — use {tool:"read"} for files`);
 
+  const limit = positiveInt(op.limit) ?? DEFAULT_LS_LIMIT;
+  const retained: ListedEntry[] = [];
   const directory = await opendir(scope.abs);
-  const entries = [];
   try {
-    for await (const entry of directory) entries.push(entry);
+    for await (const entry of directory) {
+      let isDir = entry.isDirectory();
+      if (!isDir && entry.isSymbolicLink()) {
+        // Dirents report the link itself, so a symlinked directory needs a stat to
+        // earn its trailing slash. A dangling link just stays slash-less.
+        isDir = (await statOrNull(join(scope.abs, entry.name)))?.isDirectory() ?? false;
+      }
+      retainSortedEntry(retained, { name: entry.name, isDir }, limit + 1);
+    }
   } finally {
     await directory.close().catch(() => undefined);
   }
-  entries.sort((a, b) => a.name.toLowerCase().localeCompare(b.name.toLowerCase()));
-
-  const names: string[] = [];
-  for (const entry of entries) {
-    let isDir = entry.isDirectory();
-    if (!isDir && entry.isSymbolicLink()) {
-      // Dirents report the link itself, so a symlinked directory needs a stat to
-      // earn its trailing slash. A dangling link just stays slash-less.
-      isDir = (await statOrNull(join(scope.abs, entry.name)))?.isDirectory() ?? false;
-    }
-    names.push(isDir ? `${entry.name}/` : entry.name);
-  }
-
-  const limit = positiveInt(op.limit) ?? DEFAULT_LS_LIMIT;
-  const capped = names.length > limit;
+  const capped = retained.length > limit;
+  const names = retained.slice(0, limit).map((entry) => (entry.isDir ? `${entry.name}/` : entry.name));
   return {
-    stdout: names.slice(0, limit).join("\n"),
+    stdout: names.join("\n"),
     stderr: capped ? `ls: ${limit} entry limit reached — use limit=${limit * 2} for more` : "",
     // An empty directory is a fact, not a failure: exit 0 keeps `exit == 0`
     // edges meaning "the listing succeeded", as on the sibling adapters.

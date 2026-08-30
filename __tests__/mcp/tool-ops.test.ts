@@ -508,11 +508,31 @@ describe("mcp tool-ops — executor contract", () => {
       expect(r.stderr, op.tool).toContain(`${op.tool}:`);
     }
   });
+
+  it("parses accelerator records whose filenames contain newlines", async () => {
+    const filename = "line\nname.txt";
+    write(filename, "hit\n");
+    const fakeRg = join(root, "fake-rg-newline.cjs");
+    writeFileSync(
+      fakeRg,
+      `#!/usr/bin/env node
+const path = require("node:path");
+const scope = process.argv.at(-1);
+process.stdout.write(path.join(scope, ${JSON.stringify(filename)}) + "\\0" + "1:hit\\n");
+`,
+    );
+    chmodSync(fakeRg, 0o755);
+    const r = await run({ tool: "grep", pattern: "hit", path: "." }, { rgPath: fakeRg, fdPath: null });
+    expect(r.exitCode).toBe(0);
+    expect(r.stdout).toBe(`${filename}:1:hit`);
+  });
 });
 
 describe("mcp tool-ops — helpers", () => {
-  it("screens nested quantifiers before fallback regex construction", () => {
-    expect(isSafeRegex("(a+)+$"), "nested quantifier must be unsafe").toBe(false);
+  it("screens nested and ambiguous quantifiers before fallback regex construction", () => {
+    for (const pattern of ["(a+)+$", "(a|a)+", "(a|aa)+", "(a|a?)+$"]) {
+      expect(isSafeRegex(pattern), `${pattern} must be unsafe`).toBe(false);
+    }
     expect(isSafeRegex("a+$"), "ordinary quantifier remains usable").toBe(true);
   });
 
@@ -581,13 +601,29 @@ describe("mcp tool-ops — bounded fallback scans", () => {
     expect(grep.stderr).toContain("aborted");
   });
 
-  it("rejects unsafe regexes with search-not-run exit 2", async () => {
-    const path = "unsafe-regex.txt";
-    write(path, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n");
-    const r = await run({ tool: "grep", pattern: "(a+)+$", path }, NODE_ONLY);
-    expect(r.exitCode).toBe(2);
-    expect(r.stdout).toBe("");
-    expect(r.stderr).toContain("unsafe pattern");
+  it.each(["(a+)+$", "(a|a)+", "(a|aa)+", "(a|a?)+$"])(
+    "rejects unsafe regex %s with search-not-run exit 2",
+    async (pattern) => {
+      const path = `unsafe-${pattern.replace(/[^a-z0-9]/gi, "-")}.txt`;
+      write(path, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n");
+      const r = await run({ tool: "grep", pattern, path }, NODE_ONLY);
+      expect(r.exitCode).toBe(2);
+      expect(r.stdout).toBe("");
+      expect(r.stderr).toContain("unsafe pattern");
+    },
+  );
+
+  it("refuses an unterminated line over the fallback scan bound", async () => {
+    write("oversized-line.txt", `${"x".repeat(64 * 1024 + 1)}\n`);
+    const read = await run({ tool: "read", path: "oversized-line.txt" }, NODE_ONLY);
+    expect(read.exitCode).toBe(1);
+    expect(read.stdout).toBe("");
+    expect(read.stderr).toContain("line exceeds");
+
+    const grep = await run({ tool: "grep", pattern: "x", path: "oversized-line.txt" }, NODE_ONLY);
+    expect(grep.exitCode).toBe(2);
+    expect(grep.stdout).toBe("");
+    expect(grep.stderr).toContain("line exceeds");
   });
 
   it("returns lexically ordered matches and stops at the first over-limit match", async () => {

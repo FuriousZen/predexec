@@ -2,7 +2,7 @@ import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { evaluateConditionWithDetail, parseConditionString } from "../../core/conditions.ts";
+import { evaluateConditionWithDetail, isSafeRegex, parseConditionString } from "../../core/conditions.ts";
 import type { Condition, NodeOutput } from "../../core/types.ts";
 
 const out = (o: Partial<NodeOutput>): NodeOutput => ({
@@ -80,6 +80,20 @@ describe("evaluateCondition — match (low confidence)", () => {
   it("returns false on an invalid regex instead of throwing", () => {
     expect(evaluateCondition(out({ stdout: "x" }), { kind: "match", source: "stdout", regex: "(" }, "/")).toBe(false);
   });
+
+  it.each(["(a|a)+", "(a|aa)+", "(a|a?)+$", "(?:[a-z]|a)+"])(
+    "rejects ambiguous quantified alternation %s before RegExp.test",
+    (regex) => {
+      expect(isSafeRegex(regex)).toBe(false);
+      const result = evaluateConditionWithDetail(out({ stdout: "aaaaaaaa" }), {
+        kind: "match",
+        source: "stdout",
+        regex,
+      }, "/");
+      expect(result.result).toBe(false);
+      expect(result.detail).toContain("regex rejected");
+    },
+  );
 });
 
 describe("evaluateCondition — always", () => {
