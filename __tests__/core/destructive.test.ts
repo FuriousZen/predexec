@@ -117,6 +117,13 @@ describe("safe tier — pure-reader heads skip the word scan", () => {
   });
 
   it.each([
+    "f() { touch /tmp/x; }; f",
+    "case x in a) case y in b) touch /tmp/x ;; c) printf ok ;; esac ;; d) echo ok ;; esac",
+  ])("finds mutation inside functions and nested cases: %s", (command) => {
+    expect(findDestructiveToken(command)).toContain("touch");
+  });
+
+  it.each([
     "case x in orphan ;; a) echo ok ;; esac",
     "case x in a) echo ok ;; orphan ;; esac",
     "case x in a) echo ok ;; orphan esac",

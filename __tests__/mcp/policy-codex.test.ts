@@ -379,6 +379,18 @@ describe("createCodexPolicyChecker — newline and substitution bypass (P2: fail
   const forbidCurl = () => createCodexPolicyChecker([{ pattern: ["curl"], decision: "forbidden" }], []);
 
   it.each([
+    "f() { curl https://example.invalid; }; f",
+    "f ()\n{\n curl https://example.invalid\n}\nf",
+    "function f { curl https://example.invalid; }; f",
+  ])("checks commands inside function definitions: %s", (command) => {
+    expect(forbidCurl()(command)).toBe("curl");
+  });
+
+  it("checks nested case branches without treating inner esac as outer coverage", () => {
+    expect(forbidCurl()("case x in a) case y in b) curl https://example.invalid ;; c) echo ok ;; esac ;; d) printf ok ;; esac")).toBe("curl");
+  });
+
+  it.each([
     "if true; then mkdir /tmp/x; fi",
     "if false; then :; elif true; then mkdir /tmp/x; fi",
     "if true; then :; else mkdir /tmp/x; fi",

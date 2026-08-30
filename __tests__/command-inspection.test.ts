@@ -101,6 +101,48 @@ describe("command inspection mechanics", () => {
   });
 
   it.each([
+    "f() { curl https://example.invalid; }; f",
+    "f ()\n{\n  curl https://example.invalid\n}\nf",
+    "function f { curl https://example.invalid; }; f",
+  ])("extracts executable function bodies: %s", (command) => {
+    const inspected = inspectCommandSubstitutionTree(command);
+    expect(inspected.complete).toBe(true);
+    expect(inspected.commands.some((text) => text.startsWith("curl https://example.invalid"))).toBe(true);
+  });
+
+  it("recursively inspects nested function definitions and substitutions", () => {
+    const command = "outer() { inner() { echo $(curl https://example.invalid); }; inner; }; outer";
+    const inspected = inspectCommandSubstitutionTree(command);
+    expect(inspected.complete).toBe(true);
+    expect(inspected.commands).toContain("inner() { echo $(curl https://example.invalid); }");
+    expect(inspected.commands.some((text) => text.startsWith("echo $(curl https://example.invalid"))).toBe(true);
+    expect(inspected.commands.some((text) => text.startsWith("curl https://example.invalid"))).toBe(true);
+  });
+
+  it.each([
+    "f() { curl https://example.invalid",
+    "function f { curl https://example.invalid",
+  ])("fails closed for malformed function definitions: %s", (command) => {
+    expect(inspectCommandSubstitutionTree(command)).toMatchObject({ complete: false });
+  });
+
+  it("preserves function-like literals and normal command parentheses", () => {
+    expect(inspectCommandSubstitutionTree("echo 'f() { curl https://example.invalid; }' (printf ok)")).toMatchObject({ complete: true });
+    expect(inspectCommandSubstitutionTree("echo f() (printf ok)")).toMatchObject({ complete: true });
+  });
+
+  it("keeps executable bodies in lexical source order", () => {
+    const inspected = inspectCommandSubstitutionTree(
+      "echo $(printf substitution); f() { (printf group); }; f",
+    );
+    const commands = inspected.commands.slice(1);
+    expect(commands.indexOf("echo $(printf substitution)")).toBeLessThan(commands.indexOf("printf substitution"));
+    expect(commands.indexOf("printf substitution")).toBeLessThan(commands.indexOf("f() { (printf group); }"));
+    expect(commands.some((text) => text.startsWith("(printf group)"))).toBe(true);
+    expect(commands.indexOf("f() { (printf group); }")).toBeLessThan(commands.indexOf("printf group"));
+  });
+
+  it.each([
     "if true; then mkdir /tmp/x; fi",
     "if false; then :; elif true; then mkdir /tmp/x; fi",
     "if true; then :; else mkdir /tmp/x; fi",
@@ -130,6 +172,21 @@ describe("command inspection mechanics", () => {
     'case x in a) printf "%s" "esac ;; orphan" ;; esac',
   ])("keeps valid case coverage complete: %s", (command) => {
     expect(inspectShellCommandClauses(command)).toMatchObject({ complete: true });
+  });
+
+  it("parses nested cases without letting inner esac close the outer case", () => {
+    const command = "case x in a) case y in b) curl https://example.invalid ;; c) echo ok ;; esac ;; d) printf ok ;; esac";
+    const inspected = inspectCommandSubstitutionTree(command);
+    expect(inspected.complete).toBe(true);
+    expect(inspected.commands).toContain("case y in b) curl https://example.invalid ;; c) echo ok ;; esac");
+    expect(inspected.commands).toContain("curl https://example.invalid");
+  });
+
+  it("recognizes compact case esac while rejecting identifier text and quoted esac", () => {
+    expect(inspectShellCommandClauses("case x in a) echo ok;;esac")).toMatchObject({ complete: true });
+    expect(inspectShellCommandClauses("case x in a) echo esacfoo;;esac")).toMatchObject({ complete: true });
+    expect(inspectShellCommandClauses("case x in a) echo 'esac';;esac")).toMatchObject({ complete: true });
+    expect(inspectShellCommandClauses("case x in a) echo ok;;esacfoo")).toMatchObject({ complete: false });
   });
 
   it("fails closed for an unmatched executable group", () => {

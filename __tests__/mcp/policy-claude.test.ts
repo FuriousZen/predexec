@@ -254,6 +254,20 @@ describe("Claude wrapper policy — time option arguments", () => {
 
 describe("Claude policy — recursive control clauses and malformed case syntax", () => {
   it.each([
+    "f() { curl https://example.invalid; }; f",
+    "f ()\n{\n curl https://example.invalid\n}\nf",
+    "function f { curl https://example.invalid; }; f",
+  ])("checks commands inside function definitions: %s", (command) => {
+    const check = createClaudePolicyChecker([{ pattern: "curl *", action: "deny" }]);
+    expect(check(command)).toBe("curl *");
+  });
+
+  it("checks nested case branches without treating inner esac as outer coverage", () => {
+    const check = createClaudePolicyChecker([{ pattern: "curl *", action: "deny" }]);
+    expect(check("case x in a) case y in b) curl https://example.invalid ;; c) echo ok ;; esac ;; d) printf ok ;; esac")).toBe("curl *");
+  });
+
+  it.each([
     "if true; then mkdir /tmp/x; fi",
     "if false; then :; elif true; then mkdir /tmp/x; fi",
     "if true; then :; else mkdir /tmp/x; fi",

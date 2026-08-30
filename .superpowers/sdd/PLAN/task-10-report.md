@@ -553,3 +553,84 @@ while preserving valid branch forms. Changes are limited to the shared
 inspection seam, core/policy regressions, and this report; no adapter re-parser,
 policy precedence, wrapper vocabulary, runtime dependency, ledger, or release
 metadata changed.
+
+## Extended integration fix round 8 — function definitions, nested cases, and lexical traversal
+
+This user-authorized extension started from `dce2fc83c5be8afd939b6b4a1a1eb23b58ef0cdb`.
+It addresses the remaining Important findings that POSIX/Bash function bodies
+were omitted from policy and mutation traversal, nested `case` delimiters could
+close the wrong construct, compact `esac` was rejected, and executable-body
+children were queued by extractor category rather than source order. No ledger
+edit, version bump, publish, push, merge, or release-artifact staging was
+performed.
+
+### RED evidence
+
+Before the production implementation, the new shared-inspection regressions
+were run with:
+
+```text
+./node_modules/.bin/vitest run __tests__/command-inspection.test.ts
+```
+
+Result: exit 1; **8 tests failed, 47 passed**. The failures reproduced omitted
+function bodies (inline, newline, and `function name {}` forms), malformed
+function definitions reported complete, nested function/substitution omission,
+substitution-before-clause ordering, nested-case coverage loss, and compact
+`case ... ;; esac` rejection. The new Claude/Codex policy and core mutation
+regressions were then retained as the adapter/core behavior gates.
+
+### GREEN implementation
+
+- `command-inspection.ts` now recognizes quote-aware `name() { ... }` and
+  documented `function name { ... }` definitions, including whitespace/newline
+  variants. Bodies are recursively re-entered for nested functions, groups,
+  substitutions, and clauses. Incomplete headers or unmatched bodies carry an
+  explicit incomplete result so core and Claude/Codex fail closed; quoted
+  function-like literals and ordinary command parentheses remain untouched.
+- Nested case matching now counts inner `case`/`esac` pairs while finding the
+  outer terminator, and reserved-word matching accepts compact `esac` while
+  requiring identifier boundaries and ignoring quoted text. Branch terminators
+  inside nested cases no longer corrupt outer coverage.
+- The shared executable-body queue carries relative source offsets and uses a
+  lexical priority queue. This preserves source order across substitutions,
+  function bodies, groups, and control clauses while retaining the existing
+  bounded command/depth/character budgets and policy precedence.
+- Focused regressions cover mutating and benign nested branches, all supported
+  function spellings, malformed definitions, nested substitutions, quoted
+  literals, compact delimiters, and Claude/Codex deny traversal.
+
+### GREEN verification
+
+```text
+./node_modules/.bin/vitest run __tests__/command-inspection.test.ts __tests__/core/destructive.test.ts __tests__/core/engine.test.ts __tests__/mcp/policy-claude.test.ts __tests__/mcp/policy-codex.test.ts
+```
+
+Result: exit 0; **5 test files, 520 tests passed**.
+
+Additional required checks all passed:
+
+```text
+./node_modules/.bin/tsc --noEmit
+pnpm run build
+./node_modules/.bin/vitest run
+./node_modules/.bin/vitest run __tests__/release-hygiene.test.ts __tests__/pack.test.ts
+git diff --check
+```
+
+Typecheck/build succeeded; the full suite passed **926/926 tests**; release/pack
+verification passed **9/9 tests**, including packed-install CLI/MCP smoke checks;
+and `git diff --check` passed. Generated `dist/` output remained ignored and
+unstaged.
+
+### Self-review
+
+The implementation is confined to the shared inspection seam and focused core,
+Claude, and Codex regressions. Function extraction is quote/escape-aware,
+supports nested brace depth, rejects malformed definitions, and does not treat
+quoted literals or ordinary parentheses as definitions. Case parsing retains
+the prior fail-closed orphan/unterminated behavior while adding nesting-aware
+reserved delimiters. Lexical offsets are carried only inside the bounded shared
+traversal, so host raw/stripped matching, verdict precedence, wrapper vocabulary,
+and mutation classification remain unchanged. No runtime dependency, ledger,
+release metadata, publish, push, merge, or version operation changed.
