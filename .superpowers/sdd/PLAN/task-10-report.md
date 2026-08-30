@@ -928,3 +928,65 @@ At this round's final HEAD, the code commit is `4b7b2cb`; the report append is
 kept as a separate documentation commit. Dynamic whole-branch diff counts
 remain intentionally recomputable from the final merge-base, as in prior
 rounds.
+
+## Extended integration fix round 13 — bounded comment-aware interpreter arguments
+
+This user-authorized extension started from `236c6cb34377d434b23d94c617114361927e198f`.
+It closes the remaining interpreter-call scanner gaps around comments, newline
+continuations, nested expressions, and actual mode-argument selection for Perl,
+Ruby, and PHP. No ledger edit, version bump, publish, push, merge, or release
+metadata change was performed.
+
+### RED evidence
+
+Before changing production code, the new round-13 regressions were run with:
+
+```text
+./node_modules/.bin/vitest run __tests__/core/destructive.test.ts
+```
+
+Result: exit 1; **8 tests failed, 389 passed**. The failures reproduced
+comment-hidden Perl `sysopen` flags and `open` modes, Ruby `File.open` modes,
+and PHP `fopen` modes/comments.
+
+### GREEN implementation and regressions
+
+- `core/destructive.ts` now has one bounded language argument/call scanner that
+  preserves literals, removes language comments, balances `()`/`[]`/`{}`, and
+  returns parsed top-level fields. Calls over 64 KiB and malformed/ambiguous
+  calls fail closed.
+- Bare Perl calls continue across newline comments only while their argument
+  list is incomplete; complete calls stop at the true statement boundary.
+  `sysopen` inspects only its flags field, while Perl `open` inspects the actual
+  mode field after comments and supports encoded, read-write, and pipe modes.
+- Ruby `File.open`/`File::open` and PHP namespaced/case-insensitive `fopen`
+  inspect the parsed second argument. PHP supports `//`, `#`, and block
+  comments between the function name and `(` and within arguments. Nested
+  argument expressions and multiple-statement false positives are covered.
+- Interpreter eval payloads over the bound fail closed before recursive shell
+  inspection, preventing oversized inputs from entering a quadratic path.
+
+Real temporary-directory engine probes verify that read-only Perl, Ruby, and
+available PHP forms leave the victim file unchanged and reach a leaf; static
+writer coverage remains available when an interpreter is not installed.
+
+Verification after the fix:
+
+```text
+./node_modules/.bin/vitest run __tests__/core/destructive.test.ts __tests__/core/engine.test.ts
+```
+
+Result: exit 0; **2 files, 477 tests passed, 1 skipped**.
+
+```text
+./node_modules/.bin/tsc --noEmit
+pnpm run build
+./node_modules/.bin/vitest run
+./node_modules/.bin/vitest run __tests__/release-hygiene.test.ts __tests__/pack.test.ts
+git diff --check
+```
+
+All checks passed. The full suite passed **1,145 tests with 1 skipped**; the
+release/pack suites passed **9/9 tests** and built a real `predexec@0.4.0`
+tarball with the rebuilt `dist/core/destructive.js`. The focused implementation
+and test changes are committed separately from this report.
