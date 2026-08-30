@@ -1765,3 +1765,66 @@ found no review probe; the only high-CPU process was an unrelated VS Code
 renderer. The bounded validation path is linear, all adapter rejection paths
 are before work, and OpenCode's unavoidable host overfetch is explicitly
 documented rather than presented as server-side bounded.
+
+## Extended integration fix round 24 — grep pattern parity ceiling
+
+This user-authorized extension starts from the preceding review/fix commits
+`c8c7e99`, `300b6f9`, `371ba26`, and `358327a`. It closes the remaining
+Important parity concern: core validation permitted grep patterns to the
+64 KiB command-string ceiling while the pure-Node fallback's `isSafeRegex`
+screen stopped at 8 KiB, allowing ripgrep and fallback adapters to accept
+different inputs.
+
+### RED evidence
+
+Boundary regressions were added before the implementation for exact 8 KiB and
+8 KiB + 1 grep patterns in direct validation, coercion, MCP fallback, and both
+source/compiled OpenCode executors. Before the shared constant and validation
+change, the exact-bound cases failed because the new constant was unavailable;
+after implementation, the over-bound adapter assertions initially exposed the
+existing generic error-message expectations and were corrected to assert the
+new pattern-specific rejection. No payload exceeded 8 KiB and no process was
+run without a timeout.
+
+### GREEN implementation
+
+- `core/types.ts` defines and `core/index.ts` re-exports
+  `MAX_GREP_PATTERN_LENGTH = 8 * 1024`; `plan-language.ts` re-exports it and
+  publishes the limit in the canonical model-facing description.
+- `validateOperation` applies the grep-specific cap before adapter work, so
+  `coercePlan`, MCP, OpenCode, and Pi all share exact-boundary behavior. MCP's
+  grep operation also defensively checks the cap immediately before target
+  resolution and accelerator/fallback selection.
+- README documents the 8,192-character native grep-pattern limit. Existing
+  regex safety behavior, literal matching, defaults, and search exit semantics
+  are unchanged.
+- Implementation and regression tests were committed as `ddf7e44`
+  (`fix: cap grep patterns across adapters`).
+
+### GREEN verification and self-review
+
+```text
+pnpm exec vitest run __tests__/core/validation.test.ts __tests__/mcp/tool-ops.test.ts --maxWorkers=1
+```
+
+Result: exit 0; **2 test files, 111 tests passed**.
+
+```text
+pnpm exec vitest run __tests__/core/validation.test.ts __tests__/mcp/tool-ops.test.ts __tests__/opencode.test.ts __tests__/plan-language.test.ts --maxWorkers=1
+```
+
+Result: exit 0; **4 test files, 214 tests passed**.
+
+```text
+pnpm test -- --maxWorkers=1
+pnpm run typecheck
+pnpm run build
+npm pack --dry-run
+git diff --check
+```
+
+The full suite passed **22 test files, 1,521 tests with 1 skipped**; typecheck,
+build, pack dry-run, and diff-check passed. Validation is linear and runs before
+filesystem/SDK/native-tool work; the MCP defense runs before either search
+implementation. No dependency, version, dist staging, publish, push, merge,
+background process, or unbounded stress probe changed.
