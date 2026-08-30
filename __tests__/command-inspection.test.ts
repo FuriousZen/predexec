@@ -42,6 +42,18 @@ describe("command inspection mechanics", () => {
     });
   });
 
+  it("rejects an over-limit command before scanning expensive shell syntax", () => {
+    const oversized = "echo " + "x".repeat(70_000);
+    expect(inspectCommandSubstitutionTree(oversized)).toEqual({ commands: [], complete: false });
+  });
+
+  it("reports deterministic work-budget exhaustion", () => {
+    expect(inspectCommandSubstitutionTree("echo $(printf one); echo $(printf two)", { maxCommands: 2 })).toMatchObject({
+      commands: ["echo $(printf one); echo $(printf two)", "echo $(printf one)"],
+      complete: false,
+    });
+  });
+
   it("stops after the first unmatched substitution or backtick", () => {
     const unmatchedSubstitutions = "echo " + "$(".repeat(48) + "tail";
     const unmatchedBackticks = "echo " + "`".repeat(47) + "tail";

@@ -80,6 +80,7 @@ describe("mcp tool-ops — read", () => {
     // A caller-supplied limit that stops short of EOF is still truncation.
     expect(r.stderr).toContain("showing lines 2-2 of 4");
     expect(r.stderr).toContain("use offset=3 to continue");
+    expect(r.stdoutTruncated).toBe(true);
   });
 
   it("reads to EOF silently when limit covers the file", async () => {
@@ -271,6 +272,7 @@ describe("mcp tool-ops — ls", () => {
     const r = await run({ tool: "ls", limit: 2 });
     expect(r.stdout.split("\n")).toEqual([".hidden.txt", "a.txt"]);
     expect(r.stderr).toContain("2 entry limit reached");
+    expect(r.stdoutTruncated).toBe(true);
   });
 
   it("reports a missing directory", async () => {
@@ -357,6 +359,8 @@ describe.each([
     expect(r.stderr).toContain("1 match limit reached");
     // Notices must stay out of stdout: a numeric edge would extract from them.
     expect(r.stdout).not.toContain("limit reached");
+    expect(r.stdoutTruncated).toBe(true);
+    expect(r.stderrTruncated ?? false).toBe(false);
   });
 
   // The whole point of the exit-2 convention: `exit == 1` after a grep must mean
@@ -427,6 +431,7 @@ describe.each([
     expect(r.stdout).toBe("sub/b.ts");
     expect(r.stderr).toContain("1 result limit reached");
     expect(r.stdout).not.toContain("limit reached");
+    expect(r.stdoutTruncated).toBe(true);
   });
 
   it("reports every could-not-search failure as 2, keeping 1 for no matches", async () => {

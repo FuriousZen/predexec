@@ -1,6 +1,6 @@
 /** Pure structural validation for model-authored plan operations. */
 
-import type { ToolOp } from "./types.ts";
+import { MAX_COMMAND_LENGTH, type ToolOp } from "./types.ts";
 
 const SUPPORTED_TOOLS = new Set(["read", "grep", "find", "ls", "bash", "edit", "write"]);
 
@@ -10,6 +10,10 @@ const optionalNumber = (op: ToolOp, key: string): string | null =>
   op[key] === undefined || (typeof op[key] === "number" && Number.isFinite(op[key])) ? null : `${key} must be a finite number`;
 const optionalBoolean = (op: ToolOp, key: string): string | null =>
   op[key] === undefined || typeof op[key] === "boolean" ? null : `${key} must be a boolean`;
+const stringLength = (op: ToolOp, key: string): string | null =>
+  typeof op[key] === "string" && op[key].length > MAX_COMMAND_LENGTH
+    ? `${key} exceeds the maximum length of ${MAX_COMMAND_LENGTH} characters`
+    : null;
 
 /** Validate one operation before any consumer can assume its shape. */
 export function validateOperation(operation: unknown): string | null {
@@ -24,23 +28,24 @@ export function validateOperation(operation: unknown): string | null {
   }
   const requiredString = (key: string): string | null =>
     typeof op[key] === "string" && op[key] !== "" ? null : `${op.tool} requires a non-empty string ${key}`;
+  const checkedString = (...keys: string[]): string | null => keys.map((key) => stringLength(op, key)).find(Boolean) ?? null;
   switch (op.tool) {
     case "read":
-      return requiredString("path") ?? optionalNumber(op, "offset") ?? optionalNumber(op, "limit");
+      return requiredString("path") ?? checkedString("path") ?? optionalNumber(op, "offset") ?? optionalNumber(op, "limit");
     case "grep":
-      return requiredString("pattern") ?? optionalString(op, "path") ?? optionalString(op, "glob") ??
+      return requiredString("pattern") ?? checkedString("pattern", "path", "glob") ?? optionalString(op, "path") ?? optionalString(op, "glob") ??
         optionalBoolean(op, "ignoreCase") ?? optionalBoolean(op, "literal") ?? optionalNumber(op, "context") ??
         optionalNumber(op, "limit");
     case "find":
-      return requiredString("pattern") ?? optionalString(op, "path") ?? optionalNumber(op, "limit");
+      return requiredString("pattern") ?? checkedString("pattern", "path") ?? optionalString(op, "path") ?? optionalNumber(op, "limit");
     case "ls":
-      return optionalString(op, "path") ?? optionalNumber(op, "limit");
+      return checkedString("path") ?? optionalString(op, "path") ?? optionalNumber(op, "limit");
     case "bash":
-      return requiredString("command");
+      return requiredString("command") ?? checkedString("command");
     case "edit":
-      return requiredString("path") ?? (op.edits !== undefined && !Array.isArray(op.edits) ? "edit edits must be an array" : null);
+      return requiredString("path") ?? checkedString("path") ?? (op.edits !== undefined && !Array.isArray(op.edits) ? "edit edits must be an array" : null);
     case "write":
-      return requiredString("path") ?? requiredString("content");
+      return requiredString("path") ?? requiredString("content") ?? checkedString("path", "content");
     default:
       return null;
   }

@@ -156,14 +156,16 @@ export function createToolExecutor(client: OpencodeClient, cwd: string): ToolExe
           const r = await client.file.read({ query: { path, directory } });
           if (r.error) return fail(`read ${path}`, r.error);
           let content = r.data?.content ?? "";
+          let stdoutTruncated = false;
           // v1 file.read has no offset/limit — apply line-slicing client-side (offset is 1-based).
           if (typeof op.offset === "number" || typeof op.limit === "number") {
             const lines = content.split("\n");
             const start = Math.max(0, (typeof op.offset === "number" ? op.offset : 1) - 1);
             const end = typeof op.limit === "number" ? start + op.limit : lines.length;
+            stdoutTruncated = end < lines.length;
             content = lines.slice(start, end).join("\n");
           }
-          return { stdout: content, stderr: "", exitCode: 0 };
+          return { stdout: content, stderr: "", exitCode: 0, ...(stdoutTruncated ? { stdoutTruncated: true } : {}) };
         }
         case "grep": {
           const pattern = String(op.pattern ?? "");
@@ -197,6 +199,7 @@ export function createToolExecutor(client: OpencodeClient, cwd: string): ToolExe
                 `results may be incomplete; use a shell \`rg\`/\`grep\` for an exhaustive search`
               : "",
             exitCode: stdout ? 0 : 1,
+            ...(capped ? { stdoutTruncated: true } : {}),
           };
         }
         case "find": {
@@ -213,7 +216,9 @@ export function createToolExecutor(client: OpencodeClient, cwd: string): ToolExe
           // us at its default of 10, the slice keeps op.limit exact regardless
           // of how the server interprets it.
           const stdout = sliceLimit(r.data ?? [], op.limit).join("\n");
-          return { stdout, stderr: "", exitCode: stdout ? 0 : 1 };
+          const requested = typeof op.limit === "number" && op.limit >= 0 ? op.limit : undefined;
+          const truncated = requested !== undefined && (r.data?.length ?? 0) > requested;
+          return { stdout, stderr: "", exitCode: stdout ? 0 : 1, ...(truncated ? { stdoutTruncated: true } : {}) };
         }
         case "ls": {
           const path = String(op.path ?? ".");
@@ -223,7 +228,8 @@ export function createToolExecutor(client: OpencodeClient, cwd: string): ToolExe
           if (r.error) return fail(`ls ${path}`, r.error);
           const entries = sliceLimit(r.data ?? [], op.limit);
           const stdout = entries.map((n) => n.name ?? n.path ?? "").filter(Boolean).join("\n");
-          return { stdout, stderr: "", exitCode: 0 };
+          const truncated = entries.length < (r.data?.length ?? 0);
+          return { stdout, stderr: "", exitCode: 0, ...(truncated ? { stdoutTruncated: true } : {}) };
         }
         default:
           return { stdout: "", stderr: `unknown tool: ${op.tool}`, exitCode: 1 };

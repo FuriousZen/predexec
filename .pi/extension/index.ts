@@ -171,12 +171,17 @@ export function mapToolResult(
   tool: string,
   stdout: string,
   details: unknown,
-): { stdout: string; stderr: string; exitCode: number } {
+): { stdout: string; stderr: string; exitCode: number; stdoutTruncated?: boolean } {
   const noResults =
     details === undefined &&
     ((tool === "grep" && stdout.trim() === "No matches found") ||
       (tool === "find" && stdout.trim().startsWith("No files found matching pattern")));
-  return { stdout, stderr: "", exitCode: noResults ? 1 : 0 };
+  const detailKeys = details && typeof details === "object" ? Object.keys(details) : [];
+  const stdoutTruncated = detailKeys.some((key) =>
+    key === "truncation" || key === "matchLimitReached" || key === "entryLimitReached" ||
+    key === "resultLimitReached" || key === "linesTruncated",
+  );
+  return { stdout, stderr: "", exitCode: noResults ? 1 : 0, ...(stdoutTruncated ? { stdoutTruncated: true } : {}) };
 }
 
 type PiTool = { execute: (id: string, params: any, signal?: AbortSignal) => Promise<{ content: { type: string; text?: string }[]; details?: unknown }> };

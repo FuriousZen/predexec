@@ -56,7 +56,7 @@ async function runParallel(commands: Operation[], opts: RunOptions): Promise<Com
   const results = new Array<CommandResult>(commands.length);
   let next = 0;
   async function worker(): Promise<void> {
-    while (next < commands.length) {
+    while (!opts.signal?.aborted && next < commands.length) {
       const index = next++;
       results[index] = await runOneOp(commands[index]!, opts);
     }
@@ -64,7 +64,7 @@ async function runParallel(commands: Operation[], opts: RunOptions): Promise<Com
   await Promise.all(
     Array.from({ length: Math.min(MAX_PARALLEL_CONCURRENCY, commands.length) }, () => worker()),
   );
-  return results;
+  return results.filter((result): result is CommandResult => result !== undefined);
 }
 
 async function runOneOp(op: Operation, opts: RunOptions): Promise<CommandResult> {
@@ -94,8 +94,8 @@ async function runToolOp(op: ToolOp, opts: RunOptions): Promise<CommandResult> {
   }
   try {
     const result = await opts.executeToolOp(op, { cwd: opts.cwd, signal: opts.signal });
-    const stdoutTruncated = result.stdout.length > OUTPUT_CAP;
-    const stderrTruncated = result.stderr.length > OUTPUT_CAP;
+    const stdoutTruncated = result.stdoutTruncated === true || result.stdout.length > OUTPUT_CAP;
+    const stderrTruncated = result.stderrTruncated === true || result.stderr.length > OUTPUT_CAP;
     const stdout = stdoutTruncated ? `${result.stdout.slice(0, OUTPUT_CAP)}\n${TRUNCATION_MARKER}]` : result.stdout;
     const stderr = stderrTruncated ? `${result.stderr.slice(0, OUTPUT_CAP)}\n${TRUNCATION_MARKER}]` : result.stderr;
     if (stdout) opts.onCommandOutput?.(stdout);

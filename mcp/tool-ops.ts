@@ -41,6 +41,8 @@ interface OpResult {
   stdout: string;
   stderr: string;
   exitCode: number;
+  stdoutTruncated?: boolean;
+  stderrTruncated?: boolean;
 }
 
 /**
@@ -407,6 +409,7 @@ async function readOp(op: ToolOp, root: string, base: string, signal?: AbortSign
         ? `read: showing lines ${start + 1}-${end} of ${total} in ${raw} — use offset=${end + 1} to continue`
         : "",
     exitCode: 0,
+    ...(end < total ? { stdoutTruncated: true } : {}),
   };
 }
 
@@ -600,7 +603,14 @@ async function grepOp(
     notes.push(`grep: ${limit} match limit reached — use limit=${limit * 2} for more, or narrow the pattern`);
   }
   const stdout = await formatMatches(matches.slice(0, limit), base, context, signal);
-  return { stdout, stderr: notes.join("\n"), exitCode: stdout ? 0 : 1 };
+  return {
+    stdout,
+    stderr: notes.join("\n"),
+    exitCode: stdout ? 0 : 1,
+    ...(matches.length > limit || notes.some((note) => note.includes("results are incomplete"))
+      ? { stdoutTruncated: true }
+      : {}),
+  };
 }
 
 async function grepViaRg(
@@ -855,7 +865,14 @@ async function findOp(
     notes.push(`find: ${limit} result limit reached — use limit=${limit * 2} for more, or narrow the pattern`);
   }
   const stdout = hits.slice(0, limit).join("\n");
-  return { stdout, stderr: notes.join("\n"), exitCode: stdout ? 0 : 1 };
+  return {
+    stdout,
+    stderr: notes.join("\n"),
+    exitCode: stdout ? 0 : 1,
+    ...(hits.length > limit || notes.some((note) => note.includes("results are incomplete"))
+      ? { stdoutTruncated: true }
+      : {}),
+  };
 }
 
 // ── ls ──────────────────────────────────────────────────────────────────────
@@ -918,6 +935,7 @@ async function lsOp(op: ToolOp, root: string, base: string): Promise<OpResult> {
     // An empty directory is a fact, not a failure: exit 0 keeps `exit == 0`
     // edges meaning "the listing succeeded", as on the sibling adapters.
     exitCode: 0,
+    ...(capped ? { stdoutTruncated: true } : {}),
   };
 }
 

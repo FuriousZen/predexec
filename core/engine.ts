@@ -25,6 +25,10 @@ import {
   DEFAULT_MAX_DEPTH,
   HIGH_CONFIDENCE_KINDS,
   MAX_OPERATIONS_PER_NODE,
+  MAX_PLAN_EDGES,
+  MAX_PLAN_NODES,
+  MAX_COMMAND_LENGTH,
+  MAX_NODE_ID_LENGTH,
   type CoreResult,
   type NodeOutput,
   type Operation,
@@ -170,6 +174,10 @@ export function resolvePlanCwd(sessionRoot: string, planCwd?: string): { cwd: st
  */
 export function validatePlan(plan: PlanTree, byId: Map<string, PlanNode>): string | null {
   if (!Array.isArray(plan?.nodes) || plan.nodes.length === 0) return "no nodes";
+  if (plan.nodes.length > MAX_PLAN_NODES) return `plan exceeds the maximum of ${MAX_PLAN_NODES} nodes`;
+  if (typeof plan.root !== "string" || plan.root.length === 0 || plan.root.length > MAX_NODE_ID_LENGTH) {
+    return `root must be a non-empty id of at most ${MAX_NODE_ID_LENGTH} characters`;
+  }
 
   // Shape checks come first. The plan is model-authored, so a malformed node is
   // an ordinary occurrence, not an exceptional one — and every one of these used
@@ -177,19 +185,27 @@ export function validatePlan(plan: PlanTree, byId: Map<string, PlanNode>): strin
   // result the adapters could render.
   for (const node of plan.nodes) {
     if (!node || typeof node !== "object") return "every node must be an object";
-    if (typeof node.id !== "string" || node.id === "") return "every node needs a non-empty string id";
+    if (typeof node.id !== "string" || node.id === "" || node.id.length > MAX_NODE_ID_LENGTH) {
+      return `every node needs a non-empty string id of at most ${MAX_NODE_ID_LENGTH} characters`;
+    }
     if (!Array.isArray(node.commands)) return `node "${node.id}" needs a commands array`;
     if (node.commands.length > MAX_OPERATIONS_PER_NODE) {
       return `node "${node.id}" exceeds the maximum of ${MAX_OPERATIONS_PER_NODE} operations per node`;
     }
     if (node.edges !== undefined && !Array.isArray(node.edges)) return `node "${node.id}" edges must be an array`;
     for (let index = 0; index < node.commands.length; index++) {
+      const command = node.commands[index];
+      if (typeof command === "string" && command.length > MAX_COMMAND_LENGTH) {
+        return `node "${node.id}" command ${index + 1} exceeds the maximum length of ${MAX_COMMAND_LENGTH} characters`;
+      }
       const operationError = validateOperation(node.commands[index]);
       if (operationError) return `node "${node.id}" operation ${index + 1} invalid: ${operationError}`;
     }
     if (byId.has(node.id)) return `duplicate node id "${node.id}"`;
     byId.set(node.id, node);
   }
+  const edgeCount = plan.nodes.reduce((count, node) => count + (node.edges?.length ?? 0), 0);
+  if (edgeCount > MAX_PLAN_EDGES) return `plan exceeds the maximum of ${MAX_PLAN_EDGES} edges`;
   if (!byId.has(plan.root)) return `root "${plan.root}" is not a node`;
 
   for (const node of plan.nodes) {
@@ -265,12 +281,15 @@ function findPolicyViolation(
 /** Map native relative targets to the session-root namespace used by hosts. */
 function normalizePolicyOperation(operation: Operation, sessionRoot: string, effectiveCwd: string): Operation {
   if (typeof operation === "string" || operation.tool === "bash") return operation;
-  const prefix = relative(sessionRoot, effectiveCwd).replaceAll(sep, "/");
-  if (!prefix || prefix === ".") return operation;
   const withPrefix = (value: unknown): unknown => {
-    if (typeof value !== "string" || isAbsolute(value)) return value;
-    const clean = value.replace(/^\.\//, "");
-    return clean === "." || clean === "" ? prefix : `${prefix}/${clean}`;
+    if (typeof value !== "string") return value;
+    const candidate = resolve(effectiveCwd, value);
+    const rel = relative(sessionRoot, candidate);
+    const inside = candidate === sessionRoot || (!isAbsolute(rel) && rel !== ".." && !rel.startsWith(`..${sep}`));
+    // Preserve escaping targets outside the root. The executor remains the
+    // authority that rejects them; normalization must not create an allowed
+    // in-root spelling for an invalid operation.
+    return inside ? rel.replaceAll(sep, "/") || "." : candidate.replaceAll(sep, "/");
   };
   const normalized: ToolOp = { ...operation };
   if ("path" in operation) normalized.path = withPrefix(operation.path);

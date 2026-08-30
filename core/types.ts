@@ -135,7 +135,15 @@ export type OnCommandOutput = (data: string) => void;
 export type ToolExecutor = (
   op: ToolOp,
   opts: { cwd: string; signal?: AbortSignal },
-) => Promise<{ stdout: string; stderr: string; exitCode: number }>;
+) => Promise<{
+  stdout: string;
+  stderr: string;
+  exitCode: number;
+  /** True when the adapter intentionally omitted part of stdout. */
+  stdoutTruncated?: boolean;
+  /** True when the adapter intentionally omitted part of stderr. */
+  stderrTruncated?: boolean;
+}>;
 
 export interface RunOptions {
   cwd: string;
@@ -160,3 +168,12 @@ export const MAX_OPERATIONS_PER_NODE = 64;
 
 /** Maximum number of operations running concurrently within a parallel node. */
 export const MAX_PARALLEL_CONCURRENCY = 8;
+
+/** Maximum nodes accepted from one model-authored plan. */
+export const MAX_PLAN_NODES = 256;
+/** Maximum outgoing edges across one model-authored plan. */
+export const MAX_PLAN_EDGES = 1024;
+/** Maximum length of any shell command or tool string argument. */
+export const MAX_COMMAND_LENGTH = 64 * 1024;
+/** Maximum length of a node/edge identifier. */
+export const MAX_NODE_ID_LENGTH = 256;

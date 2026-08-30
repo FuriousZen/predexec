@@ -82,6 +82,25 @@ describe("runNode — tool ops", () => {
     expect(r.stdoutTruncated).toBe(true);
     expect(r.stderrTruncated).toBe(false);
   });
+
+  it("propagates semantic truncation from a bounded tool result", async () => {
+    const r = await runNode(
+      { id: "n", commands: [{ tool: "read", path: "large.txt", limit: 1 }] },
+      {
+        cwd,
+        executeToolOp: async () => ({
+          stdout: "first line",
+          stderr: "read: showing lines 1-1 of 2 — use offset=2 to continue",
+          exitCode: 0,
+          stdoutTruncated: true,
+        }),
+      },
+    );
+    expect(r.stdout).toContain("first line");
+    expect(r.stderr).toContain("use offset=2");
+    expect(r.stdoutTruncated).toBe(true);
+    expect(r.stderrTruncated).toBe(false);
+  });
 });
 
 describe("runNode", () => {

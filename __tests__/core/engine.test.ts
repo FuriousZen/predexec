@@ -793,6 +793,96 @@ describe("runPlanTree — operation-wide policy", () => {
     }
   });
 
+  it("canonicalizes native policy paths against the session root", async () => {
+    const sessionRoot = mkdtempSync(join(tmpdir(), "predexec-policy-canonical-cwd-"));
+    try {
+      const seen: unknown[] = [];
+      const r = await runPlanTree(
+        {
+          root: "a",
+          cwd: "sub",
+          nodes: [{
+            id: "a",
+            commands: [
+              { tool: "read", path: "../private/x" },
+              { tool: "ls", path: join(sessionRoot, "private") },
+            ],
+          }],
+        },
+        {
+          cwd: sessionRoot,
+          checkOperationPolicy: (operation) => (seen.push(operation), null),
+          executeToolOp: async () => ({ stdout: "", stderr: "", exitCode: 0 }),
+        },
+      );
+      expect(r.stoppedReason).toBe("leaf");
+      expect(seen).toEqual([
+        { tool: "read", path: "private/x" },
+        { tool: "ls", path: "private" },
+      ]);
+    } finally {
+      rmSync(sessionRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("does not branch on semantically truncated native output", async () => {
+    const calls: ToolOp[] = [];
+    const r = await runPlanTree(
+      {
+        root: "read",
+        nodes: [
+          { id: "read", commands: [{ tool: "read", path: "large.txt", limit: 1 }], edges: [{ when: { kind: "numeric", extract: "(\\d+)", op: "eq", value: 1 }, to: "next" }] },
+          { id: "next", commands: ["echo SHOULD_NOT_RUN"] },
+        ],
+      },
+      {
+        cwd,
+        executeToolOp: async (op) => {
+          calls.push(op);
+          return { stdout: "READY", stderr: "read: showing lines 1-1 of 2 — use offset=2 to continue", exitCode: 0, stdoutTruncated: true };
+        },
+      },
+    );
+    expect(r.stoppedReason).toBe("noEdgeMatch");
+    expect(r.pathTaken).toEqual(["read"]);
+    expect(calls).toHaveLength(1);
+    expect(r.transcript).toContain("Use read with offset");
+  });
+
+  it("stops parallel scheduling after an abort without launching the remaining batch", async () => {
+    const controller = new AbortController();
+    const launched: number[] = [];
+    let releaseFirst!: () => void;
+    const firstFinished = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    const r = await runPlanTree(
+      {
+        root: "a",
+        nodes: [{
+          id: "a",
+          parallel: true,
+          commands: Array.from({ length: 12 }, (_, index) => ({ tool: "read", path: `slow-${index}`, index })),
+        }],
+      },
+      {
+        cwd,
+        signal: controller.signal,
+        executeToolOp: async (op) => {
+          launched.push(op.index as number);
+          if (op.index === 0) {
+            controller.abort();
+            releaseFirst();
+          }
+          await firstFinished;
+          return { stdout: String(op.index), stderr: "", exitCode: 0 };
+        },
+      },
+    );
+    expect(r.stoppedReason).toBe("aborted");
+    expect(launched).toContain(0);
+    expect(launched.length).toBeLessThanOrEqual(8);
+    expect(launched.every((index) => index < 8)).toBe(true);
+  });
+
   it("passes shell strings and bash objects to the operation checker", async () => {
     const seen: unknown[] = [];
     const r = await runPlanTree(
@@ -827,6 +917,18 @@ describe("validatePlan", () => {
 
   it("rejects duplicate ids", () => {
     expect(v({ root: "a", nodes: [{ id: "a", commands: [] }, { id: "a", commands: [] }] })).toMatch(/duplicate/);
+  });
+
+  it("rejects plans and commands over the structural budgets", () => {
+    expect(v({ root: "n0", nodes: Array.from({ length: 257 }, (_, index) => ({ id: `n${index}`, commands: [] })) })).toMatch(/maximum.*nodes/);
+    expect(v({ root: "a", nodes: [{ id: "a", commands: ["echo " + "x".repeat(70_000)] }] })).toMatch(/command.*maximum length/);
+  });
+
+  it("rejects a plan with too many edges before resolving edge targets", () => {
+    expect(v({
+      root: "a",
+      nodes: [{ id: "a", commands: [], edges: Array.from({ length: 1025 }, () => ({ when: { kind: "always" }, to: "missing" })) }],
+    })).toMatch(/maximum.*edges/);
   });
 
   it("rejects an edge to a missing node", () => {

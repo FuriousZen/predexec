@@ -22,6 +22,10 @@ export { inspectCommandSubstitutionTree } from "../command-inspection.ts";
 export {
   MAX_OPERATIONS_PER_NODE,
   MAX_PARALLEL_CONCURRENCY,
+  MAX_PLAN_NODES,
+  MAX_PLAN_EDGES,
+  MAX_COMMAND_LENGTH,
+  MAX_NODE_ID_LENGTH,
   type ToolOp,
   type Operation,
   type OperationPolicyChecker,

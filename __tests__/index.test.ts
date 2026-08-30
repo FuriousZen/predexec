@@ -33,6 +33,18 @@ describe("coercePlan — defensive param recovery", () => {
     expect(() => coercePlan({ foo: 1 })).toThrow(/`root`.*`nodes`/);
   });
 
+  it("rejects an oversized shell command before condition parsing", () => {
+    expect(() => coercePlan({
+      root: "a",
+      nodes: [{ id: "a", commands: ["echo " + "x".repeat(70_000)], edges: [{ when: "not a valid condition", to: "b" }] }, { id: "b", commands: [] }],
+    })).toThrow(/command.*maximum|too long/i);
+  });
+
+  it("rejects an oversized plan before walking or parsing its nodes", () => {
+    const nodes = Array.from({ length: 300 }, (_, index) => ({ id: `n${index}`, commands: [] }));
+    expect(() => coercePlan({ root: "n0", nodes })).toThrow(/nodes.*maximum|too many/i);
+  });
+
   it("coerces string edge conditions into objects", () => {
     const plan = coercePlan({
       root: "a",
@@ -125,6 +137,11 @@ describe("mapToolResult — pi/opencode exit-code parity", () => {
     // A file whose text happens to contain the sentinel: pi attaches details on
     // real matches, so this must not be misread as zero results.
     expect(mapToolResult("grep", "No matches found", { matchLimitReached: 5 }).exitCode).toBe(0);
+  });
+
+  it("marks pi tool results incomplete when the host reports a semantic limit", () => {
+    expect(mapToolResult("read", "line\n[Showing lines 1-1 of 2]", { truncation: { truncated: true } }).stdoutTruncated).toBe(true);
+    expect(mapToolResult("grep", "hit", { matchLimitReached: 10 }).stdoutTruncated).toBe(true);
   });
 
   it("read/ls always exit 0 on success (errors throw and are mapped by the caller)", () => {

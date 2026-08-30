@@ -6,6 +6,8 @@
  * ownership of those semantics.
  */
 
+import { MAX_COMMAND_LENGTH } from "./core/types.ts";
+
 export interface WrapperInspectionOptions {
   wrappers?: ReadonlySet<string>;
   optionTakingWrappers?: ReadonlySet<string>;
@@ -48,6 +50,8 @@ export interface ExecutableBodyTreeOptions {
   maxDepth?: number;
   maxCommands?: number;
   maxChars?: number;
+  /** Maximum size of one command before any quote/control scanning begins. */
+  maxCommandLength?: number;
 }
 
 /**
@@ -200,22 +204,57 @@ export function inspectCommandSubstitutionTree(
   const maxDepth = options.maxDepth ?? 32;
   const maxCommands = options.maxCommands ?? 512;
   const maxChars = options.maxChars ?? 1_000_000;
+  const maxCommandLength = Math.min(options.maxCommandLength ?? MAX_COMMAND_LENGTH, MAX_COMMAND_LENGTH);
   const commands: string[] = [];
-  const pending: Array<{ text: string; depth: number; offset: number }> = [{ text: command, depth: 0, offset: 0 }];
+  if (command.length > maxCommandLength) return { commands, complete: false };
+  const pending: Array<{ text: string; depth: number; offset: number; sequence: number }> = [];
+  let sequence = 0;
+  const enqueue = (item: Omit<(typeof pending)[number], "sequence">): void => {
+    pending.push({ ...item, sequence: sequence++ });
+    let index = pending.length - 1;
+    while (index > 0) {
+      const parent = Math.floor((index - 1) / 2);
+      if (queueBefore(pending[parent]!, pending[index]!)) break;
+      [pending[parent], pending[index]] = [pending[index]!, pending[parent]!];
+      index = parent;
+    }
+  };
+  const dequeue = (): (typeof pending)[number] | undefined => {
+    const first = pending[0];
+    const last = pending.pop();
+    if (last && pending.length > 0) {
+      pending[0] = last;
+      let index = 0;
+      while (true) {
+        const left = index * 2 + 1;
+        const right = left + 1;
+        let smallest = index;
+        if (left < pending.length && !queueBefore(pending[smallest]!, pending[left]!)) smallest = left;
+        if (right < pending.length && !queueBefore(pending[smallest]!, pending[right]!)) smallest = right;
+        if (smallest === index) break;
+        [pending[index], pending[smallest]] = [pending[smallest]!, pending[index]!];
+        index = smallest;
+      }
+    }
+    return first;
+  };
+  enqueue({ text: command, depth: 0, offset: 0 });
   const seen = new Set<string>();
   const queued = new Set<string>([command]);
   let chars = 0;
   while (pending.length > 0) {
-    pending.sort((a, b) => a.offset - b.offset);
-    const item = pending.shift()!;
+    const item = dequeue()!;
     if (seen.has(item.text)) continue;
     seen.add(item.text);
     if (commands.length >= maxCommands) return { commands, complete: false };
+    if (item.text.length > maxCommandLength || chars + item.text.length > maxChars) {
+      return { commands, complete: false };
+    }
     const inspected = inspectCommandSubstitutions(item.text);
     const clauses = inspectShellCommandClauseEvents(item.text);
     commands.push(item.text);
     chars += item.text.length;
-    if (!inspected.complete || !clauses.complete || chars > maxChars) {
+    if (!inspected.complete || !clauses.complete) {
       return { commands, complete: false };
     }
     const children = executableBodyEvents(item.text)
@@ -230,7 +269,7 @@ export function inspectCommandSubstitutionTree(
     }
     for (const body of children) {
       queued.add(body.text);
-      pending.push({
+      enqueue({
         text: body.text,
         depth: item.depth + 1,
         offset: item.offset + body.start,
@@ -238,6 +277,13 @@ export function inspectCommandSubstitutionTree(
     }
   }
   return { commands, complete: true };
+}
+
+function queueBefore(
+  a: { offset: number; sequence: number },
+  b: { offset: number; sequence: number },
+): boolean {
+  return a.offset < b.offset || (a.offset === b.offset && a.sequence <= b.sequence);
 }
 
 /**
