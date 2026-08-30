@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { resolvePlanCwd, runPlanTree, validatePlan } from "../../core/engine.ts";
+import { MAX_CONDITION_LENGTH, MAX_NODE_ID_LENGTH } from "../../core/types.ts";
 import type { PlanNode, PlanTree, ToolOp, RunOptions } from "../../core/types.ts";
 
 const cwd = process.cwd();
@@ -922,6 +923,25 @@ describe("validatePlan", () => {
   it("rejects plans and commands over the structural budgets", () => {
     expect(v({ root: "n0", nodes: Array.from({ length: 257 }, (_, index) => ({ id: `n${index}`, commands: [] })) })).toMatch(/maximum.*nodes/);
     expect(v({ root: "a", nodes: [{ id: "a", commands: ["echo " + "x".repeat(70_000)] }] })).toMatch(/command.*maximum length/);
+  });
+
+  it("rejects oversized condition strings before evaluation", () => {
+    const over = "x".repeat(MAX_CONDITION_LENGTH + 1);
+    expect(v({
+      root: "a",
+      nodes: [
+        { id: "a", commands: [], edges: [{ when: { kind: "match", source: "stdout", regex: over }, to: "b" }] },
+        { id: "b", commands: [] },
+      ],
+    })).toMatch(/condition.*maximum length/i);
+  });
+
+  it("rejects an oversized edge target before target lookup", () => {
+    const over = "x".repeat(MAX_NODE_ID_LENGTH + 1);
+    expect(v({
+      root: "a",
+      nodes: [{ id: "a", commands: [], edges: [{ when: { kind: "always" }, to: over }] }],
+    })).toMatch(/edge target.*maximum length/i);
   });
 
   it("rejects a plan with too many edges before resolving edge targets", () => {

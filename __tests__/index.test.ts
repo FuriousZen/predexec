@@ -4,6 +4,7 @@ import { describe, expect, it } from "vitest";
 // coercePlan is a CORE function; import it from its owning module directly
 // rather than through a harness adapter.
 import { coercePlan } from "../core/coerce.ts";
+import { MAX_CONDITION_LENGTH, MAX_CONDITION_TOTAL_LENGTH, MAX_NODE_ID_LENGTH } from "../core/types.ts";
 import { mapToolResult } from "../.pi/extension/index.ts";
 import { JSON_PATH_SINGLE_OP_LINE, STEERING_MARKERS } from "../steering.ts";
 
@@ -117,6 +118,63 @@ describe("coercePlan — object-condition validation (loud, not silent-false)", 
     expect(() =>
       coercePlan(withWhen({ kind: "exitCode", op: "eq", value: 0, comment: "extra" })),
     ).not.toThrow();
+  });
+
+  it.each([
+    ["match regex", { kind: "match", regex: "x".repeat(MAX_CONDITION_LENGTH) }],
+    ["numeric extract", { kind: "numeric", extract: "x".repeat(MAX_CONDITION_LENGTH), op: "eq", value: 0 }],
+    ["jsonPath path", { kind: "jsonPath", path: "x".repeat(MAX_CONDITION_LENGTH), op: "exists" }],
+    ["fileExists path", { kind: "fileExists", path: "x".repeat(MAX_CONDITION_LENGTH) }],
+  ])("accepts the exact condition-string boundary for %s", (_label, when) => {
+    expect(() => coercePlan(withWhen(when))).not.toThrow();
+  });
+
+  it.each([
+    ["match regex", { kind: "match", regex: "x".repeat(MAX_CONDITION_LENGTH + 1) }],
+    ["numeric extract", { kind: "numeric", extract: "x".repeat(MAX_CONDITION_LENGTH + 1), op: "eq", value: 0 }],
+    ["jsonPath path", { kind: "jsonPath", path: "x".repeat(MAX_CONDITION_LENGTH + 1), op: "exists" }],
+    ["fileExists path", { kind: "fileExists", path: "x".repeat(MAX_CONDITION_LENGTH + 1) }],
+  ])("rejects condition strings one character over the boundary for %s", (_label, when) => {
+    expect(() => coercePlan(withWhen(when))).toThrow(/maximum length.*condition|condition.*maximum length/i);
+  });
+
+  it("bounds shorthand conditions before parsing", () => {
+    const exact = `stdout =~ /${"x".repeat(MAX_CONDITION_LENGTH - "stdout =~ //".length)}/`;
+    expect(exact).toHaveLength(MAX_CONDITION_LENGTH);
+    expect(() => coercePlan(withWhen(exact))).not.toThrow();
+
+    const oversized = `stdout =~ /${"x".repeat(MAX_CONDITION_LENGTH)}/`;
+    expect(() => coercePlan(withWhen(oversized))).toThrow(/condition.*maximum length/i);
+  });
+
+  it("bounds edge targets at the node-id boundary before target lookup", () => {
+    const exactTarget = "x".repeat(MAX_NODE_ID_LENGTH);
+    expect(() => coercePlan({
+      root: "a",
+      nodes: [{ id: "a", commands: [], edges: [{ when: "always", to: exactTarget }] }],
+    })).not.toThrow();
+
+    const oversizedTarget = "x".repeat(MAX_NODE_ID_LENGTH + 1);
+    expect(() => coercePlan({
+      root: "a",
+      nodes: [{ id: "a", commands: [], edges: [{ when: "always", to: oversizedTarget }] }],
+    })).toThrow(/edge target.*maximum length|target.*maximum length/i);
+  });
+
+  it("accepts the exact aggregate condition budget and rejects one character over", () => {
+    const fixedPerEdge = "fileExists".length + "b".length;
+    const fullEdges = Math.floor(MAX_CONDITION_TOTAL_LENGTH / (MAX_CONDITION_LENGTH + fixedPerEdge));
+    const usedByFullEdges = fullEdges * (MAX_CONDITION_LENGTH + fixedPerEdge);
+    const remainder = MAX_CONDITION_TOTAL_LENGTH - usedByFullEdges - fixedPerEdge;
+    const edges = Array.from({ length: fullEdges }, () => ({
+      when: { kind: "fileExists", path: "x".repeat(MAX_CONDITION_LENGTH) },
+      to: "b",
+    }));
+    edges.push({ when: { kind: "fileExists", path: "x".repeat(remainder) }, to: "b" });
+    expect(() => coercePlan({ root: "a", nodes: [{ id: "a", commands: [], edges }] })).not.toThrow();
+
+    edges[edges.length - 1]!.when.path += "x";
+    expect(() => coercePlan({ root: "a", nodes: [{ id: "a", commands: [], edges }] })).toThrow(/condition.*aggregate|aggregate.*condition/i);
   });
 });
 

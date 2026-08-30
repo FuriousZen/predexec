@@ -6,6 +6,8 @@ import {
   MAX_PLAN_EDGES,
   MAX_COMMAND_LENGTH,
   MAX_NODE_ID_LENGTH,
+  MAX_CONDITION_LENGTH,
+  MAX_CONDITION_TOTAL_LENGTH,
 } from "./core/types.ts";
 
 export const CONDITION_KINDS = Object.freeze([
@@ -45,6 +47,8 @@ export {
   MAX_PLAN_EDGES,
   MAX_COMMAND_LENGTH,
   MAX_NODE_ID_LENGTH,
+  MAX_CONDITION_LENGTH,
+  MAX_CONDITION_TOTAL_LENGTH,
 };
 
 /** Canonical facts shared by model-facing plan descriptions. */
@@ -56,4 +60,5 @@ export const PLAN_SHAPE_DESCRIPTION =
   `Each node has at most ${MAX_OPERATIONS_PER_NODE} operations; parallel execution is capped at ${MAX_PARALLEL_CONCURRENCY} concurrent operations; ` +
   `maxDepth is capped at ${DEFAULT_MAX_DEPTH}; plans have at most ${MAX_PLAN_NODES} nodes and ${MAX_PLAN_EDGES} edges; ` +
   `commands and string arguments are capped at ${MAX_COMMAND_LENGTH} characters. ` +
+  `Condition strings and paths are capped at ${MAX_CONDITION_LENGTH} characters per field and ${MAX_CONDITION_TOTAL_LENGTH} characters in aggregate; ` +
   `${PLAN_CWD_DESCRIPTION} ${JSON_PATH_SINGLE_OP_LINE} `;

@@ -17,7 +17,7 @@
  */
 
 import { isAbsolute, relative, resolve, sep } from "node:path";
-import { evaluateConditionWithDetail } from "./conditions.ts";
+import { conditionStringBudget, evaluateConditionWithDetail } from "./conditions.ts";
 import { READ_ONLY_TOOLS, MUTATING_TOOLS, findDestructiveToken } from "./destructive.ts";
 import { runNode, isToolOp, formatToolOpLabel } from "./runner.ts";
 import { validateOperation } from "./validation.ts";
@@ -208,6 +208,7 @@ export function validatePlan(plan: PlanTree, byId: Map<string, PlanNode>): strin
   if (edgeCount > MAX_PLAN_EDGES) return `plan exceeds the maximum of ${MAX_PLAN_EDGES} edges`;
   if (!byId.has(plan.root)) return `root "${plan.root}" is not a node`;
 
+  let conditionTotal = 0;
   for (const node of plan.nodes) {
     for (const edge of node.edges ?? []) {
       if (!edge || typeof edge !== "object") return `node "${node.id}" has a malformed edge`;
@@ -215,6 +216,9 @@ export function validatePlan(plan: PlanTree, byId: Map<string, PlanNode>): strin
       if (!edge.when || typeof edge.when !== "object" || typeof edge.when.kind !== "string") {
         return `edge from "${node.id}" to "${edge.to}" has no condition kind`;
       }
+      const budget = conditionStringBudget(edge.when, edge.to, conditionTotal);
+      if (budget.error) return budget.error;
+      conditionTotal = budget.total;
       const target = byId.get(edge.to);
       if (!target) return `edge from "${node.id}" points at missing node "${edge.to}"`;
       if (edge.when.kind === "jsonPath" && node.commands.length !== 1) {

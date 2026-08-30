@@ -177,3 +177,7 @@ export const MAX_PLAN_EDGES = 1024;
 export const MAX_COMMAND_LENGTH = 64 * 1024;
 /** Maximum length of a node/edge identifier. */
 export const MAX_NODE_ID_LENGTH = 256;
+/** Maximum length of one model-authored condition string or payload. */
+export const MAX_CONDITION_LENGTH = 8 * 1024;
+/** Maximum aggregate length of condition payloads and edge targets in one plan. */
+export const MAX_CONDITION_TOTAL_LENGTH = 256 * 1024;

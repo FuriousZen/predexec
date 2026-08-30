@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
   CONDITION_KINDS,
+  MAX_CONDITION_LENGTH,
+  MAX_CONDITION_TOTAL_LENGTH,
   MAX_OPERATIONS_PER_NODE,
   MAX_PARALLEL_CONCURRENCY,
   PLAN_FIELD_NAMES,
@@ -35,5 +37,7 @@ describe("canonical plan language", () => {
     expect(PLAN_SHAPE_DESCRIPTION).toContain("relative");
     expect(PLAN_SHAPE_DESCRIPTION).toContain("one-operation");
     expect(PLAN_SHAPE_DESCRIPTION).toContain("mutates");
+    expect(PLAN_SHAPE_DESCRIPTION).toContain(`${MAX_CONDITION_LENGTH} characters per field`);
+    expect(PLAN_SHAPE_DESCRIPTION).toContain(`${MAX_CONDITION_TOTAL_LENGTH} characters in aggregate`);
   });
 });

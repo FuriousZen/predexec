@@ -94,6 +94,11 @@ describe("evaluateCondition — match (low confidence)", () => {
       expect(result.detail).toContain("regex rejected");
     },
   );
+
+  it("uses preceding-backslash parity when deciding whether a group is escaped", () => {
+    expect(isSafeRegex(String.raw`\(`)).toBe(true);
+    expect(isSafeRegex(String.raw`\\(a+)+$`)).toBe(false);
+  });
 });
 
 describe("evaluateCondition — always", () => {

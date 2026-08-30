@@ -26,6 +26,8 @@ export {
   MAX_PLAN_EDGES,
   MAX_COMMAND_LENGTH,
   MAX_NODE_ID_LENGTH,
+  MAX_CONDITION_LENGTH,
+  MAX_CONDITION_TOTAL_LENGTH,
   type ToolOp,
   type Operation,
   type OperationPolicyChecker,

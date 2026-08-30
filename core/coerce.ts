@@ -5,7 +5,7 @@
  * (common with free-tier models) and parses string condition shorthands.
  */
 
-import { isSafeRegex, parseConditionString } from "./conditions.ts";
+import { conditionStringBudget, isSafeRegex, parseConditionString } from "./conditions.ts";
 import {
   MAX_COMMAND_LENGTH,
   MAX_NODE_ID_LENGTH,
@@ -149,20 +149,22 @@ function validatePlanBudget(plan: PlanTree): string | null {
   if (plan.root.length > MAX_NODE_ID_LENGTH) return `root exceeds the maximum length of ${MAX_NODE_ID_LENGTH} characters`;
   if (plan.nodes.length > MAX_PLAN_NODES) return `nodes exceeds the maximum of ${MAX_PLAN_NODES} entries`;
   let edges = 0;
+  let conditionTotal = 0;
   for (const node of plan.nodes) {
     if (!node || typeof node !== "object") continue;
     if (typeof node.id === "string" && node.id.length > MAX_NODE_ID_LENGTH) {
       return `node id exceeds the maximum length of ${MAX_NODE_ID_LENGTH} characters`;
     }
-    if (!Array.isArray(node.commands)) continue;
-    for (const operation of node.commands) {
-      if (typeof operation === "string" && operation.length > MAX_COMMAND_LENGTH) {
-        return `command exceeds the maximum length of ${MAX_COMMAND_LENGTH} characters`;
-      }
-      if (operation && typeof operation === "object" && !Array.isArray(operation)) {
-        for (const value of Object.values(operation)) {
-          if (typeof value === "string" && value.length > MAX_COMMAND_LENGTH) {
-            return `operation string exceeds the maximum length of ${MAX_COMMAND_LENGTH} characters`;
+    if (Array.isArray(node.commands)) {
+      for (const operation of node.commands) {
+        if (typeof operation === "string" && operation.length > MAX_COMMAND_LENGTH) {
+          return `command exceeds the maximum length of ${MAX_COMMAND_LENGTH} characters`;
+        }
+        if (operation && typeof operation === "object" && !Array.isArray(operation)) {
+          for (const value of Object.values(operation)) {
+            if (typeof value === "string" && value.length > MAX_COMMAND_LENGTH) {
+              return `operation string exceeds the maximum length of ${MAX_COMMAND_LENGTH} characters`;
+            }
           }
         }
       }
@@ -170,6 +172,11 @@ function validatePlanBudget(plan: PlanTree): string | null {
     if (Array.isArray(node.edges)) {
       edges += node.edges.length;
       if (edges > MAX_PLAN_EDGES) return `edges exceeds the maximum of ${MAX_PLAN_EDGES} entries`;
+      for (const edge of node.edges) {
+        const budget = conditionStringBudget(edge?.when, edge?.to, conditionTotal);
+        if (budget.error) return budget.error;
+        conditionTotal = budget.total;
+      }
     }
   }
   return null;

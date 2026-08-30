@@ -15,7 +15,13 @@
 
 import { existsSync } from "node:fs";
 import { isAbsolute, resolve } from "node:path";
-import type { Condition, NodeOutput } from "./types.ts";
+import {
+  MAX_CONDITION_LENGTH,
+  MAX_CONDITION_TOTAL_LENGTH,
+  MAX_NODE_ID_LENGTH,
+  type Condition,
+  type NodeOutput,
+} from "./types.ts";
 
 const EXIT_RE = /^exit\s*(==|!=|>|<)\s*(\d+)$/;
 // Greedy `(.+)` with the `$` anchor takes everything between the first and last
@@ -34,6 +40,38 @@ const FILE_RE = /^file\s+(exists|missing)\s+(.+)$/;
  * `(?:\d+\.)+\d+` remain usable.
  */
 const SYNTHETIC_TRUNCATION_MARKER_RE = /…\[truncated(?:: \d+ more chars)?\]/g;
+
+/** Check edge-authored strings before any parser, compiler, or evaluator sees them. */
+export function conditionStringBudget(
+  when: unknown,
+  edgeTo: unknown,
+  currentTotal = 0,
+): { total: number; error: string | null } {
+  const parts: Array<{ label: string; value: string; limit: number }> = [];
+  if (typeof when === "string") {
+    parts.push({ label: "condition string", value: when, limit: MAX_CONDITION_LENGTH });
+  } else if (when && typeof when === "object") {
+    for (const [key, value] of Object.entries(when)) {
+      if (typeof value === "string") parts.push({ label: `condition ${key}`, value, limit: MAX_CONDITION_LENGTH });
+    }
+  }
+  if (typeof edgeTo === "string") parts.push({ label: "edge target", value: edgeTo, limit: MAX_NODE_ID_LENGTH });
+
+  let total = currentTotal;
+  for (const part of parts) {
+    if (part.value.length > part.limit) {
+      return { total, error: `${part.label} exceeds the maximum length of ${part.limit} characters` };
+    }
+    total += part.value.length;
+    if (total > MAX_CONDITION_TOTAL_LENGTH) {
+      return {
+        total,
+        error: `condition payload aggregate exceeds the maximum length of ${MAX_CONDITION_TOTAL_LENGTH} characters`,
+      };
+    }
+  }
+  return { total, error: null };
+}
 
 type RegexCharSet = Set<string> | "any" | "unknown";
 
@@ -244,8 +282,16 @@ function ambiguousAlternation(body: string): boolean {
 }
 
 export function isSafeRegex(pattern: string): boolean {
+  if (pattern.length > MAX_CONDITION_LENGTH) return false;
+  let backslashParity = 0;
   for (let i = 0; i < pattern.length; i++) {
-    if (pattern[i] !== "(" || pattern[i - 1] === "\\") continue;
+    if (pattern[i] === "\\") {
+      backslashParity ^= 1;
+      continue;
+    }
+    const escaped = backslashParity === 1;
+    backslashParity = 0;
+    if (pattern[i] !== "(" || escaped) continue;
     const end = matchingParen(pattern, i);
     if (end < 0) continue;
     const quantifier = readQuantifier(pattern, end + 1);
@@ -264,6 +310,7 @@ const EXIT_OP: Record<string, "eq" | "ne" | "gt" | "lt"> = {
 };
 
 export function parseConditionString(s: string): Condition | null {
+  if (s.length > MAX_CONDITION_LENGTH) return null;
   const trimmed = s.trim();
   if (trimmed === "always") return { kind: "always" };
 
@@ -324,6 +371,8 @@ export function evaluateConditionWithDetail(
   cwd: string,
 ): ConditionEvaluation {
   try {
+    const conditionBudget = conditionStringBudget(cond, undefined);
+    if (conditionBudget.error) return { result: false, detail: `${conditionBudget.error} → false` };
     switch (cond.kind) {
       case "exitCode": {
         const result = compareInt(output.exitCode, cond.op, cond.value);
