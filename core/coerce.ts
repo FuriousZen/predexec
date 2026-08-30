@@ -12,6 +12,7 @@ import {
   MAX_NODE_ID_LENGTH,
   MAX_PLAN_EDGES,
   MAX_PLAN_NODES,
+  MAX_OPERATIONS_PER_NODE,
   type Condition,
   type PlanTree,
 } from "./types.ts";
@@ -157,6 +158,9 @@ function validatePlanBudget(plan: PlanTree): string | null {
       return `node id exceeds the maximum length of ${MAX_NODE_ID_LENGTH} characters`;
     }
     if (Array.isArray(node.commands)) {
+      if (node.commands.length > MAX_OPERATIONS_PER_NODE) {
+        return `node "${String(node.id)}" exceeds the maximum of ${MAX_OPERATIONS_PER_NODE} operations per node`;
+      }
       for (let index = 0; index < node.commands.length; index++) {
         const operation = node.commands[index];
         if (typeof operation === "string" && operation.length > MAX_COMMAND_LENGTH) {

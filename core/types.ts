@@ -181,6 +181,12 @@ export const MAX_NODE_ID_LENGTH = 256;
 export const MAX_CONDITION_LENGTH = 8 * 1024;
 /** Maximum aggregate length of condition payloads and edge targets in one plan. */
 export const MAX_CONDITION_TOTAL_LENGTH = 256 * 1024;
+/** Maximum nesting depth of a direct jsonPath comparison value (root is depth 0). */
+export const MAX_JSON_VALUE_DEPTH = 32;
+/** Maximum scalar/container nodes in a direct jsonPath comparison value. */
+export const MAX_JSON_VALUE_NODES = 4096;
+/** Maximum length of one string in a direct jsonPath comparison value. */
+export const MAX_JSON_VALUE_STRING_LENGTH = MAX_CONDITION_LENGTH;
 /** Maximum lines a native read operation may request. */
 export const MAX_READ_LINES = 10_000;
 /** Shared maximum result count for native grep and find operations. */

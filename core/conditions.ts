@@ -18,6 +18,9 @@ import { isAbsolute, resolve } from "node:path";
 import {
   MAX_CONDITION_LENGTH,
   MAX_CONDITION_TOTAL_LENGTH,
+  MAX_JSON_VALUE_DEPTH,
+  MAX_JSON_VALUE_NODES,
+  MAX_JSON_VALUE_STRING_LENGTH,
   MAX_NODE_ID_LENGTH,
   type Condition,
   type NodeOutput,
@@ -41,6 +44,122 @@ const FILE_RE = /^file\s+(exists|missing)\s+(.+)$/;
  */
 const SYNTHETIC_TRUNCATION_MARKER_RE = /…\[truncated(?:: \d+ more chars)?\]/g;
 
+interface JsonValueInspection {
+  nodes: number;
+  stringLength: number;
+  error: string | null;
+}
+
+type JsonValueFrame = { value: unknown; depth: number; exit?: false } | { value: object; exit: true };
+
+/**
+ * Inspect a direct jsonPath comparison value without recursion. JSON parsed
+ * from stdout is already bounded by the output cap, but model callers can
+ * pass arbitrary objects (including cycles) through the public API.
+ */
+function inspectJsonValue(value: unknown): JsonValueInspection {
+  const active = new WeakSet<object>();
+  const stack: JsonValueFrame[] = [{ value, depth: 0 }];
+  let nodes = 0;
+  let stringLength = 0;
+
+  while (stack.length > 0) {
+    const frame = stack.pop()!;
+    if (frame.exit) {
+      active.delete(frame.value);
+      continue;
+    }
+
+    nodes += 1;
+    if (nodes > MAX_JSON_VALUE_NODES) {
+      return { nodes, stringLength, error: `jsonPath comparison value exceeds the maximum of ${MAX_JSON_VALUE_NODES} nodes` };
+    }
+    if (frame.depth > MAX_JSON_VALUE_DEPTH) {
+      return {
+        nodes,
+        stringLength,
+        error: `jsonPath comparison value exceeds the maximum nesting depth of ${MAX_JSON_VALUE_DEPTH}`,
+      };
+    }
+    const current = frame.value;
+    if (typeof current === "string") {
+      if (current.length > MAX_JSON_VALUE_STRING_LENGTH) {
+        return {
+          nodes,
+          stringLength,
+          error: `jsonPath comparison string exceeds the maximum length of ${MAX_JSON_VALUE_STRING_LENGTH} characters`,
+        };
+      }
+      stringLength += current.length;
+      if (stringLength > MAX_CONDITION_TOTAL_LENGTH) {
+        return {
+          nodes,
+          stringLength,
+          error: `jsonPath comparison strings exceed the aggregate maximum of ${MAX_CONDITION_TOTAL_LENGTH} characters`,
+        };
+      }
+      continue;
+    }
+    if (current === null || typeof current === "boolean" || typeof current === "number") {
+      if (typeof current === "number" && !Number.isFinite(current)) {
+        return { nodes, stringLength, error: "jsonPath comparison value contains a non-finite number" };
+      }
+      continue;
+    }
+    if (typeof current !== "object") {
+      return { nodes, stringLength, error: `jsonPath comparison value contains unsupported ${typeof current}` };
+    }
+    if (active.has(current)) {
+      return { nodes, stringLength, error: "jsonPath comparison value contains a cyclic reference" };
+    }
+    active.add(current);
+    stack.push({ value: current, exit: true });
+    if (Array.isArray(current)) {
+      if (current.length > MAX_JSON_VALUE_NODES - nodes) {
+        return { nodes, stringLength, error: `jsonPath comparison value exceeds the maximum of ${MAX_JSON_VALUE_NODES} nodes` };
+      }
+      for (let index = current.length - 1; index >= 0; index--) {
+        stack.push({ value: current[index], depth: frame.depth + 1 });
+      }
+      continue;
+    }
+    let keys: string[];
+    try {
+      keys = Object.keys(current);
+    } catch {
+      return { nodes, stringLength, error: "jsonPath comparison value could not be inspected" };
+    }
+    if (keys.length > MAX_JSON_VALUE_NODES - nodes) {
+      return { nodes, stringLength, error: `jsonPath comparison value exceeds the maximum of ${MAX_JSON_VALUE_NODES} nodes` };
+    }
+    const record = current as Record<string, unknown>;
+    for (let index = keys.length - 1; index >= 0; index--) {
+      const key = keys[index]!;
+      if (key.length > MAX_JSON_VALUE_STRING_LENGTH) {
+        return {
+          nodes,
+          stringLength,
+          error: `jsonPath comparison string exceeds the maximum length of ${MAX_JSON_VALUE_STRING_LENGTH} characters`,
+        };
+      }
+      stringLength += key.length;
+      if (stringLength > MAX_CONDITION_TOTAL_LENGTH) {
+        return {
+          nodes,
+          stringLength,
+          error: `jsonPath comparison strings exceed the aggregate maximum of ${MAX_CONDITION_TOTAL_LENGTH} characters`,
+        };
+      }
+      try {
+        stack.push({ value: record[key], depth: frame.depth + 1 });
+      } catch {
+        return { nodes, stringLength, error: "jsonPath comparison value could not be inspected" };
+      }
+    }
+  }
+  return { nodes, stringLength, error: null };
+}
+
 /** Check edge-authored strings before any parser, compiler, or evaluator sees them. */
 export function conditionStringBudget(
   when: unknown,
@@ -48,16 +167,29 @@ export function conditionStringBudget(
   currentTotal = 0,
 ): { total: number; error: string | null } {
   const parts: Array<{ label: string; value: string; limit: number }> = [];
+  let total = currentTotal;
   if (typeof when === "string") {
     parts.push({ label: "condition string", value: when, limit: MAX_CONDITION_LENGTH });
   } else if (when && typeof when === "object") {
+    const condition = when as Record<string, unknown>;
     for (const [key, value] of Object.entries(when)) {
-      if (typeof value === "string") parts.push({ label: `condition ${key}`, value, limit: MAX_CONDITION_LENGTH });
+      if (key === "value" && condition.kind === "jsonPath" && (condition.op === "eq" || condition.op === "ne")) {
+        const inspection = inspectJsonValue(value);
+        if (inspection.error) return { total, error: inspection.error };
+        total += inspection.stringLength;
+        if (total > MAX_CONDITION_TOTAL_LENGTH) {
+          return {
+            total,
+            error: `condition payload aggregate exceeds the maximum length of ${MAX_CONDITION_TOTAL_LENGTH} characters`,
+          };
+        }
+      } else if (typeof value === "string") {
+        parts.push({ label: `condition ${key}`, value, limit: MAX_CONDITION_LENGTH });
+      }
     }
   }
   if (typeof edgeTo === "string") parts.push({ label: "edge target", value: edgeTo, limit: MAX_NODE_ID_LENGTH });
 
-  let total = currentTotal;
   for (const part of parts) {
     if (part.value.length > part.limit) {
       return { total, error: `${part.label} exceeds the maximum length of ${part.limit} characters` };
@@ -350,13 +482,55 @@ const OP_SYM: Record<string, string> = { eq: "==", ne: "!=", lt: "<", le: "<=", 
 
 /** Bounded JSON render for detail strings; never throws. */
 function showValue(v: unknown): string {
+  const inspection = inspectJsonValue(v);
+  if (inspection.error) return `[${inspection.error}]`;
+  if (v === null) return "null";
+  if (typeof v === "string") return quoteJsonString(v).slice(0, 80) + (v.length > 80 ? "…" : "");
+  if (typeof v === "number" || typeof v === "boolean") return String(v);
   try {
-    const s = JSON.stringify(v);
-    const text = s === undefined ? String(v) : s;
-    return text.length > 80 ? `${text.slice(0, 80)}…` : text;
+    type RenderFrame = { text: string } | { value: unknown };
+    const stack: RenderFrame[] = [{ value: v }];
+    let text = "";
+    while (stack.length > 0 && text.length < 80) {
+      const frame = stack.pop()!;
+      if ("text" in frame) {
+        text += frame.text;
+        continue;
+      }
+      if (frame.value === null) {
+        text += "null";
+      } else if (typeof frame.value === "string") {
+        text += quoteJsonString(frame.value);
+      } else if (typeof frame.value === "number" || typeof frame.value === "boolean") {
+        text += String(frame.value);
+      } else if (Array.isArray(frame.value)) {
+        text += "[";
+        stack.push({ text: "]" });
+        for (let i = frame.value.length - 1; i >= 0; i--) {
+          if (i < frame.value.length - 1) stack.push({ text: "," });
+          stack.push({ value: frame.value[i] });
+        }
+      } else {
+        const record = frame.value as Record<string, unknown>;
+        const keys = Object.keys(record);
+        text += "{";
+        stack.push({ text: "}" });
+        for (let i = keys.length - 1; i >= 0; i--) {
+          const key = keys[i]!;
+          if (i < keys.length - 1) stack.push({ text: "," });
+          stack.push({ value: record[key] });
+          stack.push({ text: `${quoteJsonString(key)}:` });
+        }
+      }
+    }
+    return text.length > 80 || stack.length > 0 ? `${text.slice(0, 80)}…` : text;
   } catch {
-    return String(v);
+    return "[jsonPath comparison value could not be rendered]";
   }
+}
+
+function quoteJsonString(value: string): string {
+  return `"${value.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\n/g, "\\n").replace(/\r/g, "\\r").replace(/\t/g, "\\t")}"`;
 }
 
 /**
@@ -502,20 +676,30 @@ function compareFloat(actual: number, op: "lt" | "le" | "gt" | "ge" | "eq", valu
 }
 
 function deepEqual(a: unknown, b: unknown): boolean {
-  if (a === b) return true;
-  if (typeof a !== typeof b) return false;
-  if (a === null || b === null) return false;
-  if (typeof a !== "object") return false;
-  if (Array.isArray(a) || Array.isArray(b)) {
-    if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false;
-    return a.every((x, i) => deepEqual(x, b[i]));
+  const pending: Array<[unknown, unknown]> = [[a, b]];
+  let work = 0;
+  while (pending.length > 0) {
+    if (++work > MAX_JSON_VALUE_NODES) return false;
+    const [left, right] = pending.pop()!;
+    if (left === right) continue;
+    if (typeof left !== typeof right || left === null || right === null) return false;
+    if (typeof left !== "object") return false;
+    if (Array.isArray(left) || Array.isArray(right)) {
+      if (!Array.isArray(left) || !Array.isArray(right) || left.length !== right.length) return false;
+      for (let index = 0; index < left.length; index++) pending.push([left[index], right[index]]);
+      continue;
+    }
+    const leftObject = left as Record<string, unknown>;
+    const rightObject = right as Record<string, unknown>;
+    const leftKeys = Object.keys(leftObject);
+    const rightKeys = Object.keys(rightObject);
+    if (leftKeys.length !== rightKeys.length) return false;
+    for (const key of leftKeys) {
+      if (!Object.prototype.hasOwnProperty.call(rightObject, key)) return false;
+      pending.push([leftObject[key], rightObject[key]]);
+    }
   }
-  const ao = a as Record<string, unknown>;
-  const bo = b as Record<string, unknown>;
-  const ak = Object.keys(ao);
-  const bk = Object.keys(bo);
-  if (ak.length !== bk.length) return false;
-  return ak.every((k) => Object.prototype.hasOwnProperty.call(bo, k) && deepEqual(ao[k], bo[k]));
+  return true;
 }
 
 /**

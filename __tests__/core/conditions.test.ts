@@ -3,6 +3,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { evaluateConditionWithDetail, isSafeRegex, parseConditionString } from "../../core/conditions.ts";
+import {
+  MAX_JSON_VALUE_DEPTH,
+  MAX_JSON_VALUE_NODES,
+  MAX_JSON_VALUE_STRING_LENGTH,
+} from "../../core/types.ts";
 import type { Condition, NodeOutput } from "../../core/types.ts";
 
 const out = (o: Partial<NodeOutput>): NodeOutput => ({
@@ -56,6 +61,67 @@ describe("evaluateCondition — jsonPath", () => {
 
   it("returns false on unparseable JSON (benign miss, no throw)", () => {
     expect(evaluateCondition(out({ stdout: "not json" }), { kind: "jsonPath", source: "stdout", path: "a", op: "exists" }, "/")).toBe(false);
+  });
+
+  it("rejects cyclic comparison values without throwing or walking forever", () => {
+    const value: Record<string, unknown> = {};
+    value.self = value;
+    const result = evaluateConditionWithDetail(
+      out({ stdout: '{"ok":true}' }),
+      { kind: "jsonPath", source: "stdout", path: "ok", op: "eq", value },
+      "/",
+    );
+    expect(result.result).toBe(false);
+    expect(result.detail).toMatch(/cyclic|budget|invalid/i);
+  });
+
+  it("rejects comparison values deeper than the documented boundary", () => {
+    const nested = (depth: number): unknown => {
+      let value: unknown = true;
+      for (let i = 0; i < depth; i++) value = { value };
+      return value;
+    };
+    const atBoundary = evaluateConditionWithDetail(
+      out({ stdout: JSON.stringify(nested(MAX_JSON_VALUE_DEPTH)) }),
+      { kind: "jsonPath", source: "stdout", path: "$", op: "eq", value: nested(MAX_JSON_VALUE_DEPTH) },
+      "/",
+    );
+    expect(atBoundary.detail).not.toMatch(/depth|budget/i);
+
+    const overBoundary = evaluateConditionWithDetail(
+      out({ stdout: '{"ok":true}' }),
+      { kind: "jsonPath", source: "stdout", path: "ok", op: "eq", value: nested(MAX_JSON_VALUE_DEPTH + 1) },
+      "/",
+    );
+    expect(overBoundary.result).toBe(false);
+    expect(overBoundary.detail).toMatch(/depth|budget/i);
+  });
+
+  it("rejects comparison strings one character over the documented boundary", () => {
+    const result = evaluateConditionWithDetail(
+      out({ stdout: '{"ok":"x"}' }),
+      {
+        kind: "jsonPath",
+        source: "stdout",
+        path: "ok",
+        op: "eq",
+        value: "x".repeat(MAX_JSON_VALUE_STRING_LENGTH + 1),
+      },
+      "/",
+    );
+    expect(result.result).toBe(false);
+    expect(result.detail).toMatch(/length|budget/i);
+  });
+
+  it("rejects comparison values over the node boundary", () => {
+    const value = Array.from({ length: MAX_JSON_VALUE_NODES }, () => true);
+    const result = evaluateConditionWithDetail(
+      out({ stdout: "[true]" }),
+      { kind: "jsonPath", source: "stdout", path: "$", op: "eq", value: [...value, true] },
+      "/",
+    );
+    expect(result.result).toBe(false);
+    expect(result.detail).toMatch(/node|budget/i);
   });
 });
 

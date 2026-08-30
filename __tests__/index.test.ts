@@ -11,6 +11,10 @@ import {
   MAX_GREP_CONTEXT,
   MAX_GREP_RESULTS,
   MAX_LS_ENTRIES,
+  MAX_JSON_VALUE_DEPTH,
+  MAX_JSON_VALUE_NODES,
+  MAX_JSON_VALUE_STRING_LENGTH,
+  MAX_OPERATIONS_PER_NODE,
   MAX_NODE_ID_LENGTH,
   MAX_READ_LINES,
 } from "../core/types.ts";
@@ -55,6 +59,17 @@ describe("coercePlan — defensive param recovery", () => {
     expect(() => coercePlan({ root: "n0", nodes })).toThrow(/nodes.*maximum|too many/i);
   });
 
+  it("rejects an overfull node before validating individual operations", () => {
+    const commands = [
+      { malformed: true },
+      ...Array.from({ length: MAX_OPERATIONS_PER_NODE }, () => "true"),
+    ];
+    expect(commands).toHaveLength(MAX_OPERATIONS_PER_NODE + 1);
+    expect(() => coercePlan({ root: "a", nodes: [{ id: "a", commands }] })).toThrow(
+      new RegExp(`maximum of ${MAX_OPERATIONS_PER_NODE} operations`),
+    );
+  });
+
   it.each([
     ["read limit", { tool: "read", path: "file.txt", limit: MAX_READ_LINES + 1 }],
     ["grep limit", { tool: "grep", pattern: "x", limit: MAX_GREP_RESULTS + 1 }],
@@ -63,6 +78,39 @@ describe("coercePlan — defensive param recovery", () => {
     ["grep context", { tool: "grep", pattern: "x", context: MAX_GREP_CONTEXT + 1 }],
   ])("rejects an over-ceiling %s before execution", (_label, operation) => {
     expect(() => coercePlan({ root: "a", nodes: [{ id: "a", commands: [operation] }] })).toThrow(/maximum|at most/);
+  });
+
+  it("bounds direct jsonPath comparison values before condition validation", () => {
+    let boundary: unknown = true;
+    for (let index = 0; index < MAX_JSON_VALUE_DEPTH; index++) boundary = { value: boundary };
+    expect(() => coercePlan({
+      root: "a",
+      nodes: [{ id: "a", commands: ["true"], edges: [{ when: { kind: "jsonPath", path: "$", op: "eq", value: boundary }, to: "a" }] }],
+    })).not.toThrow();
+
+    const tooDeep = { value: boundary };
+    expect(() => coercePlan({
+      root: "a",
+      nodes: [{ id: "a", commands: ["true"], edges: [{ when: { kind: "jsonPath", path: "$", op: "eq", value: tooDeep }, to: "a" }] }],
+    })).toThrow(/nesting depth|depth/i);
+
+    expect(() => coercePlan({
+      root: "a",
+      nodes: [{ id: "a", commands: ["true"], edges: [{ when: { kind: "jsonPath", path: "$", op: "eq", value: "x".repeat(MAX_JSON_VALUE_STRING_LENGTH + 1) }, to: "a" }] }],
+    })).toThrow(/maximum length|characters/i);
+
+    const tooManyNodes = Array.from({ length: MAX_JSON_VALUE_NODES }, () => true);
+    expect(() => coercePlan({
+      root: "a",
+      nodes: [{ id: "a", commands: ["true"], edges: [{ when: { kind: "jsonPath", path: "$", op: "eq", value: [...tooManyNodes, true] }, to: "a" }] }],
+    })).toThrow(/nodes|maximum/i);
+
+    const cyclic: Record<string, unknown> = {};
+    cyclic.self = cyclic;
+    expect(() => coercePlan({
+      root: "a",
+      nodes: [{ id: "a", commands: ["true"], edges: [{ when: { kind: "jsonPath", path: "$", op: "eq", value: cyclic }, to: "a" }] }],
+    })).toThrow(/cyclic|cycle/i);
   });
 
   it("coerces string edge conditions into objects", () => {
