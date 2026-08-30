@@ -447,6 +447,7 @@ describe("interpreter eval — fs-writer APIs are caught", () => {
       "if true; then ruby -e '{payload}'; fi",
       "(ruby -e '{payload}')",
       "{ ruby -e '{payload}'; }",
+      "case x in a) ruby -e '{payload}' ;; esac",
     ])("preflights oversized evals in compound commands before recursive shell inspection: %s", (template) => {
       const payload = "x".repeat(17_000);
       const command = template.replace("{payload}", payload);

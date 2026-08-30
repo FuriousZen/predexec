@@ -1116,6 +1116,13 @@ function cheapInterpreterFragments(command: string, depth = 0, budget = { remain
       }
       continue;
     }
+    // A case arm starts after its unquoted `pattern)` delimiter rather than
+    // after a command separator. Expose that arm as a fresh command fragment
+    // while leaving ordinary parenthesized groups to the branch above.
+    if (ch === ")" && /\bcase\b[\s\S]*\bin\b/u.test(command.slice(start, i))) {
+      start = i + 1;
+      continue;
+    }
     if (ch === "|" || ch === ";" || ch === "&" || ch === "\n" || ch === "\r") {
       if (command.slice(start, i).trim()) fragments.push(command.slice(start, i));
       start = i + 1;
