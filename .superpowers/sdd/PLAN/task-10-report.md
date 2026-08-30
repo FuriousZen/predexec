@@ -93,7 +93,51 @@ git diff b8e4daa865691a9f0a735d1cc823270532c6d870...HEAD
 git log b8e4daa865691a9f0a735d1cc823270532c6d870..HEAD --oneline
 ```
 
-The branch diff is **38 files, 3022 insertions, 512 deletions**, covering Tasks 1–9 and their reports. Existing per-task review packages are under `.superpowers/sdd/PLAN/review-*.diff`; this report records the final merge-base command and evidence for the final whole-branch reviewer. No collaboration/reviewer sub-agent facility is available in this worker, so final two-axis review adjudication remains for the parent agent's final gate.
+The branch diff file/line counts are dynamic and intentionally not restated here; recalculate them at the final HEAD. Existing per-task review packages are under `.superpowers/sdd/PLAN/review-*.diff`; this report records the final merge-base command and evidence for the final whole-branch reviewer. No collaboration/reviewer sub-agent facility is available in this worker, so final two-axis review adjudication remains for the parent agent's final gate.
+
+## Extended integration fix round 10 — OpenCode shell policy, operation validation, and interpreter writers
+
+This user-authorized extension started from `b0843f2a7a3d7bc1614238500864a6791cd5e7c5`. It closes three Important findings: OpenCode Bash policy inspection previously stopped at `splitCommandSegments` and missed executable control/substitution bodies; malformed operation objects could reach core consumers and throw; and Perl, Ruby, and PHP eval snippets could perform common filesystem writes without classification. No ledger edit, version bump, publish, push, merge, or release-artifact staging was performed.
+
+### RED evidence
+
+Before production changes, focused regressions were run with:
+
+```text
+./node_modules/.bin/vitest run __tests__/policy.test.ts __tests__/opencode.test.ts __tests__/core/engine.test.ts __tests__/core/destructive.test.ts
+```
+
+The first policy/OpenCode/engine run reported **17 failed, 398 passed**: nested `if`, function, substitution, case, and group bodies bypassed OpenCode rules, and malformed operations did not produce a structural error. The interpreter extension was then run independently and reported **9 failed, 246 passed**, covering Perl `rename`/`open`, Ruby `File.*`, and PHP `file_put_contents`/`fopen` examples.
+
+### GREEN implementation
+
+- `policy.ts` now inspects every Bash operation through the shared bounded executable-body tree before applying the existing raw segment rules. Incomplete or over-budget executable syntax returns an actionable fail-closed policy result. Rules still evaluate in OpenCode's existing last-match-wins order, and native resource-specific checks remain unchanged. Source and compiled plugin e2e tests cover nested `curl` in `if`, substitutions, functions, cases, and groups.
+- `core/validation.ts` provides a central operation-shape validator for supported `read`, `grep`, `find`, `ls`, `bash`, `edit`, and `write` discriminants, required fields, and known optional primitive fields. `validatePlan` invokes it before mutation classification, policy checks, cwd resolution, or execution, so nulls, numbers, arrays, missing/unknown tools, and malformed command/path/pattern types return `stoppedReason: "error"` and execute nothing. Existing mutating-tool behavior remains a mutation stop for well-shaped `edit`/`write` operations.
+- Interpreter classification uses separate bounded scanners for Perl (`rename`, `unlink`, `open`, `truncate`, `sysopen`), Ruby (`File` and common `FileUtils` writers plus mutating `File.open` modes), and PHP (`file_put_contents`, `unlink`, `rename`, and mutating `fopen` modes). Read-only `open`, `File.read`, `FileUtils.compare_file`, `file_get_contents`, and `fopen(..., "r")` examples remain allowed. Real temporary-directory engine regressions prove blocked writer plans do not execute or create files.
+
+### GREEN verification
+
+Focused core/policy/OpenCode/adapter verification:
+
+```text
+./node_modules/.bin/vitest run __tests__/core __tests__/policy.test.ts __tests__/opencode.test.ts __tests__/adapter-runtime.test.ts
+```
+
+Result: exit 0; **7 test files, 514 tests passed**. Additional required checks all passed:
+
+```text
+./node_modules/.bin/tsc --noEmit
+pnpm run build
+./node_modules/.bin/vitest run
+./node_modules/.bin/vitest run __tests__/release-hygiene.test.ts __tests__/pack.test.ts
+git diff --check
+```
+
+Typecheck and build succeeded; the full suite passed **996/996 tests**; release/pack verification passed **9/9 tests**; and `git diff --check` passed. The implementation and test changes were committed as `e84400f` (`fix: close round ten policy and operation gaps`); this report follows in its own commit.
+
+### Self-review
+
+The OpenCode policy callback now shares the same bounded tree/completeness contract as Claude/Codex while retaining its own raw matching and last-match-wins precedence. Native operation mapping is untouched. Structural validation is centralized at the engine's pre-execution validation boundary and allows adapter metadata fields while checking all fields consumed by core and current executors. Language scanners are intentionally small and word-boundary based, with read-only fixtures constraining false positives. Whole-branch diff counts remain dynamic until final HEAD because this report is appended afterward. No ledger, release metadata, dependency, publish, push, merge, or version operation changed.
 
 ## Residual concerns carried forward
 
