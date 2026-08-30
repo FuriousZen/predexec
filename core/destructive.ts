@@ -962,7 +962,22 @@ function interpreterEvalPayload(segment: string): string {
   const words = shellWords(segment);
   const evalFlag = /^(?:--eval|--print|--run|-r|-[epnc]|-[pn]*e[pn]*)$/;
   const index = words.findIndex((word) => evalFlag.test(word));
-  return index < 0 ? segment : words.slice(index + 1).join(" ");
+  if (index >= 0) return words.slice(index + 1).join(" ");
+  // Ruby and Perl accept an eval program attached directly to `-e`, e.g.
+  // `ruby -eFile.write(...)`. Keep this narrow: other interpreters have
+  // materially different short-option grammars and remain fail-closed below.
+  const head = words[0]?.replace(/^.*\//, "");
+  if (head === "ruby" || head === "perl") {
+    const attached = words.findIndex((word, i) => i > 0 && /^-e.+/.test(word));
+    if (attached >= 0) return [words[attached]!.slice(2), ...words.slice(attached + 1)].join(" ");
+  }
+  return segment;
+}
+
+function interpreterLanguage(head: string): InterpolationLanguage {
+  if (head === "node" || head === "deno" || head === "bun") return "node";
+  if (head === "python3") return "python";
+  return head as InterpolationLanguage;
 }
 
 /**
@@ -971,25 +986,161 @@ function interpreterEvalPayload(segment: string): string {
  * or language syntax. A null result means this command is not a direct eval
  * invocation; callers can then proceed with ordinary shell classification.
  */
-export function interpreterEvalPreflight(segment: string): { payloadLength: number; interpreter: string } | null {
+function directInterpreterEvalPreflight(segment: string): { payloadLength: number; interpreter: string } | null {
   const words = shellWords(segment);
   const index = effectiveHeadIndex(words);
   if (index === null) {
     const splitString = envSplitStringPayload(words);
-    return splitString === null ? null : interpreterEvalPreflight(splitString);
+    return splitString === null ? null : directInterpreterEvalPreflight(splitString);
   }
   const interpreter = words[index]!.replace(/^.*\//, "");
   if (!EVAL_INTERPRETERS.has(interpreter)) return null;
   const evalFlag = /^(?:--eval|--print|--run|-r|-[epnc]|-[pn]*e[pn]*)$/;
-  const flagIndex = words.findIndex((word, i) => i > index && evalFlag.test(word));
+  let flagIndex = words.findIndex((word, i) => i > index && evalFlag.test(word));
+  if (flagIndex < 0 && (interpreter === "ruby" || interpreter === "perl")) {
+    flagIndex = words.findIndex((word, i) => i > index && /^-e.+/.test(word));
+    if (flagIndex >= 0) {
+      return { interpreter, payloadLength: [words[flagIndex]!.slice(2), ...words.slice(flagIndex + 1)].join(" ").length };
+    }
+  }
   if (flagIndex < 0) return null;
   return { interpreter, payloadLength: words.slice(flagIndex + 1).join(" ").length };
+}
+
+function stripShellControlPrefix(fragment: string): string {
+  let current = fragment.trim();
+  for (let i = 0; i < 8; i++) {
+    const next = current.replace(/^(?:(?:if|then|elif|else|fi|while|until|do|done|for|select|function|coproc)\b|[!{}()])\s*/u, "");
+    if (next === current) break;
+    current = next;
+  }
+  return current;
+}
+
+function cheapGroupClose(command: string, start: number, open: string, close: string): number {
+  let depth = 1;
+  let quote: "'" | '"' | null = null;
+  for (let i = start + 1; i < command.length; i++) {
+    const ch = command[i]!;
+    if (quote === "'") { if (ch === "'") quote = null; continue; }
+    if (quote === '"') {
+      if (ch === "\\") { i++; continue; }
+      if (ch === '"') quote = null;
+      continue;
+    }
+    if (ch === "\\") { i++; continue; }
+    if (ch === "'") { quote = "'"; continue; }
+    if (ch === '"') { quote = '"'; continue; }
+    if (ch === open) depth++;
+    else if (ch === close && --depth === 0) return i;
+  }
+  return -1;
+}
+
+/**
+ * Lightweight command-fragment extraction for the eval-size guard. This is
+ * intentionally not the shared shell parser: it only tracks quotes, joins,
+ * and substitution/group delimiters, then delegates argv interpretation to
+ * the existing direct preflight. Its bounded recursion keeps oversized evals
+ * out of the more expensive executable-body tree.
+ */
+function cheapInterpreterFragments(command: string, depth = 0, budget = { remaining: LANGUAGE_EVAL_EARLY_LIMIT * 8 }): string[] {
+  if (depth > 16 || budget.remaining <= 0) return [];
+  budget.remaining -= command.length;
+  const fragments: string[] = [];
+  let start = 0;
+  let quote: "'" | '"' | null = null;
+  for (let i = 0; i < command.length; i++) {
+    const ch = command[i]!;
+    if (quote === "'") {
+      if (ch === "'") quote = null;
+      continue;
+    }
+    if (quote === '"') {
+      if (ch === "\\") { i++; continue; }
+      if (ch === '"') { quote = null; continue; }
+    } else if (ch === "\\") {
+      i++;
+      continue;
+    } else if (ch === "'") {
+      quote = "'";
+      continue;
+    } else if (ch === '"') {
+      quote = '"';
+      continue;
+    }
+
+    const substitution = (ch === "$" || ch === "<" || ch === ">") && command[i + 1] === "(";
+    if (substitution) {
+      const bodyStart = i + 2;
+      let parens = 1;
+      let innerQuote: "'" | '"' | null = null;
+      let close = -1;
+      for (let j = bodyStart; j < command.length; j++) {
+        const inner = command[j]!;
+        if (innerQuote === "'") { if (inner === "'") innerQuote = null; continue; }
+        if (innerQuote === '"') {
+          if (inner === "\\") { j++; continue; }
+          if (inner === '"') innerQuote = null;
+          continue;
+        }
+        if (inner === "\\") { j++; continue; }
+        if (inner === "'") { innerQuote = "'"; continue; }
+        if (inner === '"') { innerQuote = '"'; continue; }
+        if (inner === "(") parens++;
+        else if (inner === ")" && --parens === 0) { close = j; break; }
+      }
+      if (close >= 0) {
+        fragments.push(...cheapInterpreterFragments(command.slice(bodyStart, close), depth + 1, budget));
+        i = close;
+      }
+      continue;
+    }
+    if (ch === "(" || ch === "{") {
+      const close = cheapGroupClose(command, i, ch, ch === "(" ? ")" : "}");
+      if (close >= 0) {
+        fragments.push(...cheapInterpreterFragments(command.slice(i + 1, close), depth + 1, budget));
+        i = close;
+      }
+      continue;
+    }
+    if (ch === "`") {
+      let close = -1;
+      for (let j = i + 1; j < command.length; j++) {
+        if (command[j] === "\\") { j++; continue; }
+        if (command[j] === "`") { close = j; break; }
+      }
+      if (close >= 0) {
+        fragments.push(...cheapInterpreterFragments(command.slice(i + 1, close), depth + 1, budget));
+        i = close;
+      }
+      continue;
+    }
+    if (ch === "|" || ch === ";" || ch === "&" || ch === "\n" || ch === "\r") {
+      if (command.slice(start, i).trim()) fragments.push(command.slice(start, i));
+      start = i + 1;
+      if ((ch === "|" || ch === "&") && command[i + 1] === ch) i++;
+      if (ch === "\r" && command[i + 1] === "\n") i++;
+    }
+  }
+  if (command.slice(start).trim()) fragments.push(command.slice(start));
+  return fragments;
+}
+
+export function interpreterEvalPreflight(segment: string): { payloadLength: number; interpreter: string } | null {
+  const direct = directInterpreterEvalPreflight(segment);
+  if (direct) return direct;
+  for (const fragment of cheapInterpreterFragments(segment)) {
+    const candidate = directInterpreterEvalPreflight(stripShellControlPrefix(fragment));
+    if (candidate) return candidate;
+  }
+  return null;
 }
 
 function languageWordScanSegment(head: string, segment: string): string {
   if (!isEvalInvocation(head, segment) || !EVAL_INTERPRETERS.has(head)) return segment;
   const payload = interpreterEvalPayload(segment);
-  const language = (head === "node" || head === "deno" || head === "bun" ? "node" : head === "python3" ? "python" : head) as InterpolationLanguage;
+  const language = interpreterLanguage(head);
   const view = executableLanguageView(payload, language);
   return view === null ? segment : `${head} ${view}`;
 }
@@ -1553,7 +1704,7 @@ function isEvalInvocation(head: string, segment: string): boolean {
 function findInterpreterWriter(head: string, segment: string): string | null {
   if (segment.length > MAX_LANGUAGE_ARGUMENT_LENGTH) return `${head} eval payload`;
   const payload = interpreterEvalPayload(segment);
-  const language = (head === "node" || head === "deno" || head === "bun" ? "node" : head) as InterpolationLanguage;
+  const language = interpreterLanguage(head);
   return scanLanguagePayload(payload, language, {
     depth: 0,
     shellBodies: new Set(),
@@ -1686,7 +1837,7 @@ function findDestructiveTokenInternal(cmd: string, depth: number): string | null
       const languageWriter = findInterpreterWriter(head, segment);
       if (languageWriter) return languageWriter;
       const writerPayload = interpreterEvalPayload(segment);
-      const language = (head === "node" || head === "deno" || head === "bun" ? "node" : head === "python3" ? "python" : head) as InterpolationLanguage;
+      const language = interpreterLanguage(head);
       const writerSource = executableLanguageView(writerPayload, language);
       if (writerSource === null) return `${head} eval payload`;
       const writer = EVAL_WRITER_RE.exec(writerSource);

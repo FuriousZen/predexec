@@ -167,6 +167,8 @@ describe("interpreter eval — fs-writer APIs are caught", () => {
     `node -e "require('fs').writeFileSync('x','y')"`,
     `node -e "fs.rmSync('x')"`,
     `python -c "open('f','w').write('x')"`,
+    `python3 -c "open('f','w').write('x')"`,
+    `/usr/bin/python3 -c "open('f','w').write('x')"`,
     `python3 -c "import os; os.remove('f')"`,
     `python -c "import shutil; shutil.rmtree('d')"`,
     `node --eval "fs.mkdirSync('d')"`,
@@ -430,6 +432,54 @@ describe("interpreter eval — fs-writer APIs are caught", () => {
         payloadLength: 17_000,
       });
       expect(interpreterEvalPreflight(`echo 'ruby -e ${"x".repeat(17_000)}'`)).toBeNull();
+    });
+
+    it("preflights oversized evals in pipelines before recursive shell inspection", () => {
+      const payload = "x".repeat(17_000);
+      expect(interpreterEvalPreflight(`printf ok | ruby -e '${payload}'`)).toMatchObject({
+        interpreter: "ruby",
+        payloadLength: 17_000,
+      });
+      expect(isDestructiveCommand(`printf ok | ruby -e '${payload}'`)).toBe(true);
+    });
+
+    it.each([
+      "if true; then ruby -e '{payload}'; fi",
+      "(ruby -e '{payload}')",
+      "{ ruby -e '{payload}'; }",
+    ])("preflights oversized evals in compound commands before recursive shell inspection: %s", (template) => {
+      const payload = "x".repeat(17_000);
+      const command = template.replace("{payload}", payload);
+      expect(interpreterEvalPreflight(command)).toMatchObject({
+        interpreter: "ruby",
+        payloadLength: 17_000,
+      });
+      expect(isDestructiveCommand(command)).toBe(true);
+    });
+
+    it("keeps the eval preflight boundary exact", () => {
+      expect(interpreterEvalPreflight(`ruby -e '${"x".repeat(16_384)}'`)).toMatchObject({
+        payloadLength: 16_384,
+      });
+      expect(interpreterEvalPreflight(`ruby -e '${"x".repeat(16_385)}'`)).toMatchObject({
+        payloadLength: 16_385,
+      });
+    });
+
+    it.each([
+      `ruby -eFile.write("x", "y")`,
+      `/usr/bin/ruby -eFile.write("x", "y")`,
+      `perl -eunlink("x")`,
+      `/usr/bin/perl -eunlink("x")`,
+    ])("catches attached Ruby/Perl eval writer: %s", (cmd) => {
+      expect(findDestructiveToken(cmd)).not.toBeNull();
+    });
+
+    it.each([
+      `ruby -eputs("ok")`,
+      `perl -eprint("ok")`,
+    ])("allows safe attached Ruby/Perl eval data: %s", (cmd) => {
+      expect(findDestructiveToken(cmd)).toBeNull();
     });
   });
 
