@@ -34,7 +34,7 @@ import { accessSync, constants } from "node:fs";
 import { open, opendir, realpath, stat } from "node:fs/promises";
 import { delimiter, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { StringDecoder } from "node:string_decoder";
-import { escapeRegExp, isSafeRegex, validateOperation, type ToolExecutor, type ToolOp } from "../core/index.ts";
+import { escapeRegExp, isSafeRegex, MAX_GREP_PATTERN_LENGTH, validateOperation, type ToolExecutor, type ToolOp } from "../core/index.ts";
 
 /** The shell-like shape the core engine branches on (see core/runner.ts). */
 interface OpResult {
@@ -650,6 +650,9 @@ async function grepOp(
 ): Promise<OpResult> {
   const pattern = String(op.pattern ?? "");
   if (!pattern) return fail("grep", "missing required arg `pattern`");
+  if (pattern.length > MAX_GREP_PATTERN_LENGTH) {
+    return fail("grep", `pattern exceeds the maximum length of ${MAX_GREP_PATTERN_LENGTH} characters`);
+  }
   const scope = await target(op, root, base, "grep");
   if (scope.err) return scope.err;
 

@@ -251,8 +251,9 @@ session root; dependency symlinks below an exact `node_modules` path segment are
 exception.
 
 Native operation limits are bounded before execution: `read` accepts at most 10,000 lines,
-`grep`/`find` at most 1,000 results, `ls` at most 5,000 entries, and `grep` context at most
-100 lines per side. Limits and offsets are positive integers; omitted values keep adapter defaults.
+`grep`/`find` at most 1,000 results, `ls` at most 5,000 entries, `grep` patterns at most
+8,192 characters, and `grep` context at most 100 lines per side. Limits and offsets are positive
+integers; omitted values keep adapter defaults.
 
 The MCP adapter revalidates canonical paths at operation boundaries, post-validates search result
 paths, uses stable directory handles for local walks/listings, and opens files with `O_NOFOLLOW`

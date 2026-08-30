@@ -4,6 +4,7 @@ import {
   MAX_COMMAND_LENGTH,
   MAX_FIND_RESULTS,
   MAX_GREP_CONTEXT,
+  MAX_GREP_PATTERN_LENGTH,
   MAX_GREP_RESULTS,
   MAX_LS_ENTRIES,
   MAX_READ_LINES,
@@ -23,9 +24,9 @@ const boundedInteger = (op: ToolOp, key: string, min: number, max: number): stri
 };
 const optionalBoolean = (op: ToolOp, key: string): string | null =>
   op[key] === undefined || typeof op[key] === "boolean" ? null : `${key} must be a boolean`;
-const stringLength = (op: ToolOp, key: string): string | null =>
-  typeof op[key] === "string" && op[key].length > MAX_COMMAND_LENGTH
-    ? `${key} exceeds the maximum length of ${MAX_COMMAND_LENGTH} characters`
+const stringLength = (op: ToolOp, key: string, max = MAX_COMMAND_LENGTH): string | null =>
+  typeof op[key] === "string" && op[key].length > max
+    ? `${key} exceeds the maximum length of ${max} characters`
     : null;
 
 /** Validate one operation before any consumer can assume its shape. */
@@ -46,7 +47,7 @@ export function validateOperation(operation: unknown): string | null {
     case "read":
       return requiredString("path") ?? checkedString("path") ?? boundedInteger(op, "offset", 1, Number.MAX_SAFE_INTEGER) ?? boundedInteger(op, "limit", 1, MAX_READ_LINES);
     case "grep":
-      return requiredString("pattern") ?? checkedString("pattern", "path", "glob") ?? optionalString(op, "path") ?? optionalString(op, "glob") ??
+      return requiredString("pattern") ?? stringLength(op, "pattern", MAX_GREP_PATTERN_LENGTH) ?? checkedString("path", "glob") ?? optionalString(op, "path") ?? optionalString(op, "glob") ??
         optionalBoolean(op, "ignoreCase") ?? optionalBoolean(op, "literal") ?? boundedInteger(op, "context", 0, MAX_GREP_CONTEXT) ??
         boundedInteger(op, "limit", 1, MAX_GREP_RESULTS);
     case "find":

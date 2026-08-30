@@ -3,6 +3,7 @@ import {
   CONDITION_KINDS,
   MAX_CONDITION_LENGTH,
   MAX_CONDITION_TOTAL_LENGTH,
+  MAX_GREP_PATTERN_LENGTH,
   MAX_OPERATIONS_PER_NODE,
   MAX_PARALLEL_CONCURRENCY,
   PLAN_FIELD_NAMES,
@@ -40,6 +41,7 @@ describe("canonical plan language", () => {
     expect(PLAN_SHAPE_DESCRIPTION).toContain("mutates");
     expect(PLAN_SHAPE_DESCRIPTION).toContain(`${MAX_CONDITION_LENGTH} characters per field`);
     expect(PLAN_SHAPE_DESCRIPTION).toContain(`${MAX_CONDITION_TOTAL_LENGTH} characters in aggregate`);
+    expect(PLAN_SHAPE_DESCRIPTION).toContain(`grep patterns are capped at ${MAX_GREP_PATTERN_LENGTH} characters`);
     expect(PLAN_SHAPE_DESCRIPTION).toContain(RESOURCE_LIMIT_DESCRIPTION);
     expect(RESOURCE_LIMIT_DESCRIPTION).toContain("read limit at most 10000");
     expect(RESOURCE_LIMIT_DESCRIPTION).toContain("grep/find limit at most 1000");

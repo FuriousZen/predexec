@@ -15,6 +15,7 @@ import {
   MAX_GREP_RESULTS,
   MAX_LS_ENTRIES,
   MAX_READ_LINES,
+  MAX_GREP_PATTERN_LENGTH,
   type ToolOp,
 } from "../core/index.ts";
 import { PLAN_SHAPE_DESCRIPTION } from "../plan-language.ts";
@@ -88,13 +89,14 @@ describe.each(variants)("opencode createToolExecutor ($name) — SDK response ma
       { tool: "find", pattern: "*.ts", limit: MAX_FIND_RESULTS },
       { tool: "ls", path: ".", limit: MAX_LS_ENTRIES },
       { tool: "grep", pattern: "x", context: MAX_GREP_CONTEXT },
+      { tool: "grep", pattern: "x".repeat(MAX_GREP_PATTERN_LENGTH) },
     ]) {
       expect((await executor(operation, { cwd: repo })).stderr).not.toContain("at most");
     }
     // OpenCode's native grep does not support context; the exact-bound context
     // is rejected as an unsupported host feature, but remains below predexec's
     // shared ceiling and therefore does not reach the SDK.
-    expect(calls).toEqual(["read", "grep", "find", "ls"]);
+    expect(calls).toEqual(["read", "grep", "find", "ls", "grep"]);
 
     calls.length = 0;
     for (const operation of [
@@ -103,10 +105,11 @@ describe.each(variants)("opencode createToolExecutor ($name) — SDK response ma
       { tool: "find", pattern: "*.ts", limit: MAX_FIND_RESULTS + 1 },
       { tool: "ls", path: ".", limit: MAX_LS_ENTRIES + 1 },
       { tool: "grep", pattern: "x", context: MAX_GREP_CONTEXT + 1 },
+      { tool: "grep", pattern: "x".repeat(MAX_GREP_PATTERN_LENGTH + 1) },
     ]) {
       const result = await executor(operation, { cwd: repo });
       expect(result.exitCode).toBe(1);
-      expect(result.stderr).toContain("at most");
+      expect(result.stderr).toMatch(/at most|maximum length/);
     }
     expect(calls).toEqual([]);
   });

@@ -11,6 +11,7 @@ import {
   MAX_GREP_RESULTS,
   MAX_LS_ENTRIES,
   MAX_READ_LINES,
+  MAX_GREP_PATTERN_LENGTH,
   type ToolOp,
 } from "../../core/index.ts";
 import {
@@ -92,12 +93,21 @@ describe("mcp tool-ops — read", () => {
       { tool: "find", pattern: "*.txt", limit: MAX_FIND_RESULTS + 1 },
       { tool: "ls", limit: MAX_LS_ENTRIES + 1 },
       { tool: "grep", pattern: "alpha", context: MAX_GREP_CONTEXT + 1 },
+      { tool: "grep", pattern: "x".repeat(MAX_GREP_PATTERN_LENGTH + 1) },
     ];
     for (const operation of over) {
       const result = await run(operation);
       expect(result.exitCode).toBeGreaterThan(0);
-      expect(result.stderr).toContain("at most");
+      expect(result.stderr).toMatch(/at most|maximum length/);
     }
+  });
+
+  it("enforces the shared grep pattern ceiling before either search path", async () => {
+    const exact = await run({ tool: "grep", pattern: "x".repeat(MAX_GREP_PATTERN_LENGTH) }, NODE_ONLY);
+    expect(exact.stderr).not.toContain("maximum length");
+    const over = await run({ tool: "grep", pattern: "x".repeat(MAX_GREP_PATTERN_LENGTH + 1) }, NODE_ONLY);
+    expect(over.exitCode).toBe(2);
+    expect(over.stderr).toContain(`maximum length of ${MAX_GREP_PATTERN_LENGTH}`);
   });
 
   it("returns the whole file on stdout with exit 0", async () => {

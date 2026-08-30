@@ -12,6 +12,7 @@ import {
   MAX_SEARCH_RESULTS,
   MAX_GREP_RESULTS,
   MAX_FIND_RESULTS,
+  MAX_GREP_PATTERN_LENGTH,
   MAX_LS_ENTRIES,
   MAX_GREP_CONTEXT,
 } from "./core/types.ts";
@@ -63,6 +64,7 @@ export {
   MAX_SEARCH_RESULTS,
   MAX_GREP_RESULTS,
   MAX_FIND_RESULTS,
+  MAX_GREP_PATTERN_LENGTH,
   MAX_LS_ENTRIES,
   MAX_GREP_CONTEXT,
 };
@@ -77,4 +79,5 @@ export const PLAN_SHAPE_DESCRIPTION =
   `maxDepth is capped at ${DEFAULT_MAX_DEPTH}; plans have at most ${MAX_PLAN_NODES} nodes and ${MAX_PLAN_EDGES} edges; ` +
   `commands and string arguments are capped at ${MAX_COMMAND_LENGTH} characters. ` +
   `Condition strings and paths are capped at ${MAX_CONDITION_LENGTH} characters per field and ${MAX_CONDITION_TOTAL_LENGTH} characters in aggregate; ` +
+  `grep patterns are capped at ${MAX_GREP_PATTERN_LENGTH} characters; ` +
   `${PLAN_CWD_DESCRIPTION} ${RESOURCE_LIMIT_DESCRIPTION} ${JSON_PATH_SINGLE_OP_LINE} `;

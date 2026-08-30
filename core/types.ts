@@ -193,6 +193,8 @@ export const MAX_READ_LINES = 10_000;
 export const MAX_SEARCH_RESULTS = 1_000;
 export const MAX_GREP_RESULTS = MAX_SEARCH_RESULTS;
 export const MAX_FIND_RESULTS = MAX_SEARCH_RESULTS;
+/** Maximum length of a native grep pattern across all adapters. */
+export const MAX_GREP_PATTERN_LENGTH = 8 * 1024;
 /** Maximum directory entries a native ls operation may retain. */
 export const MAX_LS_ENTRIES = 5_000;
 /** Maximum context lines on either side of a native grep match. */

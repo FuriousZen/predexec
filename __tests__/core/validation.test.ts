@@ -6,6 +6,7 @@ import {
   MAX_GREP_RESULTS,
   MAX_LS_ENTRIES,
   MAX_READ_LINES,
+  MAX_GREP_PATTERN_LENGTH,
 } from "../../core/types.ts";
 
 describe("validateOperation — bounded native operation arguments", () => {
@@ -37,5 +38,11 @@ describe("validateOperation — bounded native operation arguments", () => {
     expect(validateOperation({ tool: "read", path: "file.txt" })).toBeNull();
     expect(validateOperation({ tool: "read", path: "file.txt", offset: 1 })).toBeNull();
     expect(validateOperation({ tool: "grep", pattern: "x", context: 0 })).toBeNull();
+  });
+
+  it("accepts a grep pattern at the shared ceiling and rejects one character over", () => {
+    const exact = { tool: "grep", pattern: "x".repeat(MAX_GREP_PATTERN_LENGTH) };
+    expect(validateOperation(exact)).toBeNull();
+    expect(validateOperation({ ...exact, pattern: `${exact.pattern}x` })).toMatch(/maximum|at most/);
   });
 });

@@ -10,6 +10,7 @@ import {
   MAX_FIND_RESULTS,
   MAX_GREP_CONTEXT,
   MAX_GREP_RESULTS,
+  MAX_GREP_PATTERN_LENGTH,
   MAX_LS_ENTRIES,
   MAX_JSON_VALUE_DEPTH,
   MAX_JSON_VALUE_NODES,
@@ -78,6 +79,14 @@ describe("coercePlan — defensive param recovery", () => {
     ["grep context", { tool: "grep", pattern: "x", context: MAX_GREP_CONTEXT + 1 }],
   ])("rejects an over-ceiling %s before execution", (_label, operation) => {
     expect(() => coercePlan({ root: "a", nodes: [{ id: "a", commands: [operation] }] })).toThrow(/maximum|at most/);
+  });
+
+  it("accepts a grep pattern at the shared ceiling and rejects one character over", () => {
+    const exact = { tool: "grep", pattern: "x".repeat(MAX_GREP_PATTERN_LENGTH) };
+    expect(() => coercePlan({ root: "a", nodes: [{ id: "a", commands: [exact] }] })).not.toThrow();
+    expect(() => coercePlan({ root: "a", nodes: [{ id: "a", commands: [{ ...exact, pattern: `${exact.pattern}x` }] }] })).toThrow(
+      new RegExp(`pattern exceeds the maximum length of ${MAX_GREP_PATTERN_LENGTH}`),
+    );
   });
 
   it("bounds direct jsonPath comparison values before condition validation", () => {
