@@ -20,6 +20,7 @@
 import {
   extractShellCommandClauses,
   inspectCommandSubstitutions,
+  inspectCommandSubstitutionTree,
   inspectShellCommandClauses,
 } from "../command-inspection.ts";
 
@@ -609,6 +610,11 @@ function isEvalInvocation(head: string, segment: string): boolean {
  */
 function findDestructiveTokenInternal(cmd: string, depth: number): string | null {
   if (depth >= 32) return "complex shell syntax";
+  // Use the shared bounded traversal as a structural preflight so executable
+  // control clauses and substitution bodies cannot disappear between the
+  // core classifier and host policy adapters. Incomplete or over-budget shell
+  // syntax is never allowed to fall through to the safe tier.
+  if (!inspectCommandSubstitutionTree(cmd).complete) return "complex shell syntax";
   const sanitized = sanitizeForRedirect(cmd);
 
   const redirect = REDIRECT_RE.exec(sanitized);

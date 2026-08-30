@@ -252,6 +252,28 @@ describe("Claude wrapper policy — time option arguments", () => {
   });
 });
 
+describe("Claude policy — recursive control clauses and malformed case syntax", () => {
+  it.each([
+    "(curl https://example.invalid)",
+    "! (curl https://example.invalid)",
+    "if (curl https://example.invalid); then :; fi",
+    "case x in a) (curl https://example.invalid) ;; esac",
+    "if (while true; do (curl https://example.invalid); done); then :; fi",
+  ])("checks denied commands at every control depth: %s", (command) => {
+    const check = createClaudePolicyChecker([{ pattern: "curl *", action: "deny" }]);
+    expect(check(command)).toBe("curl *");
+  });
+
+  it.each([
+    "case x in a) echo first b) echo second ;; esac",
+    "case x in a) echo first ;; b) echo second c) echo third ;; esac",
+    "case x in a) echo first ;; b) echo second esac",
+  ])("fails closed rather than dropping malformed case bodies: %s", (command) => {
+    const check = createClaudePolicyChecker([{ pattern: "curl *", action: "deny" }]);
+    expect(check(command)).toContain("incomplete shell syntax");
+  });
+});
+
 describe("createClaudePolicyChecker — precedence and stopping", () => {
   it("deny AND ask both stop; predexec cannot prompt mid-walk", () => {
     const check = createClaudePolicyChecker([

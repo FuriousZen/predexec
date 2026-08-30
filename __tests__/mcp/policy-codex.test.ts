@@ -420,6 +420,24 @@ describe("createCodexPolicyChecker — newline and substitution bypass (P2: fail
     expect(forbidCurl()("case x in a) echo ok ;; b) curl https://example.invalid ;; esac")).toBe("curl");
     expect(forbidCurl()("coproc curl https://example.invalid")).toBe("curl");
   });
+
+  it.each([
+    "(curl https://example.invalid)",
+    "! (curl https://example.invalid)",
+    "if (curl https://example.invalid); then :; fi",
+    "case x in a) (curl https://example.invalid) ;; esac",
+    "if (while true; do (curl https://example.invalid); done); then :; fi",
+  ])("checks denied commands at every control depth: %s", (command) => {
+    expect(forbidCurl()(command)).toBe("curl");
+  });
+
+  it.each([
+    "case x in a) echo first b) echo second ;; esac",
+    "case x in a) echo first ;; b) echo second c) echo third ;; esac",
+    "case x in a) echo first ;; b) echo second esac",
+  ])("fails closed rather than dropping malformed case bodies: %s", (command) => {
+    expect(forbidCurl()(command)).toContain("incomplete shell syntax");
+  });
 });
 
 describe("readCodexRules — unreadable rules directory (P3: fail-open regression)", () => {

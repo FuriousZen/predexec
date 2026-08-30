@@ -96,9 +96,7 @@ import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { splitCommandSegments } from "../core/index.ts";
 import {
-  extractShellCommandClauses,
   inspectCommandSubstitutionTree,
-  inspectShellCommandClauses,
   stripLeadingAssignmentsAndWrappers,
   tokenizeShellWords,
   type WrapperInspectionOptions,
@@ -595,8 +593,6 @@ export function createCodexPolicyChecker(
       return null;
     };
   }
-  if (rules.length === 0) return () => null;
-
   return (operation: Operation) => {
     const cmd = typeof operation === "string"
       ? operation
@@ -605,10 +601,7 @@ export function createCodexPolicyChecker(
     try {
       const inspected = inspectCommandSubstitutionTree(cmd);
       for (const text of inspected.commands) {
-          if (!inspectShellCommandClauses(text).complete) {
-            return "incomplete shell syntax (policy inspection failed)";
-          }
-          for (const line of [text, ...extractShellCommandClauses(text)].flatMap((line) => line.split("\n"))) {
+          for (const line of text.split("\n")) {
             for (const segment of splitCommandSegments(line)) {
               const trimmed = segment.trim();
               if (!trimmed) continue;
@@ -621,10 +614,7 @@ export function createCodexPolicyChecker(
               const tokenForms = rawTokens.length === strippedTokens.length && rawTokens.every((token, i) => token === strippedTokens[i])
                 ? [rawTokens]
                 : [rawTokens, strippedTokens];
-              const clauseForms = tokenForms.flatMap((form) => [
-                form,
-                ...extractShellCommandClauses(form.join(" ")).map(tokenizeShellWords),
-              ]);
+              const clauseForms = tokenForms;
               let winner: CodexRule | null = null;
               for (const rule of rules) {
                 const matches = clauseForms.some(

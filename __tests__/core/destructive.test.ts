@@ -361,6 +361,14 @@ describe("mutation classifier — wrapper options and command separators", () =>
     expect(findDestructiveToken("case x in a) cat file ;; b) printf '%s' ok ;; esac")).toBeNull();
   });
 
+  it.each([
+    "case x in a) echo first b) echo second ;; esac",
+    "case x in a) echo first ;; b) echo second c) echo third ;; esac",
+    "case x in a) echo first ;; b) echo second esac",
+  ])("fails closed rather than dropping malformed case bodies: %s", (command) => {
+    expect(findDestructiveToken(command)).toBe("complex shell syntax");
+  });
+
   it("does not silently discard deeply nested substitutions", () => {
     const nested = `${"echo $(".repeat(6)}git init scratch${")".repeat(6)}`;
     expect(findDestructiveToken(nested)).not.toBeNull();

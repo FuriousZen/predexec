@@ -44,6 +44,12 @@ export interface CommandSubstitutionTree {
   complete: boolean;
 }
 
+export interface ExecutableBodyTreeOptions {
+  maxDepth?: number;
+  maxCommands?: number;
+  maxChars?: number;
+}
+
 /**
  * Inspect command substitutions without treating punctuation in shell quotes
  * as syntax. This is intentionally a small lexer, not a shell evaluator: the
@@ -184,26 +190,38 @@ export function extractCommandSubstitutions(command: string): string[] {
 /** Walk executable substitution bodies under explicit work/depth budgets. */
 export function inspectCommandSubstitutionTree(
   command: string,
-  options: { maxDepth?: number; maxCommands?: number; maxChars?: number } = {},
+  options: ExecutableBodyTreeOptions = {},
 ): CommandSubstitutionTree {
   const maxDepth = options.maxDepth ?? 32;
   const maxCommands = options.maxCommands ?? 512;
   const maxChars = options.maxChars ?? 1_000_000;
   const commands: string[] = [];
   const pending: Array<{ text: string; depth: number }> = [{ text: command, depth: 0 }];
+  const seen = new Set<string>();
+  const queued = new Set<string>([command]);
   let chars = 0;
   while (pending.length > 0) {
     const item = pending.shift()!;
+    if (seen.has(item.text)) continue;
+    seen.add(item.text);
+    if (commands.length >= maxCommands) return { commands, complete: false };
     const inspected = inspectCommandSubstitutions(item.text);
+    const clauses = inspectShellCommandClauses(item.text);
     commands.push(item.text);
     chars += item.text.length;
-    if (!inspected.complete || commands.length > maxCommands || chars > maxChars) {
+    if (!inspected.complete || !clauses.complete || chars > maxChars) {
       return { commands, complete: false };
     }
-    if (inspected.bodies.length > 0 && item.depth >= maxDepth) {
+    const children = [...inspected.bodies, ...clauses.clauses]
+      .map((child) => child.trim())
+      .filter((child) => child !== "" && !seen.has(child) && !queued.has(child));
+    if (children.length > 0 && item.depth >= maxDepth) {
       return { commands, complete: false };
     }
-    for (const body of inspected.bodies) pending.push({ text: body, depth: item.depth + 1 });
+    for (const body of children) {
+      queued.add(body);
+      pending.push({ text: body, depth: item.depth + 1 });
+    }
   }
   return { commands, complete: true };
 }
@@ -270,25 +288,33 @@ export interface ShellClauseInspection {
 
 /** Inspect executable clauses and report control syntax that cannot be split safely. */
 export function inspectShellCommandClauses(segment: string): ShellClauseInspection {
+  const groups = inspectParenthesizedBodies(segment);
+  // Arithmetic evaluation uses the same punctuation as a subshell but does
+  // not execute its contents as a command clause. Substitutions inside it are
+  // still discovered independently by inspectCommandSubstitutions.
+  if (/^\s*\(\(/.test(segment)) return { clauses: groups.bodies, complete: groups.complete };
   const caseClauses = extractCaseBranchBodies(segment);
   if (caseClauses !== null) {
     const hasCase = tokenizeShellWords(segment)[0] === "case";
     return {
-      clauses: caseClauses,
-      complete: !hasCase || findUnquotedWord(segment, "in") !== -1 &&
-        findUnquotedWord(segment, "esac") !== -1,
+      clauses: uniqueClauses([...caseClauses.bodies, ...groups.bodies]),
+      complete: caseClauses.complete && groups.complete &&
+        (!hasCase || findUnquotedWord(segment, "in") !== -1 &&
+          findUnquotedWord(segment, "esac") !== -1),
     };
   }
   const tokens = tokenizeShellWords(segment);
-  if (tokens.length === 0) return { clauses: [], complete: true };
+  if (tokens.length === 0) return { clauses: groups.bodies, complete: groups.complete };
   if (tokens[0] === "coproc") {
     let start = 1;
     // Bash permits `coproc NAME { commands; }` as well as `coproc commands`.
     if (tokens[start] && tokens[start] !== "{" && tokens[start + 1] === "{") start++;
     if (tokens[start] === "{") start++;
-    if (start >= tokens.length) return { clauses: [], complete: false };
+    if (start >= tokens.length) return { clauses: groups.bodies, complete: false };
     const body = tokens.slice(start).join(" ").replace(/}\s*$/, "").trim();
-    return body ? { clauses: [body], complete: true } : { clauses: [], complete: false };
+    return body
+      ? { clauses: uniqueClauses([body, ...groups.bodies]), complete: groups.complete }
+      : { clauses: groups.bodies, complete: false };
   }
   const reserved = new Set([
     "{", "}", "(", ")", "!", "if", "then", "elif", "else", "fi",
@@ -296,26 +322,28 @@ export function inspectShellCommandClauses(segment: string): ShellClauseInspecti
   ]);
   let index = 0;
   while (index < tokens.length && reserved.has(tokens[index]!)) index++;
-  if (tokens[0] === "case") return { clauses: [], complete: false };
+  if (tokens[0] === "case") return { clauses: groups.bodies, complete: false };
   if (tokens[0] === "function" && index < tokens.length && !reserved.has(tokens[index]!)) index++;
   while (index < tokens.length && reserved.has(tokens[index]!)) index++;
-  if (index === 0 || index >= tokens.length) return { clauses: [], complete: true };
-  return { clauses: [tokens.slice(index).join(" ")], complete: true };
+  if (index === 0 || index >= tokens.length) return { clauses: groups.bodies, complete: groups.complete };
+  return { clauses: uniqueClauses([tokens.slice(index).join(" "), ...groups.bodies]), complete: groups.complete };
 }
 
 /** Extract executable bodies from a complete `case ... in ... esac` command. */
-function extractCaseBranchBodies(segment: string): string[] | null {
+function extractCaseBranchBodies(segment: string): { bodies: string[]; complete: boolean } | null {
   const tokens = tokenizeShellWords(segment);
   if (tokens[0] !== "case") return null;
   const start = findUnquotedWord(segment, "in");
-  if (start === -1) return [];
+  if (start === -1) return { bodies: [], complete: false };
   const bodyStart = start + 2;
   const end = findUnquotedWord(segment.slice(bodyStart), "esac");
-  if (end === -1) return [];
+  if (end === -1) return { bodies: [], complete: false };
   const body = segment.slice(bodyStart, bodyStart + end);
   const clauses: string[] = [];
   let branchStart = 0;
   let patternEnd = -1;
+  let groupDepth = 0;
+  let complete = true;
   let quote: "'" | '"' | null = null;
   for (let i = 0; i < body.length; i++) {
     const ch = body[i]!;
@@ -331,21 +359,105 @@ function extractCaseBranchBodies(segment: string): string[] | null {
       quote = ch;
       continue;
     }
-    if (ch === ")" && patternEnd === -1) {
-      patternEnd = i;
-      branchStart = i + 1;
+    if (ch === "(") {
+      if (patternEnd !== -1) groupDepth++;
       continue;
     }
-    const isTerminator = ch === ";" && (body[i + 1] === ";" || body[i + 1] === "&");
+    if (ch === ")") {
+      if (groupDepth > 0) groupDepth--;
+      else if (patternEnd === -1) {
+        patternEnd = i;
+        branchStart = i + 1;
+      } else {
+        complete = false;
+      }
+      continue;
+    }
+    const isTerminator = groupDepth === 0 && ch === ";" &&
+      (body[i + 1] === ";" || body[i + 1] === "&");
     if (isTerminator && patternEnd !== -1) {
       const clause = body.slice(branchStart, i).trim();
       if (clause) clauses.push(clause);
       i++;
       if (body[i] === ";" || body[i] === "&") i++;
       patternEnd = -1;
+      branchStart = i;
     }
   }
-  return clauses;
+  if (quote !== null || groupDepth !== 0 || patternEnd !== -1) complete = false;
+  if (patternEnd !== -1) {
+    const clause = body.slice(branchStart).trim();
+    if (clause) clauses.push(clause);
+  }
+  return { bodies: clauses, complete };
+}
+
+function uniqueClauses(clauses: string[]): string[] {
+  return [...new Set(clauses.map((clause) => clause.trim()).filter(Boolean))];
+}
+
+interface ParenthesizedBodyInspection {
+  bodies: string[];
+  complete: boolean;
+}
+
+/** Extract executable `(...)` groups, excluding quoted text, arithmetic, and substitutions. */
+function inspectParenthesizedBodies(command: string): ParenthesizedBodyInspection {
+  const bodies: string[] = [];
+  let quote: "'" | '"' | null = null;
+  let complete = true;
+  for (let i = 0; i < command.length; i++) {
+    const ch = command[i]!;
+    if (ch === "\\") {
+      i++;
+      continue;
+    }
+    if (quote) {
+      if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      quote = ch;
+      continue;
+    }
+    if (ch !== "(") continue;
+    if (command[i + 1] === "(") {
+      i++;
+      continue;
+    }
+    if (command[i - 1] === "$" || command[i - 1] === "<" || command[i - 1] === ">") continue;
+    let depth = 1;
+    let innerQuote: "'" | '"' | null = null;
+    let close = -1;
+    for (let j = i + 1; j < command.length; j++) {
+      const inner = command[j]!;
+      if (inner === "\\") {
+        j++;
+        continue;
+      }
+      if (innerQuote) {
+        if (inner === innerQuote) innerQuote = null;
+        continue;
+      }
+      if (inner === "'" || inner === '"') {
+        innerQuote = inner;
+        continue;
+      }
+      if (inner === "(") depth++;
+      else if (inner === ")" && --depth === 0) {
+        close = j;
+        break;
+      }
+    }
+    if (close === -1) {
+      complete = false;
+      continue;
+    }
+    bodies.push(command.slice(i + 1, close));
+    i = close;
+  }
+  if (quote !== null) complete = false;
+  return { bodies: uniqueClauses(bodies), complete };
 }
 
 function findUnquotedWord(text: string, word: string): number {

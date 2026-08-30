@@ -411,3 +411,71 @@ budget exhaustion stop speculation. Policy inspection may therefore stop a
 command that a full shell parser would prove harmless, which is preferable to
 silently allowing an uninspected executable body. No new production dependency,
 host wrapper vocabulary, or policy precedence rule was introduced.
+
+## Extended integration fix round 6 — malformed case and recursive control clauses
+
+This user-authorized extension started from `d4ab61e64ee8c2427eb045650249cb7901363679`.
+It addresses the two remaining Important findings from the fifth review round:
+malformed `case` branches were reported complete after dropping an unterminated
+body, and Claude/Codex policy matching expanded only one control-clause level.
+No ledger edit, version bump, publish, push, merge, or release-artifact staging
+was performed.
+
+### RED evidence
+
+Before changing production code, the focused regressions were run with:
+
+```text
+./node_modules/.bin/vitest run __tests__/command-inspection.test.ts __tests__/core/destructive.test.ts __tests__/mcp/policy-claude.test.ts __tests__/mcp/policy-codex.test.ts
+```
+
+Result: exit 1; **23 tests failed, 362 passed**. The failures reproduced
+first/middle/last malformed case branches, unmatched groups, and denied
+commands nested in parenthesized, negated, conditional, case, and nested
+control clauses for both policy adapters.
+
+### GREEN implementation
+
+- The shared command-inspection traversal now walks substitution bodies and
+  executable control/group clauses recursively under depth, command-count, and
+  character budgets. It tracks seen/queued bodies to avoid self-loop and
+  duplicate expansion, and reports incomplete syntax before any pending body is
+  silently discarded.
+- Case extraction validates every branch's pattern/body delimiter and accepts
+  `;;`, `;&`, and `;;&`; an unterminated or malformed branch is retained for
+  diagnostics but marks the whole inspection incomplete. Quoted `esac` and
+  terminator text remains literal. Arithmetic `(( ... ))` is excluded from
+  executable-group extraction while substitutions inside it remain inspected.
+- Claude and Codex consume the recursive shared tree directly, preserving their
+  raw/stripped forms and existing deny/ask and most-restrictive precedence.
+  Both adapters fail closed with actionable incomplete-shell results even when
+  no restrictive rule is configured. Core mutation inspection uses the same
+  structural preflight and remains fail closed on incomplete/over-budget
+  executable syntax.
+
+### GREEN verification
+
+Focused security suites passed **385/385 tests**. The broader engine/policy
+verification passed **254/254 tests**, and `./node_modules/.bin/tsc --noEmit`
+passed with no diagnostics. The full suite passed **857/857 tests**.
+
+```text
+pnpm run build
+./node_modules/.bin/vitest run __tests__/release-hygiene.test.ts __tests__/pack.test.ts
+git diff --check
+```
+
+Build succeeded; release/pack verification passed **9/9 tests**, including the
+packed-install CLI/MCP smoke checks; and `git diff --check` passed.
+
+### Self-review
+
+The implementation is limited to the shared pure inspection seam, the core
+mutation preflight, the Claude/Codex policy consumers, and focused regressions.
+The bounded traversal is quote-aware, avoids arithmetic and quoted literals,
+does not add wrapper vocabulary or alter host precedence, and preserves the
+existing valid case/coprocess, substitution, read-only, and raw/stripped
+matching tests. Malformed first/middle/last branches and unmatched executable
+groups now fail closed instead of silently omitting bodies. Generated `dist/`
+output remains ignored and unstaged; no runtime dependency, ledger, or release
+metadata changed.

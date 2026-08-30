@@ -44,9 +44,7 @@ import { homedir, platform } from "node:os";
 import { dirname, join, parse as parsePath } from "node:path";
 import { escapeRegExp, splitCommandSegments } from "../core/index.ts";
 import {
-  extractShellCommandClauses,
   inspectCommandSubstitutionTree,
-  inspectShellCommandClauses,
   stripLeadingAssignmentsAndWrappers,
   type WrapperInspectionOptions,
 } from "../command-inspection.ts";
@@ -494,8 +492,6 @@ export function createClaudePolicyChecker(
     // it rather than an ask from a file that happened to be read first. Both
     // stop; only the pattern named in the transcript changes.
     .sort((a, b) => (a.action === b.action ? 0 : a.action === "deny" ? -1 : 1));
-  if (compiled.length === 0) return () => null;
-
   return (input: string | Operation) => {
     const cmd = typeof input === "string"
       ? input
@@ -507,10 +503,7 @@ export function createClaudePolicyChecker(
       // work budget; silently dropping pending bodies would be fail-open.
       const inspected = inspectCommandSubstitutionTree(cmd);
       for (const text of inspected.commands) {
-          if (!inspectShellCommandClauses(text).complete) {
-            return "incomplete shell syntax (policy inspection failed)";
-          }
-          for (const line of [text, ...extractShellCommandClauses(text)].flatMap((line) => line.split("\n"))) {
+          for (const line of text.split("\n")) {
             for (const segment of splitCommandSegments(line)) {
               const trimmed = segment.trim();
               if (!trimmed) continue;
@@ -520,7 +513,7 @@ export function createClaudePolicyChecker(
               // command.
               const stripped = stripBashWrappers(trimmed);
               const forms = stripped === trimmed ? [trimmed] : [trimmed, stripped];
-              const clauseForms = forms.flatMap((form) => [form, ...extractShellCommandClauses(form)]);
+              const clauseForms = forms;
               for (const rule of compiled) {
                 if (clauseForms.some((form) => rule.regex.test(form))) return rule.pattern;
               }
