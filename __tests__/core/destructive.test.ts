@@ -75,6 +75,74 @@ describe("isDestructiveCommand — heuristic coverage (2026-07 audit)", () => {
   });
 });
 
+describe("final classifier blockers", () => {
+  it.each([
+    "echo x >&out",
+    "echo x >& /tmp/out",
+    "echo x 1>&out",
+    'echo x >&"$target"',
+    "echo x 2>&${target}",
+  ])("blocks file/dynamic >& targets: %s", (command) => {
+    expect(findDestructiveToken(command)).not.toBeNull();
+  });
+
+  it.each([
+    "echo x >&2",
+    "echo x 1>&2",
+    "echo x 2>&1",
+    "echo x >&-",
+    "echo x >/dev/null",
+    "echo x 2>/dev/null",
+  ])("preserves safe fd duplication/close and /dev/null: %s", (command) => {
+    expect(findDestructiveToken(command)).toBeNull();
+  });
+
+  it.each([
+    `node -e "child_process.exec('echo ok')"`,
+    `node -e "child_process.execSync('echo ok')"`,
+    `node -e "child_process.spawn('echo', ['ok'])"`,
+    `node -e "child_process.spawnSync('echo', ['ok'])"`,
+    `node -e "child_process.fork('worker.js')"`,
+    `node -e "require('child_process').exec('echo ok')"`,
+    `node -e "const cp = require('child_process'); cp.exec('echo ok')"`,
+    `node -e "const { exec } = require('child_process'); exec('echo ok')"`,
+    `node -e "import { spawn as run } from 'child_process'; run('echo', ['ok'])"`,
+    `python -c "os.system('echo ok')"`,
+    `python -c "os.popen('echo ok')"`,
+    `python -c "subprocess.run(['echo', 'ok'])"`,
+    `python -c "subprocess.call(['echo', 'ok'])"`,
+    `python -c "subprocess.Popen(['echo', 'ok'])"`,
+    `python -c "subprocess.check_output(['echo', 'ok'])"`,
+    `ruby -e "system('echo ok')"`,
+    `ruby -e "exec('echo ok')"`,
+    `ruby -e "spawn('echo', 'ok')"`,
+    `ruby -e "Open3.capture2('echo ok')"`,
+    `perl -e "system('echo ok')"`,
+    `perl -e "exec('echo ok')"`,
+    `perl -e "readpipe('echo ok')"`,
+    `php -r "system('echo ok');"`,
+    `php -r "shell_exec('echo ok');"`,
+    `php -r "proc_open('echo ok', [], $pipes);"`,
+  ])("blocks interpreter execution sink: %s", (command) => {
+    expect(findDestructiveToken(command)).not.toBeNull();
+  });
+
+  it.each([
+    `node -e "const x = 'child_process.exec(\\\"echo\\\")'; // child_process.spawn('x')"`,
+    `python -c "# os.system('echo ok')\\nprint('os.popen')"`,
+    `ruby -e "puts 'Open3.capture2(\\\"echo\\\")'"`,
+    `perl -e "print 'system(\\\"echo\\\")'"`,
+    `php -r "echo 'shell_exec(\\\"echo\\\")'; // proc_open('x', [], $p);"`,
+  ])("allows interpreter execution names in inert data/comments: %s", (command) => {
+    expect(findDestructiveToken(command)).toBeNull();
+  });
+
+  it("does not treat heredoc body comparisons as shell redirects", () => {
+    expect(findDestructiveToken("cat <<EOF\nvalue > other\nEOF")).toBeNull();
+    expect(findDestructiveToken("cat <<'EOF'\nvalue >= other\nEOF")).toBeNull();
+  });
+});
+
 describe("safe tier — pure-reader heads skip the word scan", () => {
   // THE false-positive fix: searching a codebase for writer words is a read.
   const quotedWriterSearches = [

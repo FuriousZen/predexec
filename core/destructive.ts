@@ -40,9 +40,67 @@ export const MUTATING_TOOLS = new Set(["edit", "write"]);
  * are left alone: outside `[[ ]]`, `test $x > 5` IS a real redirect to a file
  * named `5`.
  */
+function maskHeredocBodies(cmd: string): string {
+  const chars = cmd.split("");
+  const ranges: Array<[number, number]> = [];
+  const pending: Array<{ delimiter: string; stripTabs: boolean; bodyStart: number }> = [];
+  let quote: "'" | '"' | null = null;
+  let lineStart = 0;
+  while (lineStart < cmd.length) {
+    const newline = cmd.indexOf("\n", lineStart);
+    const lineEnd = newline < 0 ? cmd.length : newline;
+    if (pending.length > 0) {
+      const candidate = cmd.slice(lineStart, lineEnd).replace(/\r$/, "");
+      const expected = pending[0]!;
+      const comparable = expected.stripTabs ? candidate.replace(/^\t+/, "") : candidate;
+      if (comparable === expected.delimiter) {
+        ranges.push([expected.bodyStart, newline < 0 ? lineEnd : newline + 1]);
+        pending.shift();
+        if (pending.length > 0) pending[0]!.bodyStart = newline < 0 ? lineEnd : newline + 1;
+      }
+      lineStart = newline < 0 ? cmd.length : newline + 1;
+      continue;
+    }
+    for (let i = lineStart; i < lineEnd; i++) {
+      const ch = cmd[i]!;
+      if (ch === "\\" && quote !== "'") { i++; continue; }
+      if (quote !== null) {
+        if (ch === quote) quote = null;
+        continue;
+      }
+      if (ch === "'" || ch === '"') { quote = ch; continue; }
+      if (ch !== "<" || cmd[i + 1] !== "<" || cmd[i + 2] === "<") continue;
+      let cursor = i + 2;
+      let stripTabs = false;
+      if (cmd[cursor] === "-") { stripTabs = true; cursor++; }
+      while (cursor < lineEnd && /[ \t]/.test(cmd[cursor]!)) cursor++;
+      let delimiter = "";
+      const delimiterQuote = cmd[cursor] === "'" || cmd[cursor] === '"' ? cmd[cursor++] : null;
+      while (cursor < lineEnd) {
+        const next = cmd[cursor]!;
+        if (delimiterQuote !== null) {
+          if (next === delimiterQuote) { cursor++; break; }
+          delimiter += next;
+        } else if (/[A-Za-z0-9_]/.test(next)) delimiter += next;
+        else break;
+        cursor++;
+      }
+      if (delimiter.length > 0) pending.push({ delimiter, stripTabs, bodyStart: lineEnd + (newline < 0 ? 0 : 1) });
+      i = Math.max(i, cursor - 1);
+    }
+    lineStart = newline < 0 ? cmd.length : newline + 1;
+  }
+  for (const [start, end] of ranges) {
+    for (let i = start; i < end; i++) {
+      if (chars[i] !== "\n" && chars[i] !== "\r") chars[i] = " ";
+    }
+  }
+  return chars.join("");
+}
+
 function sanitizeForRedirect(cmd: string): string {
   const dropAngles = (s: string) => s.replace(/[<>]/g, " ");
-  return cmd
+  return maskHeredocBodies(cmd)
     .replace(/'[^']*'/g, dropAngles)
     .replace(/"[^"]*"/g, dropAngles)
     .replace(/\[\[[\s\S]*?\]\]/g, dropAngles)
@@ -58,7 +116,7 @@ function sanitizeForRedirect(cmd: string): string {
  * explicit fd write like `echo hi 1>out.txt` or `2>err.log` is a real file write,
  * and excluding `\d` let every numbered-fd redirect through.
  */
-const REDIRECT_RE = /(?<!=)>(?!\s*\/dev\/null|[&=])/;
+const REDIRECT_RE = /(?<!=)>(?!\s*\/dev\/null(?=\s|$|[|;&<>\n\r])|[=]|&\s*(?:\d+|-|\/dev\/null)(?=\s*(?:$|[|;&<>\n\r])))/;
 
 /**
  * Word blocklist: file removers/movers/creators, process killers, `cp -`,
@@ -174,6 +232,14 @@ const EVAL_SHELLS = new Set(["sh", "bash", "zsh", "dash"]);
  */
 const EVAL_WRITER_RE =
   /\bfs\.\w*[Ww]rite\w*|writeFile\w*|appendFile\w*|rmSync|unlinkSync|mkdirSync|renameSync|rmdirSync|cpSync|createWriteStream|truncateSync|chmodSync|symlinkSync|os\.(remove|unlink|rename|mkdir|rmdir|makedirs)|shutil\.|write_text|write_bytes/;
+
+/** Command-execution APIs are destructive regardless of the command string. */
+const NODE_CHILD_PROCESS_RE = /\bchild_process\s*\.\s*(?:exec|execSync|spawn|spawnSync|fork)\s*\(/;
+const NODE_REQUIRED_CHILD_PROCESS_RE = /\brequire\s*\(\s*(['"])child_process\1\s*\)\s*\.\s*(?:exec|execSync|spawn|spawnSync|fork)\s*\(/g;
+const PYTHON_EXECUTION_RE = /\b(?:os\s*\.\s*(?:system|popen)|subprocess\s*\.\s*(?:run|call|Popen|check_[A-Za-z_][A-Za-z0-9_]*))\s*\(/;
+const RUBY_EXECUTION_RE = /\b(?:(?:Kernel\s*\.\s*)?(?:system|exec|spawn)|Open3\s*\.\s*[A-Za-z_][A-Za-z0-9_]*)\s*\(/;
+const PERL_EXECUTION_RE = /\b(?:system|exec|readpipe)\b\s*(?:\(|(?=[^A-Za-z0-9_]))/;
+const PHP_EXECUTION_RE = /\b(?:system|exec|shell_exec|passthru|proc_open|popen)\s*\(/;
 
 /**
  * Language-specific eval scanners. Keep these as small API vocabularies rather
@@ -627,7 +693,10 @@ function scanLanguagePayload(
 ): string | null {
   if (state.depth >= LANGUAGE_INTERPOLATION_DEPTH_BUDGET) return `${language} eval payload`;
   const details: LanguageViewDetails = { shellBodies: [] };
-  if (executableLanguageView(payload, language, details) === null) return `${language} eval payload`;
+  const executable = executableLanguageView(payload, language, details);
+  if (executable === null) return `${language} eval payload`;
+  const execution = findLanguageExecution(payload, executable, language);
+  if (execution) return execution;
   for (const shell of details.shellBodies) {
     const nested = scanInterpreterShellBody(shell, state);
     if (nested) return nested;
@@ -637,6 +706,57 @@ function scanLanguagePayload(
   if (language === "ruby") return findRubyWriter(payload);
   if (language === "php") return findPhpWriter(payload);
   return null;
+}
+
+function findLanguageExecution(
+  payload: string,
+  executable: string,
+  language: InterpolationLanguage,
+): string | null {
+  const match = (pattern: RegExp): string | null => {
+    pattern.lastIndex = 0;
+    return pattern.exec(executable)?.[0]?.trim() ?? null;
+  };
+  if (language === "node") {
+    const direct = match(/\bchild_process\s*\.\s*(?:exec|execSync|spawn|spawnSync|fork)\s*\(/);
+    if (direct) return direct;
+    for (const required of payload.matchAll(NODE_REQUIRED_CHILD_PROCESS_RE)) {
+      const text = required[0]!;
+      const method = /(?:exec|execSync|spawn|spawnSync|fork)\s*\(/.exec(text);
+      if (!method) continue;
+      const methodOffset = required.index! + text.lastIndexOf(method[0]);
+      if (executable[methodOffset] !== " ") return method[0].trim();
+    }
+    // Common aliases are only accepted when their binding is visibly sourced
+    // from child_process; an arbitrary `cp.exec()` must remain ordinary code.
+    const alias = /\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*require\s*\(\s*(['"])child_process\2\s*\)/.exec(payload)?.[1];
+    if (alias) {
+      const aliased = new RegExp(`\\b${alias.replace(/[.*+?^${}()|[\\]\\]/g, "\\\\$&")}\\s*\\.\\s*(?:exec|execSync|spawn|spawnSync|fork)\\s*\\(`);
+      return match(aliased);
+    }
+    const bindings = [
+      ...payload.matchAll(/\b(?:const|let|var)\s*\{([^}]+)\}\s*=\s*require\s*\(\s*(['"])child_process\2\s*\)/g),
+      ...payload.matchAll(/\bimport\s*\{([^}]+)\}\s*from\s*(['"])child_process\2/g),
+    ];
+    for (const binding of bindings) {
+      if (binding.index === undefined || executable[binding.index] === " ") continue;
+      for (const part of binding[1]!.split(",")) {
+        const pieces = part.trim().split(/\s*(?::|\bas\b)\s*/);
+        const local = (pieces[1] ?? pieces[0])?.match(/^[A-Za-z_$][\w$]*/)?.[0];
+        if (!local) continue;
+        const imported = pieces[0]?.match(/^(?:exec|execSync|spawn|spawnSync|fork)$/)?.[0];
+        if (!imported) continue;
+        const aliased = new RegExp(`\\b${local.replace(/[.*+?^${}()|[\\]\\]/g, "\\\\$&")}\\s*\\(`);
+        const call = match(aliased);
+        if (call) return call;
+      }
+    }
+    return null;
+  }
+  if (language === "python") return match(PYTHON_EXECUTION_RE);
+  if (language === "ruby") return match(RUBY_EXECUTION_RE);
+  if (language === "perl") return match(PERL_EXECUTION_RE);
+  return match(PHP_EXECUTION_RE);
 }
 
 function scanInterpreterShellBody(shell: ShellBody, state: LanguageScanState): string | null {
@@ -1427,32 +1547,33 @@ const OPAQUE_SUBSHELL_RE = /\$\(|`|<\(|>\(/;
  */
 export function splitCommandSegments(cmd: string): string[] {
   try {
+    const shellCommand = maskHeredocBodies(cmd);
     const segments: string[] = [];
     let current = "";
     let inSingle = false;
     let inDouble = false;
-    for (let i = 0; i < cmd.length; i++) {
-      const ch = cmd[i]!;
+    for (let i = 0; i < shellCommand.length; i++) {
+      const ch = shellCommand[i]!;
       if (ch === "'" && !inDouble) inSingle = !inSingle;
       else if (ch === '"' && !inSingle) inDouble = !inDouble;
       if (!inSingle && !inDouble && (ch === "|" || ch === ";" || ch === "&" || ch === "\n" || ch === "\r")) {
         // `2>&1` / `>&2`: an & directly after `>` is an fd dup, not a join.
-        if (ch === "&" && cmd[i - 1] === ">") {
+        if (ch === "&" && shellCommand[i - 1] === ">") {
           current += ch;
           continue;
         }
         if (current.trim()) segments.push(current.trim());
         current = "";
         // swallow the second char of `&&` / `||`
-        if (cmd[i + 1] === ch) i++;
+        if (shellCommand[i + 1] === ch) i++;
         // Treat CRLF as one command separator.
-        if (ch === "\r" && cmd[i + 1] === "\n") i++;
+        if (ch === "\r" && shellCommand[i + 1] === "\n") i++;
         continue;
       }
       current += ch;
     }
     if (current.trim()) segments.push(current.trim());
-    return segments.length > 0 ? segments : [cmd];
+    return segments.length > 0 ? segments : [shellCommand];
   } catch {
     return [cmd];
   }
@@ -1874,22 +1995,26 @@ function findDestructiveTokenInternal(cmd: string, depth: number): string | null
   if (evalPreflight && evalPreflight.payloadLength > LANGUAGE_EVAL_EARLY_LIMIT) {
     return "oversized interpreter eval";
   }
+  // Here-document bodies are shell data, not separate command clauses. Keep
+  // them out of every structural recursion below so a literal `>` in the body
+  // cannot be mistaken for a redirect.
+  const shellCommand = maskHeredocBodies(cmd);
   // Use the shared bounded traversal as a structural preflight so executable
   // control clauses and substitution bodies cannot disappear between the
   // core classifier and host policy adapters. Incomplete or over-budget shell
   // syntax is never allowed to fall through to the safe tier.
-  if (!inspectCommandSubstitutionTree(cmd).complete) return "complex shell syntax";
-  const sanitized = sanitizeForRedirect(cmd);
+  if (!inspectCommandSubstitutionTree(shellCommand).complete) return "complex shell syntax";
+  const sanitized = sanitizeForRedirect(shellCommand);
 
   const redirect = REDIRECT_RE.exec(sanitized);
   if (redirect) return redirect[0].trim() || ">";
 
-  const segments = splitCommandSegments(cmd);
+  const segments = splitCommandSegments(shellCommand);
 
   // Quoted command substitutions still execute their `$()`/backtick bodies.
   // Recurse with a finite budget so nested syntax cannot hide a mutation while
   // malformed or adversarially deep input remains bounded.
-  const substitutionInspection = inspectCommandSubstitutions(cmd);
+  const substitutionInspection = inspectCommandSubstitutions(shellCommand);
   if (!substitutionInspection.complete) return "complex shell syntax";
   const substitutions = substitutionInspection.bodies;
   if (substitutions.length > 0) {
@@ -1903,7 +2028,7 @@ function findDestructiveTokenInternal(cmd: string, depth: number): string | null
   // A case command with no closing `esac`, or a coprocess with no executable
   // body, is not safely decomposable. Never let the generic word scan turn an
   // opaque control construct into a SAFE result.
-  const trimmed = cmd.trim();
+  const trimmed = shellCommand.trim();
   if (/^case\b/.test(trimmed) && !inspectShellCommandClauses(trimmed).complete) return "complex shell syntax";
   if (/^coproc(?:\s|$)/.test(trimmed) && extractShellCommandClauses(trimmed).length === 0) {
     return "complex shell syntax";
@@ -1912,7 +2037,7 @@ function findDestructiveTokenInternal(cmd: string, depth: number): string | null
   // Parenthesized groups execute their contents even though the outer shell
   // segment starts with `(`. Inspect each group recursively, while the
   // quote-aware extractor leaves literal parentheses untouched.
-  for (const group of parenthesizedGroups(cmd)) {
+  for (const group of parenthesizedGroups(shellCommand)) {
     const nested = findDestructiveTokenInternal(group, depth + 1);
     if (nested) return nested;
   }
@@ -1928,7 +2053,7 @@ function findDestructiveTokenInternal(cmd: string, depth: number): string | null
     }
   }
 
-  for (const clause of extractShellCommandClauses(cmd)) {
+  for (const clause of extractShellCommandClauses(shellCommand)) {
     const nested = findDestructiveTokenInternal(clause, depth + 1);
     if (nested) return nested;
   }
@@ -1959,7 +2084,7 @@ function findDestructiveTokenInternal(cmd: string, depth: number): string | null
   // Safe tier: every head is a pure reader, no exception fires, and there is
   // no subshell content we can't attribute. Word-scan skipped.
   const allSafe =
-    !OPAQUE_SUBSHELL_RE.test(cmd) &&
+    !OPAQUE_SUBSHELL_RE.test(shellCommand) &&
     heads.every((head, i) => {
       const gitReadOnly = head === "git" && gitTokens[i] === null;
       if (head === null || (!READ_ONLY_HEADS.has(head) && !gitReadOnly)) return false;
@@ -1968,8 +2093,8 @@ function findDestructiveTokenInternal(cmd: string, depth: number): string | null
     });
   if (allSafe) return null;
 
-  const caseInspection = inspectShellCommandClauses(cmd);
-  const wordScanSegments = /^case\b/.test(cmd.trim()) && caseInspection.complete && caseInspection.clauses.length > 0
+  const caseInspection = inspectShellCommandClauses(shellCommand);
+  const wordScanSegments = /^case\b/.test(shellCommand.trim()) && caseInspection.complete && caseInspection.clauses.length > 0
     ? caseInspection.clauses
     : segments;
   const wordScanText = wordScanSegments.map((segment, i) => {
