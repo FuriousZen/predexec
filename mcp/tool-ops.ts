@@ -29,11 +29,11 @@
  */
 
 import { execFile } from "node:child_process";
+import type { ChildProcess } from "node:child_process";
 import { accessSync, constants } from "node:fs";
 import { open, opendir, realpath, stat } from "node:fs/promises";
 import { delimiter, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { StringDecoder } from "node:string_decoder";
-import { promisify } from "node:util";
 import { escapeRegExp, isSafeRegex, validateOperation, type ToolExecutor, type ToolOp } from "../core/index.ts";
 
 /** The shell-like shape the core engine branches on (see core/runner.ts). */
@@ -102,7 +102,16 @@ const walkCapNote = (label: string, reason: WalkCapReason): string => {
   return `${label}: fallback walk stopped after ${detail} — results are incomplete; scope the search with \`path\``;
 };
 
-const execFileAsync = promisify(execFile);
+/** A hard wall-clock bound for optional accelerator processes. */
+const ACCELERATOR_TIMEOUT_MS = 10_000;
+
+/** Narrow process seam used by runBinary tests; production passes node:child_process.execFile. */
+export type ExecFileLike = (
+  file: string,
+  args: string[],
+  options: { maxBuffer: number; encoding: "utf8"; signal?: AbortSignal },
+  callback: (error: Error | null, stdout: string, stderr: string) => void,
+) => ChildProcess;
 
 export interface ToolExecutorOptions {
   /** Session root. Ops resolve relative paths beneath it and may not escape it. */
@@ -328,22 +337,66 @@ async function validateFindFiles(
  * matches, 2 = bad pattern), while a killed or missing child reports a string
  * errno — collapsing the two would turn a broken regex into an empty result set.
  */
-async function runBinary(
+export async function runBinary(
   bin: string,
   args: string[],
   signal?: AbortSignal,
+  execFileImpl: ExecFileLike = execFile,
 ): Promise<{ stdout: string; stderr: string; code: number }> {
-  try {
-    const { stdout, stderr } = await execFileAsync(bin, args, { maxBuffer: MAX_BUFFER, encoding: "utf8", signal });
-    return { stdout, stderr, code: 0 };
-  } catch (err) {
-    const e = err as { code?: number | string; stdout?: string; stderr?: string; message?: string };
-    if (typeof e.code === "number") return { stdout: e.stdout ?? "", stderr: e.stderr ?? "", code: e.code };
-    if (e.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER") {
-      throw new Error(`output exceeded ${MAX_BUFFER / (1024 * 1024)}MB — narrow the pattern or scope it with \`path\``);
+  return await new Promise((resolve, reject) => {
+    let child: ChildProcess | undefined;
+    let settled = false;
+    let timedOut = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const cleanup = (): void => {
+      if (timer !== undefined) {
+        clearTimeout(timer);
+        timer = undefined;
+      }
+    };
+    const finish = (err: Error | null, stdout: string, stderr: string): void => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      if (!err) {
+        resolve({ stdout, stderr, code: 0 });
+        return;
+      }
+      const e = err as Error & { code?: number | string; stdout?: string; stderr?: string };
+      if (typeof e.code === "number") {
+        resolve({ stdout: e.stdout ?? stdout, stderr: e.stderr ?? stderr, code: e.code });
+        return;
+      }
+      if (e.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER") {
+        reject(new Error(`output exceeded ${MAX_BUFFER / (1024 * 1024)}MB — narrow the pattern or scope it with \`path\``));
+        return;
+      }
+      reject(err);
+    };
+    timer = setTimeout(() => {
+      if (settled) return;
+      timedOut = true;
+      settled = true;
+      cleanup();
+      try {
+        child?.kill();
+      } catch {
+        /* The timeout remains the truthful failure even if the child already exited. */
+      }
+      reject(new Error(`accelerator timed out after ${ACCELERATOR_TIMEOUT_MS}ms — narrow the pattern or scope it with \`path\``));
+    }, ACCELERATOR_TIMEOUT_MS);
+    try {
+      child = execFileImpl(
+        bin,
+        args,
+        { maxBuffer: MAX_BUFFER, encoding: "utf8", signal },
+        (err, stdout, stderr) => finish(err, stdout, stderr),
+      );
+      if (timedOut) child.kill();
+    } catch (err) {
+      finish(err instanceof Error ? err : new Error(String(err)), "", "");
     }
-    throw err;
-  }
+  });
 }
 
 /**

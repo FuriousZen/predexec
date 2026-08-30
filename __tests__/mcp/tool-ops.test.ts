@@ -1,7 +1,9 @@
 import { chmodSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { EventEmitter } from "node:events";
+import type { ChildProcess } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it, vi } from "vitest";
 import {
   isSafeRegex,
   MAX_FIND_RESULTS,
@@ -15,7 +17,9 @@ import {
   createToolExecutor,
   findOnPath,
   globToRegExp,
+  runBinary,
   walkFiles,
+  type ExecFileLike,
   type ToolExecutorOptions,
 } from "../../mcp/tool-ops.ts";
 
@@ -563,6 +567,43 @@ process.stdout.write(path.join(scope, ${JSON.stringify(filename)}) + "\\0" + "1:
     const r = await run({ tool: "grep", pattern: "hit", path: "." }, { rgPath: fakeRg, fdPath: null });
     expect(r.exitCode).toBe(0);
     expect(r.stdout).toBe(`${filename}:1:hit`);
+  });
+});
+
+describe("mcp tool-ops — accelerator process bounds", () => {
+  it("kills and reports an accelerator that exceeds its hard timeout", async () => {
+    vi.useFakeTimers();
+    try {
+      const child = Object.assign(new EventEmitter(), {
+        kill: vi.fn(() => true),
+      }) as ChildProcess;
+      const execFile: ExecFileLike = (_file, _args, _options, _callback) => child;
+
+      const pending = runBinary("fake-rg", [], undefined, execFile);
+      const timedOut = expect(pending).rejects.toThrow("accelerator timed out after 10000ms");
+      await vi.advanceTimersByTimeAsync(10_000);
+
+      await timedOut;
+      expect(child.kill).toHaveBeenCalledOnce();
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("passes the caller abort signal through without turning abort into no-results", async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const child = Object.assign(new EventEmitter(), { kill: vi.fn(() => true) }) as ChildProcess;
+    let providedSignal: AbortSignal | undefined;
+    const execFile: ExecFileLike = (_file, _args, options, callback) => {
+      providedSignal = options.signal;
+      callback(Object.assign(new Error("The operation was aborted"), { code: "ABORT_ERR" }), "", "");
+      return child;
+    };
+
+    await expect(runBinary("fake-rg", [], controller.signal, execFile)).rejects.toThrow("aborted");
+    expect(providedSignal).toBe(controller.signal);
   });
 });
 
