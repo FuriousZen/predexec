@@ -141,6 +141,76 @@ describe("final classifier blockers", () => {
     expect(findDestructiveToken("cat <<EOF\nvalue > other\nEOF")).toBeNull();
     expect(findDestructiveToken("cat <<'EOF'\nvalue >= other\nEOF")).toBeNull();
   });
+
+  describe("shell -c payloads are recursively classified", () => {
+    it.each([
+      "bash -c 'printf x > out'",
+      "sh -c 'echo ok; rm -f victim'",
+      "zsh -c 'printf x | tee out'",
+      "bash -ec 'printf x > out'",
+      "dash -c 'git init scratch'",
+      "/bin/bash -c 'mkdir created'",
+      "env bash -c 'printf x > out'",
+      "command /usr/bin/sh -c 'rm -f victim'",
+      "time bash -c 'echo x >> out'",
+    ])("blocks executable writer shell payload: %s", (command) => {
+      expect(findDestructiveToken(command)).not.toBeNull();
+    });
+
+    it.each([
+      "bash -c 'printf x'",
+      "sh -c 'echo ok; git status'",
+      "zsh -c 'grep rm notes.txt'",
+      "dash -c 'cat file'",
+      "env /bin/bash -c 'printf x'",
+      "echo \"bash -c 'rm -rf /'\"",
+      "grep \"bash -c 'rm -rf /'\" notes.txt",
+    ])("allows read-only shell payload or data: %s", (command) => {
+      expect(findDestructiveToken(command)).toBeNull();
+    });
+
+    it.each([
+      "bash -c",
+      "bash -c \"$SCRIPT\"",
+      "env bash -c \"$SCRIPT\"",
+    ])("fails closed for missing or ambiguous shell payload: %s", (command) => {
+      expect(findDestructiveToken(command)).not.toBeNull();
+    });
+  });
+
+  describe("git read-only global queries", () => {
+    it.each([
+      "git --version",
+      "git --help",
+      "git --exec-path",
+      "git --html-path",
+      "git --man-path",
+      "git --info-path",
+      "git --no-pager --version",
+      "git -P --help --exec-path",
+      "git --git-dir=. --exec-path",
+      "git -C /tmp --version",
+      "git --exec-path=/usr/libexec/git-core",
+      "git --exec-path /tmp",
+      "/usr/bin/git --version",
+    ])("allows global read-only query: %s", (command) => {
+      expect(findDestructiveToken(command)).toBeNull();
+    });
+
+    it.each([
+      "git",
+      "git --version add file.txt",
+      "git --help push origin main",
+      "git --git-dir=. add file.txt",
+      "git --git-dir=. --exec-path add file.txt",
+      "git --exec-path=/tmp add file.txt",
+      "git --exec-path add file.txt",
+      "git -C /tmp commit -m msg",
+      "git --unknown-option",
+    ])("blocks bare, mutating, or unknown git invocation: %s", (command) => {
+      expect(findDestructiveToken(command)).not.toBeNull();
+    });
+  });
 });
 
 describe("safe tier — pure-reader heads skip the word scan", () => {

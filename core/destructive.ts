@@ -186,6 +186,11 @@ const GIT_GLOBAL_OPTIONS = new Set([
   "--html-path", "--man-path", "--info-path", "--version", "--help",
 ]);
 
+/** Git global options that are themselves read-only queries when no verb follows. */
+const GIT_READ_ONLY_GLOBAL_OPTIONS = new Set([
+  "--exec-path", "--html-path", "--man-path", "--info-path", "--version", "--help",
+]);
+
 /**
  * Command heads that only ever read (absent an exception below). Membership
  * buys ONE thing: skipping the word-scan, so quoted writer words in their
@@ -1860,6 +1865,106 @@ function shellWords(command: string): string[] {
   return words;
 }
 
+interface ShellArgument {
+  value: string;
+  /** True when the outer shell must expand this argument before `-c` runs. */
+  dynamic: boolean;
+}
+
+interface ShellArguments {
+  args: ShellArgument[];
+  complete: boolean;
+}
+
+/**
+ * Parse shell argv while retaining whether each word contains an outer-shell
+ * expansion. `shellWords` intentionally discards that distinction for normal
+ * command classification; `sh -c` needs it because its next argv item is code.
+ */
+function shellArguments(command: string): ShellArguments {
+  const args: ShellArgument[] = [];
+  let current = "";
+  let quote: "'" | '"' | null = null;
+  let escaped = false;
+  let dynamic = false;
+  let started = false;
+
+  const push = () => {
+    if (!started) return;
+    args.push({ value: current, dynamic });
+    current = "";
+    dynamic = false;
+    started = false;
+  };
+
+  for (const ch of command) {
+    if (escaped) {
+      if (quote === '"' && !/[\\$`"\n]/.test(ch)) current += "\\";
+      current += ch;
+      escaped = false;
+      started = true;
+      continue;
+    }
+    if (ch === "\\" && quote !== "'") {
+      escaped = true;
+      started = true;
+      continue;
+    }
+    if (quote !== null) {
+      if (ch === quote) quote = null;
+      else {
+        current += ch;
+        if (quote === '"' && (ch === "$" || ch === "`")) dynamic = true;
+      }
+      started = true;
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      quote = ch;
+      started = true;
+    } else if (/\s/.test(ch)) {
+      push();
+    } else {
+      current += ch;
+      if (ch === "$" || ch === "`") dynamic = true;
+      started = true;
+    }
+  }
+  if (escaped || quote !== null) return { args, complete: false };
+  push();
+  return { args, complete: true };
+}
+
+interface ShellEvalPayload {
+  payload: string | null;
+  ambiguous: boolean;
+}
+
+/** Extract a static `-c` payload from an actual shell invocation, through wrappers. */
+function shellEvalPayload(segment: string): ShellEvalPayload | null {
+  const parsed = shellArguments(segment);
+  if (!parsed.complete) return null;
+  const tokens = parsed.args.map((arg) => arg.value);
+  const index = effectiveHeadIndex(tokens);
+  if (index === null) {
+    const splitString = envSplitStringPayload(tokens);
+    return splitString === null ? null : shellEvalPayload(splitString);
+  }
+  const head = tokens[index]!.replace(/^.*\//, "");
+  if (!EVAL_SHELLS.has(head)) return null;
+
+  for (let i = index + 1; i < tokens.length; i++) {
+    const token = tokens[i]!;
+    if (token === "--") break;
+    if (token !== "-c" && !/^-[^-]*c[^-]*$/.test(token)) continue;
+    const argument = parsed.args[i + 1];
+    if (!argument || argument.dynamic) return { payload: null, ambiguous: true };
+    if (argument.value.length > MAX_LANGUAGE_ARGUMENT_LENGTH) return { payload: null, ambiguous: true };
+    return { payload: argument.value, ambiguous: false };
+  }
+  return null;
+}
+
 /** Return the command string consumed by env's `-S`/`--split-string` option. */
 function envSplitStringPayload(tokens: string[]): string | null {
   let envSeen = false;
@@ -1913,6 +2018,7 @@ function findGitMutationToken(segment: string): string | null {
   if (tokens[gitIndex]!.replace(/^.*\//, "") !== "git") return null;
 
   let verbIndex = gitIndex + 1;
+  let readOnlyGlobalQuery = false;
   while (verbIndex < tokens.length) {
     const option = tokens[verbIndex]!;
     if (option === "--") {
@@ -1929,14 +2035,29 @@ function findGitMutationToken(segment: string): string | null {
       option.startsWith("--namespace=") ||
       option.startsWith("--super-prefix=") ||
       option.startsWith("--config-env=") ||
-      option.startsWith("--exec-path=") ||
       (option.startsWith("-C") && option.length > 2) ||
       (option.startsWith("-c") && option.length > 2)
     ) {
       verbIndex++;
       continue;
     }
+    if (option.startsWith("--exec-path=")) {
+      readOnlyGlobalQuery = true;
+      verbIndex++;
+      continue;
+    }
+    if (option === "--exec-path") {
+      readOnlyGlobalQuery = true;
+      const value = tokens[verbIndex + 1];
+      // Git's exec-path argument is optional. Consume only an unmistakable
+      // path so a mutating-looking token such as `add` cannot disappear as a
+      // purported option value.
+      if (value && /^(?:~|\.{0,2}\/|\/)/.test(value)) verbIndex += 2;
+      else verbIndex++;
+      continue;
+    }
     if (GIT_GLOBAL_OPTIONS.has(option)) {
+      if (GIT_READ_ONLY_GLOBAL_OPTIONS.has(option)) readOnlyGlobalQuery = true;
       verbIndex++;
       continue;
     }
@@ -1944,7 +2065,7 @@ function findGitMutationToken(segment: string): string | null {
   }
 
   const verb = tokens[verbIndex];
-  if (!verb) return "git";
+  if (!verb) return readOnlyGlobalQuery ? null : "git";
   if (READ_ONLY_GIT_VERBS.has(verb) || isGitReadOnlySubform(tokens, verbIndex)) return null;
   return `git ${verb}`;
 }
@@ -2081,11 +2202,28 @@ function findDestructiveTokenInternal(cmd: string, depth: number): string | null
     if (token) return token;
   }
 
+  // A shell's `-c` argument is executable code, not inert command data. Only
+  // recurse when the effective head is an actual supported shell; quoted
+  // strings passed to readers such as `echo` and `grep` never reach this path.
+  const readOnlyShellSegments = new Set<number>();
+  for (let i = 0; i < segments.length; i++) {
+    const segment = segments[i]!;
+    const shell = shellEvalPayload(segment);
+    if (!shell) continue;
+    if (shell.ambiguous) return "shell eval payload";
+    if (shell.payload !== null) {
+      const nested = findDestructiveTokenInternal(shell.payload, depth + 1);
+      if (nested) return `shell ${nested}`;
+      readOnlyShellSegments.add(i);
+    }
+  }
+
   // Safe tier: every head is a pure reader, no exception fires, and there is
   // no subshell content we can't attribute. Word-scan skipped.
   const allSafe =
     !OPAQUE_SUBSHELL_RE.test(shellCommand) &&
     heads.every((head, i) => {
+      if (readOnlyShellSegments.has(i)) return true;
       const gitReadOnly = head === "git" && gitTokens[i] === null;
       if (head === null || (!READ_ONLY_HEADS.has(head) && !gitReadOnly)) return false;
       const exception = HEAD_EXCEPTIONS[head];
