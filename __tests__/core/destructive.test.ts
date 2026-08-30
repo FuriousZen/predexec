@@ -1131,6 +1131,9 @@ describe("mutation classifier — ordinary copy and git verbs", () => {
     "git -ccore.pager=cat status",
     "git --config-env=core.pager=GIT_PAGER status",
     "git --config-env core.sshCommand=GIT_SSH_COMMAND status",
+    "git -c $KEY=$VALUE status",
+    "git -c core.pager status",
+    "git --config-env core.pager status",
   ])("blocks execution-bearing options on an otherwise read-only Git command: %s", (command) => {
     expect(findDestructiveToken(command)).not.toBeNull();
   });

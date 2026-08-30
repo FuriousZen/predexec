@@ -2065,9 +2065,13 @@ function gitConfigOptionMutation(tokens: string[], index: number): { token: stri
   const option = tokens[index]!;
   const separate = option === "-c" || option === "--config-env";
   const raw = separate ? tokens[index + 1] : option.startsWith("-c") ? option.slice(2) : option.startsWith("--config-env=") ? option.slice("--config-env=".length) : null;
-  if (!raw) return { token: option, consumed: separate ? 1 : 0 };
+  if (!raw || !raw.includes("=")) return { token: option, consumed: separate ? 1 : 0 };
   const key = raw.split("=", 1)[0]!.trim();
-  if (!key || GIT_COMMAND_CONFIG_KEY_RE.test(key)) return { token: option, consumed: separate ? 1 : 0 };
+  // A dynamic or malformed key could resolve to a command-bearing setting;
+  // only the ordinary static Git key alphabet is safe to inspect further.
+  if (!/^[A-Za-z0-9][A-Za-z0-9.-]*$/.test(key) || GIT_COMMAND_CONFIG_KEY_RE.test(key)) {
+    return { token: option, consumed: separate ? 1 : 0 };
+  }
   return { token: null, consumed: separate ? 1 : 0 };
 }
 
