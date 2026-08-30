@@ -1828,3 +1828,60 @@ build, pack dry-run, and diff-check passed. Validation is linear and runs before
 filesystem/SDK/native-tool work; the MCP defense runs before either search
 implementation. No dependency, version, dist staging, publish, push, merge,
 background process, or unbounded stress probe changed.
+
+## Extended integration fix round 25 — Git command-bearing config keys and resource prose parity
+
+This user-authorized extension closes the remaining narrow Important findings:
+Git's read-only classifier must treat `core.fsmonitor` and
+`diff.<driver>.command` as execution-bearing when supplied through attached or
+separate `-c` forms, while retaining benign similarly named keys; and every
+model-facing native-operation description must publish the shared 8,192-character
+grep-pattern ceiling.
+
+### RED evidence
+
+Focused regressions were added before implementation. The pre-fix run failed
+six Git cases (`-c` attached/separate forms and case variants) because the
+central config-key classifier returned `null`, and failed the canonical/Pi
+resource assertions because `RESOURCE_LIMIT_DESCRIPTION` did not mention the
+grep-pattern ceiling. The tests also pin safe `core.fsmonitorHookVersion`,
+`diff.<driver>.commandName`, and `diff.<driver>.commands` keys.
+
+### GREEN implementation
+
+- `GIT_COMMAND_CONFIG_KEY_RE` now blocks exact, case-insensitive
+  `core.fsmonitor` and `diff.<driver>.command` keys. The existing centralized
+  parser therefore covers both separate (`-c key=value`) and attached
+  (`-ckey=value`) forms, as well as `--config-env`, without changing benign
+  config handling or the malformed/dynamic-key fail-closed path.
+- `RESOURCE_LIMIT_DESCRIPTION` now owns the
+  `grep patterns are capped at 8192 characters` sentence. The canonical plan
+  description and Pi command schema consume that shared prose, eliminating a
+  second limit string while keeping OpenCode and MCP aligned through the same
+  canonical description.
+- Focused classifier, canonical-prose, and source/compiled Pi registration
+  regressions were committed with this report.
+
+### GREEN verification and self-review
+
+```text
+pnpm run build
+./node_modules/.bin/vitest run __tests__/core/destructive.test.ts __tests__/plan-language.test.ts __tests__/pi.test.ts --reporter=dot
+```
+
+Result: exit 0; **3 test files, 731 tests passed** after rebuilding compiled
+entries.
+
+```text
+./node_modules/.bin/tsc --noEmit
+./node_modules/.bin/vitest run --pool=threads --maxWorkers=1 --testTimeout=10000 --reporter=dot
+git diff --check
+```
+
+All passed. The full suite passed **22 test files, 1,531 tests with 1
+skipped**. The regex additions are exact and case-insensitive, so
+`core.fsmonitorHookVersion` and command-name lookalikes remain safe; existing
+pager/filter/credential and unknown-key behavior is unchanged. The shared
+description is consumed by canonical, MCP, OpenCode, and Pi model-facing
+surfaces. No payload over 4 KiB, background process, dependency, version,
+dist staging, publish, push, or merge change was made.

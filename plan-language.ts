@@ -47,7 +47,8 @@ export const PLAN_CWD_DESCRIPTION =
   "Base dir for commands and fileExists: a relative directory inside the session root; absolute or escaping paths are rejected.";
 export const RESOURCE_LIMIT_DESCRIPTION =
   `Native operation ceilings: read limit at most ${MAX_READ_LINES} lines; grep/find limit at most ${MAX_SEARCH_RESULTS} results; ` +
-  `ls limit at most ${MAX_LS_ENTRIES} entries; grep context at most ${MAX_GREP_CONTEXT} lines per side. ` +
+  `ls limit at most ${MAX_LS_ENTRIES} entries; grep context at most ${MAX_GREP_CONTEXT} lines per side; ` +
+  `grep patterns are capped at ${MAX_GREP_PATTERN_LENGTH} characters. ` +
   "Limits and offsets are positive integers; grep context may be zero. Omitted values use adapter defaults.";
 
 export {
@@ -79,5 +80,4 @@ export const PLAN_SHAPE_DESCRIPTION =
   `maxDepth is capped at ${DEFAULT_MAX_DEPTH}; plans have at most ${MAX_PLAN_NODES} nodes and ${MAX_PLAN_EDGES} edges; ` +
   `commands and string arguments are capped at ${MAX_COMMAND_LENGTH} characters. ` +
   `Condition strings and paths are capped at ${MAX_CONDITION_LENGTH} characters per field and ${MAX_CONDITION_TOTAL_LENGTH} characters in aggregate; ` +
-  `grep patterns are capped at ${MAX_GREP_PATTERN_LENGTH} characters; ` +
   `${PLAN_CWD_DESCRIPTION} ${RESOURCE_LIMIT_DESCRIPTION} ${JSON_PATH_SINGLE_OP_LINE} `;

@@ -13,7 +13,12 @@ import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { OUTPUT_CAP } from "../core/runner.ts";
 import { appendProgressText } from "../.pi/extension/index.ts";
-import { CONDITION_KINDS, DEFAULT_MAX_DEPTH, MAX_OPERATIONS_PER_NODE } from "../plan-language.ts";
+import {
+  CONDITION_KINDS,
+  DEFAULT_MAX_DEPTH,
+  MAX_OPERATIONS_PER_NODE,
+  RESOURCE_LIMIT_DESCRIPTION,
+} from "../plan-language.ts";
 import * as adapterRuntime from "../adapter-runtime.ts";
 
 const { readToolCwds } = vi.hoisted(() => ({ readToolCwds: [] as string[] }));
@@ -82,6 +87,8 @@ describe.each(variants)("pi extension ($name) — registration contract (fake Ex
     expect(tool.parameters.properties.maxDepth.description).not.toContain("clamped");
     expect(tool.parameters.properties.cwd.description).toContain("inside the session root");
     expect(tool.parameters.properties.cwd.description).toContain("absolute");
+    expect(tool.parameters.properties.nodes.items.properties.commands.items.description).toContain(RESOURCE_LIMIT_DESCRIPTION);
+    expect(tool.parameters.properties.nodes.items.properties.commands.items.description).toContain("grep patterns are capped at 8192 characters");
     for (const kind of CONDITION_KINDS) {
       expect(tool.parameters.properties.nodes.items.properties.edges.items.properties.when.description).toContain(kind);
     }

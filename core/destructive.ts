@@ -192,7 +192,7 @@ const GIT_READ_ONLY_GLOBAL_OPTIONS = new Set([
 ]);
 
 /** Git configuration keys whose values can invoke a process while reading. */
-const GIT_COMMAND_CONFIG_KEY_RE = /^(?:core\.pager(?:\..*)?|pager(?:\..*)?|diff\..*(?:external|textconv)|filter(?:\..*)?|core\.(?:sshcommand|gitproxy)|credential\.helper(?:\..*)?)$/i;
+const GIT_COMMAND_CONFIG_KEY_RE = /^(?:core\.pager(?:\..*)?|pager(?:\..*)?|core\.fsmonitor|diff\..*(?:external|textconv)|diff\..+\.command|filter(?:\..*)?|core\.(?:sshcommand|gitproxy)|credential\.helper(?:\..*)?)$/i;
 
 /** Shell builtins that evaluate or replace command text rather than reading it. */
 const SHELL_COMMAND_CONTROL_HEADS = new Set(["eval", "source", ".", "exec"]);

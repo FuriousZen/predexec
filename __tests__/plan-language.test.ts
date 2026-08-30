@@ -47,5 +47,6 @@ describe("canonical plan language", () => {
     expect(RESOURCE_LIMIT_DESCRIPTION).toContain("grep/find limit at most 1000");
     expect(RESOURCE_LIMIT_DESCRIPTION).toContain("ls limit at most 5000");
     expect(RESOURCE_LIMIT_DESCRIPTION).toContain("grep context at most 100");
+    expect(RESOURCE_LIMIT_DESCRIPTION).toContain(`grep patterns are capped at ${MAX_GREP_PATTERN_LENGTH} characters`);
   });
 });
