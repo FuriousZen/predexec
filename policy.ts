@@ -45,6 +45,8 @@ export interface PolicyRule {
   action: PolicyAction;
 }
 
+type CommandPolicyInspector = (command: string) => { commands: string[]; complete: boolean };
+
 const ACTIONS = new Set<PolicyAction>(["allow", "ask", "deny"]);
 
 const isAction = (v: unknown): v is PolicyAction => typeof v === "string" && ACTIONS.has(v as PolicyAction);
@@ -240,6 +242,7 @@ function patternToRegex(pattern: string): RegExp | null {
 export function createPolicyChecker(
   rules: PolicyRule[],
   unreadable: string[] = [],
+  inspectCommand: CommandPolicyInspector = inspectCommandSubstitutionTree,
 ): (operation: Operation) => string | null {
   if (unreadable.length > 0) {
     // Name the file and the remedy: without that this reads as a predexec bug
@@ -259,7 +262,7 @@ export function createPolicyChecker(
 
   const checkBash = (cmd: string): string | null => {
     try {
-      const inspected = inspectCommandSubstitutionTree(cmd);
+      const inspected = inspectCommand(cmd);
       if (!inspected.complete) {
         return "incomplete shell syntax (policy inspection exceeded its bounded executable-body budget)";
       }
@@ -277,7 +280,7 @@ export function createPolicyChecker(
       }
       return null;
     } catch {
-      return null;
+      return "incomplete shell syntax (policy inspection failed)";
     }
   };
 
@@ -288,14 +291,21 @@ export function createPolicyChecker(
       operation.tool === "grep" ? ["grep"] : operation.tool === "ls" ? ["list"] :
         operation.tool === "find" ? ["glob", "list"] : [];
     if (policyTools.length === 0) return null;
-    const target = operation.tool === "grep" || operation.tool === "find"
-      ? (typeof operation.pattern === "string" ? operation.pattern : ".")
-      : typeof operation.path === "string" ? operation.path :
-        typeof operation.pattern === "string" ? operation.pattern : ".";
-    const candidates = target.startsWith("./") ? [target, target.slice(2)] : [target, `./${target}`];
+    const pathTarget = typeof operation.path === "string" ? operation.path : ".";
+    const patternTarget = typeof operation.pattern === "string" ? operation.pattern : ".";
+    const candidatesFor = (target: string, includeDirectoryDescendants = false): string[] => {
+      const normalized = target.startsWith("./") ? [target, target.slice(2)] : [target, `./${target}`];
+      if (!includeDirectoryDescendants) return normalized;
+      return [...normalized, ...normalized.map((candidate) => `${candidate.replace(/\/$/, "")}/**`)];
+    };
     let winner: (PolicyRule & { regex: RegExp }) | null = null;
     for (const rule of compiled) {
       if (rule.tool !== "*" && !policyTools.includes(rule.tool)) continue;
+      const candidates = operation.tool === "find"
+        ? rule.tool === "list"
+          ? candidatesFor(pathTarget, true)
+          : candidatesFor(patternTarget)
+        : candidatesFor(operation.tool === "grep" ? patternTarget : pathTarget);
       if (candidates.some((candidate) => rule.regex.test(candidate))) winner = rule;
     }
     return winner && winner.action !== "allow" ? winner.pattern : null;

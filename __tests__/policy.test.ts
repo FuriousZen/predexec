@@ -105,6 +105,21 @@ describe("opencode operation policy", () => {
     expect(check({ tool: "find", pattern: "private/**", path: "." })).toBe("private/**");
     expect(check({ tool: "grep", pattern: "TODO", path: "." })).toBe("*");
   });
+
+  it("checks find paths against list rules and patterns against glob rules", () => {
+    const check = createPolicyChecker([
+      { tool: "glob", pattern: "*.ts", action: "deny" },
+      { tool: "list", pattern: "private/**", action: "deny" },
+    ]);
+    expect(check({ tool: "find", path: "private", pattern: "*.ts" })).toBe("private/**");
+    expect(check({ tool: "find", path: "src", pattern: "*.ts" })).toBe("*.ts");
+    expect(check({ tool: "find", path: "src", pattern: "*.md" })).toBeNull();
+  });
+
+  it("uses the find path as the list target when pattern is omitted", () => {
+    const check = createPolicyChecker([{ tool: "list", pattern: ".", action: "deny" }]);
+    expect(check({ tool: "find", path: "." })).toBe(".");
+  });
 });
 
 describe("readOpencodeBashRules — global first, project last (last-wins)", () => {
@@ -244,6 +259,13 @@ describe("createPolicyChecker — matching & precedence", () => {
   it("fails closed when executable-body inspection exceeds its depth budget", () => {
     const deep = `echo ${"$(".repeat(40)}printf ok${")".repeat(40)}`;
     expect(createPolicyChecker([])(deep)).toContain("incomplete shell syntax");
+  });
+
+  it("fails closed when executable-body inspection throws", () => {
+    const inspect = () => {
+      throw new Error("inspection failed");
+    };
+    expect(createPolicyChecker([], [], inspect)("echo hi")).toBe("incomplete shell syntax (policy inspection failed)");
   });
 });
 
