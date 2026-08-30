@@ -42,6 +42,16 @@ describe("command inspection mechanics", () => {
     });
   });
 
+  it("stops after the first unmatched substitution or backtick", () => {
+    const unmatchedSubstitutions = "echo " + "$(".repeat(48) + "tail";
+    const unmatchedBackticks = "echo " + "`".repeat(47) + "tail";
+    expect(inspectCommandSubstitutions(unmatchedSubstitutions)).toMatchObject({
+      complete: false,
+      bodies: [],
+    });
+    expect(inspectCommandSubstitutions(unmatchedBackticks).complete).toBe(false);
+  });
+
   it("tokenizes quoted and escaped shell words without quote characters", () => {
     expect(tokenizeShellWords(`git "push origin" 'main branch' escaped\\ word`)).toEqual([
       "git",

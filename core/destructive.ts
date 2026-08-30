@@ -960,15 +960,20 @@ function perlOpenWriteMode(mode: string): boolean {
 
 function interpreterEvalPayload(segment: string): string {
   const words = shellWords(segment);
+  const headIndex = effectiveHeadIndex(words);
+  if (headIndex === null) {
+    const splitString = envSplitStringPayload(words);
+    return splitString === null ? segment : interpreterEvalPayload(splitString);
+  }
+  const head = words[headIndex]!.replace(/^.*\//, "");
   const evalFlag = /^(?:--eval|--print|--run|-r|-[epnc]|-[pn]*e[pn]*)$/;
-  const index = words.findIndex((word) => evalFlag.test(word));
+  const index = words.findIndex((word, i) => i > headIndex && evalFlag.test(word));
   if (index >= 0) return words.slice(index + 1).join(" ");
   // Ruby and Perl accept an eval program attached directly to `-e`, e.g.
   // `ruby -eFile.write(...)`. Keep this narrow: other interpreters have
   // materially different short-option grammars and remain fail-closed below.
-  const head = words[0]?.replace(/^.*\//, "");
   if (head === "ruby" || head === "perl") {
-    const attached = words.findIndex((word, i) => i > 0 && /^-e.+/.test(word));
+    const attached = words.findIndex((word, i) => i > headIndex && /^-e.+/.test(word));
     if (attached >= 0) {
       const raw = attachedEvalProgram(segment, head);
       return raw ?? [words[attached]!.slice(2), ...words.slice(attached + 1)].join(" ");
@@ -1957,7 +1962,14 @@ function findDestructiveTokenInternal(cmd: string, depth: number): string | null
     });
   if (allSafe) return null;
 
-  const wordScanText = segments.map((segment, i) => languageWordScanSegment(heads[i] ?? "", segment)).join(" | ");
+  const wordScanText = segments.map((segment, i) => {
+    // Control-clause prefixes are syntax, not argv data. Strip them before
+    // language masking so `if command perl -eprint("unlink('x')")` resolves
+    // the wrapped interpreter instead of scanning its quoted program text as
+    // ordinary shell words.
+    const scanSegment = stripShellControlPrefix(segment);
+    return languageWordScanSegment(effectiveHead(scanSegment) ?? heads[i] ?? "", scanSegment);
+  }).join(" | ");
   const word = WORD_RE.exec(sanitizeForRedirect(wordScanText));
   if (word) return word[0].trim();
 

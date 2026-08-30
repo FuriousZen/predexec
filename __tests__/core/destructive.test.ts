@@ -499,6 +499,32 @@ describe("interpreter eval — fs-writer APIs are caught", () => {
       expect(findDestructiveToken(cmd)).not.toBeNull();
     });
 
+    it.each([
+      `env ruby -eFile.write("x", "y")`,
+      `command ruby -eFile.write("x", "y")`,
+      `printf ok | env ruby -eFile.write("x", "y")`,
+      `if env ruby -eFile.write("x", "y"); then :; fi`,
+      `case x in a) env ruby -eFile.write("x", "y") ;; esac`,
+      `env /usr/bin/ruby -eFile.write("x", "y")`,
+      `env -S 'ruby -eFile.write("x", "y")'`,
+      `env perl -eunlink("x")`,
+      `command /usr/bin/perl -eunlink("x")`,
+      `printf ok | env perl -eunlink("x")`,
+      `if command perl -eunlink("x"); then :; fi`,
+      `case x in a) env /usr/bin/perl -eunlink("x") ;; esac`,
+    ])("catches attached Ruby/Perl writers through wrappers and compounds: %s", (cmd) => {
+      expect(findDestructiveToken(cmd)).not.toBeNull();
+    });
+
+    it.each([
+      `env ruby -eputs("File.write('x', 'y')")`,
+      `command perl -eprint("unlink('x')")`,
+      `printf ok | env ruby -eputs("File.write('x', 'y')")`,
+      `if command perl -eprint("unlink('x')"); then :; fi`,
+    ])("preserves safe attached Ruby/Perl data through wrappers: %s", (cmd) => {
+      expect(findDestructiveToken(cmd)).toBeNull();
+    });
+
     it("does not interpret shell control or eval-looking text inside double-quoted data", () => {
       expect(interpreterEvalPreflight(`echo "safe; ruby -e 'File.write(x)'"`)).toBeNull();
       expect(findDestructiveToken(`echo "safe; ruby -e 'File.write(x)'"`)).toBeNull();

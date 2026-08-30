@@ -77,14 +77,14 @@ function substitutionBodySpans(command: string): { bodies: SpannedBody[]; comple
         quote = null;
       } else if (ch === "`" ) {
         const end = findBacktickClose(command, i + 1);
-        if (end === -1) complete = false;
+        if (end === -1) return { bodies, complete: false };
         else {
           bodies.push({ text: command.slice(i + 1, end), start: i + 1, end });
           i = end;
         }
       } else if (ch === "$" && command[i + 1] === "(") {
         const close = findParenSubstitutionClose(command, i + 2);
-        if (close === -1) complete = false;
+        if (close === -1) return { bodies, complete: false };
         else {
           bodies.push({ text: command.slice(i + 2, close), start: i + 2, end: close });
           i = close;
@@ -106,7 +106,7 @@ function substitutionBodySpans(command: string): { bodies: SpannedBody[]; comple
     }
     if (ch === "`") {
       const end = findBacktickClose(command, i + 1);
-      if (end === -1) complete = false;
+      if (end === -1) return { bodies, complete: false };
       else {
         bodies.push({ text: command.slice(i + 1, end), start: i + 1, end });
         i = end;
@@ -115,7 +115,7 @@ function substitutionBodySpans(command: string): { bodies: SpannedBody[]; comple
     }
     if ((ch === "$" || ch === "<" || ch === ">") && command[i + 1] === "(") {
       const close = findParenSubstitutionClose(command, i + 2);
-      if (close === -1) complete = false;
+      if (close === -1) return { bodies, complete: false };
       else {
         bodies.push({ text: command.slice(i + 2, close), start: i + 2, end: close });
         i = close;
@@ -389,7 +389,10 @@ function inspectShellCommandClauseEvents(segment: string): { events: ShellClause
       continue;
     }
     if (SHELL_RESERVED_WORDS.has(tokens[0]!)) {
-      const executable = stripReservedPrefix(tokens);
+      // Keep the original shell quoting when removing reserved prefixes.
+      // Rebuilding from tokenized words would turn a language string such as
+      // `perl -eprint("unlink('x')")` into executable-looking Perl source.
+      const executable = stripReservedPrefixText(part.text);
       if (executable) {
         clauses.push({ text: executable, start: part.start, end: part.end });
       }
@@ -512,13 +515,18 @@ function findMatchingBrace(segment: string, open: number): number {
   return -1;
 }
 
-function stripReservedPrefix(tokens: readonly string[]): string | null {
-  let index = 0;
-  while (index < tokens.length && SHELL_RESERVED_WORDS.has(tokens[index]!)) index++;
-  // `function name { ... }` has a function name between reserved words.
-  if (tokens[0] === "function" && index < tokens.length && !SHELL_RESERVED_WORDS.has(tokens[index]!)) index++;
-  while (index < tokens.length && SHELL_RESERVED_WORDS.has(tokens[index]!)) index++;
-  return index < tokens.length ? tokens.slice(index).join(" ") : null;
+/** Remove leading shell-control words without erasing argument quoting. */
+function stripReservedPrefixText(text: string): string | null {
+  let current = text.trim();
+  if (/^function\b/.test(current)) {
+    current = current.replace(/^function\s+[A-Za-z_][A-Za-z0-9_]*(?:\s*)/, "");
+  }
+  for (let i = 0; i < 8; i++) {
+    const next = current.replace(/^(?:(?:if|then|elif|else|fi|while|until|do|done|for|select|function|coproc)\b|[{}()!])\s*/u, "");
+    if (next === current) break;
+    current = next;
+  }
+  return current || null;
 }
 
 /** Split shell control separators without splitting quoted/nested syntax. */
