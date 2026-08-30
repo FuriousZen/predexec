@@ -361,6 +361,53 @@ describe("runPlanTree — traversal & stop reasons", () => {
     },
   );
 
+  it.skipIf(
+    !["/usr/bin/perl", "/usr/local/bin/perl", "/opt/homebrew/bin/perl", "/usr/bin/ruby", "/usr/local/bin/ruby", "/opt/homebrew/bin/ruby", "/usr/bin/php", "/usr/local/bin/php", "/opt/homebrew/bin/php"].some(existsSync),
+  )("mutationStop: shell-executing qx/backtick bodies never create or delete files", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "predexec-shell-body-"));
+    try {
+      writeFileSync(join(dir, "victim"), "keep\n");
+      const commands = [
+        `perl -e 'qx{rm -f victim}'`,
+        `perl -e 'qx{printf hi > created}'`,
+        `ruby -e 'x = \`rm -f victim\`'`,
+        `ruby -e 'x = \`printf hi > created\`'`,
+        `php -r '$x = \`rm -f victim\`;'`,
+        `php -r '$x = \`printf hi > created\`;'`,
+      ];
+      for (const command of commands) {
+        const result = await runPlanTree({ root: "a", nodes: [{ id: "a", commands: [command] }] }, { cwd: dir });
+        expect(result.stoppedReason).toBe("mutationStop");
+        expect(result.pathTaken).toEqual([]);
+      }
+      expect(existsSync(join(dir, "created"))).toBe(false);
+      expect(existsSync(join(dir, "victim"))).toBe(true);
+      expect(readFileSync(join(dir, "victim"), "utf8")).toBe("keep\n");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it.skipIf(
+    !["/usr/bin/perl", "/usr/local/bin/perl", "/opt/homebrew/bin/perl", "/usr/bin/ruby", "/usr/local/bin/ruby", "/opt/homebrew/bin/ruby", "/usr/bin/php", "/usr/local/bin/php", "/opt/homebrew/bin/php"].some(existsSync),
+  )("allows installed read-only qx/backtick bodies to reach a leaf", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "predexec-shell-body-read-"));
+    try {
+      const commands = [
+        `perl -e 'qx{printf hi}'`,
+        `ruby -e 'x = \`printf hi\`'`,
+        `php -r '$x = \`printf hi\`;'`,
+      ];
+      for (const command of commands) {
+        const result = await runPlanTree({ root: "a", nodes: [{ id: "a", commands: [command] }] }, { cwd: dir });
+        expect(result.stoppedReason).toBe("leaf");
+        expect(result.pathTaken).toEqual(["a"]);
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it.each([
     "/usr/bin/time -o timing.log printf hi",
     "time --output timing.log printf hi",

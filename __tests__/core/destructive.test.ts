@@ -314,6 +314,85 @@ describe("interpreter eval — fs-writer APIs are caught", () => {
     expect(isDestructiveCommand(cmd)).toBe(false);
   });
 
+  describe("round 16 executable shell bodies and Ruby literal semantics", () => {
+    it.each([
+      `perl -e 'qx{rm -f victim}'`,
+      `perl -e 'qx{printf hi > created}'`,
+      `perl -e 'qx{git init scratch}'`,
+      `perl -e 'qx{cp source destination}'`,
+      `perl -e 'qx(printf hi > created)'`,
+      `perl -e 'qx{echo $(rm -f victim)}'`,
+      `ruby -e 'x = \`rm -f victim\`'`,
+      `ruby -e 'x = \`printf hi > created\`'`,
+      `ruby -e 'x = \`git init scratch\`'`,
+      `php -r '$x = \`rm -f victim\`;'`,
+      `php -r '$x = \`printf hi > created\`;'`,
+    ])("classifies executable shell writer body %s", (cmd) => {
+      expect(findDestructiveToken(cmd)).not.toBeNull();
+    });
+
+    it.each([
+      `perl -e 'qx{printf hi}'`,
+      `ruby -e 'x = \`printf hi\`'`,
+      `php -r '$x = \`printf hi\`;'`,
+      "ruby -e 'x = `printf \"\\`safe\\`\"`'",
+      `ruby -e 'x = \`echo $(git status)\`'`,
+    ])("allows fully classified read-only shell body %s", (cmd) => {
+      expect(findDestructiveToken(cmd)).toBeNull();
+    });
+
+    it.each([
+      `ruby -e 'x = \`printf hi'`,
+      `php -r '$x = \`printf hi;'`,
+      `perl -e 'qx{printf hi'`,
+    ])("fails closed for incomplete executable shell body %s", (cmd) => {
+      expect(findDestructiveToken(cmd)).not.toBeNull();
+    });
+
+    it.each([
+      `ruby -e "<<'DOC'\n#{File.write('created', 'x')}\nDOC"`,
+      `ruby -e "<<\\DOC\n#{File.write('created', 'x')}\nDOC"`,
+      `ruby -e "<<~DOC\n  \\#{File.write('created', 'x')}\n  DOC"`,
+    ])("masks non-interpolating or escaped Ruby heredoc body %s", (cmd) => {
+      expect(findDestructiveToken(cmd)).toBeNull();
+    });
+
+    it.each([
+      `ruby -e "<<DOC\n#{File.write('created', 'x')}\nDOC"`,
+      `ruby -e "<<\"DOC\"\n#{File.write('created', 'x')}\nDOC"`,
+      `ruby -e "<<-DOC\n  #{File.write('created', 'x')}\n  DOC"`,
+      `ruby -e "<<~DOC\n  #{File.write('created', 'x')}\nDOC"`,
+    ])("scans interpolating Ruby heredoc body %s", (cmd) => {
+      expect(findDestructiveToken(cmd)).not.toBeNull();
+    });
+
+    it("masks nested Ruby %q literal inside interpolation", () => {
+      expect(findDestructiveToken(`ruby -e 'x = "#{%q{#{File.write("created", "x")}}}"'`)).toBeNull();
+    });
+
+    it("scans nested Ruby %Q interpolation inside interpolation", () => {
+      expect(findDestructiveToken(`ruby -e 'x = "#{%Q{#{File.write("created", "x")}}}"'`)).not.toBeNull();
+    });
+
+    it.each([
+      `ruby -e 'x = "#{\`rm -f victim\`}"'`,
+      "perl -e 'print \"${\\qx{rm -f victim}}\"'",
+    ])("scans shell execution nested inside language interpolation %s", (cmd) => {
+      expect(findDestructiveToken(cmd)).not.toBeNull();
+    });
+
+    it("masks Perl POD only through a line-boundary =cut", () => {
+      expect(findDestructiveToken("perl -e '=pod\nunlink(\"victim\")\n=cut\nprint 1'")).toBeNull();
+      expect(findDestructiveToken("perl -e '=pod\nunlink(\"victim\")\n=cut\nunlink(\"victim\")'")).not.toBeNull();
+    });
+
+    it("fails closed deterministically before rescanning an over-budget Ruby payload", () => {
+      const payload = `ruby -e '${"#{%Q{".repeat(32)}${"x".repeat(30_000)}${"}}".repeat(32)}'`;
+      expect(payload.length).toBeGreaterThan(30_000);
+      expect(findDestructiveToken(payload)).not.toBeNull();
+    });
+  });
+
   const rubyFileUtilsAliasWriters = [
     `ruby -e "FileUtils.rm_r('out')"`,
     `ruby -e "FileUtils::remove_entry('out')"`,
