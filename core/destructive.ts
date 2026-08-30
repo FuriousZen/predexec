@@ -253,6 +253,43 @@ function wrapperOptionHasAttachedValue(wrapper: string, option: string): boolean
 }
 
 /**
+ * Return the output option from a leading `time` wrapper, if present. Unlike
+ * format-only options, `time -o FILE` and `time --output=FILE` open FILE
+ * themselves before running the wrapped command, so resolving the inner head
+ * first would incorrectly classify `time -o FILE printf ...` as a safe reader.
+ */
+function timeOutputOption(segment: string): string | null {
+  const tokens = shellWords(segment);
+  let wrapper: string | null = null;
+  for (let i = 0; i < tokens.length; i++) {
+    const token = tokens[i]!;
+    if (/^\w+=/.test(token)) continue;
+    const base = token.replace(/^.*\//, "");
+    if (WRAPPERS.has(base)) {
+      wrapper = base;
+      continue;
+    }
+    if (!wrapper) return null;
+    if (token === "--") {
+      wrapper = null;
+      continue;
+    }
+    if (wrapper === "time") {
+      if (token === "-o" || token === "--output" || token.startsWith("-o") && token.length > 2 || token.startsWith("--output=")) {
+        return token;
+      }
+      if (token.startsWith("-")) {
+        const optionSet = WRAPPER_OPTIONS_WITH_VALUE.time;
+        if (optionSet?.has(token) && i + 1 < tokens.length && !wrapperOptionHasAttachedValue("time", token)) i++;
+        continue;
+      }
+    }
+    return null;
+  }
+  return null;
+}
+
+/**
  * Privileged escalation heads. Never speculated on: a privileged command is
  * outside the recoverable read-only zone by definition, and detection would
  * otherwise rest entirely on the word scan matching whatever it wraps.
@@ -457,6 +494,16 @@ export function findDestructiveToken(cmd: string): string | null {
   if (redirect) return redirect[0].trim() || ">";
 
   const segments = splitCommandSegments(cmd);
+
+  // Check output-bearing `time` options before resolving the wrapped command's
+  // head. The output file is a mutation even when the inner command is a pure
+  // reader such as `printf`; `-a`/`--append` only becomes relevant when paired
+  // with `-o`/`--output`.
+  for (const segment of segments) {
+    const output = timeOutputOption(segment);
+    if (output) return `time ${output}`;
+  }
+
   const heads = segments.map(effectiveHead);
 
   // Privileged escalation is never speculated on, whatever it wraps.

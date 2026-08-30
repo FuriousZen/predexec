@@ -169,3 +169,54 @@ real packed-install smoke checks. `git diff --check` passed. Only the owning
 engine, shared command-inspection module, Claude/Codex policy adapters, and
 their focused regressions changed; no ledger edit, dependency change, dist
 staging, publish, push, merge, or version bump was performed.
+
+## Integration fix round 2 — Important mutation bypass
+
+This round started from the round-1 commit `c2e6143`. Final whole-branch
+review identified that the new wrapper handling correctly reached the inner
+command for policy matching but caused the mutation classifier to treat an
+output-bearing `time` wrapper as the safe inner command. In particular,
+`/usr/bin/time -o timing.log printf hi` could create `timing.log`.
+
+### RED evidence
+
+Before changing production code, the classifier and engine regressions were run
+with:
+
+```text
+./node_modules/.bin/vitest run __tests__/core/destructive.test.ts __tests__/core/engine.test.ts
+```
+
+Result: exit 1; **13 tests failed, 228 passed**. Eight classifier cases
+returned `null` for `/usr/bin/time -o`, `time --output`, attached
+`-ofile`/`--output=file`, `env time` chains, and `-a/--append` paired with
+output. Five engine cases reached a successful leaf instead of stopping before
+`runNode`; each timing-file assertion confirmed the bypass could execute.
+
+### GREEN implementation and regressions
+
+- `core/destructive.ts` now inspects leading wrapper chains for output-bearing
+  `time` options before resolving the wrapped command head. It recognizes
+  absolute `/usr/bin/time`, separate and attached short/long output options,
+  `env time` chains, and append paired with output.
+- Format-only `-f/--format`, `-p`, append without output, and safe inner
+  commands remain allowed. The classifier returns a `time` output token for an
+  actionable mutation hard-stop.
+- Engine regressions prove all covered output forms stop before execution and
+  do not create the timing file.
+
+The focused mutation/engine suite passed **241/241 tests**. The combined
+mutation, engine, command-inspection, and Claude/Codex/OpenCode policy suites
+passed **382/382 tests**. `./node_modules/.bin/tsc --noEmit` passed, and
+`pnpm run build` succeeded.
+
+The full suite passed **763/763 tests**. Release verification passed **9/9
+tests**:
+
+```text
+./node_modules/.bin/vitest run __tests__/release-hygiene.test.ts __tests__/pack.test.ts
+```
+
+The packed-install smoke checks passed with the rebuilt production artifacts,
+and `git diff --check` passed. No ledger edit, dependency change, version bump,
+publish, push, merge, or release artifact staging was performed.

@@ -279,6 +279,28 @@ describe("mutation classifier — wrapper options and command separators", () =>
   it("keeps quoted newlines inside one read-only command", () => {
     expect(findDestructiveToken('git grep "status\ngit add file.txt" -- README.md')).toBeNull();
   });
+
+  it.each([
+    "/usr/bin/time -o timing.log printf hi",
+    "time --output timing.log printf hi",
+    "time -ofile printf hi",
+    "time --output=file printf hi",
+    "env time -o timing.log printf hi",
+    "env time --output=file printf hi",
+    "time -a -o timing.log printf hi",
+    "time -a --output timing.log printf hi",
+  ])("blocks time output files before resolving the inner command: %s", (command) => {
+    expect(findDestructiveToken(command)).not.toBeNull();
+  });
+
+  it.each([
+    "time -p printf hi",
+    "time -f %E printf hi",
+    "time --format %E printf hi",
+    "env time -p printf hi",
+  ])("keeps non-output time wrappers safe: %s", (command) => {
+    expect(findDestructiveToken(command)).toBeNull();
+  });
 });
 
 describe("isDestructiveCommand — bypasses found in the 2026-08 audit", () => {

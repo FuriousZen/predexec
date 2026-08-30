@@ -139,6 +139,27 @@ describe("runPlanTree — traversal & stop reasons", () => {
     }
   });
 
+  it.each([
+    "/usr/bin/time -o timing.log printf hi",
+    "time --output timing.log printf hi",
+    "time -ofile printf hi",
+    "time --output=file printf hi",
+    "env time -o timing.log printf hi",
+  ])("mutationStop: %s stops before runNode creates the timing file", async (command) => {
+    const dir = mkdtempSync(join(tmpdir(), "predexec-time-"));
+    try {
+      const r = await runPlanTree(
+        { root: "a", nodes: [{ id: "a", commands: [command] }] },
+        { cwd: dir },
+      );
+      expect(r.stoppedReason).toBe("mutationStop");
+      expect(r.pathTaken).toEqual([]);
+      expect(existsSync(join(dir, "timing.log"))).toBe(false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("mutationStop: newline-separated Git mutation stops before runNode", async () => {
     const dir = mkdtempSync(join(tmpdir(), "predexec-git-"));
     try {
