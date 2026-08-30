@@ -969,9 +969,75 @@ function interpreterEvalPayload(segment: string): string {
   const head = words[0]?.replace(/^.*\//, "");
   if (head === "ruby" || head === "perl") {
     const attached = words.findIndex((word, i) => i > 0 && /^-e.+/.test(word));
-    if (attached >= 0) return [words[attached]!.slice(2), ...words.slice(attached + 1)].join(" ");
+    if (attached >= 0) {
+      const raw = attachedEvalProgram(segment, head);
+      return raw ?? [words[attached]!.slice(2), ...words.slice(attached + 1)].join(" ");
+    }
   }
   return segment;
+}
+
+/**
+ * Extract an attached Ruby/Perl `-ePROGRAM` while retaining quotes that are
+ * part of PROGRAM. ShellWords must remove the shell's outer argument quotes,
+ * but attached programs can also use those same delimiters as language
+ * string syntax (for example `-eputs("File.write('x','y')")`). A quote that
+ * starts before any program text is an outer shell wrapper; quotes encountered
+ * after text has started are retained as language syntax.
+ */
+function attachedEvalProgram(segment: string, interpreter: "ruby" | "perl"): string | null {
+  const match = new RegExp(`(?:^|\\s)(?:[^\\s]*\\/)?${interpreter}\\s+(-e)`).exec(segment);
+  if (!match) return null;
+  const tokenStart = match.index + match[0]!.indexOf(match[1]!);
+  let tokenEnd = tokenStart + match[1]!.length;
+  let shellQuote: "'" | '"' | null = null;
+  let shellEscaped = false;
+  for (; tokenEnd < segment.length; tokenEnd++) {
+    const ch = segment[tokenEnd]!;
+    if (shellEscaped) { shellEscaped = false; continue; }
+    if (ch === "\\" && shellQuote !== "'") { shellEscaped = true; continue; }
+    if (shellQuote !== null) {
+      if (ch === shellQuote) shellQuote = null;
+      continue;
+    }
+    if (ch === "'" || ch === '"') { shellQuote = ch; continue; }
+    if (/\s/.test(ch)) break;
+  }
+  if (shellQuote !== null || shellEscaped) return null;
+  const raw = segment.slice(tokenStart + match[1]!.length, tokenEnd);
+  let program = "";
+  let quote: "'" | '"' | null = null;
+  let preserveQuote = false;
+  let escaped = false;
+  for (const ch of raw) {
+    if (escaped) {
+      program += ch;
+      escaped = false;
+      continue;
+    }
+    if (ch === "\\" && quote !== "'") {
+      escaped = true;
+      continue;
+    }
+    if (quote !== null) {
+      if (ch === quote) {
+        if (preserveQuote) program += ch;
+        quote = null;
+      } else {
+        program += ch;
+      }
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      preserveQuote = program.length > 0;
+      if (preserveQuote) program += ch;
+      quote = ch;
+      continue;
+    }
+    program += ch;
+  }
+  if (escaped || quote !== null) return null;
+  return program;
 }
 
 function interpreterLanguage(head: string): InterpolationLanguage {
@@ -1017,18 +1083,44 @@ function stripShellControlPrefix(fragment: string): string {
   return current;
 }
 
-function cheapGroupClose(command: string, start: number, open: string, close: string): number {
+interface CheapScanBudget { remaining: number; exhausted: boolean; }
+
+function chargeCheapScan(budget: CheapScanBudget): boolean {
+  if (budget.remaining <= 0) {
+    budget.exhausted = true;
+    return false;
+  }
+  budget.remaining--;
+  return true;
+}
+
+function cheapGroupClose(
+  command: string,
+  start: number,
+  open: string,
+  close: string,
+  budget: CheapScanBudget,
+): number {
   let depth = 1;
   let quote: "'" | '"' | null = null;
   for (let i = start + 1; i < command.length; i++) {
+    if (!chargeCheapScan(budget)) return -2;
     const ch = command[i]!;
     if (quote === "'") { if (ch === "'") quote = null; continue; }
     if (quote === '"') {
-      if (ch === "\\") { i++; continue; }
+      if (ch === "\\") {
+        if (i + 1 < command.length && !chargeCheapScan(budget)) return -2;
+        i++;
+        continue;
+      }
       if (ch === '"') quote = null;
       continue;
     }
-    if (ch === "\\") { i++; continue; }
+    if (ch === "\\") {
+      if (i + 1 < command.length && !chargeCheapScan(budget)) return -2;
+      i++;
+      continue;
+    }
     if (ch === "'") { quote = "'"; continue; }
     if (ch === '"') { quote = '"'; continue; }
     if (ch === open) depth++;
@@ -1044,22 +1136,37 @@ function cheapGroupClose(command: string, start: number, open: string, close: st
  * the existing direct preflight. Its bounded recursion keeps oversized evals
  * out of the more expensive executable-body tree.
  */
-function cheapInterpreterFragments(command: string, depth = 0, budget = { remaining: LANGUAGE_EVAL_EARLY_LIMIT * 8 }): string[] {
-  if (depth > 16 || budget.remaining <= 0) return [];
+function cheapInterpreterFragments(
+  command: string,
+  depth = 0,
+  budget: CheapScanBudget = { remaining: LANGUAGE_EVAL_EARLY_LIMIT * 8, exhausted: false },
+): string[] | null {
+  if (depth > 16 || budget.exhausted || command.length > budget.remaining) {
+    budget.exhausted = true;
+    return null;
+  }
   budget.remaining -= command.length;
   const fragments: string[] = [];
   let start = 0;
   let quote: "'" | '"' | null = null;
+  const isCaseCommand = /^\s*case\b[\s\S]*\bin\b/u.test(command);
   for (let i = 0; i < command.length; i++) {
+    if (!chargeCheapScan(budget)) return null;
     const ch = command[i]!;
     if (quote === "'") {
       if (ch === "'") quote = null;
       continue;
     }
     if (quote === '"') {
-      if (ch === "\\") { i++; continue; }
+      if (ch === "\\") {
+        if (i + 1 < command.length && !chargeCheapScan(budget)) return null;
+        i++;
+        continue;
+      }
       if (ch === '"') { quote = null; continue; }
+      continue;
     } else if (ch === "\\") {
+      if (i + 1 < command.length && !chargeCheapScan(budget)) return null;
       i++;
       continue;
     } else if (ch === "'") {
@@ -1077,29 +1184,43 @@ function cheapInterpreterFragments(command: string, depth = 0, budget = { remain
       let innerQuote: "'" | '"' | null = null;
       let close = -1;
       for (let j = bodyStart; j < command.length; j++) {
+        if (!chargeCheapScan(budget)) return null;
         const inner = command[j]!;
         if (innerQuote === "'") { if (inner === "'") innerQuote = null; continue; }
         if (innerQuote === '"') {
-          if (inner === "\\") { j++; continue; }
+          if (inner === "\\") {
+            if (j + 1 < command.length && !chargeCheapScan(budget)) return null;
+            j++;
+            continue;
+          }
           if (inner === '"') innerQuote = null;
           continue;
         }
-        if (inner === "\\") { j++; continue; }
+        if (inner === "\\") {
+          if (j + 1 < command.length && !chargeCheapScan(budget)) return null;
+          j++;
+          continue;
+        }
         if (inner === "'") { innerQuote = "'"; continue; }
         if (inner === '"') { innerQuote = '"'; continue; }
         if (inner === "(") parens++;
         else if (inner === ")" && --parens === 0) { close = j; break; }
       }
       if (close >= 0) {
-        fragments.push(...cheapInterpreterFragments(command.slice(bodyStart, close), depth + 1, budget));
+        const nested = cheapInterpreterFragments(command.slice(bodyStart, close), depth + 1, budget);
+        if (nested === null) return null;
+        fragments.push(...nested);
         i = close;
       }
       continue;
     }
     if (ch === "(" || ch === "{") {
-      const close = cheapGroupClose(command, i, ch, ch === "(" ? ")" : "}");
+      const close = cheapGroupClose(command, i, ch, ch === "(" ? ")" : "}", budget);
+      if (close === -2) return null;
       if (close >= 0) {
-        fragments.push(...cheapInterpreterFragments(command.slice(i + 1, close), depth + 1, budget));
+        const nested = cheapInterpreterFragments(command.slice(i + 1, close), depth + 1, budget);
+        if (nested === null) return null;
+        fragments.push(...nested);
         i = close;
       }
       continue;
@@ -1107,11 +1228,18 @@ function cheapInterpreterFragments(command: string, depth = 0, budget = { remain
     if (ch === "`") {
       let close = -1;
       for (let j = i + 1; j < command.length; j++) {
-        if (command[j] === "\\") { j++; continue; }
+        if (!chargeCheapScan(budget)) return null;
+        if (command[j] === "\\") {
+          if (j + 1 < command.length && !chargeCheapScan(budget)) return null;
+          j++;
+          continue;
+        }
         if (command[j] === "`") { close = j; break; }
       }
       if (close >= 0) {
-        fragments.push(...cheapInterpreterFragments(command.slice(i + 1, close), depth + 1, budget));
+        const nested = cheapInterpreterFragments(command.slice(i + 1, close), depth + 1, budget);
+        if (nested === null) return null;
+        fragments.push(...nested);
         i = close;
       }
       continue;
@@ -1119,7 +1247,7 @@ function cheapInterpreterFragments(command: string, depth = 0, budget = { remain
     // A case arm starts after its unquoted `pattern)` delimiter rather than
     // after a command separator. Expose that arm as a fresh command fragment
     // while leaving ordinary parenthesized groups to the branch above.
-    if (ch === ")" && /\bcase\b[\s\S]*\bin\b/u.test(command.slice(start, i))) {
+    if (ch === ")" && isCaseCommand) {
       start = i + 1;
       continue;
     }
@@ -1137,7 +1265,9 @@ function cheapInterpreterFragments(command: string, depth = 0, budget = { remain
 export function interpreterEvalPreflight(segment: string): { payloadLength: number; interpreter: string } | null {
   const direct = directInterpreterEvalPreflight(segment);
   if (direct) return direct;
-  for (const fragment of cheapInterpreterFragments(segment)) {
+  const fragments = cheapInterpreterFragments(segment);
+  if (fragments === null) return { interpreter: "shell", payloadLength: LANGUAGE_EVAL_EARLY_LIMIT + 1 };
+  for (const fragment of fragments) {
     const candidate = directInterpreterEvalPreflight(stripShellControlPrefix(fragment));
     if (candidate) return candidate;
   }
@@ -1439,6 +1569,7 @@ function parenthesizedGroups(command: string): string[] {
       i++;
       continue;
     }
+    if (i > 0 && !/[\s;|&(){}]/.test(command[i - 1]!)) continue;
     let depth = 1;
     let innerQuote: "'" | '"' | null = null;
     for (let j = i + 1; j < command.length; j++) {

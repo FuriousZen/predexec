@@ -482,6 +482,53 @@ describe("interpreter eval — fs-writer APIs are caught", () => {
     ])("allows safe attached Ruby/Perl eval data: %s", (cmd) => {
       expect(findDestructiveToken(cmd)).toBeNull();
     });
+
+    it.each([
+      `ruby -eputs("File.write('x','y')")`,
+      `perl -eprint("unlink('x')")`,
+      `ruby -eputs("File.write('x', 'y')")`,
+      `perl -eprint("unlink( 'x' )")`,
+    ])("preserves language quotes in attached Ruby/Perl eval data: %s", (cmd) => {
+      expect(findDestructiveToken(cmd)).toBeNull();
+    });
+
+    it.each([
+      `ruby -eputs(File.write("x", "y"))`,
+      `perl -eunlink("x")`,
+    ])("catches attached Ruby/Perl eval writers after preserving language quotes: %s", (cmd) => {
+      expect(findDestructiveToken(cmd)).not.toBeNull();
+    });
+
+    it("does not interpret shell control or eval-looking text inside double-quoted data", () => {
+      expect(interpreterEvalPreflight(`echo "safe; ruby -e 'File.write(x)'"`)).toBeNull();
+      expect(findDestructiveToken(`echo "safe; ruby -e 'File.write(x)'"`)).toBeNull();
+    });
+
+    it.each([
+      `echo 'safe; ruby -e "File.write(x)"'`,
+      `echo "safe\\; ruby -e 'File.write(x)'"`,
+      `echo "safe"ruby -e 'File.write(x)'`,
+    ])("keeps quoted, escaped, and adjacent eval-looking data out of preflight: %s", (cmd) => {
+      expect(interpreterEvalPreflight(cmd)).toBeNull();
+      expect(findDestructiveToken(cmd)).toBeNull();
+    });
+
+    it("does not treat an oversized double-quoted literal as an eval payload", () => {
+      const data = "x".repeat(20_000);
+      expect(interpreterEvalPreflight(`echo "${data}"`)).toBeNull();
+      expect(findDestructiveToken(`echo "${data}"`)).toBeNull();
+    });
+
+    it.each([
+      "(".repeat(2_048),
+      "$(".repeat(1_024),
+    ])("fails closed when cheap delimiter scans exhaust their work budget", (cmd) => {
+      expect(interpreterEvalPreflight(cmd)).toMatchObject({
+        interpreter: "shell",
+        payloadLength: 16_385,
+      });
+      expect(isDestructiveCommand(cmd)).toBe(true);
+    });
   });
 
   const rubyFileUtilsAliasWriters = [

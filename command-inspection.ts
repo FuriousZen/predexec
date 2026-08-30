@@ -767,6 +767,9 @@ function inspectParenthesizedBodies(command: string): ParenthesizedBodyInspectio
       continue;
     }
     if (command[i - 1] === "$" || command[i - 1] === "<" || command[i - 1] === ">") continue;
+    // An opening parenthesis embedded in a shell word is literal text, not a
+    // subshell group (`ruby -eprint(...)`, `echo foo(bar)`).
+    if (i > 0 && !/[\s;|&(){}]/.test(command[i - 1]!)) continue;
     let depth = 1;
     let innerQuote: "'" | '"' | null = null;
     let close = -1;
