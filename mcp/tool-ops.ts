@@ -64,6 +64,8 @@ const MAX_WALK_DIRECTORIES = 20_000;
 const MAX_WALK_ENTRIES = 100_000;
 /** Bound aggregate directory-open plus entry-processing work. */
 const MAX_WALK_WORK = 120_000;
+/** Bound direct `ls` enumeration independently of the caller's result limit. */
+const MAX_LS_SCAN_ENTRIES = MAX_WALK_ENTRIES;
 
 /**
  * execFile's default maxBuffer is 1MB, and overflow kills the child — which
@@ -123,6 +125,8 @@ export interface ToolExecutorOptions {
    */
   rgPath?: string | null;
   fdPath?: string | null;
+  /** Test seam only; production uses node:fs/promises.opendir. */
+  lsOpendir?: LsOpendirLike;
 }
 
 /**
@@ -993,6 +997,24 @@ interface ListedEntry {
   isDir: boolean;
 }
 
+/** Narrow directory seam used to test cancellation and scan caps deterministically. */
+export interface LsDirectoryLike extends AsyncIterable<{
+  name: string;
+  isDirectory(): boolean;
+  isSymbolicLink(): boolean;
+}> {
+  close(): Promise<void>;
+}
+
+export type LsOpendirLike = (path: string) => Promise<LsDirectoryLike>;
+
+export interface LsOpOptions {
+  /** Test seam only; production always uses the fixed scan ceiling. */
+  maxScanEntries?: number;
+  /** Test seam only; production uses node:fs/promises.opendir. */
+  opendir?: LsOpendirLike;
+}
+
 const compareEntryNames = (a: ListedEntry, b: ListedEntry): number => {
   const lowerA = a.name.toLowerCase();
   const lowerB = b.name.toLowerCase();
@@ -1017,16 +1039,49 @@ function retainSortedEntry(entries: ListedEntry[], entry: ListedEntry, capacity:
   if (entries.length > capacity) entries.pop();
 }
 
-async function lsOp(op: ToolOp, root: string, base: string): Promise<OpResult> {
+export async function lsOp(
+  op: ToolOp,
+  root: string,
+  base: string,
+  signal?: AbortSignal,
+  options: LsOpOptions = {},
+): Promise<OpResult> {
+  if (signal?.aborted) throw new Error("aborted");
   const scope = await target(op, root, base, "ls");
   if (scope.err) return scope.err;
   if (!scope.isDir) return fail("ls", `${String(op.path ?? ".")} is not a directory — use {tool:"read"} for files`);
 
   const limit = positiveInt(op.limit) ?? DEFAULT_LS_LIMIT;
+  const maxScanEntries = options.maxScanEntries ?? MAX_LS_SCAN_ENTRIES;
   const retained: ListedEntry[] = [];
-  const directory = await opendir(scope.abs);
+  const directory = await (options.opendir ?? opendir)(scope.abs);
+  let closed = false;
+  const closeDirectory = async (): Promise<void> => {
+    if (closed) return;
+    closed = true;
+    await directory.close().catch(() => undefined);
+  };
+  const abort = (): void => {
+    void closeDirectory();
+  };
+  signal?.addEventListener("abort", abort, { once: true });
+  if (signal?.aborted) {
+    await closeDirectory();
+    signal?.removeEventListener("abort", abort);
+    throw new Error("aborted");
+  }
+  let scanCapped = false;
+  let entriesSeen = 0;
   try {
     for await (const entry of directory) {
+      if (signal?.aborted) throw new Error("aborted");
+      // The loop pulls one entry beyond the cap before this check, proving that
+      // the directory was not exhausted while retaining only the bounded prefix.
+      if (entriesSeen >= maxScanEntries) {
+        scanCapped = true;
+        break;
+      }
+      entriesSeen += 1;
       let isDir = entry.isDirectory();
       if (!isDir && entry.isSymbolicLink()) {
         // Dirents report the link itself, so a symlinked directory needs a stat to
@@ -1035,18 +1090,32 @@ async function lsOp(op: ToolOp, root: string, base: string): Promise<OpResult> {
       }
       retainSortedEntry(retained, { name: entry.name, isDir }, limit + 1);
     }
+  } catch (err) {
+    // Closing the handle from the abort listener can make a pending next()
+    // reject before its result reaches the loop body. Preserve the established
+    // abort contract instead of leaking a platform-specific close error.
+    if (signal?.aborted) throw new Error("aborted");
+    throw err;
   } finally {
-    await directory.close().catch(() => undefined);
+    signal?.removeEventListener("abort", abort);
+    await closeDirectory();
   }
-  const capped = retained.length > limit;
+  const resultCapped = retained.length > limit;
   const names = retained.slice(0, limit).map((entry) => (entry.isDir ? `${entry.name}/` : entry.name));
+  const notices: string[] = [];
+  if (resultCapped) notices.push(`ls: ${limit} entry limit reached — use limit=${limit * 2} for more`);
+  if (scanCapped) {
+    notices.push(
+      `ls: directory-entry scan cap reached after ${maxScanEntries} entries — results are incomplete; narrow the path`,
+    );
+  }
   return {
     stdout: names.join("\n"),
-    stderr: capped ? `ls: ${limit} entry limit reached — use limit=${limit * 2} for more` : "",
+    stderr: notices.join("\n"),
     // An empty directory is a fact, not a failure: exit 0 keeps `exit == 0`
     // edges meaning "the listing succeeded", as on the sibling adapters.
     exitCode: 0,
-    ...(capped ? { stdoutTruncated: true } : {}),
+    ...(resultCapped || scanCapped ? { stdoutTruncated: true } : {}),
   };
 }
 
@@ -1089,7 +1158,7 @@ export function createToolExecutor(opts: ToolExecutorOptions): ToolExecutor {
         case "find":
           return await findOp(op, root, base, fd, runOpts.signal);
         case "ls":
-          return await lsOp(op, root, base);
+          return await lsOp(op, root, base, runOpts.signal, opts.lsOpendir ? { opendir: opts.lsOpendir } : undefined);
         default:
           return { stdout: "", stderr: `unknown tool: ${op.tool}`, exitCode: 1 };
       }

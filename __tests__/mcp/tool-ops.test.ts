@@ -18,8 +18,11 @@ import {
   createToolExecutor,
   findOnPath,
   globToRegExp,
+  lsOp,
   runBinary,
   walkFiles,
+  type LsDirectoryLike,
+  type LsOpendirLike,
   type ExecFileLike,
   type ToolExecutorOptions,
 } from "../../mcp/tool-ops.ts";
@@ -320,6 +323,70 @@ describe("mcp tool-ops — ls", () => {
     expect(r.stdout.split("\n")).toEqual([".hidden.txt", "a.txt"]);
     expect(r.stderr).toContain("2 entry limit reached");
     expect(r.stdoutTruncated).toBe(true);
+  });
+
+  it("stops an in-flight enumeration on abort and closes the iterator", async () => {
+    const controller = new AbortController();
+    let nextCalls = 0;
+    let returnCalls = 0;
+    let closeCalls = 0;
+    const directory: LsDirectoryLike = {
+      [Symbol.asyncIterator]() {
+        return {
+          next: async () => {
+            nextCalls += 1;
+            if (nextCalls === 1) {
+              controller.abort();
+              return { value: { name: "first.txt", isDirectory: () => false, isSymbolicLink: () => false }, done: false };
+            }
+            throw new Error("enumeration continued after abort");
+          },
+          return: async () => {
+            returnCalls += 1;
+            return { value: undefined, done: true };
+          },
+        };
+      },
+      close: async () => {
+        closeCalls += 1;
+      },
+    };
+    const opendir: LsOpendirLike = async () => directory;
+    const executor = createToolExecutor({ cwd: root, lsOpendir: opendir });
+
+    const result = await executor({ tool: "ls" }, { cwd: root, signal: controller.signal });
+
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("aborted");
+    expect(nextCalls).toBe(1);
+    expect(returnCalls).toBe(1);
+    expect(closeCalls).toBe(1);
+  });
+
+  it("reports an incomplete scan cap while retaining the smallest scanned entries", async () => {
+    const entries = ["z-last.txt", "a-first.txt", "m-unseen.txt"].map((name) => ({
+      name,
+      isDirectory: () => false,
+      isSymbolicLink: () => false,
+    }));
+    const directory: LsDirectoryLike = {
+      [Symbol.asyncIterator]() {
+        let index = 0;
+        return {
+          next: async () => ({ value: entries[index++], done: index > entries.length }),
+          return: async () => ({ value: undefined, done: true }),
+        };
+      },
+      close: async () => undefined,
+    };
+    const opendir: LsOpendirLike = async () => directory;
+
+    const result = await lsOp({ tool: "ls", limit: 1 }, root, root, undefined, { opendir, maxScanEntries: 2 });
+
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toBe("a-first.txt");
+    expect(result.stderr).toContain("incomplete");
+    expect(result.stdoutTruncated).toBe(true);
   });
 
   it("reports a missing directory", async () => {
