@@ -1704,3 +1704,64 @@ reads without inventing output for work that never launched. The changes are
 limited to core contracts/execution, command inspection, adapter result
 mapping, focused regressions, and this report; no dependency or harness policy
 semantics were changed.
+
+## Extended integration fix round 23 — shared native-operation ceilings
+
+This user-authorized extension starts from the three parallel reviewer fixes
+`f57c1e2`, `1257347`, and `8753216`. It closes the remaining Important resource
+bound concern: caller-supplied `read`/`grep`/`find`/`ls` limits and grep context
+were finite-checked but otherwise unbounded before adapter slicing or fallback
+work. No dependency, release metadata, version, publish, push, merge, or
+release-artifact staging changed.
+
+### RED evidence
+
+New boundary regressions were added before the implementation. The first
+focused run failed because the shared ceiling constants and validation behavior
+did not yet exist. The regressions cover exact and one-over values for read
+lines (10,000), grep/find results (1,000), ls entries (5,000), and grep context
+(100), plus zero/negative/fractional numeric semantics and coercion-time
+rejection.
+
+### GREEN implementation
+
+- `core/types.ts` is the single source for adapter-neutral ceilings. Core
+  operation validation now requires positive safe integers for offsets/limits,
+  permits zero grep context, and rejects values over the documented ceilings.
+  `coercePlan` applies this validation before execution or expensive plan work.
+- MCP, OpenCode, and Pi direct executor seams defensively reuse the same
+  validator. Over-ceiling direct calls fail before filesystem/SDK/native-tool
+  work; no adapter clamps silently. Existing omitted defaults remain unchanged,
+  and exact in-range values remain accepted.
+- `RESOURCE_LIMIT_DESCRIPTION` and `PLAN_SHAPE_DESCRIPTION` publish the shared
+  ceilings and numeric semantics. Pi's schema now lists all native operation
+  arguments, and README/MCP/OpenCode guidance retains the accepted OpenCode
+  host limitation that `file.read`/search/list may overfetch server-side before
+  predexec bounds retained output.
+- The implementation and regression suite were committed as `56a745e`
+  (`fix: cap native operation limits before execution`).
+
+### GREEN verification and self-review
+
+```text
+./node_modules/.bin/vitest run __tests__/core/validation.test.ts __tests__/index.test.ts __tests__/mcp/tool-ops.test.ts __tests__/plan-language.test.ts __tests__/opencode.test.ts __tests__/pi.test.ts --pool=threads --maxWorkers=1 --testTimeout=10000
+```
+
+Result: exit 0; **6 test files, 273 tests passed** after rebuilding compiled
+entries.
+
+```text
+./node_modules/.bin/tsc --noEmit
+pnpm run build
+./node_modules/.bin/vitest run --pool=threads --maxWorkers=1 --testTimeout=10000
+git diff --check
+```
+
+All passed. The full suite passed **22 test files, 1,446 tests with 1
+skipped**; typecheck and build passed; and `git diff --check` passed. The
+worktree is clean after the implementation commit. No custom stress probe,
+background process, or payload over 4 KiB was used. A process-footprint check
+found no review probe; the only high-CPU process was an unrelated VS Code
+renderer. The bounded validation path is linear, all adapter rejection paths
+are before work, and OpenCode's unavoidable host overfetch is explicitly
+documented rather than presented as server-side bounded.
