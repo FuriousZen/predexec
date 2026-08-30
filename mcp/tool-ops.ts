@@ -58,6 +58,12 @@ const MAX_TEXT_LINE_BYTES = 64 * 1024;
 
 /** Ceiling on the pure-Node walk. An unbounded walk on a huge tree reads as a hang. */
 const MAX_WALK_FILES = 20_000;
+/** Bound directory-heavy trees even when they contain few or no files. */
+const MAX_WALK_DIRECTORIES = 20_000;
+/** Bound the number of directory entries considered by the walk. */
+const MAX_WALK_ENTRIES = 100_000;
+/** Bound aggregate directory-open plus entry-processing work. */
+const MAX_WALK_WORK = 120_000;
 
 /**
  * execFile's default maxBuffer is 1MB, and overflow kills the child — which
@@ -82,8 +88,19 @@ const SKIP_DIRS: ReadonlySet<string> = new Set([".git", "node_modules"]);
 const NO_GITIGNORE_NOTE =
   "unavailable; using the pure-Node walk, which does not honor .gitignore — results may include ignored files";
 
-const walkCapNote = (label: string): string =>
-  `${label}: stopped after visiting ${MAX_WALK_FILES} files — results are incomplete; scope the search with \`path\``;
+type WalkCapReason = "files" | "directories" | "entries" | "work";
+
+const walkCapNote = (label: string, reason: WalkCapReason): string => {
+  const detail =
+    reason === "files"
+      ? `visiting ${MAX_WALK_FILES} files`
+      : reason === "directories"
+        ? "scheduling its directory cap"
+        : reason === "entries"
+          ? "visiting its directory-entry cap"
+          : "reaching its total work cap";
+  return `${label}: fallback walk stopped after ${detail} — results are incomplete; scope the search with \`path\``;
+};
 
 const execFileAsync = promisify(execFile);
 
@@ -336,11 +353,40 @@ async function runBinary(
  * `isDirectory()` is false for them. That drops cycle risk for free and matches
  * fd, which also needs an explicit `--follow`.
  */
-async function walkFiles(dir: string, signal?: AbortSignal): Promise<{ files: string[]; capped: boolean }> {
+export interface WalkLimits {
+  /** Test seam only; executor callers always use the fixed defaults below. */
+  maxFiles?: number;
+  maxDirectories?: number;
+  maxEntries?: number;
+  maxWork?: number;
+}
+
+interface WalkResult {
+  files: string[];
+  capped: boolean;
+  capReason?: WalkCapReason;
+}
+
+/**
+ * Walk with fixed safety ceilings. The optional limits are a narrow deterministic
+ * test seam; production operations never pass them, so a caller's result limit
+ * cannot raise or lower the walk's safety budget.
+ */
+export async function walkFiles(dir: string, signal?: AbortSignal, limits: WalkLimits = {}): Promise<WalkResult> {
+  const maxFiles = limits.maxFiles ?? MAX_WALK_FILES;
+  const maxDirectories = limits.maxDirectories ?? MAX_WALK_DIRECTORIES;
+  const maxEntries = limits.maxEntries ?? MAX_WALK_ENTRIES;
+  const maxWork = limits.maxWork ?? MAX_WALK_WORK;
   const files: string[] = [];
   const stack: string[] = [dir];
+  let directoriesScheduled = 1;
+  let entriesVisited = 0;
+  let work = 0;
+  const capped = (capReason: WalkCapReason): WalkResult => ({ files, capped: true, capReason });
   while (stack.length > 0) {
     if (signal?.aborted) throw new Error("aborted");
+    if (work >= maxWork) return capped("work");
+    work += 1;
     const current = stack.pop()!;
     const currentCanonical = await realpathOrNull(current);
     if (currentCanonical !== current) continue;
@@ -355,11 +401,19 @@ async function walkFiles(dir: string, signal?: AbortSignal): Promise<{ files: st
     }
     try {
       for await (const entry of handle) {
+        if (entriesVisited >= maxEntries) return capped("entries");
+        if (work >= maxWork) return capped("work");
+        entriesVisited += 1;
+        work += 1;
         const abs = join(current, entry.name);
         if (entry.isDirectory()) {
-          if (!SKIP_DIRS.has(entry.name)) stack.push(abs);
+          if (!SKIP_DIRS.has(entry.name)) {
+            if (directoriesScheduled >= maxDirectories) return capped("directories");
+            directoriesScheduled += 1;
+            stack.push(abs);
+          }
         } else if (entry.isFile()) {
-          if (files.length >= MAX_WALK_FILES) return { files, capped: true };
+          if (files.length >= maxFiles) return capped("files");
           files.push(abs);
         }
       }
@@ -588,7 +642,7 @@ async function grepOp(
       signal,
     );
     if (found.err) return found.err;
-    if (found.capped) notes.push(walkCapNote("grep"));
+    if (found.capped) notes.push(walkCapNote("grep", found.capReason ?? "work"));
     matches = found.matches;
   }
 
@@ -690,7 +744,8 @@ async function grepViaNode(
   limit: number,
   signal?: AbortSignal,
 ): Promise<
-  { matches: Match[]; capped: boolean; err?: undefined } | { matches?: undefined; capped?: undefined; err: OpResult }
+  { matches: Match[]; capped: boolean; capReason?: WalkCapReason; err?: undefined } |
+  { matches?: undefined; capped?: undefined; capReason?: undefined; err: OpResult }
 > {
   let re: RegExp;
   if (!flags.literal && !isSafeRegex(pattern)) {
@@ -739,7 +794,7 @@ async function grepViaNode(
       break;
     }
   }
-  return { matches: sortMatches(matches), capped: walked.capped };
+  return { matches: sortMatches(matches), capped: walked.capped, capReason: walked.capReason };
 }
 
 const sortMatches = (matches: Match[]): Match[] =>
@@ -848,7 +903,7 @@ async function findOp(
   } else {
     notes.push(`find: fd ${NO_GITIGNORE_NOTE}`);
     const walked = await walkFiles(currentScope.abs, signal);
-    if (walked.capped) notes.push(walkCapNote("find"));
+    if (walked.capped) notes.push(walkCapNote("find", walked.capReason ?? "work"));
     files = walked.files;
   }
 

@@ -184,22 +184,27 @@ export function createToolExecutor(client: OpencodeClient, cwd: string): ToolExe
           const raw = r.data ?? [];
           const matches = sliceLimit(raw, op.limit);
           const stdout = matches.map((m) => `${m.path.text}:${m.line_number}:${m.lines.text}`).join("\n");
+          const callerCapped = raw.length > matches.length;
           // opencode's /find endpoint hard-codes limit:10 server-side and takes
           // no limit parameter, so a hit count of exactly 10 is indistinguishable
           // from "truncated". Silent truncation feeding a match/numeric edge is
           // false-hit fuel, so say so instead of letting the model assume it saw
           // everything. Verified against opencode 1.18.14.
-          // Only warn when the caller is actually seeing the cap: if they asked
-          // for fewer than we got, they received exactly what they requested.
-          const capped = raw.length >= OPENCODE_GREP_CAP && matches.length === raw.length;
+          // Keep caller-side slicing separate from the host cap: the former is
+          // known truncation even when the SDK returned fewer than ten rows;
+          // the latter is only inferable from a complete ten-row page.
+          const hostCapped = !callerCapped && raw.length >= OPENCODE_GREP_CAP && matches.length === raw.length;
           return {
             stdout,
-            stderr: capped
-              ? `grep: opencode caps results at ${OPENCODE_GREP_CAP} matches and cannot raise it — ` +
-                `results may be incomplete; use a shell \`rg\`/\`grep\` for an exhaustive search`
-              : "",
+            stderr: callerCapped
+              ? `grep: caller limit ${String(op.limit)} reached — results may be incomplete; ` +
+                `use a larger limit or narrow the pattern`
+              : hostCapped
+                ? `grep: opencode caps results at ${OPENCODE_GREP_CAP} matches and cannot raise it — ` +
+                  `results may be incomplete; use a shell \`rg\`/\`grep\` for an exhaustive search`
+                : "",
             exitCode: stdout ? 0 : 1,
-            ...(capped ? { stdoutTruncated: true } : {}),
+            ...(callerCapped || hostCapped ? { stdoutTruncated: true } : {}),
           };
         }
         case "find": {

@@ -173,6 +173,17 @@ describe.each(variants)("opencode createToolExecutor ($name) — grep/find arg h
     expect(r.stdout.split("\n")).toHaveLength(2);
   });
 
+  it("grep: reports caller truncation when the SDK returned more rows than requested", async () => {
+    const client = {
+      find: { text: async () => ({ data: [matchRow("a.ts", 1), matchRow("b.ts", 2), matchRow("c.ts", 3)] }) },
+    };
+    const r = await run(client, { tool: "grep", pattern: "x", limit: 2 });
+    expect(r.stdout.split("\n")).toHaveLength(2);
+    expect(r.stderr).toContain("caller limit 2 reached");
+    expect(r.stderr).toContain("results may be incomplete");
+    expect(r.stdoutTruncated).toBe(true);
+  });
+
   it("find: `path` scopes, and the limit is sent server-side as well as sliced", async () => {
     let seen: any;
     const client = { find: { files: async (o: any) => ((seen = o), { data: ["a.ts", "b.ts", "c.ts"] }) } };

@@ -1,4 +1,4 @@
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
@@ -7,6 +7,7 @@ import {
   createToolExecutor,
   findOnPath,
   globToRegExp,
+  walkFiles,
   type ToolExecutorOptions,
 } from "../../mcp/tool-ops.ts";
 
@@ -565,6 +566,23 @@ describe("mcp tool-ops — helpers", () => {
 });
 
 describe("mcp tool-ops — bounded fallback scans", () => {
+  it("bounds directory-heavy fallback walks independently of file count", async () => {
+    const dir = join(root, "directory-heavy-walk");
+    mkdirSync(join(dir, "a", "leaf"), { recursive: true });
+    mkdirSync(join(dir, "b", "leaf"), { recursive: true });
+    mkdirSync(join(dir, "c", "leaf"), { recursive: true });
+
+    const walked = await walkFiles(realpathSync(dir), undefined, {
+      maxFiles: 100,
+      maxDirectories: 2,
+      maxEntries: 100,
+      maxWork: 100,
+    });
+
+    expect(walked.capped).toBe(true);
+    expect(walked.files).toEqual([]);
+  });
+
   it("searches empty files and the synthetic terminal line from LF splitting", async () => {
     write("empty-grep.txt", "");
     write("trailing-empty-grep.txt", "one\n");
