@@ -184,7 +184,7 @@ const PERL_WRITER_FUNCTIONS =
   /\b(?:rename|unlink|truncate|mkdir|rmdir|chmod|chown|link|symlink)\s*\(/gi;
 const PERL_WRITER_KEYWORDS = ["rename", "unlink", "truncate", "mkdir", "rmdir", "chmod", "chown", "link", "symlink"];
 const RUBY_FILE_WRITER_FUNCTIONS = /\bFile\s*(?:\.|::)\s*(?:write|binwrite|delete|unlink|rename|truncate|symlink|link|utime)\s*\(/gi;
-const RUBY_FILEUTILS_WRITER_FUNCTIONS = /\bFileUtils\s*(?:\.|::)\s*(?:rm|rm_f|rm_rf|mv|cp|cp_r|mkdir|mkdir_p|touch|ln|ln_s|install|chmod|chown|remove)\s*\(/gi;
+const RUBY_FILEUTILS_WRITER_FUNCTIONS = /\bFileUtils\s*(?:\.|::)\s*(?:rm|rm_f|rm_r|rm_rf|mv|move|cp|copy|cp_r|cp_lr|copy_entry|copy_file|copy_stream|mkdir|mkdir_p|makedirs|mkpath|touch|ln|ln_s|ln_sf|link|link_entry|symlink|install|chmod|chmod_R|chown|chown_R|remove|remove_file|remove_dir|remove_entry|remove_entry_secure|rmtree|safe_unlink)\s*\(/gi;
 const RUBY_FILE_OPEN = /\bFile\s*(?:\.|::)\s*open\s*\(/gi;
 const PHP_WRITER_FUNCTIONS = /\b(?:fwrite|fputs|file_put_contents|unlink|rename|copy|touch|mkdir|rmdir|chmod|chown|link|symlink|move_uploaded_file|ftruncate)\s*\(/gi;
 const PHP_FOPEN = /\bfopen\s*\(/gi;
@@ -214,7 +214,13 @@ function maskLanguageCode(source: string, hashComments: boolean, slashComments: 
     }
     if (quote) {
       if (escaped) { if (ch !== "\n" && ch !== "\r") chars[i] = " "; escaped = false; }
-      else if (ch === "\\" && quote !== "'") { chars[i] = " "; escaped = true; }
+      else if (ch === "\\") {
+        chars[i] = " ";
+        // Perl single-quoted strings only treat backslash before another
+        // backslash or quote as an escape. Do not let \q hide the closing
+        // quote and make following executable code look like string data.
+        if (quote !== "'" || next === "'" || next === "\\") escaped = true;
+      }
       else if (ch === quote) { chars[i] = " "; quote = null; }
       else if (ch !== "\n" && ch !== "\r") chars[i] = " ";
       continue;
@@ -239,7 +245,7 @@ function captureLanguageCall(source: string, openIndex: number): string | null {
     const ch = source[i]!;
     if (quote) {
       if (escaped) escaped = false;
-      else if (ch === "\\") escaped = true;
+      else if (ch === "\\" && (quote !== "'" || source[i + 1] === "'" || source[i + 1] === "\\")) escaped = true;
       else if (ch === quote) quote = null;
       continue;
     }
@@ -302,6 +308,50 @@ function languageWordScanSegment(head: string, segment: string): string {
   return `${head} ${maskLanguageCode(payload, true, head === "php")}`;
 }
 
+function captureBarePerlArguments(masked: string, start: number): string {
+  let paren = 0;
+  let bracket = 0;
+  let brace = 0;
+  for (let i = start; i < masked.length; i++) {
+    const ch = masked[i]!;
+    if (ch === "(") paren++;
+    else if (ch === ")") {
+      if (paren === 0) return masked.slice(start, i);
+      paren--;
+    } else if (ch === "[") bracket++;
+    else if (ch === "]") bracket = Math.max(0, bracket - 1);
+    else if (ch === "{") brace++;
+    else if (ch === "}") brace = Math.max(0, brace - 1);
+    else if ((ch === ";" || ch === "\n" || ch === "\r") && paren === 0 && bracket === 0 && brace === 0) {
+      return masked.slice(start, i);
+    }
+  }
+  return masked.slice(start);
+}
+
+function splitTopLevelArguments(args: string): string[] {
+  const fields: string[] = [];
+  let start = 0;
+  let paren = 0;
+  let bracket = 0;
+  let brace = 0;
+  for (let i = 0; i < args.length; i++) {
+    const ch = args[i]!;
+    if (ch === "(") paren++;
+    else if (ch === ")") paren = Math.max(0, paren - 1);
+    else if (ch === "[") bracket++;
+    else if (ch === "]") bracket = Math.max(0, bracket - 1);
+    else if (ch === "{") brace++;
+    else if (ch === "}") brace = Math.max(0, brace - 1);
+    else if (ch === "," && paren === 0 && bracket === 0 && brace === 0) {
+      fields.push(args.slice(start, i).trim());
+      start = i + 1;
+    }
+  }
+  fields.push(args.slice(start).trim());
+  return fields;
+}
+
 function findPerlWriter(payload: string): string | null {
   const common = findLanguageCalls(payload, PERL_WRITER_FUNCTIONS, true, false)[0];
   if (common) return common.match;
@@ -309,8 +359,19 @@ function findPerlWriter(payload: string): string | null {
     const index = findLanguageKeywords(payload, keyword, true, false)[0];
     if (index !== undefined) return keyword;
   }
+  const masked = maskLanguageCode(payload, true, false);
   for (const index of findLanguageKeywords(payload, "sysopen", true, false)) {
-    if (/\bO_(?:WRONLY|RDWR|CREAT|TRUNC|APPEND)\b/i.test(payload.slice(index, index + 600))) return "sysopen";
+    const afterKeyword = index + "sysopen".length;
+    let cursor = afterKeyword;
+    while (/\s/.test(masked[cursor] ?? "")) cursor++;
+    const args = masked[cursor] === "("
+      ? captureLanguageCall(masked, cursor)
+      : captureBarePerlArguments(masked, cursor);
+    if (args === null) continue;
+    const fields = splitTopLevelArguments(args);
+    // sysopen's third argument is the flags expression. Never inspect the
+    // filename, trailing permissions, printed text, or comments for flags.
+    if (fields.length >= 3 && /\bO_(?:WRONLY|RDWR|CREAT|TRUNC|APPEND)\b/i.test(fields[2]!)) return "sysopen";
   }
   for (const index of findLanguageKeywords(payload, "open", true, false)) {
     const mode = /['"]([^'"]*)['"]/.exec(payload.slice(index + 4, index + 600))?.[1];
@@ -333,9 +394,9 @@ function findRubyWriter(payload: string): string | null {
 }
 
 function findPhpWriter(payload: string): string | null {
-  const direct = findLanguageCalls(payload, PHP_WRITER_FUNCTIONS, false, true)[0];
+  const direct = findLanguageCalls(payload, PHP_WRITER_FUNCTIONS, true, true)[0];
   if (direct) return direct.match;
-  for (const call of findLanguageCalls(payload, PHP_FOPEN, false, true)) {
+  for (const call of findLanguageCalls(payload, PHP_FOPEN, true, true)) {
     const mode = firstQuotedArgument(call.args);
     if (mode && phpWriteMode(mode)) return call.match;
   }
@@ -638,6 +699,10 @@ function shellWords(command: string): string[] {
 
   for (const ch of command) {
     if (escaped) {
+      // In a double-quoted shell word, backslash only quotes $, `, ", \,
+      // and newline. Preserve it for PHP namespaces and Perl single-quoted
+      // escape sequences such as \' so the eval payload remains intact.
+      if (quote === "\"" && !/[\\$`\"\n]/.test(ch)) current += "\\";
       current += ch;
       escaped = false;
       continue;
@@ -897,7 +962,10 @@ function findDestructiveTokenInternal(cmd: string, depth: number): string | null
     if (isEvalInvocation(head, segment)) {
       const languageWriter = findInterpreterWriter(head, segment);
       if (languageWriter) return languageWriter;
-      const writer = EVAL_WRITER_RE.exec(segment);
+      const writerSource = head === "php"
+        ? maskLanguageCode(interpreterEvalPayload(segment), true, true)
+        : segment;
+      const writer = EVAL_WRITER_RE.exec(writerSource);
       if (writer) return writer[0].trim();
     }
   }

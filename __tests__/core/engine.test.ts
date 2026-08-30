@@ -171,6 +171,8 @@ describe("runPlanTree — traversal & stop reasons", () => {
           "ruby -e \"FileUtils::mkdir_p('created')\"",
           "ruby -e \"File::delete('victim')\"",
           "ruby -e \"File.open('victim', 'rb+') { |f| f.write('changed') }\"",
+          "ruby -e \"require 'fileutils'; FileUtils::remove_entry('victim')\"",
+          "ruby -e \"require 'fileutils'; FileUtils.ln_sf('victim', 'linked')\"",
         ];
         for (const command of commands) {
           const result = await runPlanTree({ root: "a", nodes: [{ id: "a", commands: [command] }] }, { cwd: dir });
@@ -179,6 +181,25 @@ describe("runPlanTree — traversal & stop reasons", () => {
         }
         expect(existsSync(join(dir, "created"))).toBe(false);
         expect(existsSync(victim)).toBe(true);
+        expect(existsSync(join(dir, "linked"))).toBe(false);
+        expect(readFileSync(victim, "utf8")).toBe("keep\n");
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.skipIf(!existsSync("/usr/bin/perl") && !existsSync("/opt/homebrew/bin/perl"))(
+    "allows an installed Perl O_RDONLY sysopen despite printed/commented writer flags",
+    async () => {
+      const dir = mkdtempSync(join(tmpdir(), "predexec-perl-read-probe-"));
+      try {
+        const victim = join(dir, "victim");
+        writeFileSync(victim, "keep\n");
+        const command = `perl -e "use Fcntl qw(O_RDONLY); sysopen(FH, 'victim', O_RDONLY); print 'O_TRUNC'; # O_WRONLY"`;
+        const result = await runPlanTree({ root: "a", nodes: [{ id: "a", commands: [command] }] }, { cwd: dir });
+        expect(result.stoppedReason).toBe("leaf");
+        expect(result.pathTaken).toEqual(["a"]);
         expect(readFileSync(victim, "utf8")).toBe("keep\n");
       } finally {
         rmSync(dir, { recursive: true, force: true });

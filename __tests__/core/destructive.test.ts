@@ -312,6 +312,85 @@ describe("interpreter eval — fs-writer APIs are caught", () => {
   it.each(extendedLanguageReaders)("allows extended interpreter read/data %s", (cmd) => {
     expect(isDestructiveCommand(cmd)).toBe(false);
   });
+
+  const rubyFileUtilsAliasWriters = [
+    `ruby -e "FileUtils.rm_r('out')"`,
+    `ruby -e "FileUtils::remove_entry('out')"`,
+    `ruby -e "FileUtils.remove_entry_secure('out')"`,
+    `ruby -e "FileUtils.rmtree('out')"`,
+    `ruby -e "FileUtils.safe_unlink('out')"`,
+    `ruby -e "FileUtils.ln_sf('a', 'b')"`,
+    `ruby -e "FileUtils.chmod_R(0o600, 'out')"`,
+    `ruby -e "FileUtils::chown_R(1, 1, 'out')"`,
+    `ruby -e "FileUtils.copy('a', 'b')"`,
+    `ruby -e "FileUtils.copy_entry('a', 'b')"`,
+    `ruby -e "FileUtils.copy_file('a', 'b')"`,
+    `ruby -e "FileUtils.copy_stream('a', 'b')"`,
+    `ruby -e "FileUtils.cp_lr('a', 'b')"`,
+    `ruby -e "FileUtils.move('a', 'b')"`,
+    `ruby -e "FileUtils.makedirs('d')"`,
+    `ruby -e "FileUtils.mkpath('d')"`,
+    `ruby -e "FileUtils.link('a', 'b')"`,
+    `ruby -e "FileUtils.link_entry('a', 'b')"`,
+    `ruby -e "FileUtils.symlink('a', 'b')"`,
+    `ruby -e "FileUtils.remove_file('out')"`,
+    `ruby -e "FileUtils.remove_dir('out')"`,
+  ];
+  it.each(rubyFileUtilsAliasWriters)("catches Ruby FileUtils alias writer %s", (cmd) => {
+    expect(isDestructiveCommand(cmd)).toBe(true);
+  });
+
+  it.each([
+    `ruby -e "FileUtils.pwd"`,
+    `ruby -e "FileUtils.uptodate?('a', 'b')"`,
+    `ruby -e "FileUtils.compare_file('a', 'b')"`,
+  ])("keeps benign Ruby FileUtils query %s read-only", (cmd) => {
+    expect(isDestructiveCommand(cmd)).toBe(false);
+  });
+
+  it.each([
+    `perl -e "sysopen(FH, 'in', O_RDONLY); print O_TRUNC"`,
+    `perl -e "sysopen(FH, 'in', O_RDONLY); print 'O_WRONLY O_CREAT O_TRUNC'"`,
+    `perl -e "sysopen(FH, 'in', O_RDONLY); # O_TRUNC O_WRONLY"`,
+    `perl -e "sysopen FH, 'in', O_RDONLY # O_TRUNC\n"`,
+  ])("keeps Perl sysopen reader flags/data safe %s", (cmd) => {
+    expect(isDestructiveCommand(cmd)).toBe(false);
+  });
+
+  it.each([
+    `perl -e "sysopen(FH, 'out', O_TRUNC)"`,
+    `perl -e "sysopen FH, 'out', O_WRONLY | O_CREAT"`,
+    `perl -e "sysopen(FH, 'out', O_CREAT | O_RDONLY)"`,
+    `perl -e "sysopen(FH, 'out', O_RDONLY | O_TRUNC)"`,
+    `perl -e "sysopen FH, 'out', O_RDWR | O_APPEND"`,
+  ])("catches Perl sysopen writer flags %s", (cmd) => {
+    expect(isDestructiveCommand(cmd)).toBe(true);
+  });
+
+  it.each([
+    `perl -e "print 'rename(\\'a\\',\\'b\\')'"`,
+    `perl -e "print 'sysopen(FH, \\'in\\', O_TRUNC)'"`,
+  ])("masks Perl single-quoted printed code %s", (cmd) => {
+    expect(isDestructiveCommand(cmd)).toBe(false);
+  });
+
+  it.each([
+    `php -r "# file_put_contents('out', 'x')\necho 'ok';"`,
+    `php -r "echo 'file_put_contents(\\'out\\', \\'x\\')'; // unlink('out');"`,
+    `php -r "/* rename('a', 'b'); fopen('out', 'w'); */ echo 'ok';"`,
+    `php -r "fopen('in', 'r'); echo 'fopen(\\'out\\', \\'w\\')';"`,
+  ])("keeps PHP writer-looking strings/comments safe %s", (cmd) => {
+    expect(isDestructiveCommand(cmd)).toBe(false);
+  });
+
+  it.each([
+    `php -r "\\unlink('out');"`,
+    `php -r "Namespace\\rename('a', 'b');"`,
+    `php -r "\\NS\\fopen('out', 'w');"`,
+    `php -r "# harmless\n\\NS\\FOPEN('out', 'w');"`,
+  ])("catches PHP namespaced/case-insensitive writer %s", (cmd) => {
+    expect(isDestructiveCommand(cmd)).toBe(true);
+  });
 });
 
 describe("splitCommandSegments", () => {
