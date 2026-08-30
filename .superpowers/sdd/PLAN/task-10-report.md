@@ -1598,3 +1598,109 @@ wrapper, interpolation, shell-body, and language-literal tests remain green.
 Changes are limited to `core/destructive.ts`, focused destructive/engine
 regressions, and this report. No dependency, ledger, release metadata,
 version, dist staging, publish, push, or merge changed.
+
+## Final whole-branch blocker remediation — native policy, completeness, budgets, and abort scheduling
+
+This consolidated final gate covers the three parallel reviewer fixes
+(`0c239fd`, `a978e83`, and `a7d2945`) plus the core remediation commit
+`98da8fb`. It addresses the final cross-branch findings before release review:
+native operation policy paths now resolve lexically from the effective plan cwd
+into the session-root-relative POSIX namespace; tool adapters propagate
+semantic incompleteness for read/search/list limits; plan and classifier inputs
+are bounded before expensive parsing; and parallel workers stop claiming new
+operations once an abort is observed.
+
+### RED evidence
+
+The new bounded regressions were run before the corresponding production
+changes. The initial focused run reported failures for semantic tool-result
+propagation, native path canonicalization, sparse aborted parallel results,
+coercion/plan budgets, and semantic MCP limit flags. A separate Pi mapping
+regression failed until host truncation details were propagated:
+
+```text
+./node_modules/.bin/vitest run __tests__/core/runner.test.ts --pool=threads --maxWorkers=1
+```
+
+Result: **1 failed, 16 passed** (the new semantic result assertion).
+
+```text
+./node_modules/.bin/vitest run __tests__/index.test.ts --pool=threads --maxWorkers=1
+```
+
+Result: **1 failed, 26 passed** (the new semantic host-limit assertion).
+
+The combined red run also reproduced the expected native policy, engine
+budget, and abort-scheduling failures; its process was stopped after the
+30-second observation window to avoid an unbounded review probe. No manual
+payload exceeded 4 KiB and no background process was retained.
+
+### GREEN implementation
+
+- `core/types.ts` exposes documented node, edge, command/string, and identifier
+  budgets. `core/coerce.ts`, `core/validation.ts`, and `core/engine.ts` reject
+  oversized model input before condition or destructive-command inspection.
+  `command-inspection.ts` rejects over-limit roots before scanning and replaces
+  repeated queue sorting/materialization with a deterministic offset/sequence
+  min-heap while preserving the existing depth, command, and 1 MiB total-char
+  bounds.
+- `normalizePolicyOperation` resolves native `path` values against the
+  effective cwd and emits an in-root POSIX path relative to the session root.
+  Escaping values remain outside-root spellings, leaving executor containment
+  authoritative; patterns and shell/Bash operations are untouched.
+- The `ToolExecutor` result contract accepts structural stdout/stderr
+  completeness flags. Core runner aggregation combines those flags with output
+  caps. MCP read/grep/find/ls, Opencode native operations, and Pi host-detail
+  mapping mark omitted semantic output, so negative/numeric/JSON conditions do
+  not establish facts from incomplete stdout while visible notices remain in
+  the transcript.
+- Parallel workers check the abort signal before each claim and filter
+  unclaimed sparse results safely, preserving completed result ordering and
+  allowing only already-active operations (at most the configured concurrency)
+  to finish.
+
+### GREEN verification
+
+Focused core/classifier verification:
+
+```text
+./node_modules/.bin/vitest run __tests__/core/engine.test.ts __tests__/core/runner.test.ts __tests__/core/conditions.test.ts __tests__/core/destructive.test.ts --pool=threads --maxWorkers=1
+```
+
+Result: exit 0; **4 files, 727 tests passed, 1 skipped**.
+
+Focused adapter/inspection verification:
+
+```text
+./node_modules/.bin/vitest run __tests__/command-inspection.test.ts __tests__/index.test.ts __tests__/mcp/tool-ops.test.ts __tests__/opencode.test.ts --pool=threads --maxWorkers=1
+```
+
+Result: exit 0; **4 files, 280 tests passed**.
+
+```text
+./node_modules/.bin/tsc --noEmit
+pnpm run build
+./node_modules/.bin/vitest run --pool=threads --maxWorkers=1
+git diff --check
+```
+
+All passed. The full suite passed **21 files, 1,367 tests with 1 skipped**;
+typecheck and build passed; and the combined branch was verified after the
+three reviewer commits and `98da8fb`. Generated `dist/` output remained
+ignored and unstaged. No push, merge, publish, version bump, or release
+metadata change was made.
+
+### Self-review
+
+The policy normalization has no effect on shell strings, Bash operations, or
+pattern fields, and preserves outside-root values for the executor's final
+containment check. Semantic flags are optional at the adapter boundary for
+compatibility with existing executors but become required booleans in
+`NodeOutput`; cap markers and adapter notices remain visible. Budget checks are
+linear and occur before regex, shell-tree, or destructive classification work;
+the heap tie-breaker retains source-offset order deterministically. Aborted
+parallel batches return only completed operations, avoiding undefined result
+reads without inventing output for work that never launched. The changes are
+limited to core contracts/execution, command inspection, adapter result
+mapping, focused regressions, and this report; no dependency or harness policy
+semantics were changed.
