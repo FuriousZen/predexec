@@ -834,3 +834,97 @@ Result: exit 0; **21 test files, 1,070 tests passed**.
 Result: exit 0; **2 test files, 9 tests passed**, including packed-install CLI
 and MCP smoke checks. `git diff --check` passed. No ledger, release metadata,
 dependency, dist, publish, push, merge, or version operation changed.
+
+## Extended integration fix round 12 — interpreter scanner hardening
+
+This user-authorized extension started from `3e05dfac085f998ae2d3f0aa55c6b86454e45c52`.
+It closes the remaining Task 10 scanner gaps without changing the ledger,
+release metadata, dependency set, publish/push/merge state, or version. Ruby
+FileUtils now covers the documented direct mutating aliases (including
+`rm_r`, `remove_entry`, `remove_entry_secure`, `rmtree`, `safe_unlink`,
+`ln_sf`, recursive chmod/chown, copy/link/move/mkpath/remove aliases), while
+query helpers remain read-only. Perl `sysopen` now evaluates only the
+balanced, top-level third argument as its flags expression. Perl single-quoted
+masking follows escaped quote/backslash semantics. PHP masking covers `#`,
+`//`, and block comments, and PHP fallback scans use masked executable source;
+leading-backslash, namespaced, and case-insensitive writers remain blocked.
+
+### RED evidence
+
+Before changing production code, the focused regression table was run with:
+
+```text
+./node_modules/.bin/vitest run __tests__/core/destructive.test.ts
+```
+
+Result: exit 1; **25 tests failed, 341 passed**. Failures reproduced the
+missing FileUtils aliases, flags found in Perl `sysopen` payload suffixes,
+printed single-quoted Perl code, PHP `#`/block/string false positives, and
+namespaced PHP writers. The first sysopen regression was then corrected to
+keep `O_RDONLY` followed by printed/commented `O_TRUNC` safe while retaining
+actual writer-flag cases.
+
+### GREEN implementation and regressions
+
+- `core/destructive.ts` expands the Ruby FileUtils vocabulary to the installed
+  documented mutating aliases while preserving `pwd`, `uptodate?`, and
+  comparison queries as benign. It adds a quote/comment-aware balanced parser
+  for parenthesized and bare Perl `sysopen`; only its third top-level argument
+  is checked for `O_WRONLY`, `O_RDWR`, `O_CREAT`, `O_TRUNC`, or `O_APPEND`.
+- Language masking now handles Perl single-quoted escaped quotes and
+  backslashes without swallowing following executable code. PHP call and
+  fallback scans mask hash, slash, and block comments plus string contents.
+  Shell eval payload extraction preserves backslashes that are literal inside
+  double-quoted shell words, so PHP namespace separators and Perl escapes are
+  retained for scanning.
+- Focused static tests cover all requested aliases, read-only FileUtils
+  queries, parenthesized/bare sysopen forms and flags, printed/commented
+  writer text, PHP comment forms, and leading-backslash/namespaced/case-
+  insensitive writers. Installed Ruby engine probes verify alias deletion and
+  symlink creation are stopped before execution; an installed Perl probe
+  executes an `O_RDONLY` sysopen with writer-looking printed/commented text and
+  confirms the victim remains unchanged.
+
+Focused verification:
+
+```text
+./node_modules/.bin/vitest run __tests__/core/destructive.test.ts __tests__/core/engine.test.ts
+```
+
+Result: exit 0; **2 test files, 446 tests passed**. The implementation and
+regressions were committed separately as `4b7b2cb` (`fix: harden interpreter
+mutation scanners`).
+
+### Required release verification
+
+```text
+./node_modules/.bin/tsc --noEmit
+pnpm run build
+./node_modules/.bin/vitest run
+./node_modules/.bin/vitest run __tests__/release-hygiene.test.ts __tests__/pack.test.ts
+git diff --check
+```
+
+All commands passed. Typecheck/build succeeded; the full suite passed **21
+files, 1,114 tests**; release/pack verification passed **2 files, 9 tests**,
+including the real packed-install smoke checks; and `git diff --check` passed.
+Generated `dist/` output remained ignored and unstaged.
+
+### Self-review and scope/counts
+
+The sysopen scanner is intentionally limited to the actual flags argument and
+does not treat filenames, permissions, comments, strings, or later statements
+as flags. Balanced parsing retains nested expressions and both call forms;
+malformed/incomplete calls do not become a writer match through the new path.
+Perl string masking remains offset-preserving, and PHP's executable scanner
+uses the same masked source for direct and fallback checks. The Ruby list is
+based on the installed FileUtils direct API and leaves query-only methods
+untouched. Existing Node/Python fallback behavior, policy precedence, shell
+traversal, and wrapper handling are unchanged. Working-tree changes at report
+append time are limited to this report; no ledger, release metadata,
+dependency, dist, publish, push, merge, or version operation changed.
+
+At this round's final HEAD, the code commit is `4b7b2cb`; the report append is
+kept as a separate documentation commit. Dynamic whole-branch diff counts
+remain intentionally recomputable from the final merge-base, as in prior
+rounds.
