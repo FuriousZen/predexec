@@ -232,6 +232,87 @@ This narrow refinement is committed as `32e7eeb`; no full-suite rerun was
 needed after the already-green bounded lexical change, and no custom process
 was started.
 
+## Extended integration fix round 19 — attached eval quoting and bounded preflight
+
+This user-authorized extension starts from the round-18 verification commit
+`0b979c5`. It closes three Important classifier gaps: attached Ruby/Perl eval
+program extraction could erase language-string quotes; the cheap eval
+preflight could treat separators inside ordinary double-quoted data as shell
+structure; and delimiter-close scans were not charged against the preflight
+work budget. The shell clause parser also now recognizes that parentheses
+embedded in a shell word are literal text, which is required for attached
+language syntax such as `ruby -eputs(...)`. No dependency, release metadata,
+version, publish, push, merge, or release-artifact staging changed.
+
+### RED evidence
+
+Before production changes, the focused regression run failed as expected:
+
+```text
+./node_modules/.bin/vitest run __tests__/core/destructive.test.ts --testTimeout=10000
+```
+
+Result: exit 1; **3 tests failed, 503 passed**. The failures reproduced
+Ruby/Perl attached language strings being reported as writers and a quoted
+`echo` fragment being incorrectly recognized as an eval preflight candidate.
+Additional red regressions covered attached programs with spaces in quoted
+arguments.
+
+### GREEN implementation and regressions
+
+- `attachedEvalProgram` scans the raw attached `-e` token through shell
+  quoting, removes only an outer shell wrapper, and retains quotes that belong
+  to the Ruby/Perl program. It handles path-qualified interpreters and quoted
+  program text containing spaces. Writer calls remain visible while writer
+  names inside language strings are masked.
+- `cheapInterpreterFragments` now continues through ordinary double-quoted
+  characters, so separators and eval-looking words in data cannot become
+  executable fragments. Single-quoted, escaped, adjacent, and substitution-
+  adjacent data regressions remain covered by the focused suite.
+- Group-close, command-substitution, backtick, escape, and top-level fragment
+  scans charge each inspected character against a shared deterministic budget.
+  Exhaustion returns a conservative shell preflight marker before the shared
+  substitution tree is invoked. Unmatched/repeated delimiter regressions
+  prove the marker is observed and the command hard-stops.
+- Shell parenthesis extraction now requires a token boundary, avoiding
+  interpretation of `foo(bar)` as a subshell while preserving real groups and
+  substitutions.
+
+Verification:
+
+```text
+./node_modules/.bin/vitest run __tests__/core/destructive.test.ts __tests__/core/engine.test.ts __tests__/policy.test.ts __tests__/opencode.test.ts --testTimeout=10000
+```
+
+Result: exit 0; **4 files, 720 tests passed, 1 skipped**.
+
+```text
+./node_modules/.bin/tsc --noEmit
+pnpm run build
+./node_modules/.bin/vitest run --testTimeout=10000
+./node_modules/.bin/vitest run __tests__/release-hygiene.test.ts __tests__/pack.test.ts --testTimeout=10000
+git diff --check
+```
+
+All checks passed: typecheck/build succeeded; the full suite passed **21
+files, 1,259 tests with 1 skipped**; release/pack verification passed **9/9
+tests**; and `git diff --check` passed. No custom subprocess or background
+process was started.
+
+### Self-review and scope
+
+The attached-token parser retains language syntax only after program text has
+started, so a shell quote wrapping the entire attached program is still
+removed. The shell-word boundary correction prevents language call
+parentheses from entering generic shell-group recursion, while actual
+space-delimited groups and substitutions remain handled by existing paths.
+The cheap preflight uses one shared budget object through recursive fragments
+and charges skipped escaped characters as well as delimiter scans; budget
+exhaustion is fail-closed. Changes are limited to `core/destructive.ts`,
+`command-inspection.ts`, focused destructive regressions, and this report. No
+ledger, dependency, release metadata, publish, push, merge, version, dist, or
+harness operation changed.
+
 ## Integration fix round 1 — Important findings
 
 The final-review gate identified two integration regressions in the previously
