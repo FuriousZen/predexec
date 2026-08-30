@@ -1211,3 +1211,82 @@ All commands passed. The full suite passed **21 files, 1,223 tests with 1 skippe
 The shell-body parser is quote-aware and delimiter-bounded, preserves recursive shell classification through the existing depth/substitution guards, and returns an actionable eval-payload hard stop for incomplete language constructs. The language view's optional shell-body collection is only consumed by interpreter eval classification; existing Node/Python behavior and adapter policy precedence remain unchanged. Heredoc and POD masking is offset-preserving, and nested interpolation routes through the same parser rather than inserting raw text. The 30K+ nested `%Q` payload is a deterministic non-timing regression for the early 24 KiB interpreter-eval bound; no expensive shared shell-tree traversal runs for that input.
 
 Changes are limited to `core/destructive.ts`, focused destructive/engine regressions, and this report. No ledger, release metadata, dependency, version, dist, publish, push, merge, or harness operation changed.
+
+## Extended integration fix round 17 — host interpolation shell semantics and early eval preflight
+
+This user-authorized extension starts from the round-16 verification commit
+`426ad8c4b0e5248024cc5bed3ee49317e6b0dee3`. It closes the remaining shell
+literal semantic gap for Ruby/Perl host interpolation, applies conservative PHP
+backtick variable handling, and moves eval-size rejection ahead of shared shell
+substitution-tree inspection. No ledger, release metadata, dependency, version,
+publish, push, merge, or release-artifact staging was performed.
+
+### RED evidence
+
+After correcting test-fixture escaping, the new focused regressions failed with
+**7 failed, 476 passed** in `__tests__/core/destructive.test.ts`. The failures
+reproduced Ruby `File.write` and Perl `${\\unlink}`/nested `qx` hidden inside
+shell literals, dynamic PHP `$` interpolation accepted as safe, and the
+20KiB adversarial eval payload taking the expensive path.
+
+### GREEN implementation
+
+- `core/destructive.ts` now records each executable Ruby/Perl/PHP shell body
+  with its owning language. A bounded host-interpolation extractor scans Ruby
+  `#{...}`, Perl `${\\ ...}`/`@{[ ... ]}`, and PHP backtick variables before
+  separately classifying the shell body. Nested host expressions can discover
+  further shell literals without re-collecting the same literal; explicit
+  depth and shell-body candidate budgets fail closed.
+- PHP backtick interpolation treats escaped dollars as literal shell text but
+  fails closed on unescaped variable/braced interpolation whose value could
+  introduce shell syntax. Direct shell redirects and mutation words continue
+  through the existing shell classifier.
+- `interpreterEvalPreflight` is a quote-aware argv seam used before
+  `inspectCommandSubstitutionTree`. It recognizes only actual interpreter eval
+  invocations (including env split-string wrappers), measures the extracted
+  payload linearly, and hard-stops payloads over the configured 16KiB bound.
+  Ordinary commands containing quoted `ruby -e` text retain their previous
+  behavior. The deterministic seam test asserts payload measurement and the
+  quoted-data exclusion; no timing assertion is used.
+
+### GREEN verification and probes
+
+Focused mutation and engine verification:
+
+```text
+./node_modules/.bin/tsc --noEmit
+./node_modules/.bin/vitest run __tests__/core/destructive.test.ts __tests__/core/engine.test.ts
+```
+
+Result: typecheck passed; **2 files, 567 tests passed, 1 skipped**. Installed
+Ruby and Perl temporary-directory probes confirm interpolated `File.write` and
+`${\\unlink}` plans stop before execution and leave `created` absent and
+`victim` unchanged.
+
+Required release checks:
+
+```text
+pnpm run build
+./node_modules/.bin/vitest run
+./node_modules/.bin/vitest run __tests__/release-hygiene.test.ts __tests__/pack.test.ts
+git diff --check
+```
+
+All commands passed: build succeeded; the full suite passed **21 files, 1,235
+tests with 1 skipped**; release/pack verification passed **9/9 tests**,
+including packed-install CLI/MCP smoke checks; and `git diff --check` passed.
+Generated `dist/` output remained ignored and unstaged.
+
+### Self-review, scope, and counts
+
+Shell-body records carry language context so host expressions are scanned by
+the owning writer scanner while shell syntax is inspected independently.
+Object-identity tracking prevents recursive self-looping, and the existing
+language-view, call-candidate, substitution, and classifier depth limits remain
+in force. PHP's fail-closed dynamic-dollar rule is intentionally stricter than
+Ruby/Perl because no executable PHP expression can be proven inert from a
+backtick body by this heuristic. The preflight uses the same shell-word parser
+as eval extraction, so quoted payload extraction and wrapper behavior remain
+aligned. Changes are limited to `core/destructive.ts`, focused destructive and
+engine regressions, and this report. No ledger, release metadata, dependency,
+version, dist, publish, push, merge, or harness operation changed.
