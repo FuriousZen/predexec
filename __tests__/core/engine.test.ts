@@ -179,6 +179,27 @@ describe("runPlanTree — traversal & stop reasons", () => {
     }
   });
 
+  it.each([
+    "env -iu GIT_CONFIG_NOSYSTEM git init scratch",
+    "env -iS\"git init scratch\"",
+    "{ git init scratch; }",
+    "if git init scratch; then :; fi",
+    'echo "$(git init scratch)"',
+  ])("mutationStop: hidden Git mutation %s stops before execution", async (command) => {
+    const dir = mkdtempSync(join(tmpdir(), "predexec-hidden-git-"));
+    try {
+      const r = await runPlanTree(
+        { root: "a", nodes: [{ id: "a", commands: [command] }] },
+        { cwd: dir },
+      );
+      expect(r.stoppedReason).toBe("mutationStop");
+      expect(r.pathTaken).toEqual([]);
+      expect(existsSync(join(dir, "scratch", ".git"))).toBe(false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("does NOT false-positive on 2>/dev/null or 2>&1", async () => {
     const plan: PlanTree = {
       root: "a",

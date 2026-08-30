@@ -12,6 +12,8 @@ export interface WrapperInspectionOptions {
   bareOnlyWrappers?: ReadonlySet<string>;
   /** Wrapper-specific options whose following token is an option argument. */
   optionArguments?: ReadonlyMap<string, ReadonlySet<string>>;
+  /** Wrapper-specific options whose argument is itself a command string. */
+  splitStringOptions?: ReadonlyMap<string, ReadonlySet<string>>;
   durationPattern?: RegExp;
 }
 
@@ -27,6 +29,7 @@ const wrapperOptions = (options: WrapperInspectionOptions = {}) => ({
   optionTakingWrappers: options.optionTakingWrappers ?? DEFAULT_OPTION_TAKING_WRAPPERS,
   bareOnlyWrappers: options.bareOnlyWrappers ?? DEFAULT_BARE_ONLY_WRAPPERS,
   optionArguments: options.optionArguments ?? new Map(),
+  splitStringOptions: options.splitStringOptions ?? new Map(),
   durationPattern: options.durationPattern ?? DEFAULT_DURATION_PATTERN,
 });
 
@@ -115,6 +118,34 @@ export function tokenizeShellWords(segment: string): string[] {
   return tokens;
 }
 
+/**
+ * Extract the executable-looking clause from one shell-control segment.
+ * `splitCommandSegments` already separates command terminators; this small
+ * seam removes syntax words which otherwise hide the first command in a
+ * group (`{ git ...`, `if git ...`, `then git ...`). It intentionally only
+ * strips a leading, quote-aware token sequence and returns no result when it
+ * cannot identify one, leaving callers' conservative fallback intact.
+ */
+export function extractShellCommandClauses(segment: string): string[] {
+  const tokens = tokenizeShellWords(segment);
+  if (tokens.length === 0) return [];
+  const reserved = new Set([
+    "{", "}", "(", ")", "!", "if", "then", "elif", "else", "fi",
+    "while", "until", "do", "done", "for", "select", "function",
+  ]);
+  let index = 0;
+  while (index < tokens.length && reserved.has(tokens[index]!)) index++;
+  if (tokens[0] === "case") {
+    index = 1;
+    while (index < tokens.length && !tokens[index]!.endsWith(")")) index++;
+    if (index < tokens.length) index++;
+  }
+  if (tokens[0] === "function" && index < tokens.length && !reserved.has(tokens[index]!)) index++;
+  while (index < tokens.length && reserved.has(tokens[index]!)) index++;
+  if (index === 0 || index >= tokens.length) return [];
+  return [tokens.slice(index).join(" ")];
+}
+
 function stripTokenAssignments(tokens: readonly string[]): string[] {
   let i = 0;
   while (i < tokens.length - 1 && TOKEN_ASSIGNMENT_PATTERN.test(tokens[i]!)) i++;
@@ -147,17 +178,45 @@ function optionArgument(
   return { takesArgument: false, attached: false };
 }
 
+function splitStringPayload(
+  wrapper: string,
+  token: string,
+  options: ReturnType<typeof wrapperOptions>,
+): string | null {
+  const names = options.splitStringOptions.get(wrapper);
+  if (!names) return null;
+  for (const name of names) {
+    if (token === name) return "";
+    if (name.startsWith("--") && token.startsWith(`${name}=`)) return token.slice(name.length + 1);
+    if (!name.startsWith("-") || token.startsWith("--")) continue;
+    const short = name.slice(1);
+    const position = token.indexOf(short, 1);
+    if (position !== -1 && position < token.length - 1) return token.slice(position + short.length);
+  }
+  return null;
+}
+
 function stripTokenWrapper(tokens: readonly string[], options: ReturnType<typeof wrapperOptions>): string[] {
   const head = tokens[0];
-  if (!head || !(options.wrappers.has(head) || options.bareOnlyWrappers.has(head))) return [...tokens];
+  const wrapper = head?.replace(/^.*\//, "");
+  if (!wrapper || !(options.wrappers.has(wrapper) || options.bareOnlyWrappers.has(wrapper))) return [...tokens];
   const next = tokens[1];
   const isFlag = next !== undefined && next.startsWith("-");
-  if (options.bareOnlyWrappers.has(head) && isFlag) return [...tokens];
+  if (options.bareOnlyWrappers.has(wrapper) && isFlag) return [...tokens];
   let drop = 1;
-  if (options.optionTakingWrappers.has(head) || options.optionArguments.has(head)) {
+  if (options.splitStringOptions.has(wrapper)) {
+    for (let i = 1; i < tokens.length; i++) {
+      const payload = splitStringPayload(wrapper, tokens[i]!, options);
+      if (payload !== null) {
+        if (payload !== "") return tokenizeShellWords(payload);
+        return i + 1 < tokens.length ? tokenizeShellWords(tokens[i + 1]!) : [...tokens];
+      }
+    }
+  }
+  if (options.optionTakingWrappers.has(wrapper) || options.optionArguments.has(wrapper)) {
     while (drop < tokens.length) {
       const token = tokens[drop]!;
-      const argument = optionArgument(head, token, options);
+      const argument = optionArgument(wrapper, token, options);
       if (argument.takesArgument) {
         drop++;
         if (!argument.attached && drop < tokens.length) drop++;
@@ -177,15 +236,26 @@ function stripRaw(command: string, options: ReturnType<typeof wrapperOptions>): 
     cmd = cmd.replace(RAW_ASSIGNMENT_PATTERN, "").trimStart();
     const tokens = cmd.split(/\s+/);
     const head = tokens[0];
-    if (head && (options.wrappers.has(head) || options.bareOnlyWrappers.has(head))) {
+    const wrapper = head?.replace(/^.*\//, "");
+    if (wrapper && (options.wrappers.has(wrapper) || options.bareOnlyWrappers.has(wrapper))) {
       const next = tokens[1];
       const isFlag = next !== undefined && next.startsWith("-");
-      if (!(options.bareOnlyWrappers.has(head) && isFlag)) {
+      if (!(options.bareOnlyWrappers.has(wrapper) && isFlag)) {
+        if (options.splitStringOptions.has(wrapper)) {
+          const lexicalTokens = tokenizeShellWords(cmd);
+          for (let i = 1; i < lexicalTokens.length; i++) {
+            const payload = splitStringPayload(wrapper, lexicalTokens[i]!, options);
+            if (payload !== null) {
+              const source = payload || lexicalTokens[i + 1];
+              return source === undefined ? cmd : stripRaw(source, options);
+            }
+          }
+        }
         let drop = 1;
-        if (options.optionTakingWrappers.has(head) || options.optionArguments.has(head)) {
+        if (options.optionTakingWrappers.has(wrapper) || options.optionArguments.has(wrapper)) {
           while (drop < tokens.length) {
             const token = tokens[drop]!;
-            const argument = optionArgument(head, token, options);
+            const argument = optionArgument(wrapper, token, options);
             if (argument.takesArgument) {
               drop++;
               if (!argument.attached && drop < tokens.length) drop++;

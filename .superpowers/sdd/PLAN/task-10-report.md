@@ -269,3 +269,59 @@ verification passed **9/9 tests**:
 The packed-install smoke checks passed with rebuilt artifacts and
 `git diff --check` passed. No ledger edit, dependency change, version bump,
 publish, push, merge, or release artifact staging was performed.
+
+## Integration fix round 4 — Important shell-boundary bypasses
+
+This round started from `207091ba7664b33badb0cafdff3192918865c861` after the
+third integration-fix review. The new regressions covered clustered `env`
+options and split-string payloads, non-parenthesized shell control syntax, and
+commands hidden inside double-quoted substitutions.
+
+### RED evidence
+
+Before changing production code, the new focused regressions were run with:
+
+```text
+./node_modules/.bin/vitest run __tests__/command-inspection.test.ts __tests__/core/destructive.test.ts __tests__/mcp/policy-claude.test.ts __tests__/mcp/policy-codex.test.ts
+```
+
+Result: exit 1; **15 tests failed, 327 passed**. The failures reproduced the
+three boundary classes: clustered `env -iu`/`-iS` consumption, `env`-wrapped
+time output, brace/`if` clauses, and mutation commands inside double-quoted
+`$()`/backtick substitutions. The shared seam assertion also showed that
+split-string payloads were not recursively inspected.
+
+### GREEN implementation and regressions
+
+- `command-inspection.ts` now has a bounded shell-clause extraction seam that
+  removes only quote-aware leading control words/braces (`{`, `if`, `then`,
+  `case`, and related reserved words), preserving quoted literals. Wrapper
+  inspection now supports command-string options and basename-qualified
+  wrapper paths.
+- `core/destructive.ts` parses GNU-style `env` short clusters, separate and
+  attached `-u`/`-C`/`-S`, and long equivalents. `-S`/`--split-string` payloads
+  recurse through the same mutation/time-output classifier. Substitution
+  bodies are recursively classified with a finite depth budget, and grouped
+  shell clauses are inspected before the safe-tier decision.
+- Claude and Codex policy checkers include the same extracted shell clauses in
+  their existing raw/stripped matching union; their precedence, wrapper
+  semantics, and single-quoted literal behavior remain unchanged.
+- Focused destructive/engine/command-inspection/policy verification passed
+  **406/406 tests**. `./node_modules/.bin/tsc --noEmit` passed with no
+  diagnostics.
+
+The full suite passed **812/812 tests**. `pnpm run build` succeeded, and the
+release/pack suites passed **9/9 tests**, including packed-install smoke checks.
+`git diff --check` passed. No ledger edit, dependency change, dist staging,
+version bump, publish, push, merge, or release artifact staging was performed.
+
+### Self-review
+
+The changes are limited to the shared pure inspection seam, the core mutation
+classifier, the two policy consumers, and focused regressions. The new tests
+cover mutating and read-only grouped clauses, recursive and single-quoted
+substitutions, clustered/separate/long `env` forms, and no-execution engine
+guards. Existing read-only compound, quoted-literal, wrapper, precedence, and
+packed-install tests remain green. Recursive shell inspection is bounded and
+falls back conservatively for over-depth syntax; no policy precedence or
+mutation wrapper behavior outside the requested boundaries was changed.

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   extractCommandSubstitutions,
+  extractShellCommandClauses,
   stripLeadingAssignmentsAndWrappers,
   tokenizeShellWords,
 } from "../command-inspection.ts";
@@ -24,6 +25,13 @@ describe("command inspection mechanics", () => {
       "main branch",
       "escaped word",
     ]);
+  });
+
+  it("extracts executable clauses after shell control words without opening quoted literals", () => {
+    expect(extractShellCommandClauses("{ git init scratch")).toEqual(["git init scratch"]);
+    expect(extractShellCommandClauses("if git init scratch")).toEqual(["git init scratch"]);
+    expect(extractShellCommandClauses("then git init scratch")).toEqual(["git init scratch"]);
+    expect(extractShellCommandClauses("printf '{ git init scratch; }'")).toEqual([]);
   });
 
   it("strips assignments and wrapper chains while preserving the command", () => {
@@ -53,5 +61,26 @@ describe("command inspection mechanics", () => {
       "curl",
       "https://example.invalid",
     ]);
+  });
+
+  it("consumes clustered env options and their values", () => {
+    const options = {
+      wrappers: new Set(["env", "time"]),
+      optionTakingWrappers: new Set(["env", "time"]),
+      optionArguments: new Map([
+        ["env", new Set(["-u", "-C", "-S", "--unset", "--chdir", "--split-string"])],
+        ["time", new Set(["-f", "--format", "-o", "--output"])],
+      ]),
+      splitStringOptions: new Map([
+        ["env", new Set(["-S", "--split-string"])],
+      ]),
+    };
+    expect(stripLeadingAssignmentsAndWrappers(tokenizeShellWords("env -iu X git init scratch"), options)).toEqual([
+      "git", "init", "scratch",
+    ]);
+    expect(stripLeadingAssignmentsAndWrappers(
+      tokenizeShellWords('env -iS"/usr/bin/time -o timing.log printf hi"'), options,
+    )).toEqual(["printf", "hi"]);
+    expect(stripLeadingAssignmentsAndWrappers('env -iS"/usr/bin/time -o timing.log printf hi"', options)).toBe("printf hi");
   });
 });

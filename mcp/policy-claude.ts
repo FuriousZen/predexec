@@ -45,6 +45,7 @@ import { dirname, join, parse as parsePath } from "node:path";
 import { escapeRegExp, splitCommandSegments } from "../core/index.ts";
 import {
   extractCommandSubstitutions,
+  extractShellCommandClauses,
   stripLeadingAssignmentsAndWrappers,
   type WrapperInspectionOptions,
 } from "../command-inspection.ts";
@@ -517,8 +518,9 @@ export function createClaudePolicyChecker(
               // command.
               const stripped = stripBashWrappers(trimmed);
               const forms = stripped === trimmed ? [trimmed] : [trimmed, stripped];
+              const clauseForms = forms.flatMap((form) => [form, ...extractShellCommandClauses(form)]);
               for (const rule of compiled) {
-                if (forms.some((form) => rule.regex.test(form))) return rule.pattern;
+                if (clauseForms.some((form) => rule.regex.test(form))) return rule.pattern;
               }
             }
           }

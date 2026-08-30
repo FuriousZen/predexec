@@ -17,6 +17,8 @@
  * guidance wants tests/builds speculating), rsync/tar -x (mode-sensitive parsing).
  */
 
+import { extractCommandSubstitutions, extractShellCommandClauses } from "../command-inspection.ts";
+
 /** Tool names that are definitively read-only — no regex analysis needed. */
 export const READ_ONLY_TOOLS = new Set(["read", "grep", "find", "ls"]);
 /** Tool names that are definitively mutating — hard-stop unconditionally. */
@@ -281,6 +283,22 @@ function timeOutputOption(segment: string): string | null {
         return token;
       }
     }
+    if (wrapper === "env") {
+      const option = envOption(token);
+      if (option.splitPayload !== undefined) {
+        const payload = option.splitPayload || tokens[i + 1];
+        if (payload) {
+          const nested = timeOutputOption(payload);
+          if (nested) return nested;
+          if (!option.attached) i++;
+        }
+        continue;
+      }
+      if (option.takesArgument) {
+        if (!option.attached) i++;
+        continue;
+      }
+    }
     if (token.startsWith("-")) {
       const optionSet = WRAPPER_OPTIONS_WITH_VALUE[wrapper];
       if (optionSet?.has(token) && i + 1 < tokens.length && !wrapperOptionHasAttachedValue(wrapper, token)) i++;
@@ -354,6 +372,40 @@ function parenthesizedGroups(command: string): string[] {
  */
 const PRIVILEGE_HEADS = new Set(["sudo", "doas", "pkexec"]);
 
+interface EnvOption {
+  takesArgument: boolean;
+  attached: boolean;
+  splitPayload?: string;
+}
+
+/** Parse env's short clusters without mistaking an option value for a command. */
+function envOption(token: string): EnvOption {
+  if (token === "--ignore-environment") return { takesArgument: false, attached: false };
+  for (const name of ["--unset", "--chdir"]) {
+    if (token === name) return { takesArgument: true, attached: false };
+    if (token.startsWith(`${name}=`)) return { takesArgument: true, attached: true };
+  }
+  if (token === "--split-string") return { takesArgument: true, attached: false, splitPayload: "" };
+  if (token.startsWith("--split-string=")) return {
+    takesArgument: true,
+    attached: true,
+    splitPayload: token.slice("--split-string=".length),
+  };
+  if (!token.startsWith("-") || token.startsWith("--")) return { takesArgument: false, attached: false };
+  const flags = token.slice(1);
+  for (let i = 0; i < flags.length; i++) {
+    const flag = flags[i]!;
+    if (flag !== "u" && flag !== "C" && flag !== "S") continue;
+    const rest = flags.slice(i + 1);
+    return {
+      takesArgument: true,
+      attached: rest.length > 0,
+      ...(flag === "S" ? { splitPayload: rest } : {}),
+    };
+  }
+  return { takesArgument: false, attached: false };
+}
+
 /**
  * The token that decides a segment's classification: skips VAR=val prefixes
  * and wrapper commands, resolves `/usr/bin/cat` → `cat`. `sudo`/`doas` are
@@ -372,6 +424,13 @@ function effectiveHeadIndex(tokens: string[]): number | null {
     if (wrapper && token === "--") {
       wrapper = null;
       continue;
+    }
+    if (wrapper === "env") {
+      const option = envOption(token);
+      if (option.takesArgument) {
+        if (!option.attached) i++;
+        continue;
+      }
     }
     if (wrapper && token.startsWith("-")) {
       const optionSet = WRAPPER_OPTIONS_WITH_VALUE[wrapper];
@@ -447,11 +506,10 @@ function envSplitStringPayload(tokens: string[]): string | null {
       continue;
     }
     if (token === "--") return null;
-    if (token === "-S" || token === "--split-string") return tokens[i + 1] ?? null;
-    if (token.startsWith("-S") && token.length > 2) return token.slice(2);
-    if (token.startsWith("--split-string=") && token.length > 15) return token.slice(15);
-    if (WRAPPER_OPTIONS_WITH_VALUE.env?.has(token)) {
-      i++;
+    const option = envOption(token);
+    if (option.splitPayload !== undefined) return option.splitPayload || tokens[i + 1] || null;
+    if (option.takesArgument) {
+      if (!option.attached) i++;
       continue;
     }
     if (token.startsWith("-")) continue;
@@ -483,7 +541,7 @@ function findGitMutationToken(segment: string): string | null {
   const index = effectiveHeadIndex(tokens);
   if (index === null) {
     const splitString = envSplitStringPayload(tokens);
-    return splitString === null ? null : findDestructiveToken(splitString);
+    return splitString === null ? null : findDestructiveTokenInternal(splitString, 1);
   }
 
   const gitIndex = index;
@@ -545,7 +603,8 @@ function isEvalInvocation(head: string, segment: string): boolean {
  * The classifier. Returns the offending token for the hard-stop message, or
  * null when the command is (heuristically) read-only.
  */
-export function findDestructiveToken(cmd: string): string | null {
+function findDestructiveTokenInternal(cmd: string, depth: number): string | null {
+  if (depth >= 8) return "complex shell syntax";
   const sanitized = sanitizeForRedirect(cmd);
 
   const redirect = REDIRECT_RE.exec(sanitized);
@@ -553,12 +612,35 @@ export function findDestructiveToken(cmd: string): string | null {
 
   const segments = splitCommandSegments(cmd);
 
+  // Quoted command substitutions still execute their `$()`/backtick bodies.
+  // Recurse with a finite budget so nested syntax cannot hide a mutation while
+  // malformed or adversarially deep input remains bounded.
+  const substitutions = extractCommandSubstitutions(cmd);
+  if (substitutions.length > 0) {
+    if (depth >= 8) return "command substitution";
+    for (const substitution of substitutions) {
+      const nested = findDestructiveTokenInternal(substitution, depth + 1);
+      if (nested) return nested;
+    }
+  }
+
   // Parenthesized groups execute their contents even though the outer shell
   // segment starts with `(`. Inspect each group recursively, while the
   // quote-aware extractor leaves literal parentheses untouched.
   for (const group of parenthesizedGroups(cmd)) {
-    const nested = findDestructiveToken(group);
+    const nested = findDestructiveTokenInternal(group, depth + 1);
     if (nested) return nested;
+  }
+
+  // Braces and control words are shell syntax, not executable heads. Inspect
+  // the command clause they introduce so `{ git add; }` and `if git add; ...`
+  // cannot hide the effective command. Quoted literals are not tokenized as
+  // leading syntax and remain in the established safe tier.
+  for (const segment of segments) {
+    for (const clause of extractShellCommandClauses(segment)) {
+      const nested = findDestructiveTokenInternal(clause, depth + 1);
+      if (nested) return nested;
+    }
   }
 
   // Check output-bearing `time` options before resolving the wrapped command's
@@ -616,6 +698,10 @@ export function findDestructiveToken(cmd: string): string | null {
   }
 
   return null;
+}
+
+export function findDestructiveToken(cmd: string): string | null {
+  return findDestructiveTokenInternal(cmd, 0);
 }
 
 export function isDestructiveCommand(cmd: string): boolean {

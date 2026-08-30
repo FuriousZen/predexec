@@ -225,6 +225,20 @@ describe("Claude wrapper policy — time option arguments", () => {
     const check = createClaudePolicyChecker([{ pattern: "curl *", action: "deny" }]);
     expect(check(command)).toBe("curl *");
   });
+
+  it.each([
+    "{ git push origin main; }",
+    "if git push origin main; then :; fi",
+    'echo "$(git push origin main)"',
+  ])("inspects commands inside shell clauses and substitutions: %s", (command) => {
+    const check = createClaudePolicyChecker([{ pattern: "git push *", action: "deny" }]);
+    expect(check(command)).toBe("git push *");
+  });
+
+  it("does not inspect a literal single-quoted substitution", () => {
+    const check = createClaudePolicyChecker([{ pattern: "git push *", action: "deny" }]);
+    expect(check("echo '$(git push origin main)'")).toBeNull();
+  });
 });
 
 describe("createClaudePolicyChecker — precedence and stopping", () => {

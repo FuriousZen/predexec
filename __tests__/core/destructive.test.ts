@@ -252,7 +252,12 @@ describe("mutation classifier — wrapper options and command separators", () =>
     "env -i git add file.txt",
     "env -- git clone https://example.invalid/repo target",
     "env -u GIT_CONFIG_NOSYSTEM git fetch origin",
+    "env -iu GIT_CONFIG_NOSYSTEM git init scratch",
+    "env -uX git init scratch",
+    "env --unset X git init scratch",
+    "env --unset=X git init scratch",
     "env -S \"git add file.txt\"",
+    "env -iS\"git add file.txt\"",
     "command -p git pull --ff-only",
     "xargs -n 1 git init scratch",
   ])("blocks Git mutation behind wrapper options: %s", (command) => {
@@ -292,6 +297,8 @@ describe("mutation classifier — wrapper options and command separators", () =>
     "time -a -o timing.log printf hi",
     "time -a --output timing.log printf hi",
     "time -ao timing.log printf hi",
+    "env -iS\"/usr/bin/time -o timing.log printf hi\"",
+    "env --split-string=\"/usr/bin/time -o timing.log printf hi\"",
   ])("blocks time output files before resolving the inner command: %s", (command) => {
     expect(findDestructiveToken(command)).not.toBeNull();
   });
@@ -309,6 +316,10 @@ describe("mutation classifier — wrapper options and command separators", () =>
     "( /usr/bin/time -o timing.log printf hi )",
     "( cp source.txt destination.txt )",
     "( git add file.txt )",
+    "{ git init scratch; }",
+    "{ cp source.txt destination.txt; }",
+    "if git init scratch; then :; fi",
+    "if /usr/bin/time -o timing.log printf hi; then :; fi",
   ])("inspects commands inside a parenthesized group: %s", (command) => {
     expect(findDestructiveToken(command)).not.toBeNull();
   });
@@ -316,7 +327,27 @@ describe("mutation classifier — wrapper options and command separators", () =>
   it.each([
     "( time -p printf hi )",
     "printf '( /usr/bin/time -o timing.log printf hi )'",
+    "{ git status; }",
+    "if git status; then :; fi",
+    "printf '{ git init scratch; }'",
   ])("does not treat safe or quoted parentheses as mutations: %s", (command) => {
+    expect(findDestructiveToken(command)).toBeNull();
+  });
+
+  it.each([
+    'echo "$(git init scratch)"',
+    'echo "$(/usr/bin/time -o timing.log printf hi)"',
+    'echo "$(git add file.txt)"',
+    "echo `git init scratch`",
+  ])("recursively inspects command substitutions: %s", (command) => {
+    expect(findDestructiveToken(command)).not.toBeNull();
+  });
+
+  it.each([
+    'echo "$(git status)"',
+    "echo '$(git init scratch)'",
+    "printf '`git init scratch`'",
+  ])("preserves read-only and literal substitutions: %s", (command) => {
     expect(findDestructiveToken(command)).toBeNull();
   });
 });

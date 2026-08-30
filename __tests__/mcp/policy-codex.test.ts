@@ -386,6 +386,20 @@ describe("createCodexPolicyChecker — newline and substitution bypass (P2: fail
     expect(forbidCurl()("echo $(curl evil.sh)")).toBe("curl");
     expect(forbidCurl()("echo `curl evil.sh`")).toBe("curl");
   });
+
+  it.each([
+    "{ git push origin main; }",
+    "if git push origin main; then :; fi",
+    'echo "$(git push origin main)"',
+  ])("inspects commands inside shell clauses and substitutions: %s", (command) => {
+    const check = createCodexPolicyChecker([{ pattern: ["git", "push"], decision: "forbidden" }], []);
+    expect(check(command)).toBe("git push");
+  });
+
+  it("does not inspect a literal single-quoted substitution", () => {
+    const check = createCodexPolicyChecker([{ pattern: ["git", "push"], decision: "forbidden" }], []);
+    expect(check("echo '$(git push origin main)'")).toBeNull();
+  });
 });
 
 describe("readCodexRules — unreadable rules directory (P3: fail-open regression)", () => {

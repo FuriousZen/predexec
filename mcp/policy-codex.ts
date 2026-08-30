@@ -97,6 +97,7 @@ import { join, resolve } from "node:path";
 import { splitCommandSegments } from "../core/index.ts";
 import {
   extractCommandSubstitutions,
+  extractShellCommandClauses,
   stripLeadingAssignmentsAndWrappers,
   tokenizeShellWords,
   type WrapperInspectionOptions,
@@ -619,9 +620,13 @@ export function createCodexPolicyChecker(
               const tokenForms = rawTokens.length === strippedTokens.length && rawTokens.every((token, i) => token === strippedTokens[i])
                 ? [rawTokens]
                 : [rawTokens, strippedTokens];
+              const clauseForms = tokenForms.flatMap((form) => [
+                form,
+                ...extractShellCommandClauses(form.join(" ")).map(tokenizeShellWords),
+              ]);
               let winner: CodexRule | null = null;
               for (const rule of rules) {
-                const matches = tokenForms.some(
+                const matches = clauseForms.some(
                   (toks) => toks.length >= rule.pattern.length && rule.pattern.every((tok, i) => toks[i] === tok),
                 );
                 if (matches && (!winner || SEVERITY[rule.decision] > SEVERITY[winner.decision])) winner = rule;
