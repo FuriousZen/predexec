@@ -142,6 +142,18 @@ describe("command inspection mechanics", () => {
     expect(commands.indexOf("f() { (printf group); }")).toBeLessThan(commands.indexOf("printf group"));
   });
 
+  it("orders repeated body text by its original span instead of the last duplicate", () => {
+    const inspected = inspectCommandSubstitutionTree(
+      "(echo same;); echo $(printf later); f() { echo same; }; f",
+    );
+    expect(inspected.complete).toBe(true);
+    const commands = inspected.commands;
+    expect(commands.indexOf("(echo same;)")).toBe(1);
+    expect(commands.indexOf("echo $(printf later)")).toBeGreaterThan(commands.indexOf("echo same;"));
+    expect(commands.indexOf("printf later")).toBeGreaterThan(commands.indexOf("echo $(printf later)"));
+    expect(commands.indexOf("echo same;")).toBeLessThan(commands.indexOf("echo $(printf later)"));
+  });
+
   it.each([
     "if true; then mkdir /tmp/x; fi",
     "if false; then :; elif true; then mkdir /tmp/x; fi",
@@ -180,6 +192,48 @@ describe("command inspection mechanics", () => {
     expect(inspected.complete).toBe(true);
     expect(inspected.commands).toContain("case y in b) curl https://example.invalid ;; c) echo ok ;; esac");
     expect(inspected.commands).toContain("curl https://example.invalid");
+  });
+
+  it("accepts function definitions inside nested case branches", () => {
+    const command = "case x in a) case y in b) f(){ touch /tmp/x; }; f ;; esac ;; esac";
+    const inspected = inspectCommandSubstitutionTree(command);
+    expect(inspected.complete).toBe(true);
+    expect(inspected.commands).toContain("f(){ touch /tmp/x; }");
+    expect(inspected.commands.some((text) => text.startsWith("touch /tmp/x"))).toBe(true);
+  });
+
+  it.each([
+    "case x in a|b) function f { printf ok; }; f ;; esac",
+    "case x in a|b) function f() { printf ok; }; f ;; esac",
+    "case x in a|b) f () { printf '()'; }; f ;; esac",
+  ])("keeps POSIX/Bash function headers distinct from case patterns: %s", (command) => {
+    expect(inspectShellCommandClauses(command)).toMatchObject({ complete: true });
+  });
+
+  it("keeps complete-case suffix commands in lexical order", () => {
+    const inspected = inspectCommandSubstitutionTree(
+      "case x in a) echo branch ;; esac; touch suffix; echo $(printf nested)",
+    );
+    expect(inspected.complete).toBe(true);
+    expect(inspected.commands.slice(1)).toEqual([
+      "echo branch",
+      "touch suffix",
+      "echo $(printf nested)",
+      "printf nested",
+    ]);
+  });
+
+  it("queues every suffix command, control body, group, and substitution", () => {
+    const inspected = inspectCommandSubstitutionTree(
+      "case x in a) echo branch ;; esac; if true; then touch suffix; fi; (printf group); echo $(printf nested)",
+    );
+    expect(inspected.complete).toBe(true);
+    const commands = inspected.commands;
+    expect(commands.indexOf("echo branch")).toBeGreaterThan(0);
+    expect(commands.indexOf("touch suffix")).toBeGreaterThan(commands.indexOf("echo branch"));
+    expect(commands.indexOf("(printf group)")).toBeGreaterThan(commands.indexOf("touch suffix"));
+    expect(commands.indexOf("echo $(printf nested)")).toBeGreaterThan(commands.indexOf("(printf group)"));
+    expect(commands.indexOf("printf nested")).toBeGreaterThan(commands.indexOf("echo $(printf nested)"));
   });
 
   it("recognizes compact case esac while rejecting identifier text and quoted esac", () => {

@@ -212,7 +212,7 @@ export function inspectCommandSubstitutionTree(
     seen.add(item.text);
     if (commands.length >= maxCommands) return { commands, complete: false };
     const inspected = inspectCommandSubstitutions(item.text);
-    const clauses = inspectShellCommandClauses(item.text);
+    const clauses = inspectShellCommandClauseEvents(item.text);
     commands.push(item.text);
     chars += item.text.length;
     if (!inspected.complete || !clauses.complete || chars > maxChars) {
@@ -220,18 +220,20 @@ export function inspectCommandSubstitutionTree(
     }
     const children = executableBodyEvents(item.text)
       .sort((a, b) => a.start - b.start)
-      .map((event) => event.text.trim())
-      .filter((child) => child !== "" && !seen.has(child) && !queued.has(child));
+      .map((event) => ({
+        text: event.text.trim(),
+        start: event.start + (event.text.length - event.text.trimStart().length),
+      }))
+      .filter((child) => child.text !== "" && !seen.has(child.text) && !queued.has(child.text));
     if (children.length > 0 && item.depth >= maxDepth) {
       return { commands, complete: false };
     }
     for (const body of children) {
-      queued.add(body);
-      const event = executableBodyEvents(item.text).find((candidate) => candidate.text.trim() === body);
+      queued.add(body.text);
       pending.push({
-        text: body,
+        text: body.text,
         depth: item.depth + 1,
-        offset: item.offset + (event?.start ?? 0),
+        offset: item.offset + body.start,
       });
     }
   }
@@ -250,18 +252,8 @@ function executableBodyEvents(command: string): ExecutableBodyEvent[] {
   const substitutionBodies = substitutionBodySpans(command);
   for (const body of substitutionBodies.bodies) events.push({ text: body.text, start: body.start });
 
-  const clauses = inspectShellCommandClauses(command).clauses;
-  const used = new Set<number>();
-  for (const clause of clauses) {
-    const text = clause.trim();
-    if (!text) continue;
-    // Clause text is emitted without leading reserved words. Locate it in the
-    // original source; duplicate clause strings are harmlessly deduplicated by
-    // the tree's existing seen/queued sets.
-    const start = command.lastIndexOf(text);
-    if (start === -1 || used.has(start)) continue;
-    used.add(start);
-    events.push({ text, start });
+  for (const clause of inspectShellCommandClauseEvents(command).events) {
+    events.push({ text: clause.text, start: clause.start });
   }
   return events;
 }
@@ -326,6 +318,12 @@ export interface ShellClauseInspection {
   complete: boolean;
 }
 
+interface ShellClauseEvent {
+  text: string;
+  start: number;
+  end: number;
+}
+
 interface ExecutableBodyEvent {
   text: string;
   start: number;
@@ -339,6 +337,14 @@ interface SpannedBody {
 
 /** Inspect executable clauses and report control syntax that cannot be split safely. */
 export function inspectShellCommandClauses(segment: string): ShellClauseInspection {
+  const inspected = inspectShellCommandClauseEvents(segment);
+  return {
+    clauses: uniqueClauses(inspected.events.map((event) => event.text)),
+    complete: inspected.complete,
+  };
+}
+
+function inspectShellCommandClauseEvents(segment: string): { events: ShellClauseEvent[]; complete: boolean } {
   const groups = inspectParenthesizedBodies(segment);
   const functions = inspectFunctionDefinitions(segment);
   // Arithmetic evaluation uses the same punctuation as a subshell but does
@@ -346,7 +352,7 @@ export function inspectShellCommandClauses(segment: string): ShellClauseInspecti
   // still discovered independently by inspectCommandSubstitutions.
   if (/^\s*\(\(/.test(segment)) {
     return {
-      clauses: uniqueClauses([...functions.bodies, ...groups.bodies]),
+      events: [...functions.bodies, ...groups.bodies],
       complete: functions.complete && groups.complete,
     };
   }
@@ -354,35 +360,39 @@ export function inspectShellCommandClauses(segment: string): ShellClauseInspecti
   if (caseClauses !== null) {
     const hasCase = tokenizeShellWords(segment)[0] === "case";
     return {
-      clauses: uniqueClauses([...caseClauses.bodies, ...functions.bodies, ...groups.bodies]),
+      events: [...caseClauses.bodies, ...functions.bodies, ...groups.bodies],
       complete: caseClauses.complete && functions.complete && groups.complete &&
         (!hasCase || findUnquotedWord(segment, "in") !== -1 &&
           findUnquotedWord(segment, "esac") !== -1),
     };
   }
-  const clauses: string[] = [];
-  const parts = splitShellControlClauses(segment);
+  const clauses: ShellClauseEvent[] = [];
+  const parts = splitShellControlClauseSpans(segment);
   const exposeAllParts = parts.length > 1;
   for (const part of parts) {
-    const tokens = tokenizeShellWords(part);
+    const tokens = tokenizeShellWords(part.text);
     if (tokens.length === 0) continue;
     // Newline-separated function syntax (`f ()\n{ ... }`) is split into a
     // header fragment and its body by the generic control splitter. The
     // function extractor owns that header; treating it as a command would make
     // a valid definition look like an incomplete function invocation.
-    if (isFunctionHeaderPart(part)) continue;
+    if (isFunctionHeaderPart(part.text)) continue;
     if (tokens[0] === "coproc") {
       let start = 1;
       // Bash permits `coproc NAME { commands; }` as well as `coproc commands`.
       if (tokens[start] && tokens[start] !== "{" && tokens[start + 1] === "{") start++;
       if (tokens[start] === "{") start++;
       const body = tokens.slice(start).join(" ").replace(/}\s*$/, "").trim();
-      if (body) clauses.push(body);
+      if (body) {
+        clauses.push({ text: body, start: part.start, end: part.end });
+      }
       continue;
     }
     if (SHELL_RESERVED_WORDS.has(tokens[0]!)) {
       const executable = stripReservedPrefix(tokens);
-      if (executable) clauses.push(executable);
+      if (executable) {
+        clauses.push({ text: executable, start: part.start, end: part.end });
+      }
     } else if (exposeAllParts) {
       // A compound command's ordinary parts are terminal clauses too. A
       // single ordinary part is already represented by the current tree node;
@@ -391,7 +401,7 @@ export function inspectShellCommandClauses(segment: string): ShellClauseInspecti
     }
   }
   return {
-    clauses: uniqueClauses([...clauses, ...functions.bodies, ...groups.bodies]),
+    events: [...clauses, ...functions.bodies, ...groups.bodies],
     complete: groups.complete && functions.complete,
   };
 }
@@ -399,7 +409,7 @@ export function inspectShellCommandClauses(segment: string): ShellClauseInspecti
 function isFunctionHeaderPart(part: string): boolean {
   const text = part.trim();
   return /^[A-Za-z_][A-Za-z0-9_]*\s*\(\s*\)$/.test(text) ||
-    /^function\s+[A-Za-z_][A-Za-z0-9_]*$/.test(text);
+    /^function\s+[A-Za-z_][A-Za-z0-9_]*(?:\s*\(\s*\))?$/.test(text);
 }
 
 const SHELL_RESERVED_WORDS = new Set([
@@ -408,8 +418,8 @@ const SHELL_RESERVED_WORDS = new Set([
 ]);
 
 /** Extract POSIX/Bash function bodies, preserving quoted literals and groups. */
-function inspectFunctionDefinitions(segment: string): { bodies: string[]; complete: boolean } {
-  const bodies: string[] = [];
+function inspectFunctionDefinitions(segment: string): { bodies: ShellClauseEvent[]; complete: boolean } {
+  const bodies: ShellClauseEvent[] = [];
   let complete = true;
   let quote: "'" | '"' | null = null;
   for (let i = 0; i < segment.length; i++) {
@@ -436,9 +446,9 @@ function inspectFunctionDefinitions(segment: string): { bodies: string[]; comple
         i += namedHead[0].length - 1;
         continue;
       }
-      braceStart = i + namedHead[0].length + segment.slice(i + namedHead[0].length).indexOf("{");
+      braceStart = findFunctionBrace(segment, i + namedHead[0].length);
     } else {
-      const documentedHead = /function\s+[A-Za-z_][A-Za-z0-9_]*/.exec(segment.slice(i));
+      const documentedHead = /function\s+[A-Za-z_][A-Za-z0-9_]*(?:\s*\(\s*\))?/.exec(segment.slice(i));
       if (documentedHead && documentedHead.index === 0 && functionPrefixAllowed(segment, i)) {
         const afterHead = segment.slice(i + documentedHead[0].length).trimStart();
         if (!afterHead.startsWith("{")) {
@@ -446,7 +456,7 @@ function inspectFunctionDefinitions(segment: string): { bodies: string[]; comple
           i += documentedHead[0].length - 1;
           continue;
         }
-        braceStart = i + documentedHead[0].length + segment.slice(i + documentedHead[0].length).indexOf("{");
+        braceStart = findFunctionBrace(segment, i + documentedHead[0].length);
       }
     }
     if (braceStart === -1) continue;
@@ -455,12 +465,12 @@ function inspectFunctionDefinitions(segment: string): { bodies: string[]; comple
       complete = false;
       continue;
     }
-    const body = segment.slice(braceStart + 1, close).trim();
+    const body = trimSpan(segment, braceStart + 1, close);
     if (body) bodies.push(body);
     i = close;
   }
   if (quote !== null) complete = false;
-  return { bodies: uniqueClauses(bodies), complete };
+  return { bodies, complete };
 }
 
 function functionPrefixAllowed(segment: string, start: number): boolean {
@@ -471,6 +481,12 @@ function functionPrefixAllowed(segment: string, start: number): boolean {
   if (";\n\r|&{}()".includes(boundary)) return true;
   const prefix = segment.slice(0, start).trim().split(/[;\n\r|&]/).pop()?.trim() ?? "";
   return /^(?:if|then|elif|else|while|until|do|for|select|!|function)$/.test(prefix) || /\)\s*$/.test(prefix);
+}
+
+function findFunctionBrace(segment: string, from: number): number {
+  let i = from;
+  while (i < segment.length && /\s/.test(segment[i]!)) i++;
+  return segment[i] === "{" ? i : -1;
 }
 
 function findMatchingBrace(segment: string, open: number): number {
@@ -507,46 +523,56 @@ function stripReservedPrefix(tokens: readonly string[]): string | null {
 
 /** Split shell control separators without splitting quoted/nested syntax. */
 function splitShellControlClauses(command: string): string[] {
-  const clauses: string[] = [];
-  let current = "";
+  return splitShellControlClauseSpans(command).map((clause) => clause.text);
+}
+
+function splitShellControlClauseSpans(command: string): ShellClauseEvent[] {
+  const clauses: ShellClauseEvent[] = [];
+  let currentStart = -1;
+  const pushCurrent = (end: number) => {
+    if (currentStart === -1) return;
+    const span = trimSpan(command, currentStart, end);
+    if (span) clauses.push(span);
+    currentStart = -1;
+  };
   let quote: "'" | '"' | null = null;
   let parenDepth = 0;
   let braceDepth = 0;
   for (let i = 0; i < command.length; i++) {
     const ch = command[i]!;
     if (ch === "\\") {
-      current += ch + (command[i + 1] ?? "");
+      if (currentStart === -1) currentStart = i;
       i++;
       continue;
     }
     if (quote) {
-      current += ch;
+      if (currentStart === -1) currentStart = i;
       if (ch === quote) quote = null;
       continue;
     }
     if (ch === "'" || ch === '"') {
       quote = ch;
-      current += ch;
+      if (currentStart === -1) currentStart = i;
       continue;
     }
     if (ch === "(") {
       parenDepth++;
-      current += ch;
+      if (currentStart === -1) currentStart = i;
       continue;
     }
     if (ch === ")" && parenDepth > 0) {
       parenDepth--;
-      current += ch;
+      if (currentStart === -1) currentStart = i;
       continue;
     }
     if (ch === "{") {
       braceDepth++;
-      current += ch;
+      if (currentStart === -1) currentStart = i;
       continue;
     }
     if (ch === "}" && braceDepth > 0) {
       braceDepth--;
-      current += ch;
+      if (currentStart === -1) currentStart = i;
       continue;
     }
     const separator = parenDepth === 0 && braceDepth === 0 &&
@@ -557,29 +583,25 @@ function splitShellControlClauses(command: string): string[] {
       // command separators. Keep them with the case construct so its parser
       // can validate branch coverage and extract complete bodies.
       if (ch === ";" && (command[i + 1] === ";" || command[i + 1] === "&")) {
-        current += ch + command[i + 1];
+        if (currentStart === -1) currentStart = i;
         i++;
-        if (command[i] === "&") {
-          current += command[i + 1] ?? "";
-          if (command[i + 1] === "&") i++;
-        }
+        if (command[i] === "&" && command[i + 1] === "&") i++;
         continue;
       }
-      if (current.trim()) clauses.push(current.trim());
-      current = "";
+      pushCurrent(i);
       if ((ch === "\r" && command[i + 1] === "\n") ||
           (ch === "&" && command[i + 1] === "&") ||
           (ch === "|" && command[i + 1] === "|")) i++;
       continue;
     }
-    current += ch;
+    if (currentStart === -1) currentStart = i;
   }
-  if (current.trim()) clauses.push(current.trim());
+  pushCurrent(command.length);
   return clauses;
 }
 
 /** Extract executable bodies from a complete `case ... in ... esac` command. */
-function extractCaseBranchBodies(segment: string): { bodies: string[]; complete: boolean } | null {
+function extractCaseBranchBodies(segment: string): { bodies: ShellClauseEvent[]; complete: boolean } | null {
   const tokens = tokenizeShellWords(segment);
   if (tokens[0] !== "case") return null;
   const start = findReservedWord(segment, "in");
@@ -588,7 +610,7 @@ function extractCaseBranchBodies(segment: string): { bodies: string[]; complete:
   const end = findMatchingCaseEnd(segment, bodyStart);
   if (end === -1) return { bodies: [], complete: false };
   const body = segment.slice(bodyStart, bodyStart + end);
-  const clauses: string[] = [];
+  const clauses: ShellClauseEvent[] = [];
   let cursor = 0;
   let complete = true;
   while (cursor < body.length) {
@@ -611,10 +633,19 @@ function extractCaseBranchBodies(segment: string): { bodies: string[]; complete:
       break;
     }
     if (terminator.malformed) complete = false;
-    const clause = body.slice(branchStart, terminator.bodyEnd).trim();
-    if (clause) clauses.push(clause);
+    const clause = trimSpan(body, branchStart, terminator.bodyEnd);
+    if (clause) {
+      clauses.push({ ...clause, start: bodyStart + clause.start, end: bodyStart + clause.end });
+    }
     cursor = terminator.next;
   }
+  const caseEnd = bodyStart + end + "esac".length;
+  const suffix = splitShellControlClauseSpans(segment.slice(caseEnd));
+  if (suffix.length > 0) clauses.push(...suffix.map((part) => ({
+    ...part,
+    start: part.start + caseEnd,
+    end: part.end + caseEnd,
+  })));
   return { bodies: clauses, complete };
 }
 
@@ -635,7 +666,7 @@ function findCasePatternEnd(body: string, start: number): number {
       quote = ch;
       continue;
     }
-    if (ch === "(") {
+    if (ch === "(" && !isFunctionHeaderOpen(body, i)) {
       depth++;
       continue;
     }
@@ -681,11 +712,12 @@ function findCaseBranchTerminator(body: string, start: number): { bodyEnd: numbe
       i += reserved.length - 1;
       continue;
     }
-    if (ch === "(") {
+    if (ch === "(" && !isFunctionHeaderOpen(body, i)) {
       depth++;
       continue;
     }
     if (ch === ")") {
+      if (isFunctionHeaderClose(body, i)) continue;
       if (nestedCases > 0) continue;
       if (depth > 0) depth--;
       else malformed = true;
@@ -706,13 +738,13 @@ function uniqueClauses(clauses: string[]): string[] {
 }
 
 interface ParenthesizedBodyInspection {
-  bodies: string[];
+  bodies: ShellClauseEvent[];
   complete: boolean;
 }
 
 /** Extract executable `(...)` groups, excluding quoted text, arithmetic, and substitutions. */
 function inspectParenthesizedBodies(command: string): ParenthesizedBodyInspection {
-  const bodies: string[] = [];
+  const bodies: ShellClauseEvent[] = [];
   let quote: "'" | '"' | null = null;
   let complete = true;
   for (let i = 0; i < command.length; i++) {
@@ -762,11 +794,41 @@ function inspectParenthesizedBodies(command: string): ParenthesizedBodyInspectio
       complete = false;
       continue;
     }
-    bodies.push(command.slice(i + 1, close));
+    const body = trimSpan(command, i + 1, close);
+    if (body) bodies.push(body);
     i = close;
   }
   if (quote !== null) complete = false;
-  return { bodies: uniqueClauses(bodies), complete };
+  return { bodies, complete };
+}
+
+function trimSpan(source: string, start: number, end: number): ShellClauseEvent | null {
+  while (start < end && /\s/.test(source[start]!)) start++;
+  while (end > start && /\s/.test(source[end - 1]!)) end--;
+  return start < end ? { text: source.slice(start, end), start, end } : null;
+}
+
+function isFunctionHeaderClose(source: string, close: number): boolean {
+  if (source[close] !== ")") return false;
+  let i = close - 1;
+  while (i >= 0 && /\s/.test(source[i]!)) i--;
+  if (source[i] !== "(") return false;
+  i--;
+  while (i >= 0 && /\s/.test(source[i]!)) i--;
+  const end = i + 1;
+  while (i >= 0 && /[A-Za-z0-9_]/.test(source[i]!)) i--;
+  if (end === i + 1) return false;
+  let after = close + 1;
+  while (after < source.length && /\s/.test(source[after]!)) after++;
+  return source[after] === "{";
+}
+
+function isFunctionHeaderOpen(source: string, open: number): boolean {
+  if (source[open] !== "(") return false;
+  let close = open + 1;
+  while (close < source.length && /\s/.test(source[close]!)) close++;
+  if (source[close] !== ")") return false;
+  return isFunctionHeaderClose(source, close);
 }
 
 function findUnquotedWord(text: string, word: string): number {

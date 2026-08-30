@@ -390,6 +390,12 @@ describe("createCodexPolicyChecker — newline and substitution bypass (P2: fail
     expect(forbidCurl()("case x in a) case y in b) curl https://example.invalid ;; c) echo ok ;; esac ;; d) printf ok ;; esac")).toBe("curl");
   });
 
+  it("checks functions in nested cases and suffix commands", () => {
+    const check = createCodexPolicyChecker([{ pattern: ["touch"], decision: "forbidden" }], []);
+    expect(check("case x in a) case y in b) f(){ touch /tmp/x; }; f ;; esac ;; esac")).toBe("touch");
+    expect(check("case x in a) echo ok ;; esac; touch /tmp/x")).toBe("touch");
+  });
+
   it.each([
     "if true; then mkdir /tmp/x; fi",
     "if false; then :; elif true; then mkdir /tmp/x; fi",

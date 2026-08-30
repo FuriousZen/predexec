@@ -634,3 +634,78 @@ reserved delimiters. Lexical offsets are carried only inside the bounded shared
 traversal, so host raw/stripped matching, verdict precedence, wrapper vocabulary,
 and mutation classification remain unchanged. No runtime dependency, ledger,
 release metadata, publish, push, merge, or version operation changed.
+
+## Extended integration fix round 9 — exact spans, function headers in cases, and case suffixes
+
+This user-authorized extension started from `16e9ed6d2647d5a69bf90ce16d7da95b8ef00a79`.
+It closes three remaining shared-traversal completeness defects: duplicate
+body text could be assigned the wrong source position by `lastIndexOf`, a
+function header's `()` could be mistaken for case syntax, and commands after a
+complete top-level `esac` were omitted. No ledger edit, version bump, publish,
+push, merge, or release-artifact staging was performed.
+
+### RED evidence
+
+Before changing production code, the new regressions were run with:
+
+```text
+./node_modules/.bin/vitest run __tests__/command-inspection.test.ts
+```
+
+Result: exit 1; **3 tests failed, 55 passed**. The failures reproduced
+duplicate-body ordering, the nested-case `f(){ ... }` completeness failure,
+and dropped commands after `esac`. The duplicate-body test was then sharpened
+to place the group occurrence before the function occurrence, proving the
+failure came from last-occurrence lookup rather than extractor ordering.
+
+### GREEN implementation
+
+- Shared clause, function, case-branch, group, and control-split extractors now
+  carry exact source spans internally. The bounded tree sorts all executable
+  events by their original offsets before deduplicating queued command text;
+  no source offset is inferred with substring search. Existing depth, command,
+  and character budgets remain unchanged.
+- Case branch termination tracks function-header parentheses separately from
+  case-pattern parentheses. POSIX and Bash `name()`, `name ()`, `function
+  name`, and `function name()` definitions remain complete inside nested cases;
+  alternation, quoted parentheses, and malformed cases preserve fail-closed
+  behavior.
+- The complete-case path emits every top-level suffix clause after `esac`,
+  including multiple commands, control bodies, groups, and substitutions, in
+  lexical order. Core mutation inspection and Claude/Codex policy checks use
+  the shared tree regressions for nested-case functions and suffix commands.
+
+### GREEN verification
+
+Focused security suites passed **531/531 tests**:
+
+```text
+./node_modules/.bin/vitest run __tests__/command-inspection.test.ts __tests__/core/destructive.test.ts __tests__/core/engine.test.ts __tests__/mcp/policy-claude.test.ts __tests__/mcp/policy-codex.test.ts
+```
+
+Additional required checks all passed:
+
+```text
+./node_modules/.bin/tsc --noEmit
+pnpm run build
+./node_modules/.bin/vitest run
+./node_modules/.bin/vitest run __tests__/release-hygiene.test.ts __tests__/pack.test.ts
+git diff --check
+```
+
+Typecheck/build succeeded; the full suite passed **937/937 tests**; release/pack
+verification passed **9/9 tests**, including packed-install CLI/MCP smoke checks;
+and `git diff --check` passed. Generated `dist/` output remained ignored and
+unstaged.
+
+### Self-review
+
+The shared event queue now preserves first-in-source occurrence even when
+function, group, and substitution bodies have identical text, while retaining
+string-level deduplication and all traversal caps. Function-header recognition
+is quote/escape-aware and scoped to a following brace, so case patterns and
+malformed syntax still fail closed. Case suffixes are span-bearing events and
+are recursively inspected by the same shared tree consumed by core, Claude,
+and Codex. Changes are limited to `command-inspection.ts`, focused shared/core/
+adapter regressions, and this report; policy precedence, mutation rules,
+dependencies, ledger, and release metadata are unchanged.
