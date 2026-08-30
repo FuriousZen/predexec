@@ -190,6 +190,77 @@ describe("runPlanTree — traversal & stop reasons", () => {
     },
   );
 
+  it.skipIf(
+    (![process.execPath, "/usr/bin/node", "/usr/local/bin/node", "/opt/homebrew/bin/node"].some(existsSync)) ||
+      (!["/usr/bin/ruby", "/usr/local/bin/ruby", "/opt/homebrew/bin/ruby"].some(existsSync)) ||
+      (!["/usr/bin/python3", "/usr/local/bin/python3", "/opt/homebrew/bin/python3"].some(existsSync)),
+  )("allows installed interpreters to run escaped/literal interpolation data without writes", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "predexec-interpolation-read-"));
+    try {
+      const commands = [
+        "node -e 'const fs=require(\"fs\"); const x = `safe \\${fs.writeFileSync(\"created\", \"x\")}`; console.log(x)'",
+        `ruby -e 'puts %q{#{File.write("created", "x")}}'`,
+        `python3 -c "from pathlib import Path; print(f'{{Path(\"created\").write_text(\"x\")}}')"`,
+      ];
+      for (const command of commands) {
+        const result = await runPlanTree({ root: "a", nodes: [{ id: "a", commands: [command] }] }, { cwd: dir });
+        expect(result.stoppedReason).toBe("leaf");
+        expect(result.pathTaken).toEqual(["a"]);
+      }
+      expect(existsSync(join(dir, "created"))).toBe(false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it.skipIf(![process.execPath, "/usr/bin/node", "/usr/local/bin/node", "/opt/homebrew/bin/node"].some(existsSync))(
+    "mutationStop: Node template interpolation writers never execute",
+    async () => {
+      const dir = mkdtempSync(join(tmpdir(), "predexec-node-interpolation-"));
+      try {
+        const command = `node -e 'const fs=require("fs"); const x = \`safe \${fs.writeFileSync("created", "x")}\`'`;
+        const result = await runPlanTree({ root: "a", nodes: [{ id: "a", commands: [command] }] }, { cwd: dir });
+        expect(result.stoppedReason).toBe("mutationStop");
+        expect(result.pathTaken).toEqual([]);
+        expect(existsSync(join(dir, "created"))).toBe(false);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.skipIf(!["/usr/bin/python3", "/usr/local/bin/python3", "/opt/homebrew/bin/python3"].some(existsSync))(
+    "mutationStop: Python f-string interpolation writers never execute",
+    async () => {
+      const dir = mkdtempSync(join(tmpdir(), "predexec-python-interpolation-"));
+      try {
+        const command = `python3 -c "from pathlib import Path; x=f'''safe {Path('created').write_text('x')}'''"`;
+        const result = await runPlanTree({ root: "a", nodes: [{ id: "a", commands: [command] }] }, { cwd: dir });
+        expect(result.stoppedReason).toBe("mutationStop");
+        expect(result.pathTaken).toEqual([]);
+        expect(existsSync(join(dir, "created"))).toBe(false);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.skipIf(!["/usr/bin/ruby", "/usr/local/bin/ruby", "/opt/homebrew/bin/ruby"].some(existsSync))(
+    "mutationStop: Ruby interpolated strings writers never execute",
+    async () => {
+      const dir = mkdtempSync(join(tmpdir(), "predexec-ruby-interpolation-"));
+      try {
+        const command = `ruby -e 'x = %Q{safe #{File.write("created", "x")}}'`;
+        const result = await runPlanTree({ root: "a", nodes: [{ id: "a", commands: [command] }] }, { cwd: dir });
+        expect(result.stoppedReason).toBe("mutationStop");
+        expect(result.pathTaken).toEqual([]);
+        expect(existsSync(join(dir, "created"))).toBe(false);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    },
+  );
+
   it.skipIf(!existsSync("/usr/bin/perl") && !existsSync("/opt/homebrew/bin/perl"))(
     "allows an installed Perl O_RDONLY sysopen despite printed/commented writer flags",
     async () => {
@@ -274,6 +345,7 @@ describe("runPlanTree — traversal & stop reasons", () => {
           String.raw`perl -e 'open(FH, "\x3e", "created")'`,
           `perl -e "unlink('victim')"`,
           `perl -e "sysopen(FH, 'victim', O_WRONLY)"`,
+          "perl -e 'print qq{safe ${\\unlink(\"victim\")}}'",
         ];
         for (const command of commands) {
           const result = await runPlanTree({ root: "a", nodes: [{ id: "a", commands: [command] }] }, { cwd: dir });

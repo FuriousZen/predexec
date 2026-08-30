@@ -521,6 +521,54 @@ describe("interpreter eval — fs-writer APIs are caught", () => {
   });
 });
 
+describe("round 15 executable interpolation extraction", () => {
+  it.each([
+    String.raw`node -e 'const x = \`safe \${fs.writeFileSync("out", "x")}\`'`,
+    `ruby -e 'puts %Q{safe #{File.write("out", "x")}}'`,
+    `python -c 'print(f"safe {Path("out").write_text("x")}")'`,
+    "perl -e 'print qq{safe ${\\unlink(\"out\")}}'",
+  ])("catches a writer in executable interpolation: %s", (cmd) => {
+    expect(isDestructiveCommand(cmd)).toBe(true);
+  });
+
+  it.each([
+    "node -e 'const x = `\\${fs.writeFileSync(\"out\", \"x\")}`'",
+    "node -e 'const x = `safe ${/* fs.writeFileSync(\"out\", \"x\") */ \"ok\"}`'",
+    `ruby -e 'puts %q{#{File.write("out", "x")}}'`,
+    `ruby -e '=begin\nFile.write("out", "x")\n=end\nputs :ok'`,
+    String.raw`perl -e 'print q{unlink("out")}'`,
+    `ruby -e 'puts "escaped \\#{File.write(\"out\", \"x\")}"'`,
+    `python -c 'print("{Path(\\"out\\").write_text(\\"x\\")}")'`,
+    `python -c 'print(f"{{Path(\\"out\\").write_text(\\"x\\")}}")'`,
+  ])("masks non-executable interpolation-looking data: %s", (cmd) => {
+    expect(isDestructiveCommand(cmd)).toBe(false);
+  });
+
+  it.each([
+    `ruby -e 'puts <<~TEXT\nFile.write("out", "x")\nTEXT'`,
+    `perl -e 'print <<"TEXT";\nunlink("out")\nTEXT'`,
+    `php -r '$x = <<<TEXT\nfile_put_contents("out", "x");\nTEXT;'`,
+    `python -c 'print("""Path("out").write_text("x")""")'`,
+  ])("masks writer-looking alternate literal data: %s", (cmd) => {
+    expect(isDestructiveCommand(cmd)).toBe(false);
+  });
+
+  it.each([
+    String.raw`node -e 'const x = \`unterminated \${fs.writeFileSync("out", "x")}'`,
+    `ruby -e 'puts %Q{unterminated #{File.write("out", "x")}'`,
+    `python -c 'print(f"unterminated {Path("out").write_text("x")")'`,
+  ])("fails closed for malformed interpolation source: %s", (cmd) => {
+    expect(findDestructiveToken(cmd)).not.toBeNull();
+  });
+
+  it("fails closed when interpolation nesting exceeds the language budget", () => {
+    let expression = "fs.writeFileSync('out', 'x')";
+    for (let i = 0; i < 40; i++) expression = "`nested ${" + expression + "}`";
+    const payload = "const x = `outer ${" + expression + "}`";
+    expect(isDestructiveCommand(`node -e ${JSON.stringify(payload)}`)).toBe(true);
+  });
+});
+
 describe("splitCommandSegments", () => {
   it("splits on unquoted |, ;, &&, ||", () => {
     expect(splitCommandSegments("a | b && c ; d || e")).toEqual(["a", "b", "c", "d", "e"]);

@@ -191,12 +191,238 @@ const PHP_FOPEN = /\bfopen\s*\(/gi;
 const MAX_LANGUAGE_ARGUMENT_LENGTH = 64 * 1024;
 /** Maximum language-call candidates inspected in one eval payload. */
 export const LANGUAGE_CALL_CANDIDATE_BUDGET = 256;
+/** Bounds for recursive language-string interpolation extraction. */
+export const LANGUAGE_INTERPOLATION_DEPTH_BUDGET = 32;
+export const LANGUAGE_VIEW_CHARACTER_BUDGET = 64 * 1024;
 
 interface LanguageCall { match: string; args: string | null; }
 
 interface LanguageSyntaxOptions {
   hashComments: boolean;
   slashComments: boolean;
+}
+
+type InterpolationLanguage = "node" | "python" | "ruby" | "perl" | "php";
+
+/**
+ * Return an offset-preserving view of executable language source. Ordinary
+ * strings, alternate literals, heredocs, and comments become spaces, while
+ * interpolation bodies are recursively retained because they are executable
+ * in JavaScript template strings, Ruby interpolated strings, and Python
+ * f-strings. Perl only executes the explicit `${\ ...}`/`@{[ ... ]}` forms.
+ * A malformed or over-budget construct returns null (fail closed).
+ */
+function executableLanguageView(source: string, language: InterpolationLanguage): string | null {
+  if (source.length > LANGUAGE_VIEW_CHARACTER_BUDGET) return null;
+  const chars = source.split("");
+  let visited = 0;
+  let depth = 0;
+  const mask = (start: number, end: number) => {
+    for (let i = start; i < end && i < chars.length; i++) {
+      if (chars[i] !== "\n" && chars[i] !== "\r") chars[i] = " ";
+    }
+  };
+  const step = () => ++visited <= LANGUAGE_VIEW_CHARACTER_BUDGET;
+  const lineStart = (index: number) => index === 0 || source[index - 1] === "\n" || source[index - 1] === "\r";
+
+  const parseCode = (start: number, end: number): number | null => {
+    for (let i = start; i < end; i++) {
+      if (!step()) return null;
+      const ch = source[i]!;
+      const next = source[i + 1];
+      if (ch === "#" && (language === "python" || language === "ruby" || language === "perl" || language === "php")) {
+        const commentEnd = source.slice(i).search(/[\r\n]/);
+        const stop = commentEnd < 0 ? end : Math.min(end, i + commentEnd);
+        mask(i, stop); i = stop - 1; continue;
+      }
+      if ((language === "php" || language === "node") && ch === "/" && next === "/") {
+        const commentEnd = source.slice(i).search(/[\r\n]/);
+        const stop = commentEnd < 0 ? end : Math.min(end, i + commentEnd);
+        mask(i, stop); i = stop - 1; continue;
+      }
+      if ((language === "php" || language === "node") && ch === "/" && next === "*") {
+        const close = source.indexOf("*/", i + 2);
+        if (close < 0 || close + 2 > end) return null;
+        mask(i, close + 2); i = close + 1; continue;
+      }
+      // Recursive interpolation walks may revisit a region that was masked by
+      // its enclosing literal; executable code must be restored before nested
+      // strings/comments are handled.
+      chars[i] = source[i]!;
+      if (language === "ruby" && lineStart(i) && /^\s*=begin(?:\s|$)/.test(source.slice(i))) {
+        const marker = /(?:^|\r?\n)[ \t]*=end(?:[ \t]*)(?:\r?\n|$)/m.exec(source.slice(i));
+        if (!marker) return null;
+        const stop = i + marker.index + marker[0].length;
+        mask(i, stop); i = stop - 1; continue;
+      }
+      if ((language === "ruby" || language === "perl" || language === "php") && ch === "<" && next === "<") {
+        const heredoc = source.slice(i).match(/^<<<?[-~]?\s*(['"]?)([A-Za-z_]\w*)\1[ \t]*;?[ \t]*(?:\r?\n|\r)/);
+        if (heredoc) {
+          const bodyStart = i + heredoc[0].length;
+          const terminator = new RegExp(`(?:^|\\r?\\n)[ \\t]*${heredoc[2]}[ \\t]*;?[ \\t]*(?:\\r?\\n|$)`, "m").exec(source.slice(bodyStart));
+          if (!terminator) return null;
+          const bodyEnd = bodyStart + terminator.index + terminator[0].length;
+          const interpolating = language === "ruby" || (language === "perl" && heredoc[1] !== "'");
+          mask(i, bodyStart);
+          if (interpolating) {
+            const parsed = maskInterpolatedLiteral(bodyStart, bodyEnd, language);
+            if (parsed === null) return null;
+          } else mask(bodyStart, bodyEnd);
+          i = bodyEnd - 1; continue;
+        }
+      }
+      if (language === "ruby" && ch === "%" && /[qQ]/.test(next ?? "")) {
+        const parsed = parsePercent(i, end);
+        if (parsed === null) return null;
+        i = parsed - 1; continue;
+      }
+      if (language === "perl" && ch === "q" && (next === "q" || next === "w" || next === "x" || /[\[{(<'\"]/.test(next ?? ""))) {
+        const parsed = parsePerlQuote(i, end);
+        if (parsed === null) return null;
+        i = parsed - 1; continue;
+      }
+      if (ch === "'" || ch === '"' || (language === "node" && ch === "`") || (language === "python" && (ch === "'" || ch === '"'))) {
+        const triple = language === "python" && source.slice(i, i + 3) === ch.repeat(3);
+        const prefix = language === "python" ? (source.slice(0, i).match(/(?:^|[^A-Za-z0-9_])([A-Za-z]+)$/)?.[1] ?? "") : "";
+        const interpolating = language === "node" ? ch === "`" : language === "ruby" ? ch === '"' : language === "perl" ? ch === '"' : language === "python" && /f/i.test(prefix);
+        const parsed = parseString(i, ch, triple, interpolating, end);
+        if (parsed === null) return null;
+        i = parsed - 1; continue;
+      }
+    }
+    return end;
+  };
+
+  const parseInterpolated = (start: number, end: number, lang: InterpolationLanguage): number | null => {
+    if (++depth > LANGUAGE_INTERPOLATION_DEPTH_BUDGET) return null;
+    let braces = 1;
+    let parsed: number | null = null;
+    for (let i = start; i < end; i++) {
+      if (!step()) { parsed = null; break; }
+      const ch = source[i]!;
+      const next = source[i + 1];
+      if (ch === "#" && (lang === "python" || lang === "ruby" || lang === "perl" || lang === "php")) {
+        const commentEnd = source.slice(i).search(/[\r\n]/);
+        const stop = commentEnd < 0 ? end : Math.min(end, i + commentEnd);
+        mask(i, stop); i = stop - 1; continue;
+      }
+      if ((lang === "php" || lang === "node") && ch === "/" && next === "/") {
+        const commentEnd = source.slice(i).search(/[\r\n]/);
+        const stop = commentEnd < 0 ? end : Math.min(end, i + commentEnd);
+        mask(i, stop); i = stop - 1; continue;
+      }
+      if ((lang === "php" || lang === "node") && ch === "/" && next === "*") {
+        const close = source.indexOf("*/", i + 2);
+        if (close < 0 || close + 2 > end) { parsed = null; break; }
+        mask(i, close + 2); i = close + 1; continue;
+      }
+      // The enclosing literal may have been masked before this recursive
+      // pass; restore executable interpolation source as it is traversed.
+      chars[i] = source[i]!;
+      if (ch === "\\") { i++; continue; }
+      if (ch === "'" || ch === '"' || (lang === "node" && ch === "`") || (lang === "python" && (ch === "'" || ch === '"'))) {
+        const triple = lang === "python" && source.slice(i, i + 3) === ch.repeat(3);
+        const prefix = lang === "python" ? (source.slice(0, i).match(/(?:^|[^A-Za-z0-9_])([A-Za-z]+)$/)?.[1] ?? "") : "";
+        const nestedInterpolation = lang === "node" ? ch === "`" : lang === "ruby" ? ch === '"' : lang === "perl" ? ch === '"' : lang === "python" && /f/i.test(prefix);
+        const stringEnd = parseString(i, ch, triple, nestedInterpolation, end);
+        if (stringEnd === null) { parsed = null; break; }
+        i = stringEnd - 1; continue;
+      }
+      if (ch === "{") braces++;
+      else if (ch === "}" && --braces === 0) { parsed = i + 1; break; }
+    }
+    depth--;
+    return parsed;
+  };
+
+  const maskInterpolatedLiteral = (start: number, end: number, lang: InterpolationLanguage): number | null => {
+    for (let i = start; i < end; i++) {
+      if (!step()) return null;
+      const ch = source[i]!;
+      if (ch === "\\") { mask(i, Math.min(end, i + 2)); i++; continue; }
+      const marker = (lang === "ruby" && source.startsWith("#{", i)) ||
+        (lang === "perl" && (source.startsWith("${\\", i) || source.startsWith("@{[", i)));
+      if (marker) {
+        const markerLength = lang === "ruby" ? 2 : source.startsWith("@{[", i) ? 3 : 3;
+        mask(i, i + markerLength);
+        const parsed = parseInterpolated(i + markerLength, end, lang);
+        if (parsed === null) return null;
+        i = parsed - 1;
+      } else mask(i, i + 1);
+    }
+    return end;
+  };
+
+  const parseString = (start: number, quote: string, triple: boolean, interpolating: boolean, end: number): number | null => {
+    const opening = triple ? 3 : 1;
+    mask(start, Math.min(end, start + opening));
+    for (let i = start + opening; i < end; i++) {
+      if (!step()) return null;
+      const ch = source[i]!;
+      if (ch === "\\") { mask(i, Math.min(end, i + 2)); i++; continue; }
+      if (triple ? source.slice(i, i + 3) === quote.repeat(3) : ch === quote) {
+        mask(i, i + (triple ? 3 : 1)); return i + (triple ? 3 : 1);
+      }
+      const marker = language === "node" && quote === "`" ? source.startsWith("${", i) :
+        language === "ruby" && interpolating ? source.startsWith("#{", i) :
+        language === "perl" && interpolating ? source.startsWith("${\\", i) || source.startsWith("@{[", i) :
+        language === "python" && interpolating && ch === "{" && source[i + 1] !== "{" ? true : false;
+      if (language === "python" && interpolating && (source.startsWith("{{", i) || source.startsWith("}}", i))) {
+        mask(i, i + 2); i++; continue;
+      }
+      if (marker) {
+        const markerLength = language === "python" ? 1 : language === "perl" ? source.startsWith("@{[", i) ? 3 : 3 : 2;
+        mask(i, i + markerLength);
+        const parsed = parseInterpolated(i + markerLength, end, language);
+        if (parsed === null) return null;
+        i = parsed - 1;
+        continue;
+      }
+      mask(i, i + 1);
+    }
+    return null;
+  };
+
+  const parseDelimited = (start: number, open: string, close: string, interpolating: boolean, end: number, openerLength: number): number | null => {
+    mask(start, start + openerLength);
+    let pairDepth = 1;
+    for (let i = start + openerLength; i < end; i++) {
+      if (!step()) return null;
+      const ch = source[i]!;
+      if (ch === "\\") { mask(i, Math.min(end, i + 2)); i++; continue; }
+      if (interpolating && ((language === "ruby" && source.startsWith("#{", i)) || (language === "perl" && (source.startsWith("${\\", i) || source.startsWith("@{[", i))))) {
+        const markerLength = language === "ruby" ? 2 : source.startsWith("@{[", i) ? 3 : 3;
+        mask(i, i + markerLength);
+        const parsed = parseInterpolated(i + markerLength, end, language);
+        if (parsed === null) return null;
+        i = parsed - 1; continue;
+      }
+      if (ch === open) pairDepth++;
+      else if (ch === close && --pairDepth === 0) { mask(i, i + 1); return i + 1; }
+      else mask(i, i + 1);
+    }
+    return null;
+  };
+
+  const parsePercent = (start: number, end: number): number | null => {
+    const kind = source[start + 1]!;
+    const open = source[start + 2];
+    if (!open) return null;
+    const close = ({ "{": "}", "[": "]", "(": ")", "<": ">" } as Record<string, string>)[open] ?? open;
+    return parseDelimited(start, open, close, kind === "Q", end, 3);
+  };
+
+  const parsePerlQuote = (start: number, end: number): number | null => {
+    const second = source[start + 1];
+    const openerLength = second === "q" || second === "w" || second === "x" ? 2 : 1;
+    const open = source[start + openerLength];
+    if (!open) return null;
+    const close = ({ "{": "}", "[": "]", "(": ")", "<": ">" } as Record<string, string>)[open] ?? open;
+    return parseDelimited(start, open, close, second === "q", end, openerLength + 1);
+  };
+
+  const root = parseCode(0, source.length);
+  return root === null ? null : chars.join("");
 }
 
 function maskLanguageCode(source: string, hashComments: boolean, slashComments: boolean): string {
@@ -335,8 +561,15 @@ function captureLanguageCall(source: string, openIndex: number, options: Languag
   return null;
 }
 
-function findLanguageCalls(source: string, pattern: RegExp, hashComments: boolean, slashComments: boolean): LanguageCall[] {
-  const masked = maskLanguageCode(source, hashComments, slashComments);
+function findLanguageCalls(
+  source: string,
+  pattern: RegExp,
+  hashComments: boolean,
+  slashComments: boolean,
+  language?: InterpolationLanguage,
+): LanguageCall[] {
+  const masked = language ? executableLanguageView(source, language) : maskLanguageCode(source, hashComments, slashComments);
+  if (masked === null) return [{ match: "ambiguous language source", args: null }];
   const matcher = new RegExp(pattern.source, `${pattern.flags.replace("g", "")}g`);
   const calls: LanguageCall[] = [];
   for (let match = matcher.exec(masked); match; match = matcher.exec(masked)) {
@@ -352,8 +585,9 @@ function findLanguageCalls(source: string, pattern: RegExp, hashComments: boolea
   return calls;
 }
 
-function findLanguageKeywords(source: string, keyword: string, hashComments: boolean, slashComments: boolean): number[] {
-  const masked = maskLanguageCode(source, hashComments, slashComments);
+function findLanguageKeywords(source: string, keyword: string, hashComments: boolean, slashComments: boolean, language?: InterpolationLanguage): number[] {
+  const masked = language ? executableLanguageView(source, language) : maskLanguageCode(source, hashComments, slashComments);
+  if (masked === null) return [];
   const matcher = new RegExp(`\\b${keyword}\\b`, "g");
   const indexes: number[] = [];
   for (let match = matcher.exec(masked); match; match = matcher.exec(masked)) indexes.push(match.index);
@@ -496,9 +730,11 @@ function interpreterEvalPayload(segment: string): string {
 }
 
 function languageWordScanSegment(head: string, segment: string): string {
-  if (!isEvalInvocation(head, segment) || !["perl", "ruby", "php"].includes(head)) return segment;
+  if (!isEvalInvocation(head, segment) || !EVAL_INTERPRETERS.has(head)) return segment;
   const payload = interpreterEvalPayload(segment);
-  return `${head} ${maskLanguageCode(payload, true, head === "php")}`;
+  const language = (head === "node" || head === "deno" || head === "bun" ? "node" : head === "python3" ? "python" : head) as InterpolationLanguage;
+  const view = executableLanguageView(payload, language);
+  return view === null ? segment : `${head} ${view}`;
 }
 
 /** Capture bare Perl arguments, continuing across newline comments only while incomplete. */
@@ -539,14 +775,14 @@ function captureBarePerlArguments(
 }
 
 function findPerlWriter(payload: string): string | null {
-  const common = findLanguageCalls(payload, PERL_WRITER_FUNCTIONS, true, false)[0];
+  const common = findLanguageCalls(payload, PERL_WRITER_FUNCTIONS, true, false, "perl")[0];
   if (common) return common.match;
   for (const keyword of PERL_WRITER_KEYWORDS) {
-    const index = findLanguageKeywords(payload, keyword, true, false)[0];
+    const index = findLanguageKeywords(payload, keyword, true, false, "perl")[0];
     if (index !== undefined) return keyword;
   }
-  const masked = maskLanguageCode(payload, true, false);
-  for (const index of findLanguageKeywords(payload, "sysopen", true, false)) {
+  const masked = executableLanguageView(payload, "perl") ?? "";
+  for (const index of findLanguageKeywords(payload, "sysopen", true, false, "perl")) {
     const afterKeyword = index + "sysopen".length;
     let cursor = afterKeyword;
     while (/\s/.test(masked[cursor] ?? "")) cursor++;
@@ -564,7 +800,7 @@ function findPerlWriter(payload: string): string | null {
     // be combined with the non-mutating descriptor flags.
     if (!/\bO_RDONLY\b/i.test(flags)) return "sysopen";
   }
-  for (const index of findLanguageKeywords(payload, "open", true, false)) {
+  for (const index of findLanguageKeywords(payload, "open", true, false, "perl")) {
     const afterKeyword = index + "open".length;
     let cursor = afterKeyword;
     while (/\s/.test(masked[cursor] ?? "")) cursor++;
@@ -578,16 +814,16 @@ function findPerlWriter(payload: string): string | null {
     if (mode.kind === "ambiguous") return "open";
     if (perlOpenWriteMode(mode.value)) return `open ${mode.value}`;
   }
-  const print = /\bprint\s+[A-Za-z_$][\w$]*\s+/.exec(maskLanguageCode(payload, true, false));
+  const print = /\bprint\s+[A-Za-z_$][\w$]*\s+/.exec(executableLanguageView(payload, "perl") ?? "");
   return print?.[0]?.trim() ?? null;
 }
 
 function findRubyWriter(payload: string): string | null {
-  const direct = findLanguageCalls(payload, RUBY_FILE_WRITER_FUNCTIONS, true, false)[0];
+  const direct = findLanguageCalls(payload, RUBY_FILE_WRITER_FUNCTIONS, true, false, "ruby")[0];
   if (direct) return direct.match;
-  const fileUtils = findLanguageCalls(payload, RUBY_FILEUTILS_WRITER_FUNCTIONS, true, false)[0];
+  const fileUtils = findLanguageCalls(payload, RUBY_FILEUTILS_WRITER_FUNCTIONS, true, false, "ruby")[0];
   if (fileUtils) return fileUtils.match;
-  for (const call of findLanguageCalls(payload, RUBY_FILE_OPEN, true, false)) {
+  for (const call of findLanguageCalls(payload, RUBY_FILE_OPEN, true, false, "ruby")) {
     if (call.args === null) return call.match;
     const fields = splitTopLevelArguments(call.args, { hashComments: true, slashComments: false });
     if (fields === null || fields.length < 2) return call.match;
@@ -598,9 +834,9 @@ function findRubyWriter(payload: string): string | null {
 }
 
 function findPhpWriter(payload: string): string | null {
-  const direct = findLanguageCalls(payload, PHP_WRITER_FUNCTIONS, true, true)[0];
+  const direct = findLanguageCalls(payload, PHP_WRITER_FUNCTIONS, true, true, "php")[0];
   if (direct) return direct.match;
-  for (const call of findLanguageCalls(payload, PHP_FOPEN, true, true)) {
+  for (const call of findLanguageCalls(payload, PHP_FOPEN, true, true, "php")) {
     if (call.args === null) return call.match;
     const fields = splitTopLevelArguments(call.args, { hashComments: true, slashComments: true });
     if (fields === null || fields.length < 2) return call.match;
@@ -612,7 +848,7 @@ function findPhpWriter(payload: string): string | null {
 
 /** Python's built-in open is the one generic writer API requiring mode parsing. */
 function findPythonWriter(payload: string): string | null {
-  for (const call of findLanguageCalls(payload, /\bopen\s*\(/gi, true, false)) {
+  for (const call of findLanguageCalls(payload, /\bopen\s*\(/gi, true, false, "python")) {
     if (call.args === null) return call.match;
     const fields = splitTopLevelArguments(call.args, { hashComments: true, slashComments: false });
     if (fields === null || fields.length < 2) continue;
@@ -1060,6 +1296,8 @@ function isEvalInvocation(head: string, segment: string): boolean {
 function findInterpreterWriter(head: string, segment: string): string | null {
   if (segment.length > MAX_LANGUAGE_ARGUMENT_LENGTH) return `${head} eval payload`;
   const payload = interpreterEvalPayload(segment);
+  const language = (head === "node" || head === "deno" || head === "bun" ? "node" : head) as InterpolationLanguage;
+  if (EVAL_INTERPRETERS.has(head) && executableLanguageView(payload, language) === null) return `${head} eval payload`;
   if (head === "python" || head === "python3") return findPythonWriter(payload);
   if (head === "perl") return findPerlWriter(payload);
   if (head === "ruby") return findRubyWriter(payload);
@@ -1192,11 +1430,9 @@ function findDestructiveTokenInternal(cmd: string, depth: number): string | null
       const languageWriter = findInterpreterWriter(head, segment);
       if (languageWriter) return languageWriter;
       const writerPayload = interpreterEvalPayload(segment);
-      const writerSource = maskLanguageCode(
-        writerPayload,
-        !["node", "deno", "bun"].includes(head),
-        head === "php" || ["node", "deno", "bun"].includes(head),
-      );
+      const language = (head === "node" || head === "deno" || head === "bun" ? "node" : head === "python3" ? "python" : head) as InterpolationLanguage;
+      const writerSource = executableLanguageView(writerPayload, language);
+      if (writerSource === null) return `${head} eval payload`;
       const writer = EVAL_WRITER_RE.exec(writerSource);
       if (writer) return writer[0].trim();
     }
