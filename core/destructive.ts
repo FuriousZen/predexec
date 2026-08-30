@@ -17,7 +17,11 @@
  * guidance wants tests/builds speculating), rsync/tar -x (mode-sensitive parsing).
  */
 
-import { extractCommandSubstitutions, extractShellCommandClauses } from "../command-inspection.ts";
+import {
+  extractShellCommandClauses,
+  inspectCommandSubstitutions,
+  inspectShellCommandClauses,
+} from "../command-inspection.ts";
 
 /** Tool names that are definitively read-only — no regex analysis needed. */
 export const READ_ONLY_TOOLS = new Set(["read", "grep", "find", "ls"]);
@@ -604,7 +608,7 @@ function isEvalInvocation(head: string, segment: string): boolean {
  * null when the command is (heuristically) read-only.
  */
 function findDestructiveTokenInternal(cmd: string, depth: number): string | null {
-  if (depth >= 8) return "complex shell syntax";
+  if (depth >= 32) return "complex shell syntax";
   const sanitized = sanitizeForRedirect(cmd);
 
   const redirect = REDIRECT_RE.exec(sanitized);
@@ -615,13 +619,24 @@ function findDestructiveTokenInternal(cmd: string, depth: number): string | null
   // Quoted command substitutions still execute their `$()`/backtick bodies.
   // Recurse with a finite budget so nested syntax cannot hide a mutation while
   // malformed or adversarially deep input remains bounded.
-  const substitutions = extractCommandSubstitutions(cmd);
+  const substitutionInspection = inspectCommandSubstitutions(cmd);
+  if (!substitutionInspection.complete) return "complex shell syntax";
+  const substitutions = substitutionInspection.bodies;
   if (substitutions.length > 0) {
-    if (depth >= 8) return "command substitution";
+    if (depth >= 32) return "complex shell syntax";
     for (const substitution of substitutions) {
       const nested = findDestructiveTokenInternal(substitution, depth + 1);
       if (nested) return nested;
     }
+  }
+
+  // A case command with no closing `esac`, or a coprocess with no executable
+  // body, is not safely decomposable. Never let the generic word scan turn an
+  // opaque control construct into a SAFE result.
+  const trimmed = cmd.trim();
+  if (/^case\b/.test(trimmed) && !inspectShellCommandClauses(trimmed).complete) return "complex shell syntax";
+  if (/^coproc(?:\s|$)/.test(trimmed) && extractShellCommandClauses(trimmed).length === 0) {
+    return "complex shell syntax";
   }
 
   // Parenthesized groups execute their contents even though the outer shell
@@ -641,6 +656,11 @@ function findDestructiveTokenInternal(cmd: string, depth: number): string | null
       const nested = findDestructiveTokenInternal(clause, depth + 1);
       if (nested) return nested;
     }
+  }
+
+  for (const clause of extractShellCommandClauses(cmd)) {
+    const nested = findDestructiveTokenInternal(clause, depth + 1);
+    if (nested) return nested;
   }
 
   // Check output-bearing `time` options before resolving the wrapped command's

@@ -96,8 +96,9 @@ import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { splitCommandSegments } from "../core/index.ts";
 import {
-  extractCommandSubstitutions,
   extractShellCommandClauses,
+  inspectCommandSubstitutionTree,
+  inspectShellCommandClauses,
   stripLeadingAssignmentsAndWrappers,
   tokenizeShellWords,
   type WrapperInspectionOptions,
@@ -602,12 +603,12 @@ export function createCodexPolicyChecker(
       : operation.tool === "bash" && typeof operation.command === "string" ? operation.command : null;
     if (cmd === null) return null;
     try {
-      const pending = [cmd];
-      for (let depth = 0; depth < 4 && pending.length > 0; depth++) {
-        const batch = pending.splice(0, pending.length);
-        for (const text of batch) {
-          pending.push(...extractCommandSubstitutions(text));
-          for (const line of text.split("\n")) {
+      const inspected = inspectCommandSubstitutionTree(cmd);
+      for (const text of inspected.commands) {
+          if (!inspectShellCommandClauses(text).complete) {
+            return "incomplete shell syntax (policy inspection failed)";
+          }
+          for (const line of [text, ...extractShellCommandClauses(text)].flatMap((line) => line.split("\n"))) {
             for (const segment of splitCommandSegments(line)) {
               const trimmed = segment.trim();
               if (!trimmed) continue;
@@ -634,11 +635,11 @@ export function createCodexPolicyChecker(
               if (winner && winner.decision !== "allow") return formatPattern(winner.pattern);
             }
           }
-        }
       }
+      if (!inspected.complete) return "incomplete shell syntax (policy inspection budget exceeded)";
       return null;
     } catch {
-      return null;
+      return "incomplete shell syntax (policy inspection failed)";
     }
   };
 }

@@ -325,3 +325,89 @@ guards. Existing read-only compound, quoted-literal, wrapper, precedence, and
 packed-install tests remain green. Recursive shell inspection is bounded and
 falls back conservatively for over-depth syntax; no policy precedence or
 mutation wrapper behavior outside the requested boundaries was changed.
+
+## Integration fix round 5 — final shell-boundary/fail-closed integration
+
+This final allowed integration round started from `6c1940de68ca2a052ee79cca2f302ff35e292b77`.
+It addressed the remaining shell parsing and bounded-inspection findings. No
+ledger edit, version bump, publish, push, merge, or release-artifact staging was
+performed.
+
+### RED evidence
+
+Before production changes, the new public-seam regressions were run with:
+
+```text
+./node_modules/.bin/vitest run __tests__/command-inspection.test.ts __tests__/core/destructive.test.ts __tests__/mcp/policy-claude.test.ts __tests__/mcp/policy-codex.test.ts
+```
+
+Result: exit 1; **9 tests failed, 346 passed**. The failures reproduced
+quote-insensitive `$()`/process-substitution extraction, absent completeness
+signalling, missing `coproc`/case-branch extraction, silent mutation recursion
+loss, Claude's quoted `time -f` value bypass, and the existing four-level
+Claude/Codex policy traversal cutoff.
+
+### GREEN implementation and fail-closed contract
+
+- `command-inspection.ts` now uses a quote/escape-aware substitution lexer. It
+  ignores parentheses inside single/double quotes and backticks, handles nested
+  `$()` and process substitutions, and preserves the existing body-only
+  `extractCommandSubstitutions` API. The explicit
+  `inspectCommandSubstitutions` and `inspectCommandSubstitutionTree` seams report
+  completeness and enforce depth, command-count, and character budgets.
+- Core mutation classification now hard-stops with `complex shell syntax` for
+  incomplete or over-budget executable substitutions. It recursively inspects
+  every extracted body, case branch, named/unnamed coprocess body, and grouped
+  clause before considering the safe tier. An un-decomposable case/coprocess
+  construct cannot become SAFE.
+- Claude and Codex policy checkers use the shared bounded substitution tree
+  (32 levels, 512 inspected commands, and a 1 MiB aggregate character budget).
+  Any incomplete/over-budget tree or control-clause inspection returns an
+  actionable `incomplete shell syntax (policy inspection ...)` verdict instead
+  of discarding pending bodies. Existing deny/prompt precedence and raw/stripped
+  forms remain unchanged.
+- Claude's raw wrapper stripper now tokenizes with quote-aware source spans and
+  removes wrapper option arguments from the original string. Thus
+  `time -f "%E %U" curl ...` reaches the inner command while preserving exact
+  and glob rule spelling. Codex retains its argv-token behavior.
+- `env` remains deliberately out of scope for host wrapper policy matching.
+  The documented Claude/Codex wrapper vocabularies do not include `env`; this
+  round does not invent policy semantics for it. Core mutation inspection still
+  handles `env` as its own executable wrapper, including split-string payloads.
+
+### GREEN verification
+
+Focused destructive/engine/inspection/Claude/Codex verification:
+
+```text
+./node_modules/.bin/vitest run __tests__/command-inspection.test.ts __tests__/core/destructive.test.ts __tests__/core/engine.test.ts __tests__/mcp/policy-claude.test.ts __tests__/mcp/policy-codex.test.ts
+```
+
+Result: exit 0; **5 test files, 423 tests passed**. This includes engine
+no-execution guards for quoted substitutions, case branches, and coprocesses,
+read-only case false-positive coverage, deep denied `curl` policy coverage, and
+over-budget fail-closed policy coverage.
+
+Additional required checks:
+
+```text
+./node_modules/.bin/tsc --noEmit
+pnpm run build
+./node_modules/.bin/vitest run
+./node_modules/.bin/vitest run __tests__/release-hygiene.test.ts __tests__/pack.test.ts
+git diff --check
+```
+
+All passed: typecheck/build succeeded; the full suite passed **829/829 tests**;
+release/pack passed **9/9 tests**, including packed-install CLI/MCP smoke
+checks; and `git diff --check` passed.
+
+### Residual concerns
+
+The shell inspection remains intentionally bounded and heuristic rather than a
+full shell parser. The explicit contract is conservative at the boundary:
+malformed quotes/substitutions, unsupported case/coprocess decomposition, and
+budget exhaustion stop speculation. Policy inspection may therefore stop a
+command that a full shell parser would prove harmless, which is preferable to
+silently allowing an uninspected executable body. No new production dependency,
+host wrapper vocabulary, or policy precedence rule was introduced.

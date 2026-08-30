@@ -350,6 +350,21 @@ describe("mutation classifier — wrapper options and command separators", () =>
   ])("preserves read-only and literal substitutions: %s", (command) => {
     expect(findDestructiveToken(command)).toBeNull();
   });
+
+  it("fails closed for executable substitutions whose syntax is incomplete", () => {
+    expect(findDestructiveToken("echo $(printf '('; git status")).toBe("complex shell syntax");
+  });
+
+  it("inspects every case branch and coprocess body", () => {
+    expect(findDestructiveToken("case x in a) echo ok ;; b) git init scratch ;; esac")).not.toBeNull();
+    expect(findDestructiveToken("coproc git init scratch")).not.toBeNull();
+    expect(findDestructiveToken("case x in a) cat file ;; b) printf '%s' ok ;; esac")).toBeNull();
+  });
+
+  it("does not silently discard deeply nested substitutions", () => {
+    const nested = `${"echo $(".repeat(6)}git init scratch${")".repeat(6)}`;
+    expect(findDestructiveToken(nested)).not.toBeNull();
+  });
 });
 
 describe("isDestructiveCommand — bypasses found in the 2026-08 audit", () => {

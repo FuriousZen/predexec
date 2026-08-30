@@ -44,8 +44,9 @@ import { homedir, platform } from "node:os";
 import { dirname, join, parse as parsePath } from "node:path";
 import { escapeRegExp, splitCommandSegments } from "../core/index.ts";
 import {
-  extractCommandSubstitutions,
   extractShellCommandClauses,
+  inspectCommandSubstitutionTree,
+  inspectShellCommandClauses,
   stripLeadingAssignmentsAndWrappers,
   type WrapperInspectionOptions,
 } from "../command-inspection.ts";
@@ -501,14 +502,15 @@ export function createClaudePolicyChecker(
       : input.tool === "bash" && typeof input.command === "string" ? input.command : null;
     if (cmd === null) return null;
     try {
-      // Substitution bodies are judged as commands too, and are themselves
-      // rescanned (capped) so nesting cannot hide one level deeper.
-      const pending = [cmd];
-      for (let depth = 0; depth < 4 && pending.length > 0; depth++) {
-        const batch = pending.splice(0, pending.length);
-        for (const text of batch) {
-          pending.push(...extractCommandSubstitutions(text));
-          for (const line of text.split("\n")) {
+      // Substitution bodies are judged as commands too. The shared traversal
+      // reports an explicit incomplete result when syntax exceeds its bounded
+      // work budget; silently dropping pending bodies would be fail-open.
+      const inspected = inspectCommandSubstitutionTree(cmd);
+      for (const text of inspected.commands) {
+          if (!inspectShellCommandClauses(text).complete) {
+            return "incomplete shell syntax (policy inspection failed)";
+          }
+          for (const line of [text, ...extractShellCommandClauses(text)].flatMap((line) => line.split("\n"))) {
             for (const segment of splitCommandSegments(line)) {
               const trimmed = segment.trim();
               if (!trimmed) continue;
@@ -524,11 +526,13 @@ export function createClaudePolicyChecker(
               }
             }
           }
-        }
+      }
+      if (!inspected.complete) {
+        return "incomplete shell syntax (policy inspection budget exceeded)";
       }
       return null;
     } catch {
-      return null;
+      return "incomplete shell syntax (policy inspection failed)";
     }
   };
 }

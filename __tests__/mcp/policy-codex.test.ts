@@ -400,6 +400,26 @@ describe("createCodexPolicyChecker — newline and substitution bypass (P2: fail
     const check = createCodexPolicyChecker([{ pattern: ["git", "push"], decision: "forbidden" }], []);
     expect(check("echo '$(git push origin main)'")).toBeNull();
   });
+
+  it("matches a command after a quoted multi-word time format", () => {
+    const check = createCodexPolicyChecker([{ pattern: ["curl"], decision: "forbidden" }], []);
+    expect(check('time -f "%E %U" curl https://example.invalid')).toBe("curl");
+  });
+
+  it("continues inspecting nested substitutions beyond four levels", () => {
+    const command = `${"echo $(".repeat(6)}curl https://example.invalid${")".repeat(6)}`;
+    expect(forbidCurl()(command)).toBe("curl");
+  });
+
+  it("fails closed when substitution inspection exceeds its bounded budget", () => {
+    const command = `${"echo $(".repeat(40)}curl https://example.invalid${")".repeat(40)}`;
+    expect(forbidCurl()(command)).toContain("incomplete shell syntax");
+  });
+
+  it("checks each case branch and coprocess body", () => {
+    expect(forbidCurl()("case x in a) echo ok ;; b) curl https://example.invalid ;; esac")).toBe("curl");
+    expect(forbidCurl()("coproc curl https://example.invalid")).toBe("curl");
+  });
 });
 
 describe("readCodexRules — unreadable rules directory (P3: fail-open regression)", () => {

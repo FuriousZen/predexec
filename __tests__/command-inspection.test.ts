@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   extractCommandSubstitutions,
+  inspectCommandSubstitutions,
   extractShellCommandClauses,
   stripLeadingAssignmentsAndWrappers,
   tokenizeShellWords,
@@ -18,6 +19,27 @@ describe("command inspection mechanics", () => {
     expect(extractCommandSubstitutions(command)).toEqual(expected);
   });
 
+  it("ignores quoted parentheses while extracting nested command substitutions", () => {
+    expect(extractCommandSubstitutions(`echo "$(printf '('; git init scratch)"`)).toEqual([
+      "printf '('; git init scratch",
+    ]);
+    expect(extractCommandSubstitutions(`diff <(printf ')'; git status) >(echo "(")`)).toEqual([
+      "printf ')'; git status",
+      'echo "("',
+    ]);
+    expect(extractCommandSubstitutions("echo $(printf `(`; git status)")).toEqual([
+      "printf `(`; git status",
+    ]);
+  });
+
+  it("reports incomplete executable substitution syntax instead of silently returning no bodies", () => {
+    expect(inspectCommandSubstitutions("echo $(printf '('; git status")).toMatchObject({ complete: false });
+    expect(inspectCommandSubstitutions("echo $(git status)")).toMatchObject({
+      complete: true,
+      bodies: ["git status"],
+    });
+  });
+
   it("tokenizes quoted and escaped shell words without quote characters", () => {
     expect(tokenizeShellWords(`git "push origin" 'main branch' escaped\\ word`)).toEqual([
       "git",
@@ -32,6 +54,12 @@ describe("command inspection mechanics", () => {
     expect(extractShellCommandClauses("if git init scratch")).toEqual(["git init scratch"]);
     expect(extractShellCommandClauses("then git init scratch")).toEqual(["git init scratch"]);
     expect(extractShellCommandClauses("printf '{ git init scratch; }'")).toEqual([]);
+    expect(extractShellCommandClauses("coproc git init scratch")).toEqual(["git init scratch"]);
+    expect(extractShellCommandClauses("coproc worker { git init scratch; }")).toEqual(["git init scratch;"]);
+    expect(extractShellCommandClauses("case x in a) git status ;; b) git init scratch ;; esac")).toEqual([
+      "git status",
+      "git init scratch",
+    ]);
   });
 
   it("strips assignments and wrapper chains while preserving the command", () => {

@@ -226,6 +226,17 @@ describe("Claude wrapper policy — time option arguments", () => {
     expect(check(command)).toBe("curl *");
   });
 
+  it("matches a command after a quoted multi-word time format", () => {
+    const check = createClaudePolicyChecker([{ pattern: "curl *", action: "deny" }]);
+    expect(check('time -f "%E %U" curl https://example.invalid')).toBe("curl *");
+  });
+
+  it("fails closed when substitution inspection exceeds its bounded budget", () => {
+    const check = createClaudePolicyChecker([{ pattern: "curl *", action: "deny" }]);
+    const command = `${"echo $(".repeat(40)}curl https://example.invalid${")".repeat(40)}`;
+    expect(check(command)).toContain("incomplete shell syntax");
+  });
+
   it.each([
     "{ git push origin main; }",
     "if git push origin main; then :; fi",

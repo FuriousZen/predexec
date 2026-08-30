@@ -200,6 +200,25 @@ describe("runPlanTree — traversal & stop reasons", () => {
     }
   });
 
+  it.each([
+    `echo "$(printf '('; git init scratch)"`,
+    "case x in a) echo ok ;; b) git init scratch ;; esac",
+    "coproc git init scratch",
+  ])("mutationStop: executable shell syntax %s is never run", async (command) => {
+    const dir = mkdtempSync(join(tmpdir(), "predexec-shell-boundary-"));
+    try {
+      const r = await runPlanTree(
+        { root: "a", nodes: [{ id: "a", commands: [command] }] },
+        { cwd: dir },
+      );
+      expect(r.stoppedReason).toBe("mutationStop");
+      expect(r.pathTaken).toEqual([]);
+      expect(existsSync(join(dir, "scratch", ".git"))).toBe(false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("does NOT false-positive on 2>/dev/null or 2>&1", async () => {
     const plan: PlanTree = {
       root: "a",
