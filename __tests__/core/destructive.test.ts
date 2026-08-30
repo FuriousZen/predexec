@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   effectiveHead,
   findDestructiveToken,
+  interpreterEvalPreflight,
   isDestructiveCommand,
   LANGUAGE_CALL_CANDIDATE_BUDGET,
   splitCommandSegments,
@@ -381,6 +382,31 @@ describe("interpreter eval — fs-writer APIs are caught", () => {
       expect(findDestructiveToken(cmd)).not.toBeNull();
     });
 
+    it.each([
+      `ruby -e 'x = \`echo #{File.write("created", "x")}\`'`,
+      "perl -e 'x = qx{echo ${\\\\unlink(\"victim\")}}'",
+      "perl -e 'x = qx{echo ${\\\\qx{rm -f victim}}}'",
+      `ruby -e 'x = \`printf hi > created\`'`,
+      "perl -e 'x = qx{printf hi > created}'",
+    ])("scans host-language executable interpolation inside shell bodies %s", (cmd) => {
+      expect(findDestructiveToken(cmd)).not.toBeNull();
+    });
+
+    it.each([
+      `php -r '$x = \`printf \\$HOME\`;'`,
+      `php -r '$x = \`printf \\$literal\`;'`,
+    ])("keeps escaped PHP shell dollars safe when shell syntax is read-only %s", (cmd) => {
+      expect(findDestructiveToken(cmd)).toBeNull();
+    });
+
+    it.each([
+      `php -r '$x = \`printf $command\`;'`,
+      `php -r '$x = \`printf \${command}\`;'`,
+      `php -r '$x = \`printf \${$name}\`;'`,
+    ])("fails closed for dynamic PHP interpolation inside shell bodies %s", (cmd) => {
+      expect(findDestructiveToken(cmd)).not.toBeNull();
+    });
+
     it("masks Perl POD only through a line-boundary =cut", () => {
       expect(findDestructiveToken("perl -e '=pod\nunlink(\"victim\")\n=cut\nprint 1'")).toBeNull();
       expect(findDestructiveToken("perl -e '=pod\nunlink(\"victim\")\n=cut\nunlink(\"victim\")'")).not.toBeNull();
@@ -390,6 +416,20 @@ describe("interpreter eval — fs-writer APIs are caught", () => {
       const payload = `ruby -e '${"#{%Q{".repeat(32)}${"x".repeat(30_000)}${"}}".repeat(32)}'`;
       expect(payload.length).toBeGreaterThan(30_000);
       expect(findDestructiveToken(payload)).not.toBeNull();
+    });
+
+    it("fails closed on a 20KiB eval payload before shell substitution traversal", () => {
+      const payload = `ruby -e '${"echo $(".repeat(2)}${"x".repeat(20_000)}${")".repeat(2)}'`;
+      expect(payload.length).toBeGreaterThan(20_000);
+      expect(findDestructiveToken(payload)).not.toBeNull();
+    });
+
+    it("preflights only argv-level interpreter eval payloads", () => {
+      expect(interpreterEvalPreflight(`ruby -e '${"x".repeat(17_000)}'`)).toMatchObject({
+        interpreter: "ruby",
+        payloadLength: 17_000,
+      });
+      expect(interpreterEvalPreflight(`echo 'ruby -e ${"x".repeat(17_000)}'`)).toBeNull();
     });
   });
 

@@ -196,13 +196,18 @@ export const LANGUAGE_INTERPOLATION_DEPTH_BUDGET = 32;
 export const LANGUAGE_VIEW_CHARACTER_BUDGET = 32 * 1024;
 /** Deterministic traversal budget for masking and recursive rescans. */
 export const LANGUAGE_VIEW_WORK_BUDGET = 256 * 1024;
-/** Keep the quadratic host shell preflight away from oversized eval payloads. */
-const LANGUAGE_EVAL_EARLY_LIMIT = 24 * 1024;
+/** Keep expensive shared shell inspection off oversized eval payloads. */
+export const LANGUAGE_EVAL_EARLY_LIMIT = 16 * 1024;
 
 interface LanguageCall { match: string; args: string | null; }
 
 interface LanguageViewDetails {
-  shellBodies: string[];
+  shellBodies: ShellBody[];
+}
+
+interface ShellBody {
+  body: string;
+  language: InterpolationLanguage;
 }
 
 interface LanguageSyntaxOptions {
@@ -335,7 +340,7 @@ function executableLanguageView(
       if ((language === "ruby" || language === "perl" || language === "php") && ch === "`") {
         const parsed = parseShellDelimited(source, i, end, "`", "`");
         if (parsed === null) return null;
-        details?.shellBodies.push(parsed.body);
+        details?.shellBodies.push({ body: parsed.body, language });
         mask(i, parsed.end); i = parsed.end - 1; continue;
       }
       if (language === "perl" && ch === "q" && next === "x" &&
@@ -345,7 +350,7 @@ function executableLanguageView(
         const close = ({ "{": "}", "[": "]", "(": ")", "<": ">" } as Record<string, string>)[open] ?? open;
         const parsed = parseShellDelimited(source, i + 2, end, open, close);
         if (parsed === null) return null;
-        details?.shellBodies.push(parsed.body);
+        details?.shellBodies.push({ body: parsed.body, language });
         mask(i, parsed.end); i = parsed.end - 1; continue;
       }
       if (language === "ruby" && ch === "%" && /[qQ]/.test(next ?? "")) {
@@ -400,7 +405,7 @@ function executableLanguageView(
       if ((lang === "ruby" || lang === "perl" || lang === "php") && ch === "`") {
         const shell = parseShellDelimited(source, i, end, "`", "`");
         if (shell === null) { parsed = null; break; }
-        details?.shellBodies.push(shell.body);
+        details?.shellBodies.push({ body: shell.body, language: lang });
         mask(i, shell.end); i = shell.end - 1; continue;
       }
       if (lang === "perl" && ch === "q" && next === "x" &&
@@ -410,7 +415,7 @@ function executableLanguageView(
         const close = ({ "{": "}", "[": "]", "(": ")", "<": ">" } as Record<string, string>)[open] ?? open;
         const shell = parseShellDelimited(source, i + 2, end, open, close);
         if (shell === null) { parsed = null; break; }
-        details?.shellBodies.push(shell.body);
+        details?.shellBodies.push({ body: shell.body, language: lang });
         mask(i, shell.end); i = shell.end - 1; continue;
       }
       if (lang === "ruby" && ch === "%" && /[qQ]/.test(next ?? "")) {
@@ -526,6 +531,134 @@ function executableLanguageView(
 
   const root = parseCode(0, source.length);
   return root === null || overBudget ? null : chars.join("");
+}
+
+interface ShellInterpolationDetails {
+  expressions: string[];
+  complete: boolean;
+  ambiguous: boolean;
+}
+
+/**
+ * Extract host-language expressions which are evaluated while a shell literal
+ * is rendered. Shell quoting is deliberately ignored here: Ruby/Perl/PHP
+ * interpolation happens before the resulting string is handed to the shell.
+ */
+function extractShellInterpolations(body: string, language: InterpolationLanguage): ShellInterpolationDetails {
+  const expressions: string[] = [];
+  let complete = true;
+  let ambiguous = false;
+
+  const balanced = (start: number, expected: string[]): { value: string; end: number } | null => {
+    const stack = [...expected];
+    let quote: "'" | '"' | "`" | null = null;
+    for (let i = start; i < body.length; i++) {
+      const ch = body[i]!;
+      if (quote !== null) {
+        if (ch === "\\") { i++; continue; }
+        if (ch === quote) quote = null;
+        continue;
+      }
+      if (ch === "'" || ch === '"' || ch === "`") { quote = ch; continue; }
+      if (ch === "(") { stack.push(")"); continue; }
+      if (ch === "[") { stack.push("]"); continue; }
+      if (ch === "{") { stack.push("}"); continue; }
+      if (ch === stack[stack.length - 1]) {
+        stack.pop();
+        if (stack.length === 0) return { value: body.slice(start, i), end: i + 1 };
+      } else if (ch === ")" || ch === "]" || ch === "}") {
+        return null;
+      }
+    }
+    return null;
+  };
+
+  const escaped = (index: number): boolean => {
+    let slashes = 0;
+    for (let i = index - 1; i >= 0 && body[i] === "\\"; i--) slashes++;
+    return slashes % 2 === 1;
+  };
+
+  for (let i = 0; i < body.length; i++) {
+    const ch = body[i]!;
+    if (ch === "\\") { i++; continue; }
+    if (language === "ruby" && body.startsWith("#{", i)) {
+      const parsed = balanced(i + 2, ["}"]);
+      if (parsed === null) { complete = false; break; }
+      expressions.push(parsed.value);
+      i = parsed.end - 1;
+      continue;
+    }
+    if (language === "perl" && body.startsWith("${\\", i)) {
+      const parsed = balanced(i + 3, ["}"]);
+      if (parsed === null) { complete = false; break; }
+      expressions.push(parsed.value);
+      i = parsed.end - 1;
+      continue;
+    }
+    if (language === "perl" && body.startsWith("@{[", i)) {
+      const parsed = balanced(i + 3, ["]", "}"]);
+      if (parsed === null) { complete = false; break; }
+      expressions.push(parsed.value);
+      i = parsed.end - 1;
+      continue;
+    }
+    if (language === "php" && ch === "$" && !escaped(i)) {
+      // Backtick strings interpolate PHP variables. A variable's value can
+      // introduce arbitrary shell syntax, so only an escaped dollar is
+      // unambiguously inert. Braced forms are dynamic as well; their contents
+      // are not PHP expressions we can safely evaluate here.
+      if (/[A-Za-z_{0-9]/.test(body[i + 1] ?? "")) ambiguous = true;
+    }
+  }
+  return { expressions, complete, ambiguous };
+}
+
+interface LanguageScanState {
+  depth: number;
+  shellBodies: Set<ShellBody>;
+  shellBodyCount: number;
+}
+
+function scanLanguagePayload(
+  payload: string,
+  language: InterpolationLanguage,
+  state: LanguageScanState,
+): string | null {
+  if (state.depth >= LANGUAGE_INTERPOLATION_DEPTH_BUDGET) return `${language} eval payload`;
+  const details: LanguageViewDetails = { shellBodies: [] };
+  if (executableLanguageView(payload, language, details) === null) return `${language} eval payload`;
+  for (const shell of details.shellBodies) {
+    const nested = scanInterpreterShellBody(shell, state);
+    if (nested) return nested;
+  }
+  if (language === "python") return findPythonWriter(payload);
+  if (language === "perl") return findPerlWriter(payload);
+  if (language === "ruby") return findRubyWriter(payload);
+  if (language === "php") return findPhpWriter(payload);
+  return null;
+}
+
+function scanInterpreterShellBody(shell: ShellBody, state: LanguageScanState): string | null {
+  if (state.shellBodies.has(shell)) return null;
+  if (++state.shellBodyCount > LANGUAGE_CALL_CANDIDATE_BUDGET || state.depth >= LANGUAGE_INTERPOLATION_DEPTH_BUDGET) {
+    return `${shell.language} shell body`;
+  }
+  state.shellBodies.add(shell);
+  const interpolation = extractShellInterpolations(shell.body, shell.language);
+  if (!interpolation.complete || interpolation.ambiguous) return `${shell.language} shell interpolation`;
+  const previousDepth = state.depth;
+  state.depth++;
+  for (const expression of interpolation.expressions) {
+    const nested = scanLanguagePayload(expression, shell.language, state);
+    if (nested) { state.depth = previousDepth; return nested; }
+  }
+  state.depth = previousDepth;
+  // The host expression scan and shell scan are separate by design: direct
+  // shell redirects/mutations remain visible even when host interpolation is
+  // otherwise harmless.
+  const shellMutation = findDestructiveTokenInternal(shell.body, state.depth + 1);
+  return shellMutation ? `shell ${shellMutation}` : null;
 }
 
 function maskLanguageCode(source: string, hashComments: boolean, slashComments: boolean): string {
@@ -830,6 +963,27 @@ function interpreterEvalPayload(segment: string): string {
   const evalFlag = /^(?:--eval|--print|--run|-r|-[epnc]|-[pn]*e[pn]*)$/;
   const index = words.findIndex((word) => evalFlag.test(word));
   return index < 0 ? segment : words.slice(index + 1).join(" ");
+}
+
+/**
+ * Cheap argv-aware eval preflight. It intentionally uses the same quote-aware
+ * shell word splitter as payload extraction, but does not inspect substitutions
+ * or language syntax. A null result means this command is not a direct eval
+ * invocation; callers can then proceed with ordinary shell classification.
+ */
+export function interpreterEvalPreflight(segment: string): { payloadLength: number; interpreter: string } | null {
+  const words = shellWords(segment);
+  const index = effectiveHeadIndex(words);
+  if (index === null) {
+    const splitString = envSplitStringPayload(words);
+    return splitString === null ? null : interpreterEvalPreflight(splitString);
+  }
+  const interpreter = words[index]!.replace(/^.*\//, "");
+  if (!EVAL_INTERPRETERS.has(interpreter)) return null;
+  const evalFlag = /^(?:--eval|--print|--run|-r|-[epnc]|-[pn]*e[pn]*)$/;
+  const flagIndex = words.findIndex((word, i) => i > index && evalFlag.test(word));
+  if (flagIndex < 0) return null;
+  return { interpreter, payloadLength: words.slice(flagIndex + 1).join(" ").length };
 }
 
 function languageWordScanSegment(head: string, segment: string): string {
@@ -1400,17 +1554,11 @@ function findInterpreterWriter(head: string, segment: string): string | null {
   if (segment.length > MAX_LANGUAGE_ARGUMENT_LENGTH) return `${head} eval payload`;
   const payload = interpreterEvalPayload(segment);
   const language = (head === "node" || head === "deno" || head === "bun" ? "node" : head) as InterpolationLanguage;
-  const details: LanguageViewDetails = { shellBodies: [] };
-  if (EVAL_INTERPRETERS.has(head) && executableLanguageView(payload, language, details) === null) return `${head} eval payload`;
-  for (const body of details.shellBodies) {
-    const nested = findDestructiveTokenInternal(body, 1);
-    if (nested) return `shell ${nested}`;
-  }
-  if (head === "python" || head === "python3") return findPythonWriter(payload);
-  if (head === "perl") return findPerlWriter(payload);
-  if (head === "ruby") return findRubyWriter(payload);
-  if (head === "php") return findPhpWriter(payload);
-  return null;
+  return scanLanguagePayload(payload, language, {
+    depth: 0,
+    shellBodies: new Set(),
+    shellBodyCount: 0,
+  });
 }
 
 /**
@@ -1422,10 +1570,10 @@ function findDestructiveTokenInternal(cmd: string, depth: number): string | null
   // Avoid sending oversized interpreter payloads through the recursive shell
   // inspection machinery. They cannot be parsed within the language-call
   // budget, so fail closed before any potentially quadratic traversal.
-  if (
-    cmd.length > LANGUAGE_EVAL_EARLY_LIMIT &&
-    /\b(?:node|deno|bun|python3?|ruby|perl|php)\b[^\n]*\s(?:-\w*[ecnp]\w*|--eval|--print|--run|-r)\b/.test(cmd)
-  ) return "oversized interpreter eval";
+  const evalPreflight = interpreterEvalPreflight(cmd);
+  if (evalPreflight && evalPreflight.payloadLength > LANGUAGE_EVAL_EARLY_LIMIT) {
+    return "oversized interpreter eval";
+  }
   // Use the shared bounded traversal as a structural preflight so executable
   // control clauses and substitution bodies cannot disappear between the
   // core classifier and host policy adapters. Incomplete or over-budget shell

@@ -372,6 +372,8 @@ describe("runPlanTree — traversal & stop reasons", () => {
         `perl -e 'qx{printf hi > created}'`,
         `ruby -e 'x = \`rm -f victim\`'`,
         `ruby -e 'x = \`printf hi > created\`'`,
+        `ruby -e 'x = \`echo #{File.write("created", "x")}\`'`,
+        "perl -e 'x = qx{echo ${\\\\unlink(\"victim\")}}'",
         `php -r '$x = \`rm -f victim\`;'`,
         `php -r '$x = \`printf hi > created\`;'`,
       ];
