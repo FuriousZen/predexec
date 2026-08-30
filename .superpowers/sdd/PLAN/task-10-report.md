@@ -1524,3 +1524,77 @@ consumers and preserves bodies preceding malformed syntax. Changes are limited
 to `core/destructive.ts`, `command-inspection.ts`, focused regressions, and
 this report. No ledger, release metadata, dependency, version, dist, publish,
 push, merge, or harness operation changed.
+
+## Extended integration fix round 21 — valid quoted attached Ruby/Perl evals
+
+This user-authorized extension starts from the round-17 verification commit
+`dcd0dc4`. It closes the remaining valid-shell invocation gap for Ruby/Perl
+attached `-ePROGRAM` arguments when shell quotes surround the complete token,
+including wrappers and compound commands, while preserving inert language
+strings as read-only data.
+
+### RED evidence
+
+Before production changes, the new bounded regressions were run with:
+
+```text
+pnpm exec vitest run __tests__/core/destructive.test.ts --reporter=dot
+```
+
+Result: exit 1; **20 tests failed, 531 passed**. The failures reproduced valid
+Ruby `File.write` and Perl `unlink` invocations of the form
+`ruby '-eFile.write(...)'` / `perl '-eunlink(...)'`, including env/command
+wrappers, pipelines, `if`, and `case` compounds. The same valid whole-token
+quoting caused inert Perl `print("unlink(\\"x\\")")` data to be reported as a
+shell unlink word.
+
+### GREEN implementation
+
+- `core/destructive.ts` now uses the quote-aware argv eval preflight from
+  `isEvalInvocation`, so a shell quote immediately before an attached `-e`
+  token cannot hide an executable Ruby/Perl program. The existing raw fallback
+  remains for interpreter spellings not represented by the preflight.
+- Final interpreter writer inspection strips shell control prefixes before
+  evaluating the segment, allowing `if`, `then`, and related clauses to retain
+  the same language scanner and quote boundaries as direct invocations.
+- Complete `case` commands feed their extracted executable branch clauses into
+  the generic word scan instead of rescanning the raw control envelope. This
+  prevents writer words inside a valid, quoted language string from becoming
+  false shell mutations while nested branch writers remain covered by the
+  earlier recursive clause pass.
+- Focused destructive tests cover shell quotes immediately before and after
+  `-e`, absolute interpreter paths, env/command wrappers, pipelines, `if`,
+  `case`, and inert Perl writer-looking string data. An engine regression uses
+  installed Ruby and Perl with a temporary directory to verify valid writers
+  stop before creating or deleting files; no writes escape that directory.
+
+### GREEN verification and safety checks
+
+```text
+pnpm exec vitest run __tests__/core/destructive.test.ts __tests__/core/engine.test.ts --reporter=dot
+pnpm run typecheck
+pnpm run build
+pnpm test -- --reporter=dot
+pnpm exec vitest run __tests__/release-hygiene.test.ts __tests__/pack.test.ts --reporter=dot
+git diff --check
+```
+
+All commands passed. Focused mutation and engine verification passed **2
+files, 633 tests with 1 skipped**; typecheck and build passed; the bounded
+full suite passed **21 files, 1,302 tests with 1 skipped**; release/pack
+verification passed **9/9 tests**; and `git diff --check` passed. No manual
+payload exceeded 4 KiB, no custom subprocess was started by the fix, and no
+background process was left running. Generated `dist/` output remained ignored
+and unstaged.
+
+### Self-review and scope
+
+The argv preflight is already bounded by the existing shell-word and eval-size
+limits, and it only upgrades a segment to language scanning when its effective
+head is the same interpreter being classified. The case rewrite is applied
+only to a complete leading case envelope with extracted executable clauses;
+malformed cases retain the existing fail-closed path. Existing direct eval,
+wrapper, interpolation, shell-body, and language-literal tests remain green.
+Changes are limited to `core/destructive.ts`, focused destructive/engine
+regressions, and this report. No dependency, ledger, release metadata,
+version, dist staging, publish, push, or merge changed.

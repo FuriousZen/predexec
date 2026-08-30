@@ -1838,8 +1838,14 @@ const INPLACE_EDIT_RE = /\s-\w*i(\.\w+)?\b/;
 function isEvalInvocation(head: string, segment: string): boolean {
   // `-p`/`-n`/`--print` are eval flags too: `node -p 'require("fs").rmSync(…)'`
   // executes exactly like `-e`, and clustered forms (`perl -pi -e`) are common.
-  if (head === "php") return /\s(?:-\w*r\w*|--run)\b/.test(segment);
-  if (EVAL_INTERPRETERS.has(head)) return /\s(-\w*[ecnp]\w*|--eval|--print)\b/.test(segment);
+  // Shell quotes may surround the complete `-ePROGRAM` token, so use the
+  // argv-aware preflight before falling back to the legacy raw spelling.
+  if (EVAL_INTERPRETERS.has(head)) {
+    const evaluation = directInterpreterEvalPreflight(segment);
+    if (evaluation?.interpreter === head) return true;
+    if (head === "php") return /\s(?:-\w*r\w*|--run)\b/.test(segment);
+    return /\s(-\w*[ecnp]\w*|--eval|--print)\b/.test(segment);
+  }
   if (EVAL_SHELLS.has(head)) return /\s-c\b/.test(segment);
   return false;
 }
@@ -1962,7 +1968,11 @@ function findDestructiveTokenInternal(cmd: string, depth: number): string | null
     });
   if (allSafe) return null;
 
-  const wordScanText = segments.map((segment, i) => {
+  const caseInspection = inspectShellCommandClauses(cmd);
+  const wordScanSegments = /^case\b/.test(cmd.trim()) && caseInspection.complete && caseInspection.clauses.length > 0
+    ? caseInspection.clauses
+    : segments;
+  const wordScanText = wordScanSegments.map((segment, i) => {
     // Control-clause prefixes are syntax, not argv data. Strip them before
     // language masking so `if command perl -eprint("unlink('x')")` resolves
     // the wrapped interpreter instead of scanning its quoted program text as
@@ -1978,7 +1988,7 @@ function findDestructiveTokenInternal(cmd: string, depth: number): string | null
   for (let i = 0; i < segments.length; i++) {
     const head = heads[i];
     if (!head) continue;
-    const segment = segments[i]!;
+    const segment = stripShellControlPrefix(segments[i]!);
     if ((head === "awk" || head === "gawk") && AWK_WRITE_RE.test(segment)) {
       return AWK_WRITE_RE.exec(segment)![0].trim();
     }

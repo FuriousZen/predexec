@@ -525,6 +525,43 @@ describe("interpreter eval — fs-writer APIs are caught", () => {
       expect(findDestructiveToken(cmd)).toBeNull();
     });
 
+    it.each([
+      `ruby '-eFile.write("x", "y")'`,
+      `/usr/bin/ruby '-eFile.write("x", "y")'`,
+      `env ruby '-eFile.write("x", "y")'`,
+      `command /usr/bin/ruby '-eFile.write("x", "y")'`,
+      `printf ok | env ruby '-eFile.write("x", "y")'`,
+      `if env ruby '-eFile.write("x", "y")'; then :; fi`,
+      `case x in a) env /usr/bin/ruby '-eFile.write("x", "y")' ;; esac`,
+      `perl '-eunlink("x")'`,
+      `/usr/bin/perl '-eunlink("x")'`,
+      `env perl '-eunlink("x")'`,
+      `command /usr/bin/perl '-eunlink("x")'`,
+      `printf ok | env perl '-eunlink("x")'`,
+      `if command perl '-eunlink("x")'; then :; fi`,
+      `case x in a) env /usr/bin/perl '-eunlink("x")' ;; esac`,
+    ])("catches whole-token quoted Ruby/Perl eval writers through wrappers and compounds: %s", (cmd) => {
+      expect(findDestructiveToken(cmd)).not.toBeNull();
+    });
+
+    it.each([
+      `ruby -e'File.write("x", "y")'`,
+      `perl -e'unlink("x")'`,
+    ])("catches eval programs quoted immediately after -e: %s", (cmd) => {
+      expect(findDestructiveToken(cmd)).not.toBeNull();
+    });
+
+    it.each([
+      `perl '-eprint("unlink(\\"x\\")")'`,
+      `env perl '-eprint("unlink(\\"x\\")")'`,
+      `command /usr/bin/perl '-eprint("unlink(\\"x\\")")'`,
+      `printf ok | env perl '-eprint("unlink(\\"x\\")")'`,
+      `if command perl '-eprint("unlink(\\"x\\")")'; then :; fi`,
+      `case x in a) env /usr/bin/perl '-eprint("unlink(\\"x\\")")' ;; esac`,
+    ])("allows inert Perl writer text inside a whole-token quoted eval: %s", (cmd) => {
+      expect(findDestructiveToken(cmd)).toBeNull();
+    });
+
     it("does not interpret shell control or eval-looking text inside double-quoted data", () => {
       expect(interpreterEvalPreflight(`echo "safe; ruby -e 'File.write(x)'"`)).toBeNull();
       expect(findDestructiveToken(`echo "safe; ruby -e 'File.write(x)'"`)).toBeNull();

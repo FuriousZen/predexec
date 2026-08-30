@@ -160,6 +160,33 @@ describe("runPlanTree — traversal & stop reasons", () => {
     }
   });
 
+  it.skipIf(
+    !["/usr/bin/ruby", "/usr/local/bin/ruby", "/opt/homebrew/bin/ruby"].some(existsSync) ||
+      !["/usr/bin/perl", "/usr/local/bin/perl", "/opt/homebrew/bin/perl"].some(existsSync),
+  )("mutationStop: valid whole-token quoted Ruby/Perl eval writers never execute", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "predexec-attached-eval-"));
+    try {
+      const commands = [
+        `ruby '-eFile.write("created", "x")'`,
+        `env ruby '-eFile.write("created", "x")'`,
+        `printf ok | env ruby '-eFile.write("created", "x")'`,
+        `perl '-eunlink("victim")'`,
+        `command perl '-eunlink("victim")'`,
+        `printf ok | env perl '-eunlink("victim")'`,
+      ];
+      writeFileSync(join(dir, "victim"), "keep\n");
+      for (const command of commands) {
+        const result = await runPlanTree({ root: "a", nodes: [{ id: "a", commands: [command] }] }, { cwd: dir });
+        expect(result.stoppedReason).toBe("mutationStop");
+        expect(result.pathTaken).toEqual([]);
+      }
+      expect(existsSync(join(dir, "created"))).toBe(false);
+      expect(readFileSync(join(dir, "victim"), "utf8")).toBe("keep\n");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it.skipIf(!existsSync("/usr/bin/ruby") && !existsSync("/opt/homebrew/bin/ruby"))(
     "mutationStop: installed Ruby writers cannot create, delete, or modify temp files",
     async () => {
