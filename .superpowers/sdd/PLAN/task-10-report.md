@@ -990,3 +990,95 @@ All checks passed. The full suite passed **1,145 tests with 1 skipped**; the
 release/pack suites passed **9/9 tests** and built a real `predexec@0.4.0`
 tarball with the rebuilt `dist/core/destructive.js`. The focused implementation
 and test changes are committed separately from this report.
+
+## Extended integration fix round 14 — static mode decoding and bounded language scans
+
+This user-authorized extension starts from `f9dd973226b972be96f77c836d77be89859aa02a`.
+It closes three remaining interpreter-scanner defects: encoded Ruby/Perl/PHP
+writer modes were treated as raw text, generic `open(...)` fallback scanning
+could mistake a filename/data string beginning with `w` or `a` for a writer
+mode, and repeated nested language calls could drive reparsing toward a
+quadratic path. No ledger, release metadata, dependency, version, publish,
+push, or merge operation was performed.
+
+### RED evidence
+
+Before changing production code, the focused regression suite was run with:
+
+```text
+./node_modules/.bin/vitest run __tests__/core/destructive.test.ts
+```
+
+Result: exit 1; **13 tests failed, 409 passed**. The failures reproduced Ruby,
+Perl, and PHP hex-encoded writer modes; interpolation/variable and concatenated
+mode expressions; Ruby/Perl/PHP filename/data false positives; and a nested
+Ruby-call candidate budget regression.
+
+### GREEN implementation and regressions
+
+- Language mode arguments now return a typed `static`/`ambiguous` result.
+  Double-quoted static values decode ordinary simple, hexadecimal, and octal
+  escapes for Ruby, Perl, PHP, and Python mode parsing. Ruby interpolation and
+  Perl/PHP variable interpolation are ambiguous and fail closed; concatenated,
+  malformed, or non-quoted mode expressions also fail closed. Encoded read
+  modes remain in the safe tier.
+- Ruby, Perl, and PHP scanners inspect only their actual parsed mode argument.
+  The generic eval fallback now scans masked executable identifiers and no
+  longer contains a broad `open(...)` string-content regex. Python's built-in
+  `open` keeps a dedicated parsed mode scanner, preserving existing writer
+  coverage without reintroducing filename/data false positives.
+- `findLanguageCalls` exports a deterministic
+  `LANGUAGE_CALL_CANDIDATE_BUDGET` of 256. On the next candidate it returns a
+  fail-closed sentinel before another balanced capture. Each capture and
+  argument split retains the existing 64 KiB bound, so candidate work is
+  bounded rather than allowing repeated nested calls to re-scan unbounded
+  source. The regression builds exactly budget-plus-one nested Ruby calls and
+  asserts a mutation stop; it does not rely on wall-clock timing.
+- Real temporary-directory engine probes add encoded Ruby and Perl writer
+  commands and confirm they stop before create/delete/modify execution. PHP
+  remains statically covered because no PHP executable is installed on this
+  host; its encoded writer, read, dynamic, and filename/data cases are in the
+  classifier table.
+
+### Verification and counts
+
+Focused mutation and engine verification:
+
+```text
+./node_modules/.bin/vitest run __tests__/core/destructive.test.ts __tests__/core/engine.test.ts
+```
+
+Result: exit 0; **2 files, 497 tests passed, 1 skipped** (the platform-conditional
+interpreter probe skip).
+
+Additional required checks:
+
+```text
+./node_modules/.bin/tsc --noEmit
+pnpm run build
+./node_modules/.bin/vitest run
+./node_modules/.bin/vitest run __tests__/release-hygiene.test.ts __tests__/pack.test.ts
+git diff --check
+```
+
+All commands passed. The full suite passed **21 files, 1,165 tests with 1
+skipped**; release/pack verification passed **9/9 tests**, including the real
+packed-install CLI/MCP smoke checks; and the build regenerated ignored,
+unstaged `dist/` output. The focused run completed in about one second and the
+full suite in about five seconds as observational evidence only; the
+budget-plus-one assertion is the deterministic performance bound.
+
+### Self-review and scope
+
+The decoder preserves single-quoted language semantics, ignores escaped
+interpolation markers, rejects dynamic mode expressions, and recognizes only
+complete quoted arguments. The fallback masking change leaves executable
+writer identifiers visible for Node/Python APIs while hiding arbitrary string
+and comment data. A budget sentinel is first in the result so direct-first and
+iterating scanner consumers both fail closed. Existing read-mode, comment-aware
+argument, Python writer, shell policy, and adapter behavior remain covered by
+the full suite. Changes are limited to `core/destructive.ts`, focused
+destructive/engine regressions, and this report. The code/test change is
+committed as `905c5a8` (`fix: harden encoded interpreter modes and scan bounds`);
+this report append remains a separate documentation commit. No ledger, release
+metadata, dependency, dist, publish, push, merge, or version operation changed.
