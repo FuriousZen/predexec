@@ -1944,3 +1944,41 @@ directory handle and iterator path, and existing exit-0 listing semantics,
 ordering, symlink classification, containment checks, and result-limit output
 remain unchanged. No dependency, version, dist staging, publish, push, merge,
 Git alias, stress probe, or background-process change was made.
+
+## Extended integration fix round 27 — BSD env split-string composition
+
+This user-authorized extension closes a classifier bypass where BSD `env -S` /
+`--split-string` assignments were inspected without the trailing utility argv.
+The composed argv now preserves split-string assignments and command words in
+order, handles attached and separate short/long forms through absolute and
+wrapped `env`, and consumes env options and `--` boundaries before classifying
+the effective utility. Dynamic, malformed, unknown-option, and incomplete
+split strings fail closed. No dependency, release metadata, version, publish,
+push, merge, or release-artifact staging changed.
+
+### RED evidence
+
+The new focused regressions initially failed as expected: **9 tests failed**
+in `__tests__/core/destructive.test.ts` (the seven hook-composition cases and
+two dynamic split cases returned `null`), reproducing the dropped-argv bypass.
+
+### GREEN implementation and verification
+
+- `envSplitStringPayload` now parses the split payload with the existing
+  quote-aware shell argument parser, rejects dynamic/incomplete payloads, and
+  composes the parsed words with the remaining utility argv.
+- The composed command retains environment assignments for Git hook/config
+  inspection while consuming env option values (`-u`, `-C`, etc.) and honoring
+  `--`; all prior consumers (effective head, Git, shell eval, and interpreter
+  preflight) use the same composition result.
+- Focused destructive suite: **759 tests passed**.
+- Core suite: **914 tests passed, 1 skipped**.
+- Typecheck and diff check passed.
+- Full suite with bounded `--testTimeout=15000`: **22 test files, 1,584 tests
+  passed, 1 skipped**. The default-timeout run hit the 20-KB literal test's
+  5-second threshold; the bounded run completed successfully in under five
+  seconds.
+
+The source/test/report change is committed as the round-27 fix commit. No
+custom runtime hook, process probe, background process, or destructive
+filesystem operation was used.

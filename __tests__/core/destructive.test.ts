@@ -1369,6 +1369,40 @@ describe("mutation classifier — Git command-bearing environment prefixes", () 
   });
 });
 
+describe("mutation classifier — env split-string composition", () => {
+  it.each([
+    'env -S "GIT_EXTERNAL_DIFF=/hook" git diff',
+    "env -S GIT_EXTERNAL_DIFF=/hook git diff",
+    "env -SGIT_EXTERNAL_DIFF=/hook git diff",
+    'env --split-string="GIT_PAGER=/hook" git log',
+    "env --split-string GIT_PAGER=/hook git log",
+    'env -S "GIT_EXTERNAL_DIFF=/hook git diff"',
+    '/usr/bin/env --split-string="GIT_PAGER=/hook" git log',
+    'command env -S "GIT_EXTERNAL_DIFF=/hook" git diff',
+  ])("composes split assignments with the utility argv: %s", (command) => {
+    expect(findDestructiveToken(command)).not.toBeNull();
+  });
+
+  it.each([
+    'env -i -S "FOO=bar" git status',
+    'env -S "git log"',
+    'env -S "FOO=bar" printf ok',
+    'echo \'env -S "GIT_EXTERNAL_DIFF=/hook" git diff\'',
+    'env -u GIT_PAGER -S "FOO=bar" git log',
+    'env --split-string "FOO=bar" -- git status',
+  ])("preserves safe split-string composition: %s", (command) => {
+    expect(findDestructiveToken(command)).toBeNull();
+  });
+
+  it.each([
+    'env -S "GIT_EXTERNAL_DIFF=$HOOK" git diff',
+    'env --split-string="GIT_PAGER=$(printf /hook)" git log',
+    `env -S "'GIT_EXTERNAL_DIFF=/hook git diff"`,
+  ])("fails closed for ambiguous split strings: %s", (command) => {
+    expect(findDestructiveToken(command)).not.toBeNull();
+  });
+});
+
 describe("isDestructiveCommand — bypasses found in the 2026-08 audit", () => {
   // Each of these returned null before the fix. Grouped by the tier that failed.
   const bypasses: Record<string, string[]> = {

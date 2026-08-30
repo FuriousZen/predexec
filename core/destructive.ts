@@ -1105,11 +1105,11 @@ function perlOpenWriteMode(mode: string): boolean {
 
 function interpreterEvalPayload(segment: string): string {
   const words = shellWords(segment);
+  const split = envSplitStringPayload(words);
+  if (split.ambiguous) return segment;
+  if (split.command !== null) return interpreterEvalPayload(split.command);
   const headIndex = effectiveHeadIndex(words);
-  if (headIndex === null) {
-    const splitString = envSplitStringPayload(words);
-    return splitString === null ? segment : interpreterEvalPayload(splitString);
-  }
+  if (headIndex === null) return segment;
   const head = words[headIndex]!.replace(/^.*\//, "");
   const evalFlag = /^(?:--eval|--print|--run|-r|-[epnc]|-[pn]*e[pn]*)$/;
   const index = words.findIndex((word, i) => i > headIndex && evalFlag.test(word));
@@ -1204,11 +1204,11 @@ function interpreterLanguage(head: string): InterpolationLanguage {
  */
 function directInterpreterEvalPreflight(segment: string): { payloadLength: number; interpreter: string } | null {
   const words = shellWords(segment);
+  const split = envSplitStringPayload(words);
+  if (split.ambiguous) return null;
+  if (split.command !== null) return directInterpreterEvalPreflight(split.command);
   const index = effectiveHeadIndex(words);
-  if (index === null) {
-    const splitString = envSplitStringPayload(words);
-    return splitString === null ? null : directInterpreterEvalPreflight(splitString);
-  }
+  if (index === null) return null;
   const interpreter = words[index]!.replace(/^.*\//, "");
   if (!EVAL_INTERPRETERS.has(interpreter)) return null;
   const evalFlag = /^(?:--eval|--print|--run|-r|-[epnc]|-[pn]*e[pn]*)$/;
@@ -1830,11 +1830,10 @@ function effectiveHeadIndex(tokens: string[]): number | null {
 
 export function effectiveHead(segment: string): string | null {
   const tokens = shellWords(segment);
+  const split = envSplitStringPayload(tokens);
+  if (split.command !== null) return effectiveHead(split.command);
   const index = effectiveHeadIndex(tokens);
-  if (index === null) {
-    const splitString = envSplitStringPayload(tokens);
-    return splitString === null ? null : effectiveHead(splitString);
-  }
+  if (index === null) return null;
   const base = tokens[index]!.replace(/^.*\//, "");
   return base || null;
 }
@@ -2038,11 +2037,11 @@ function shellEvalPayload(segment: string): ShellEvalPayload | null {
   const parsed = shellArguments(segment);
   if (!parsed.complete) return null;
   const tokens = parsed.args.map((arg) => arg.value);
+  const split = envSplitStringPayload(tokens);
+  if (split.ambiguous) return { payload: null, ambiguous: true };
+  if (split.command !== null) return shellEvalPayload(split.command);
   const index = effectiveHeadIndex(tokens);
-  if (index === null) {
-    const splitString = envSplitStringPayload(tokens);
-    return splitString === null ? null : shellEvalPayload(splitString);
-  }
+  if (index === null) return null;
   const head = tokens[index]!.replace(/^.*\//, "");
   if (!EVAL_SHELLS.has(head)) return null;
 
@@ -2065,8 +2064,20 @@ function shellEnvironmentPrefixMutation(segment: string): string | null {
   return index === null ? null : gitEnvironmentPrefixMutation(tokens, index);
 }
 
-/** Return the command string consumed by env's `-S`/`--split-string` option. */
-function envSplitStringPayload(tokens: string[]): string | null {
+interface EnvSplitStringResult {
+  command: string | null;
+  ambiguous: boolean;
+}
+
+const ENV_OPTIONS_WITHOUT_ARGUMENT = new Set(["-i", "--ignore-environment", "-0", "--null", "-v", "--debug"]);
+
+function quoteShellWord(word: string): string {
+  if (/^[A-Za-z0-9_./:@%+,=-]+$/.test(word)) return word;
+  return `"${word.replace(/[\\$`"]|\n/g, (character) => `\\${character}`)}"`;
+}
+
+/** Return the command composed from env's split-string words and utility argv. */
+function envSplitStringPayload(tokens: string[]): EnvSplitStringResult {
   let envSeen = false;
   for (let i = 0; i < tokens.length; i++) {
     const token = tokens[i]!;
@@ -2075,17 +2086,63 @@ function envSplitStringPayload(tokens: string[]): string | null {
       if (base === "env") envSeen = true;
       continue;
     }
-    if (token === "--") return null;
+    if (token === "--") return { command: null, ambiguous: false };
     const option = envOption(token);
-    if (option.splitPayload !== undefined) return option.splitPayload || tokens[i + 1] || null;
+    if (option.splitPayload !== undefined) {
+      let payload = option.splitPayload;
+      if (!option.attached) {
+        if (i + 1 >= tokens.length) return { command: null, ambiguous: true };
+        payload = tokens[++i]!;
+      }
+      const parsed = shellArguments(payload);
+      if (!parsed.complete || parsed.args.some((argument) => argument.dynamic)) {
+        return { command: null, ambiguous: true };
+      }
+      const merged = parsed.args.map((argument) => argument.value).concat(tokens.slice(i + 1));
+      const assignments: string[] = [];
+      let commandIndex = 0;
+      for (; commandIndex < merged.length; commandIndex++) {
+        const mergedToken = merged[commandIndex]!;
+        if (mergedToken === "--") {
+          commandIndex++;
+          break;
+        }
+        if (ENV_ASSIGNMENT_RE.test(mergedToken)) {
+          assignments.push(mergedToken);
+          continue;
+        }
+        const mergedOption = envOption(mergedToken);
+        if (mergedOption.splitPayload !== undefined) return { command: null, ambiguous: true };
+        if (mergedOption.takesArgument) {
+          if (!mergedOption.attached) commandIndex++;
+          if (commandIndex >= merged.length) return { command: null, ambiguous: true };
+          continue;
+        }
+        if (mergedToken.startsWith("-")) {
+          if (!ENV_OPTIONS_WITHOUT_ARGUMENT.has(mergedToken)) return { command: null, ambiguous: true };
+          continue;
+        }
+        break;
+      }
+      if (commandIndex >= merged.length) return { command: null, ambiguous: false };
+      return {
+        command: assignments.concat(merged.slice(commandIndex)).map(quoteShellWord).join(" "),
+        ambiguous: false,
+      };
+    }
     if (option.takesArgument) {
-      if (!option.attached) i++;
+      if (!option.attached) {
+        if (i + 1 >= tokens.length) return { command: null, ambiguous: true };
+        i++;
+      }
       continue;
     }
+    if (ENV_ASSIGNMENT_RE.test(token)) continue;
+    if (ENV_OPTIONS_WITHOUT_ARGUMENT.has(token)) continue;
     if (token.startsWith("-")) continue;
-    return null;
+    return { command: null, ambiguous: false };
   }
-  return null;
+  return { command: null, ambiguous: false };
 }
 
 function gitReadOnlySubformOption(
@@ -2189,11 +2246,11 @@ function gitReadOnlyOptionMutation(tokens: string[], start: number): string | nu
  */
 function findGitMutationToken(segment: string): string | null {
   const tokens = shellWords(segment);
+  const split = envSplitStringPayload(tokens);
+  if (split.ambiguous) return "ambiguous env split-string";
+  if (split.command !== null) return findGitMutationToken(split.command);
   const index = effectiveHeadIndex(tokens);
-  if (index === null) {
-    const splitString = envSplitStringPayload(tokens);
-    return splitString === null ? null : findDestructiveTokenInternal(splitString, 1);
-  }
+  if (index === null) return null;
 
   const gitIndex = index;
   if (tokens[gitIndex]!.replace(/^.*\//, "") !== "git") {
@@ -2309,6 +2366,8 @@ function findInterpreterWriter(head: string, segment: string): string | null {
  */
 function findDestructiveTokenInternal(cmd: string, depth: number): string | null {
   if (depth >= 32) return "complex shell syntax";
+  const split = envSplitStringPayload(shellWords(cmd));
+  if (split.ambiguous) return "ambiguous env split-string";
   // Avoid sending oversized interpreter payloads through the recursive shell
   // inspection machinery. They cannot be parsed within the language-call
   // budget, so fail closed before any potentially quadratic traversal.
