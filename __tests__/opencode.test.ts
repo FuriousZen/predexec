@@ -294,6 +294,19 @@ describe.each(variants)("opencode plugin ($name) — host permission policy e2e"
     expect(out).not.toContain("nested secret");
   });
 
+  it("matches a native glob rule against the requested pattern under plan cwd", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "px-oc-policy-"));
+    mkdirSync(join(dir, "sub"));
+    writeFileSync(join(dir, "opencode.json"), '{"permission":{"glob":{"README.md":"deny"}}}');
+    const out = await execute(dir, {
+      root: "a",
+      cwd: "sub",
+      nodes: [{ id: "a", commands: [{ tool: "find", path: ".", pattern: "README.md" }] }],
+    });
+    expect(out).toContain("POLICY HARD-STOP (not run)");
+    expect(out).toContain("'README.md'");
+  });
+
   it("without a permission block the same plan runs normally", async () => {
     const dir = mkdtempSync(join(tmpdir(), "px-oc-policy-"));
     writeFileSync(join(dir, "opencode.json"), "{}");

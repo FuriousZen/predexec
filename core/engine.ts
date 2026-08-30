@@ -269,7 +269,6 @@ function normalizePolicyOperation(operation: Operation, sessionRoot: string, eff
   };
   const normalized: ToolOp = { ...operation };
   if ("path" in operation) normalized.path = withPrefix(operation.path);
-  if (operation.tool === "find" && "pattern" in operation) normalized.pattern = withPrefix(operation.pattern);
   return normalized;
 }
 

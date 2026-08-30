@@ -394,6 +394,42 @@ describe("runPlanTree — operation-wide policy", () => {
     expect(r.transcript).toContain("'Read(./.env)'");
   });
 
+  it("normalizes native paths for policy without prefixing find or grep patterns", async () => {
+    const sessionRoot = mkdtempSync(join(tmpdir(), "predexec-policy-cwd-"));
+    try {
+      const seen: unknown[] = [];
+      const r = await runPlanTree(
+        {
+          root: "a",
+          cwd: "sub",
+          nodes: [{
+            id: "a",
+            commands: [
+              { tool: "read", path: ".env" },
+              { tool: "ls", path: "." },
+              { tool: "grep", path: "src", pattern: "ERROR" },
+              { tool: "find", path: ".", pattern: "README.md" },
+            ],
+          }],
+        },
+        {
+          cwd: sessionRoot,
+          checkOperationPolicy: (operation) => (seen.push(operation), null),
+          executeToolOp: async () => ({ stdout: "", stderr: "", exitCode: 0 }),
+        },
+      );
+      expect(r.stoppedReason).toBe("leaf");
+      expect(seen).toEqual([
+        { tool: "read", path: "sub/.env" },
+        { tool: "ls", path: "sub" },
+        { tool: "grep", path: "sub/src", pattern: "ERROR" },
+        { tool: "find", path: "sub", pattern: "README.md" },
+      ]);
+    } finally {
+      rmSync(sessionRoot, { recursive: true, force: true });
+    }
+  });
+
   it("passes shell strings and bash objects to the operation checker", async () => {
     const seen: unknown[] = [];
     const r = await runPlanTree(

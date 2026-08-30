@@ -112,7 +112,11 @@ const BASH_PARAMETERS = new Set(["command", "timeout", "description", "run_in_ba
  */
 const WRAPPERS = new Set(["timeout", "time", "nice", "nohup", "stdbuf", "noglob"]);
 /** Wrappers that take their own options, whose flags/durations are consumed too. */
-const OPTION_TAKING_WRAPPERS = new Set(["timeout", "nice", "stdbuf"]);
+const OPTION_TAKING_WRAPPERS = new Set(["timeout", "time", "nice", "stdbuf"]);
+/** `time` options whose following token is a format/output argument. */
+const OPTION_ARGUMENTS = new Map([
+  ["time", new Set(["-f", "--format", "-o", "--output"])],
+]);
 /** Stripped only when NOT followed by a flag: `command -v foo` looks a command up rather than running it, and `xargs -n1 grep` is matched as an xargs command. */
 const BARE_ONLY_WRAPPERS = new Set(["command", "builtin", "xargs"]);
 
@@ -121,6 +125,7 @@ const DURATION_RE = /^\d+(?:\.\d+)?[smhd]?$/;
 const WRAPPER_OPTIONS: WrapperInspectionOptions = {
   wrappers: WRAPPERS,
   optionTakingWrappers: OPTION_TAKING_WRAPPERS,
+  optionArguments: OPTION_ARGUMENTS,
   bareOnlyWrappers: BARE_ONLY_WRAPPERS,
   durationPattern: DURATION_RE,
 };

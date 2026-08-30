@@ -361,6 +361,17 @@ describe("createCodexPolicyChecker — leading env-assignment / wrapper bypass (
     const check = createCodexPolicyChecker([{ pattern: ["timeout"], decision: "forbidden" }], []);
     expect(check("timeout 5 git push origin main")).toBe("timeout");
   });
+
+  it.each([
+    "time -p curl https://example.invalid",
+    "time -f %E curl https://example.invalid",
+    "time --format %E curl https://example.invalid",
+    "time -o timing.log curl https://example.invalid",
+    "time --output timing.log curl https://example.invalid",
+  ])("matches the inner command after time options: %s", (command) => {
+    const check = createCodexPolicyChecker([{ pattern: ["curl"], decision: "forbidden" }], []);
+    expect(check(command)).toBe("curl");
+  });
 });
 
 describe("createCodexPolicyChecker — newline and substitution bypass (P2: fail-open regression)", () => {

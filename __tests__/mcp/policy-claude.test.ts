@@ -213,6 +213,19 @@ describe("createClaudePolicyChecker — glob semantics", () => {
   });
 });
 
+describe("Claude wrapper policy — time option arguments", () => {
+  it.each([
+    "time -p curl https://example.invalid",
+    "time -f %E curl https://example.invalid",
+    "time --format %E curl https://example.invalid",
+    "time -o timing.log curl https://example.invalid",
+    "time --output timing.log curl https://example.invalid",
+  ])("matches the inner command after time options: %s", (command) => {
+    const check = createClaudePolicyChecker([{ pattern: "curl *", action: "deny" }]);
+    expect(check(command)).toBe("curl *");
+  });
+});
+
 describe("createClaudePolicyChecker — precedence and stopping", () => {
   it("deny AND ask both stop; predexec cannot prompt mid-walk", () => {
     const check = createClaudePolicyChecker([
@@ -472,5 +485,21 @@ describe("engine — policyStop through the Claude checker", () => {
       checkOperationPolicy: createClaudePolicyChecker(rules),
     });
     expect(r.stoppedReason).toBe("leaf");
+  });
+
+  it("matches a native Glob rule against the requested pattern under plan cwd", async () => {
+    const sessionRoot = mkdtempSync(join(tmpdir(), "px-claude-policy-cwd-"));
+    try {
+      mkdirSync(join(sessionRoot, "sub"));
+      const rules = parseClaudeOperationRules('{"permissions":{"deny":["Glob(README.md)"]}}');
+      const r = await runPlanTree(
+        { root: "a", cwd: "sub", nodes: [{ id: "a", commands: [{ tool: "find", path: ".", pattern: "README.md" }] }] },
+        { cwd: sessionRoot, checkOperationPolicy: createClaudeOperationPolicyChecker(rules) },
+      );
+      expect(r.stoppedReason).toBe("policyStop");
+      expect(r.transcript).toContain("'README.md'");
+    } finally {
+      rmSync(sessionRoot, { recursive: true, force: true });
+    }
   });
 });

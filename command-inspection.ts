@@ -10,6 +10,8 @@ export interface WrapperInspectionOptions {
   wrappers?: ReadonlySet<string>;
   optionTakingWrappers?: ReadonlySet<string>;
   bareOnlyWrappers?: ReadonlySet<string>;
+  /** Wrapper-specific options whose following token is an option argument. */
+  optionArguments?: ReadonlyMap<string, ReadonlySet<string>>;
   durationPattern?: RegExp;
 }
 
@@ -24,6 +26,7 @@ const wrapperOptions = (options: WrapperInspectionOptions = {}) => ({
   wrappers: options.wrappers ?? DEFAULT_WRAPPERS,
   optionTakingWrappers: options.optionTakingWrappers ?? DEFAULT_OPTION_TAKING_WRAPPERS,
   bareOnlyWrappers: options.bareOnlyWrappers ?? DEFAULT_BARE_ONLY_WRAPPERS,
+  optionArguments: options.optionArguments ?? new Map(),
   durationPattern: options.durationPattern ?? DEFAULT_DURATION_PATTERN,
 });
 
@@ -118,6 +121,25 @@ function stripTokenAssignments(tokens: readonly string[]): string[] {
   return i === 0 ? [...tokens] : tokens.slice(i);
 }
 
+function optionArgument(
+  wrapper: string,
+  token: string,
+  options: ReturnType<typeof wrapperOptions>,
+): { takesArgument: boolean; attached: boolean } {
+  const names = options.optionArguments.get(wrapper);
+  if (!names) return { takesArgument: false, attached: false };
+  for (const name of names) {
+    if (token === name) return { takesArgument: true, attached: false };
+    if (name.startsWith("--") && token.startsWith(`${name}=`)) {
+      return { takesArgument: true, attached: true };
+    }
+    if (!name.startsWith("--") && token.startsWith(name) && token.length > name.length) {
+      return { takesArgument: true, attached: true };
+    }
+  }
+  return { takesArgument: false, attached: false };
+}
+
 function stripTokenWrapper(tokens: readonly string[], options: ReturnType<typeof wrapperOptions>): string[] {
   const head = tokens[0];
   if (!head || !(options.wrappers.has(head) || options.bareOnlyWrappers.has(head))) return [...tokens];
@@ -125,9 +147,15 @@ function stripTokenWrapper(tokens: readonly string[], options: ReturnType<typeof
   const isFlag = next !== undefined && next.startsWith("-");
   if (options.bareOnlyWrappers.has(head) && isFlag) return [...tokens];
   let drop = 1;
-  if (options.optionTakingWrappers.has(head)) {
+  if (options.optionTakingWrappers.has(head) || options.optionArguments.has(head)) {
     while (drop < tokens.length) {
       const token = tokens[drop]!;
+      const argument = optionArgument(head, token, options);
+      if (argument.takesArgument) {
+        drop++;
+        if (!argument.attached && drop < tokens.length) drop++;
+        continue;
+      }
       if (token.startsWith("-") || options.durationPattern.test(token)) drop++;
       else break;
     }
@@ -147,9 +175,15 @@ function stripRaw(command: string, options: ReturnType<typeof wrapperOptions>): 
       const isFlag = next !== undefined && next.startsWith("-");
       if (!(options.bareOnlyWrappers.has(head) && isFlag)) {
         let drop = 1;
-        if (options.optionTakingWrappers.has(head)) {
+        if (options.optionTakingWrappers.has(head) || options.optionArguments.has(head)) {
           while (drop < tokens.length) {
             const token = tokens[drop]!;
+            const argument = optionArgument(head, token, options);
+            if (argument.takesArgument) {
+              drop++;
+              if (!argument.attached && drop < tokens.length) drop++;
+              continue;
+            }
             if (token.startsWith("-") || options.durationPattern.test(token)) drop++;
             else break;
           }

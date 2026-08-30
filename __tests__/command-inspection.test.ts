@@ -36,4 +36,20 @@ describe("command inspection mechanics", () => {
     expect(stripLeadingAssignmentsAndWrappers(tokenizeShellWords("command -v rg"))).toEqual(["command", "-v", "rg"]);
     expect(stripLeadingAssignmentsAndWrappers(tokenizeShellWords("xargs -n1 grep pattern"))).toEqual(["xargs", "-n1", "grep", "pattern"]);
   });
+
+  it.each([
+    "time -p curl https://example.invalid",
+    "time -f %E curl https://example.invalid",
+    "time --format %E curl https://example.invalid",
+    "time -o timing.log curl https://example.invalid",
+    "time --output timing.log curl https://example.invalid",
+  ])("skips time wrapper option arguments before the inner command: %s", (command) => {
+    const options = {
+      optionArguments: new Map([["time", new Set(["-f", "--format", "-o", "--output"])]]),
+    };
+    expect(stripLeadingAssignmentsAndWrappers(tokenizeShellWords(command), options)).toEqual([
+      "curl",
+      "https://example.invalid",
+    ]);
+  });
 });
