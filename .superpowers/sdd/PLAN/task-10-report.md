@@ -1082,3 +1082,83 @@ destructive/engine regressions, and this report. The code/test change is
 committed as `905c5a8` (`fix: harden encoded interpreter modes and scan bounds`);
 this report append remains a separate documentation commit. No ledger, release
 metadata, dependency, dist, publish, push, merge, or version operation changed.
+
+## Extended integration fix round 15 — executable interpolation and alternate literals
+
+This user-authorized extension starts from `907ac63d4fc02f03ddb89cac134ee10ec6c711d4`.
+It closes the generic-language-mask regression where executable interpolation
+bodies were hidden along with literal strings. Node template `${...}`, Ruby
+`#{...}` (including `%Q`), Python f-string braces (including prefixes and
+triple strings), and Perl's executable `${\\ ...}`/`@{[ ... ]}` interpolation
+forms now remain visible to the language-specific writer scanners. Ruby
+`%q`, Perl `q{}`, anchored `=begin` blocks, heredoc/nowdoc bodies, Python
+triple literals, and ordinary comments remain masked. Interpolation traversal
+is bounded by explicit character/depth budgets and malformed or over-budget
+source fails closed. No ledger, release metadata, dependency, version,
+publish, push, merge, or release-artifact staging was performed.
+
+### RED evidence
+
+Before production changes, the focused regression run was:
+
+```text
+./node_modules/.bin/vitest run __tests__/core/destructive.test.ts
+```
+
+Result: exit 1; **10 tests failed, 427 passed**. Failures reproduced writer
+calls hidden inside Node/Ruby/Python interpolation, escaped/literal marker
+false positives, writer-looking heredoc data, malformed interpolation, and
+the nested interpolation budget case.
+
+### GREEN implementation and regressions
+
+- `core/destructive.ts` now builds an offset-preserving executable-language
+  view for Node, Python, Ruby, Perl, and PHP. It recursively balances
+  interpolation braces while respecting nested strings, escapes, comments,
+  alternate literals, and heredoc terminators. `LANGUAGE_VIEW_CHARACTER_BUDGET`
+  and `LANGUAGE_INTERPOLATION_DEPTH_BUDGET` bound traversal; existing
+  `LANGUAGE_CALL_CANDIDATE_BUDGET` and mode-argument bounds remain intact.
+- Node/Python/Ruby/Perl writer scanners consume the language-specific view;
+  literal strings/comments are no longer generic fallback data, while actual
+  executable interpolation bodies are scanned. PHP heredoc/comments are
+  masked conservatively and static PHP writer coverage remains unchanged.
+- Focused static regressions cover nested braces/quotes, escaped markers,
+  `%q`/`q{}`, `=begin`, heredoc/nowdoc/triple-literal data, malformed source,
+  and depth overflow. Installed Node/Python/Ruby/Perl engine probes confirm
+  writer interpolations stop before create/delete/modify execution and benign
+  escaped/literal forms reach a leaf without creating files. PHP remains
+  static-only when no PHP interpreter is installed.
+
+Verification:
+
+```text
+./node_modules/.bin/vitest run __tests__/core/destructive.test.ts __tests__/core/engine.test.ts
+```
+
+Result: exit 0; **2 files, 521 tests passed, 1 skipped**.
+
+```text
+./node_modules/.bin/tsc --noEmit
+pnpm run build
+./node_modules/.bin/vitest run
+./node_modules/.bin/vitest run __tests__/release-hygiene.test.ts __tests__/pack.test.ts
+git diff --check
+```
+
+All checks passed: typecheck/build succeeded; the full suite passed **21
+files, 1,189 tests with 1 skipped**; release/pack verification passed **9/9
+tests**; and `git diff --check` passed. Generated `dist/` remains ignored and
+unstaged.
+
+### Self-review and scope/counts
+
+The executable view preserves source offsets for balanced call extraction,
+restores only code reached through executable interpolation, and masks nested
+literal strings. Escapes and doubled Python f-string braces cannot open an
+interpolation. Perl's alternate literals preserve only constructs documented
+to execute code. Incomplete heredocs, unterminated strings/interpolations,
+depth overflow, and character overflow return the fail-closed eval marker.
+Mode parsing from round 14 remains unchanged. Changes are limited to
+`core/destructive.ts`, focused destructive/engine regressions, and this report;
+no dependency, ledger, release metadata, publish, push, merge, version, or
+dist staging changed.
