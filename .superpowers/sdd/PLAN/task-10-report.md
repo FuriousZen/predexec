@@ -182,7 +182,7 @@ payload; that failure drove the bounded group-fragment correction.
   unchanged and conservative.
 - The exported eval preflight retains its direct argv check, then performs a
   small quote-aware lexical walk over pipeline separators, shell-control
-  fragments, substitutions, and parenthesized/brace groups. It delegates only
+  fragments, substitutions, case arms, and parenthesized/brace groups. It delegates only
   direct argv parsing to the existing helper and uses a bounded recursion/work
   budget; it does not invoke the recursive executable shell tree. Thus an
   oversized eval in a pipeline or compound command hard-stops before the
@@ -194,7 +194,8 @@ payload; that failure drove the bounded group-fragment correction.
 ./node_modules/.bin/vitest run __tests__/core/destructive.test.ts __tests__/core/engine.test.ts --testTimeout=10000
 ```
 
-Result: exit 0; **2 files, 580 tests passed, 1 skipped**.
+Result: exit 0; **2 files, 581 tests passed, 1 skipped**. The final focused
+run includes the case-arm refinement described below.
 
 ```text
 ./node_modules/.bin/tsc --noEmit
@@ -223,6 +224,13 @@ destructive regressions, and this report. The code/test change is committed as
 `1234f97`; this report append follows in a separate documentation commit. No
 ledger, dependency, release, publish, push, merge, or version operation
 changed.
+
+The final scoped review added one additional compound form: a `case` arm's
+unquoted `pattern)` delimiter is now treated as an executable-fragment
+boundary, so `case x in a) ruby -e ... ;; esac` receives the same early bound.
+This narrow refinement is committed as `32e7eeb`; no full-suite rerun was
+needed after the already-green bounded lexical change, and no custom process
+was started.
 
 ## Integration fix round 1 — Important findings
 
