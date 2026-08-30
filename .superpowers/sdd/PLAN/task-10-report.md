@@ -2015,3 +2015,23 @@ option coverage were added alongside the regressions.
 - Focused destructive coverage passes **767 tests**; core coverage passes
   **922 tests with 1 skipped**. Typecheck, build, and diff checks pass. No
   custom hook/stress probe, background process, or payload over 4 KiB was used.
+
+## Final whole-branch release verdict
+
+The definitive source-only Luna review covered `b8e4daa..c3de776`, including
+all 76 audit-remediation commits, this report, the design, the SDD ledger, and
+the affected source and tests. Verdict: **READY**. No Critical or Important
+findings remain, and the reviewer recommends integration.
+
+The latest bounded runtime evidence is **22 test files, 1,592 tests passed with
+1 skipped**, plus successful typecheck, build, and diff checks. The final
+review deliberately executed no repository code after an earlier reviewer
+violated the CPU guard with a regex timing probe; that exact process was
+terminated and the replacement review was source-only.
+
+Accepted deferred Minors are limited to NUL-containing relative-cwd
+diagnostics, marker-shaped output sanitization, missing symmetric stderr
+truncation coverage, fallback grep context/final-read edge cases, the
+documented non-kernel-atomic pathname containment boundary, and one stale
+truncation-marker comment. None blocks integration. Nothing was pushed,
+published, merged, or version-bumped.

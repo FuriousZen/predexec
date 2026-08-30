@@ -793,10 +793,10 @@ Generate the SDD review package from the branch merge-base through HEAD. The fin
 
 ## Definition of Done
 
-- [ ] Tasks 1-10 have completion entries in the SDD ledger.
-- [ ] Every production behavior change has recorded RED and GREEN evidence.
-- [ ] Every task received independent spec-compliance and code-quality approval.
-- [ ] Every audit concern is implemented or has an explicit reviewed ruling in the ledger.
-- [ ] Full tests, typecheck, build, and packed-install verification pass.
-- [ ] Final whole-branch review is clean or residual findings are explicitly adjudicated.
-- [ ] Nothing was pushed, published, merged, or version-bumped.
+- [x] Tasks 1-10 have completion entries in the SDD ledger.
+- [x] Every production behavior change has recorded RED and GREEN evidence.
+- [x] Every task received independent spec-compliance and code-quality approval.
+- [x] Every audit concern is implemented or has an explicit reviewed ruling in the ledger.
+- [x] Full tests, typecheck, build, and packed-install verification pass.
+- [x] Final whole-branch review is clean or residual findings are explicitly adjudicated.
+- [x] Nothing was pushed, published, merged, or version-bumped.
