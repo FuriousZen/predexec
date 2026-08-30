@@ -152,6 +152,78 @@ These are documented/deferred findings from the completed task reports, not newl
 No residual concern was release-blocking under the brief's criteria during the
 initial verification pass. The subsequent final-review gate is recorded below.
 
+## Extended integration fix round 18 — interpreter aliases, attached evals, and compound preflight
+
+This user-authorized extension starts from the round-17 verification commit
+`dcd0dc4`. It closes three Important classifier gaps: Python 3 interpreter
+aliases were not mapped to the Python language scanner, the 16 KiB eval-size
+guard only inspected a command whose first head was an interpreter, and
+attached Ruby/Perl `-e` programs were left inside the shell segment instead of
+being extracted as eval payloads. No dependency, release metadata, version,
+publish, push, merge, or release-artifact staging changed.
+
+### RED evidence
+
+Before production changes, the focused regression run failed as expected. The
+new tests reproduced Python 3 `open(..., 'w')` writer bypasses (including an
+absolute interpreter path), pipeline and compound commands reaching the
+expensive substitution tree, and attached `ruby -eFile.write(...)` /
+`perl -eunlink(...)` forms being classified safe. A follow-up group-body
+regression initially showed the closing `)` being counted in the extracted
+payload; that failure drove the bounded group-fragment correction.
+
+### GREEN implementation
+
+- `interpreterLanguage` centralizes interpreter-to-scanner mapping so `python3`
+  uses the Python writer rules everywhere, including `/usr/bin/python3` after
+  normal head resolution.
+- Ruby and Perl attached `-ePROGRAM` forms are extracted narrowly in both
+  writer scanning and eval preflight. Other interpreter option grammars remain
+  unchanged and conservative.
+- The exported eval preflight retains its direct argv check, then performs a
+  small quote-aware lexical walk over pipeline separators, shell-control
+  fragments, substitutions, and parenthesized/brace groups. It delegates only
+  direct argv parsing to the existing helper and uses a bounded recursion/work
+  budget; it does not invoke the recursive executable shell tree. Thus an
+  oversized eval in a pipeline or compound command hard-stops before the
+  expensive traversal.
+
+### Verification
+
+```text
+./node_modules/.bin/vitest run __tests__/core/destructive.test.ts __tests__/core/engine.test.ts --testTimeout=10000
+```
+
+Result: exit 0; **2 files, 580 tests passed, 1 skipped**.
+
+```text
+./node_modules/.bin/tsc --noEmit
+pnpm run build
+./node_modules/.bin/vitest run
+./node_modules/.bin/vitest run __tests__/release-hygiene.test.ts __tests__/pack.test.ts
+git diff --check
+```
+
+All commands passed. The full suite passed **21 files, 1,248 tests with 1
+skipped**; release/pack verification passed **9/9 tests**, including packed
+CLI/MCP smoke checks; typecheck and build succeeded; and no custom probe or
+background process remained after verification. Generated `dist/` output is
+ignored and unstaged.
+
+### Self-review and scope
+
+The lexical preflight is intentionally separate from the shared shell tree and
+tracks only executable-looking boundaries; quoted static data remains excluded
+while substitutions and shell groups are recursively considered under explicit
+depth and character budgets. Group close delimiters are excluded from payload
+length, and exact 16 KiB/16 KiB-plus-one unit boundaries are covered. Attached
+eval extraction is limited to Ruby/Perl, preserving existing Node/Python/PHP
+option behavior. Changes are limited to `core/destructive.ts`, focused
+destructive regressions, and this report. The code/test change is committed as
+`1234f97`; this report append follows in a separate documentation commit. No
+ledger, dependency, release, publish, push, merge, or version operation
+changed.
+
 ## Integration fix round 1 — Important findings
 
 The final-review gate identified two integration regressions in the previously
