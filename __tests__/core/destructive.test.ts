@@ -3,6 +3,7 @@ import {
   effectiveHead,
   findDestructiveToken,
   isDestructiveCommand,
+  LANGUAGE_CALL_CANDIDATE_BUDGET,
   splitCommandSegments,
 } from "../../core/destructive.ts";
 
@@ -469,6 +470,53 @@ describe("interpreter eval — fs-writer APIs are caught", () => {
     it("fails closed when a language call exceeds the bounded argument scan", () => {
       const oversizedPath = "x".repeat(64 * 1024);
       expect(isDestructiveCommand(`ruby -e "File.open('${oversizedPath}', 'r')"`)).toBe(true);
+    });
+  });
+
+  describe("round 14 static mode decoding and bounded call candidates", () => {
+    it.each([
+      String.raw`ruby -e 'File.open("victim", "\x77") { |f| f.write("x") }'`,
+      String.raw`ruby -e 'File.open("victim", "\x61") { |f| f.write("x") }'`,
+      String.raw`perl -e 'open(FH, "\x3e", "victim")'`,
+      String.raw`perl -e 'open(FH, "\x3e\x3e", "victim")'`,
+      String.raw`php -r 'fopen("victim", "\x77");'`,
+      String.raw`php -r 'fopen("victim", "\x61+");'`,
+    ])("blocks an encoded static writer mode: %s", (cmd) => {
+      expect(isDestructiveCommand(cmd)).toBe(true);
+    });
+
+    it.each([
+      String.raw`ruby -e 'File.open("victim", "\x72") { |f| f.read }'`,
+      String.raw`perl -e 'open(FH, "\x3c", "victim")'`,
+      String.raw`php -r 'fopen("victim", "\x72");'`,
+    ])("preserves an encoded static read mode: %s", (cmd) => {
+      expect(isDestructiveCommand(cmd)).toBe(false);
+    });
+
+    it.each([
+      String.raw`ruby -e 'mode = "w"; File.open("victim", "#{mode}") { |f| f.write("x") }'`,
+      String.raw`perl -e '$mode = ">"; open(FH, "$mode", "victim")'`,
+      String.raw`php -r '$mode = "w"; fopen("victim", "$mode");'`,
+      String.raw`php -r 'fopen("victim", "w" . $suffix);'`,
+    ])("fails closed for dynamic or concatenated mode expressions: %s", (cmd) => {
+      expect(isDestructiveCommand(cmd)).toBe(true);
+    });
+
+    it.each([
+      String.raw`ruby -e 'File.open("writeonly", "rb") { |f| f.read }'`,
+      String.raw`ruby -e 'File.open("append-data", "rb") { |f| f.read }'`,
+      String.raw`perl -e 'sysopen(FH, "writeonly", O_RDONLY)'`,
+      String.raw`perl -e 'sysopen(FH, "append-data", O_RDONLY)'`,
+      String.raw`php -r 'fopen("writeonly", "r");'`,
+      String.raw`php -r 'fopen("append-data", "r");'`,
+    ])("does not scan filename/data text as a mode: %s", (cmd) => {
+      expect(isDestructiveCommand(cmd)).toBe(false);
+    });
+
+    it("fails closed after the bounded number of nested language call candidates", () => {
+      let expression = "'victim'";
+      for (let i = 0; i <= LANGUAGE_CALL_CANDIDATE_BUDGET; i++) expression = `File.open(${expression}, 'rb')`;
+      expect(isDestructiveCommand(`ruby -e ${JSON.stringify(expression)}`)).toBe(true);
     });
   });
 });

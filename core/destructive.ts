@@ -173,7 +173,7 @@ const EVAL_SHELLS = new Set(["sh", "bash", "zsh", "dash"]);
  * gap, it does not close it.
  */
 const EVAL_WRITER_RE =
-  /\bfs\.\w*[Ww]rite\w*|writeFile\w*|appendFile\w*|rmSync|unlinkSync|mkdirSync|renameSync|rmdirSync|cpSync|createWriteStream|truncateSync|chmodSync|symlinkSync|os\.(remove|unlink|rename|mkdir|rmdir|makedirs)|shutil\.|write_text|write_bytes|open\([^)]*['"][wa]/;
+  /\bfs\.\w*[Ww]rite\w*|writeFile\w*|appendFile\w*|rmSync|unlinkSync|mkdirSync|renameSync|rmdirSync|cpSync|createWriteStream|truncateSync|chmodSync|symlinkSync|os\.(remove|unlink|rename|mkdir|rmdir|makedirs)|shutil\.|write_text|write_bytes/;
 
 /**
  * Language-specific eval scanners. Keep these as small API vocabularies rather
@@ -189,6 +189,8 @@ const RUBY_FILE_OPEN = /\bFile\s*(?:\.|::)\s*open\s*\(/gi;
 const PHP_WRITER_FUNCTIONS = /\b(?:fwrite|fputs|file_put_contents|unlink|rename|copy|touch|mkdir|rmdir|chmod|chown|link|symlink|move_uploaded_file|ftruncate)\s*\(/gi;
 const PHP_FOPEN = /\bfopen\s*\(/gi;
 const MAX_LANGUAGE_ARGUMENT_LENGTH = 64 * 1024;
+/** Maximum language-call candidates inspected in one eval payload. */
+export const LANGUAGE_CALL_CANDIDATE_BUDGET = 256;
 
 interface LanguageCall { match: string; args: string | null; }
 
@@ -338,6 +340,11 @@ function findLanguageCalls(source: string, pattern: RegExp, hashComments: boolea
   const matcher = new RegExp(pattern.source, `${pattern.flags.replace("g", "")}g`);
   const calls: LanguageCall[] = [];
   for (let match = matcher.exec(masked); match; match = matcher.exec(masked)) {
+    if (calls.length >= LANGUAGE_CALL_CANDIDATE_BUDGET) {
+      // Put the fail-closed marker first so every consumer, including callers
+      // that inspect only the first match, observes the bounded traversal.
+      return [{ match: "language call candidate budget", args: null }];
+    }
     const text = match[0]!;
     const args = captureLanguageCall(source, match.index + text.lastIndexOf("("), { hashComments, slashComments });
     calls.push({ match: text.trim(), args });
@@ -389,19 +396,81 @@ function splitTopLevelArguments(args: string, options: LanguageSyntaxOptions): s
   return fields;
 }
 
-/** Return a complete quoted literal, or null for expressions/ambiguous syntax. */
-function quotedArgumentValue(arg: string): string | null {
+type StaticMode = { kind: "static"; value: string } | { kind: "ambiguous" };
+type ModeLanguage = "ruby" | "perl" | "php" | "python";
+
+function modeEscapeApplies(quote: "'" | '"', next: string | undefined): boolean {
+  return quote === '"' || next === quote || next === "\\";
+}
+
+function hasModeInterpolation(body: string, language: ModeLanguage): boolean {
+  if (language === "python") return false;
+  for (let i = 0; i < body.length; i++) {
+    const ch = body[i]!;
+    if (ch === "\\" && modeEscapeApplies('"', body[i + 1])) { i++; continue; }
+    if (language === "ruby" && (body.startsWith("#{", i) || ch === "$" || ch === "@")) return true;
+    if ((language === "perl" || language === "php") && (ch === "$" || ch === "@" || ch === "%")) return true;
+  }
+  return false;
+}
+
+function decodeModeEscapes(body: string, quote: "'" | '"'): StaticMode {
+  let value = "";
+  for (let i = 0; i < body.length; i++) {
+    const ch = body[i]!;
+    if (ch !== "\\" || !modeEscapeApplies(quote, body[i + 1])) {
+      value += ch;
+      continue;
+    }
+    const next = body[++i]!;
+    if (quote === "'") {
+      value += next;
+      continue;
+    }
+    const simple: Record<string, string> = {
+      a: "\x07", b: "\b", e: "\x1b", f: "\f", n: "\n", r: "\r", s: " ", t: "\t", v: "\v",
+      "\\": "\\", "\"": "\"", "'": "'",
+    };
+    if (simple[next] !== undefined) {
+      value += simple[next]!;
+      continue;
+    }
+    if (next === "x") {
+      const hex = body.slice(i + 1).match(/^[0-9a-fA-F]{1,2}/)?.[0];
+      if (!hex) return { kind: "ambiguous" };
+      value += String.fromCharCode(parseInt(hex, 16));
+      i += hex.length;
+      continue;
+    }
+    if (/[0-7]/.test(next)) {
+      const octal = (next + body.slice(i + 1).match(/^[0-7]{0,2}/)?.[0]).slice(0, 3);
+      value += String.fromCharCode(parseInt(octal, 8));
+      i += octal.length - 1;
+      continue;
+    }
+    // Unknown escapes have language-specific semantics; treating them as
+    // ambiguous keeps mode classification fail-closed.
+    return { kind: "ambiguous" };
+  }
+  return { kind: "static", value };
+}
+
+/** Decode a complete static quoted argument, or classify it as ambiguous. */
+function decodeStaticMode(arg: string, language: ModeLanguage): StaticMode {
   const text = arg.trim();
   const quote = text[0];
-  if (quote !== "'" && quote !== '"') return null;
-  let escaped = false;
+  if (quote !== "'" && quote !== '"') return { kind: "ambiguous" };
   for (let i = 1; i < text.length; i++) {
     const ch = text[i]!;
-    if (escaped) { escaped = false; continue; }
-    if (ch === "\\" && (quote !== "'" || text[i + 1] === "'" || text[i + 1] === "\\")) { escaped = true; continue; }
-    if (ch === quote) return /^\s*$/.test(text.slice(i + 1)) ? text.slice(1, i) : null;
+    if (ch === "\\" && modeEscapeApplies(quote, text[i + 1])) { i++; continue; }
+    if (ch === quote) {
+      if (!/^\s*$/.test(text.slice(i + 1))) return { kind: "ambiguous" };
+      const body = text.slice(1, i);
+      if (quote === '"' && hasModeInterpolation(body, language)) return { kind: "ambiguous" };
+      return decodeModeEscapes(body, quote);
+    }
   }
-  return null;
+  return { kind: "ambiguous" };
 }
 
 function rubyWriteMode(mode: string): boolean {
@@ -505,9 +574,9 @@ function findPerlWriter(payload: string): string | null {
     if (args === null) return "open";
     const fields = splitTopLevelArguments(args, { hashComments: true, slashComments: false });
     if (fields === null || fields.length < 2) return "open";
-    const mode = quotedArgumentValue(fields[1]!);
-    if (mode === null) return "open";
-    if (perlOpenWriteMode(mode)) return `open ${mode}`;
+    const mode = decodeStaticMode(fields[1]!, "perl");
+    if (mode.kind === "ambiguous") return "open";
+    if (perlOpenWriteMode(mode.value)) return `open ${mode.value}`;
   }
   const print = /\bprint\s+[A-Za-z_$][\w$]*\s+/.exec(maskLanguageCode(payload, true, false));
   return print?.[0]?.trim() ?? null;
@@ -522,8 +591,8 @@ function findRubyWriter(payload: string): string | null {
     if (call.args === null) return call.match;
     const fields = splitTopLevelArguments(call.args, { hashComments: true, slashComments: false });
     if (fields === null || fields.length < 2) return call.match;
-    const mode = quotedArgumentValue(fields[1]!);
-    if (mode === null || rubyWriteMode(mode) || /\b(?:WRONLY|RDWR|CREAT|TRUNC|APPEND)\b/.test(fields[1]!)) return call.match;
+    const mode = decodeStaticMode(fields[1]!, "ruby");
+    if (mode.kind === "ambiguous" || rubyWriteMode(mode.value) || /\b(?:WRONLY|RDWR|CREAT|TRUNC|APPEND)\b/.test(fields[1]!)) return call.match;
   }
   return null;
 }
@@ -535,8 +604,21 @@ function findPhpWriter(payload: string): string | null {
     if (call.args === null) return call.match;
     const fields = splitTopLevelArguments(call.args, { hashComments: true, slashComments: true });
     if (fields === null || fields.length < 2) return call.match;
-    const mode = quotedArgumentValue(fields[1]!);
-    if (mode === null || phpWriteMode(mode)) return call.match;
+    const mode = decodeStaticMode(fields[1]!, "php");
+    if (mode.kind === "ambiguous" || phpWriteMode(mode.value)) return call.match;
+  }
+  return null;
+}
+
+/** Python's built-in open is the one generic writer API requiring mode parsing. */
+function findPythonWriter(payload: string): string | null {
+  for (const call of findLanguageCalls(payload, /\bopen\s*\(/gi, true, false)) {
+    if (call.args === null) return call.match;
+    const fields = splitTopLevelArguments(call.args, { hashComments: true, slashComments: false });
+    if (fields === null || fields.length < 2) continue;
+    const mode = decodeStaticMode(fields[1]!, "python");
+    if (mode.kind === "ambiguous") return call.match;
+    if (/^[waxc]/i.test(mode.value) || mode.value.includes("+")) return call.match;
   }
   return null;
 }
@@ -978,6 +1060,7 @@ function isEvalInvocation(head: string, segment: string): boolean {
 function findInterpreterWriter(head: string, segment: string): string | null {
   if (segment.length > MAX_LANGUAGE_ARGUMENT_LENGTH) return `${head} eval payload`;
   const payload = interpreterEvalPayload(segment);
+  if (head === "python" || head === "python3") return findPythonWriter(payload);
   if (head === "perl") return findPerlWriter(payload);
   if (head === "ruby") return findRubyWriter(payload);
   if (head === "php") return findPhpWriter(payload);
@@ -1109,12 +1192,11 @@ function findDestructiveTokenInternal(cmd: string, depth: number): string | null
       const languageWriter = findInterpreterWriter(head, segment);
       if (languageWriter) return languageWriter;
       const writerPayload = interpreterEvalPayload(segment);
-      const writerSource = head === "php"
-        ? maskLanguageCode(writerPayload, true, true)
-        : stripLanguageComments(writerPayload, {
-            hashComments: !["node", "deno", "bun"].includes(head),
-            slashComments: ["node", "deno", "bun"].includes(head),
-          }) ?? writerPayload;
+      const writerSource = maskLanguageCode(
+        writerPayload,
+        !["node", "deno", "bun"].includes(head),
+        head === "php" || ["node", "deno", "bun"].includes(head),
+      );
       const writer = EVAL_WRITER_RE.exec(writerSource);
       if (writer) return writer[0].trim();
     }

@@ -171,6 +171,7 @@ describe("runPlanTree — traversal & stop reasons", () => {
           "ruby -e \"FileUtils::mkdir_p('created')\"",
           "ruby -e \"File::delete('victim')\"",
           "ruby -e \"File.open('victim', 'rb+') { |f| f.write('changed') }\"",
+          String.raw`ruby -e 'File.open("victim", "\x77") { |f| f.write("changed") }'`,
           "ruby -e \"require 'fileutils'; FileUtils::remove_entry('victim')\"",
           "ruby -e \"require 'fileutils'; FileUtils.ln_sf('victim', 'linked')\"",
         ];
@@ -270,6 +271,7 @@ describe("runPlanTree — traversal & stop reasons", () => {
         writeFileSync(victim, "keep\n");
         const commands = [
           `perl -e "open(FH, '>:encoding(UTF-8)', 'created')"`,
+          String.raw`perl -e 'open(FH, "\x3e", "created")'`,
           `perl -e "unlink('victim')"`,
           `perl -e "sysopen(FH, 'victim', O_WRONLY)"`,
         ];
