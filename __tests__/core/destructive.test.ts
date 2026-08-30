@@ -1401,6 +1401,30 @@ describe("mutation classifier — env split-string composition", () => {
   ])("fails closed for ambiguous split strings: %s", (command) => {
     expect(findDestructiveToken(command)).not.toBeNull();
   });
+
+  it.each([
+    `env -S "GIT_EXTERNAL_DIFF=/hook bash -c 'git diff'"`,
+    "env -P /bin -S GIT_EXTERNAL_DIFF=/hook git diff",
+    "env env -S GIT_EXTERNAL_DIFF=/hook git diff",
+  ])("propagates env assignments through bounded nested invocations: %s", (command) => {
+    expect(findDestructiveToken(command)).not.toBeNull();
+  });
+
+  it("does not interpret env-looking data passed to a reader", () => {
+    expect(findDestructiveToken("echo env -S GIT_EXTERNAL_DIFF=/hook git diff")).toBeNull();
+  });
+
+  it("fails closed for unknown env options rather than skipping them", () => {
+    expect(findDestructiveToken("env --unknown -S GIT_EXTERNAL_DIFF=/hook git diff")).not.toBeNull();
+  });
+
+  it.each([
+    "env -C /tmp --argv0 git git status",
+    "env -P /bin -u GIT_PAGER -C /tmp --argv0 git git log",
+    "env -i -0 -v --debug git status",
+  ])("accepts documented env option arguments and flags: %s", (command) => {
+    expect(findDestructiveToken(command)).toBeNull();
+  });
 });
 
 describe("isDestructiveCommand — bypasses found in the 2026-08 audit", () => {

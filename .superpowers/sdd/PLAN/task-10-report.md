@@ -1982,3 +1982,36 @@ two dynamic split cases returned `null`), reproducing the dropped-argv bypass.
 The source/test/report change is committed as the round-27 fix commit. No
 custom runtime hook, process probe, background process, or destructive
 filesystem operation was used.
+
+## Extended integration fix round 28 — bounded env invocation normalization
+
+This user-authorized extension closes four Important env-parser regressions
+from the round-27 review: split-string assignments were lost when the payload
+launched a shell, BSD `-P` consumed the wrong token, arbitrary `env` text in a
+reader argument was treated as executable syntax, and nested env chains could
+skip Git hook inspection. No dependency, release metadata, version, publish,
+push, merge, or release-artifact staging changed.
+
+### RED evidence
+
+Before production changes, four focused regressions failed as expected in
+`__tests__/core/destructive.test.ts`: shell-launched split assignments,
+`-P` plus split-string composition, nested env composition, and the reader
+data false-positive. The unknown-option fail-closed assertion and documented
+option coverage were added alongside the regressions.
+
+### GREEN implementation and self-review
+
+- `normalizeEnvInvocation` is the single quote-aware, bounded env prefix
+  normalizer. It returns effective argv, inherited assignments, env presence,
+  and completeness; it enforces depth, argv-count, and character ceilings.
+- GNU/BSD option forms (`-S`/`--split-string`, `-P`, `-u`, `-C`, `--argv0`,
+  `-i`, `--`, plus existing `-0`/`-v`/`--debug`) consume their arguments
+  explicitly. Unknown or incomplete env syntax fails closed.
+- Effective-head, Git environment-hook detection, shell `-c` extraction, and
+  interpreter preflight/payload all consume the normalized argv/assignments.
+  Only an effective executable head can activate env parsing, while recursive
+  split payloads retain assignments for nested Git commands.
+- Focused destructive coverage passes **767 tests**; core coverage passes
+  **922 tests with 1 skipped**. Typecheck, build, and diff checks pass. No
+  custom hook/stress probe, background process, or payload over 4 KiB was used.

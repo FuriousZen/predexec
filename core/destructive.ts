@@ -1105,23 +1105,20 @@ function perlOpenWriteMode(mode: string): boolean {
 
 function interpreterEvalPayload(segment: string): string {
   const words = shellWords(segment);
-  const split = envSplitStringPayload(words);
-  if (split.ambiguous) return segment;
-  if (split.command !== null) return interpreterEvalPayload(split.command);
-  const headIndex = effectiveHeadIndex(words);
-  if (headIndex === null) return segment;
-  const head = words[headIndex]!.replace(/^.*\//, "");
+  const normalized = normalizeEnvInvocation(words);
+  if (!normalized.complete || normalized.argv.length === 0) return segment;
+  const head = normalized.argv[0]!.replace(/^.*\//, "");
   const evalFlag = /^(?:--eval|--print|--run|-r|-[epnc]|-[pn]*e[pn]*)$/;
-  const index = words.findIndex((word, i) => i > headIndex && evalFlag.test(word));
-  if (index >= 0) return words.slice(index + 1).join(" ");
+  const index = normalized.argv.findIndex((word, i) => i > 0 && evalFlag.test(word));
+  if (index >= 0) return normalized.argv.slice(index + 1).join(" ");
   // Ruby and Perl accept an eval program attached directly to `-e`, e.g.
   // `ruby -eFile.write(...)`. Keep this narrow: other interpreters have
   // materially different short-option grammars and remain fail-closed below.
   if (head === "ruby" || head === "perl") {
-    const attached = words.findIndex((word, i) => i > headIndex && /^-e.+/.test(word));
+    const attached = normalized.argv.findIndex((word, i) => i > 0 && /^-e.+/.test(word));
     if (attached >= 0) {
       const raw = attachedEvalProgram(segment, head);
-      return raw ?? [words[attached]!.slice(2), ...words.slice(attached + 1)].join(" ");
+      return raw ?? [normalized.argv[attached]!.slice(2), ...normalized.argv.slice(attached + 1)].join(" ");
     }
   }
   return segment;
@@ -1204,23 +1201,20 @@ function interpreterLanguage(head: string): InterpolationLanguage {
  */
 function directInterpreterEvalPreflight(segment: string): { payloadLength: number; interpreter: string } | null {
   const words = shellWords(segment);
-  const split = envSplitStringPayload(words);
-  if (split.ambiguous) return null;
-  if (split.command !== null) return directInterpreterEvalPreflight(split.command);
-  const index = effectiveHeadIndex(words);
-  if (index === null) return null;
-  const interpreter = words[index]!.replace(/^.*\//, "");
+  const normalized = normalizeEnvInvocation(words);
+  if (!normalized.complete || normalized.argv.length === 0) return null;
+  const interpreter = normalized.argv[0]!.replace(/^.*\//, "");
   if (!EVAL_INTERPRETERS.has(interpreter)) return null;
   const evalFlag = /^(?:--eval|--print|--run|-r|-[epnc]|-[pn]*e[pn]*)$/;
-  let flagIndex = words.findIndex((word, i) => i > index && evalFlag.test(word));
+  let flagIndex = normalized.argv.findIndex((word, i) => i > 0 && evalFlag.test(word));
   if (flagIndex < 0 && (interpreter === "ruby" || interpreter === "perl")) {
-    flagIndex = words.findIndex((word, i) => i > index && /^-e.+/.test(word));
+    flagIndex = normalized.argv.findIndex((word, i) => i > 0 && /^-e.+/.test(word));
     if (flagIndex >= 0) {
-      return { interpreter, payloadLength: [words[flagIndex]!.slice(2), ...words.slice(flagIndex + 1)].join(" ").length };
+      return { interpreter, payloadLength: [normalized.argv[flagIndex]!.slice(2), ...normalized.argv.slice(flagIndex + 1)].join(" ").length };
     }
   }
   if (flagIndex < 0) return null;
-  return { interpreter, payloadLength: words.slice(flagIndex + 1).join(" ").length };
+  return { interpreter, payloadLength: normalized.argv.slice(flagIndex + 1).join(" ").length };
 }
 
 function stripShellControlPrefix(fragment: string): string {
@@ -1762,139 +1756,164 @@ interface EnvOption {
   takesArgument: boolean;
   attached: boolean;
   splitPayload?: string;
+  known: boolean;
 }
 
 /** Parse env's short clusters without mistaking an option value for a command. */
 function envOption(token: string): EnvOption {
-  if (token === "--ignore-environment") return { takesArgument: false, attached: false };
-  for (const name of ["--unset", "--chdir"]) {
-    if (token === name) return { takesArgument: true, attached: false };
-    if (token.startsWith(`${name}=`)) return { takesArgument: true, attached: true };
+  if (token === "--ignore-environment") return { takesArgument: false, attached: false, known: true };
+  if (token === "--null" || token === "--debug") return { takesArgument: false, attached: false, known: true };
+  for (const name of ["--unset", "--chdir", "--argv0"]) {
+    if (token === name) return { takesArgument: true, attached: false, known: true };
+    if (token.startsWith(`${name}=`)) return { takesArgument: true, attached: true, known: true };
   }
-  if (token === "--split-string") return { takesArgument: true, attached: false, splitPayload: "" };
+  if (token === "--split-string") return { takesArgument: true, attached: false, splitPayload: "", known: true };
   if (token.startsWith("--split-string=")) return {
     takesArgument: true,
     attached: true,
     splitPayload: token.slice("--split-string=".length),
+    known: true,
   };
-  if (!token.startsWith("-") || token.startsWith("--")) return { takesArgument: false, attached: false };
+  if (token === "-i" || token === "-0" || token === "-v") return { takesArgument: false, attached: false, known: true };
+  if (!token.startsWith("-") || token.startsWith("--")) return { takesArgument: false, attached: false, known: false };
   const flags = token.slice(1);
   for (let i = 0; i < flags.length; i++) {
     const flag = flags[i]!;
-    if (flag !== "u" && flag !== "C" && flag !== "S") continue;
+    if (flag === "i" || flag === "0" || flag === "v") continue;
+    if (flag !== "u" && flag !== "C" && flag !== "S" && flag !== "P") return { takesArgument: false, attached: false, known: false };
     const rest = flags.slice(i + 1);
     return {
       takesArgument: true,
       attached: rest.length > 0,
       ...(flag === "S" ? { splitPayload: rest } : {}),
+      known: true,
     };
   }
-  return { takesArgument: false, attached: false };
-}
-
-/**
- * The token that decides a segment's classification: skips VAR=val prefixes
- * and wrapper commands, resolves `/usr/bin/cat` → `cat`. `sudo`/`doas` are
- * returned as-is (never allowlisted). Null when nothing identifiable remains.
- */
-function effectiveHeadIndex(tokens: string[]): number | null {
-  let wrapper: string | null = null;
-  for (let i = 0; i < tokens.length; i++) {
-    const token = tokens[i]!;
-    if (/^\w+=/.test(token)) continue; // env-var prefix
-    const base = token.replace(/^.*\//, "");
-    if (WRAPPERS.has(base)) {
-      wrapper = base;
-      continue; // classify what it runs
-    }
-    if (wrapper && token === "--") {
-      wrapper = null;
-      continue;
-    }
-    if (wrapper === "env") {
-      const option = envOption(token);
-      if (option.takesArgument) {
-        if (!option.attached) i++;
-        continue;
-      }
-    }
-    if (wrapper && token.startsWith("-")) {
-      const optionSet = WRAPPER_OPTIONS_WITH_VALUE[wrapper];
-      if (optionSet?.has(token) && i + 1 < tokens.length && !wrapperOptionHasAttachedValue(wrapper, token)) i++;
-      continue;
-    }
-    return i;
-  }
-  return null;
-}
-
-export function effectiveHead(segment: string): string | null {
-  const tokens = shellWords(segment);
-  const split = envSplitStringPayload(tokens);
-  if (split.command !== null) return effectiveHead(split.command);
-  const index = effectiveHeadIndex(tokens);
-  if (index === null) return null;
-  const base = tokens[index]!.replace(/^.*\//, "");
-  return base || null;
+  return { takesArgument: false, attached: false, known: true };
 }
 
 const ENV_ASSIGNMENT_RE = /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/s;
 
+interface EnvInvocationNormalization {
+  argv: string[];
+  assignments: string[];
+  envSeen: boolean;
+  complete: boolean;
+}
+
+const ENV_MAX_DEPTH = 8;
+const ENV_MAX_ARGV = 256;
+const ENV_MAX_CHARS = 64 * 1024;
+
+function incompleteEnvNormalization(): EnvInvocationNormalization {
+  return { argv: [], assignments: [], envSeen: true, complete: false };
+}
+
+/** Normalize only an effective executable prefix, including nested env. */
+function normalizeEnvInvocation(tokens: string[], depth = 0, inherited: string[] = []): EnvInvocationNormalization {
+  if (depth > ENV_MAX_DEPTH || tokens.length > ENV_MAX_ARGV || tokens.join(" ").length > ENV_MAX_CHARS) {
+    return incompleteEnvNormalization();
+  }
+  const assignments = [...inherited];
+  let index = 0;
+  let envSeen = false;
+  const consumeAssignments = () => {
+    while (index < tokens.length) {
+      const token = tokens[index]!;
+      if (ENV_ASSIGNMENT_RE.test(token)) { assignments.push(token); index++; continue; }
+      // shellWords keeps a trailing command separator attached to an
+      // assignment (`x=1; [[ ... ]]`). It is still an assignment prefix for
+      // head resolution; retaining the token keeps Git-name matching strict.
+      if (/^[A-Za-z_][A-Za-z0-9_]*=[^;|&(){}[\]]+[;|&(){}[\]]/.test(token)) {
+        assignments.push(token);
+        index++;
+      }
+      break;
+    }
+  };
+  const consumeWrapperOptions = (wrapper: string): boolean => {
+    while (index < tokens.length && tokens[index]!.startsWith("-")) {
+      const option = tokens[index]!;
+      if (option === "--") { index++; return true; }
+      const optionSet = WRAPPER_OPTIONS_WITH_VALUE[wrapper];
+      if (optionSet?.has(option) && !wrapperOptionHasAttachedValue(wrapper, option)) {
+        if (++index >= tokens.length) return false;
+      }
+      index++;
+    }
+    return true;
+  };
+
+  consumeAssignments();
+
+  while (index < tokens.length) {
+    const base = tokens[index]!.replace(/^.*\//, "");
+    if (base !== "env") {
+      if (tokens[index]!.includes("=") && !/[;|&(){}[\]]/.test(tokens[index]!)) return incompleteEnvNormalization();
+      if (!WRAPPERS.has(base)) return { argv: tokens.slice(index), assignments, envSeen, complete: true };
+      index++;
+      if (!consumeWrapperOptions(base)) return incompleteEnvNormalization();
+      consumeAssignments();
+      continue;
+    }
+
+    envSeen = true;
+    index++;
+    while (index < tokens.length) {
+      const token = tokens[index]!;
+      if (ENV_ASSIGNMENT_RE.test(token)) { assignments.push(token); index++; continue; }
+      if (token === "--") { index++; break; }
+      if (!token.startsWith("-")) break;
+      const option = envOption(token);
+      if (!option.known) return incompleteEnvNormalization();
+      if (option.splitPayload !== undefined) {
+        let payload = option.splitPayload;
+        if (!option.attached) {
+          if (++index >= tokens.length) return incompleteEnvNormalization();
+          payload = tokens[index]!;
+        }
+        if (payload.length > ENV_MAX_CHARS) return incompleteEnvNormalization();
+        const parsed = shellArguments(payload);
+        if (!parsed.complete || parsed.args.some((argument) => argument.dynamic)) return incompleteEnvNormalization();
+        const composed = parsed.args.map((argument) => argument.value).concat(tokens.slice(index + 1));
+        if (composed.length > ENV_MAX_ARGV || composed.join(" ").length > ENV_MAX_CHARS) return incompleteEnvNormalization();
+        const nested = normalizeEnvInvocation(composed, depth + 1, assignments);
+        return { ...nested, envSeen: true };
+      }
+      if (option.takesArgument && !option.attached) {
+        if (++index >= tokens.length) return incompleteEnvNormalization();
+      }
+      index++;
+    }
+    consumeAssignments();
+    if (index >= tokens.length) return { argv: [], assignments, envSeen, complete: true };
+  }
+  return { argv: [], assignments, envSeen, complete: true };
+}
+
+export function effectiveHead(segment: string): string | null {
+  const normalized = normalizeEnvInvocation(shellWords(segment));
+  if (!normalized.complete || normalized.argv.length === 0) return null;
+  const base = normalized.argv[0]!.replace(/^.*\//, "");
+  return base || null;
+}
+
 /**
  * Inspect only the prefix that launches Git. Assignment-looking text in Git
  * arguments (especially after `--`) is data and must not trigger this check.
- * Wrapper option values are skipped with the same grammar as
- * `effectiveHeadIndex`, including nested `env`/`command` forms.
+ * Assignments are supplied by the bounded env normalizer, including nested
+ * `env`/`command` forms.
  */
-function gitEnvironmentPrefixMutation(tokens: string[], gitIndex: number): string | null {
-  let wrapper: string | null = null;
-  for (let i = 0; i < gitIndex; i++) {
-    const token = tokens[i]!;
+function gitEnvironmentPrefixMutation(assignments: string[]): string | null {
+  for (const token of assignments) {
     const assignment = ENV_ASSIGNMENT_RE.exec(token);
-    if (assignment) {
-      const name = assignment[1]!;
-      if (GIT_COMMAND_ENV_NAME_RE.test(name)) return name;
-      if (name.startsWith("GIT_CONFIG_KEY_") || name.startsWith("GIT_CONFIG_VALUE_")) return name;
-      continue;
-    }
-    const base = token.replace(/^.*\//, "");
-    if (WRAPPERS.has(base)) {
-      wrapper = base;
-      continue;
-    }
-    if (wrapper && token === "--") {
-      wrapper = null;
-      continue;
-    }
-    if (wrapper === "env") {
-      const option = envOption(token);
-      if (option.takesArgument) {
-        if (!option.attached) i++;
-        continue;
-      }
-    }
-    if (wrapper && token.startsWith("-")) {
-      const optionSet = WRAPPER_OPTIONS_WITH_VALUE[wrapper];
-      if (optionSet?.has(token) && i + 1 < tokens.length && !wrapperOptionHasAttachedValue(wrapper, token)) i++;
-      continue;
-    }
+    if (!assignment) continue;
+    const name = assignment[1]!;
+    if (GIT_COMMAND_ENV_NAME_RE.test(name)) return name;
+    if (name.startsWith("GIT_CONFIG_KEY_") || name.startsWith("GIT_CONFIG_VALUE_")) return name;
   }
   return null;
 }
-
-/** A malformed assignment-like token before Git is ambiguous command syntax. */
-function hasAmbiguousGitEnvironmentPrefix(tokens: string[], gitIndex: number): boolean {
-  if (!tokens[gitIndex]!.includes("=")) return false;
-  for (let i = gitIndex + 1; i < tokens.length; i++) {
-    const token = tokens[i]!;
-    if (ENV_ASSIGNMENT_RE.test(token) || token.includes("=")) continue;
-    const base = token.replace(/^.*\//, "");
-    if (WRAPPERS.has(base) || token.startsWith("-")) continue;
-    return base === "git";
-  }
-  return false;
-}
-
 /**
  * Split a command into shell words for Git's option/verb inspection. This is
  * intentionally narrower than a shell parser: quotes and escapes are kept
@@ -2037,112 +2056,43 @@ function shellEvalPayload(segment: string): ShellEvalPayload | null {
   const parsed = shellArguments(segment);
   if (!parsed.complete) return null;
   const tokens = parsed.args.map((arg) => arg.value);
-  const split = envSplitStringPayload(tokens);
-  if (split.ambiguous) return { payload: null, ambiguous: true };
-  if (split.command !== null) return shellEvalPayload(split.command);
-  const index = effectiveHeadIndex(tokens);
-  if (index === null) return null;
-  const head = tokens[index]!.replace(/^.*\//, "");
+  const normalized = normalizeEnvInvocation(tokens);
+  if (!normalized.complete) return { payload: null, ambiguous: true };
+  if (normalized.argv.length === 0) return null;
+  const index = 0;
+  const head = normalized.argv[index]!.replace(/^.*\//, "");
   if (!EVAL_SHELLS.has(head)) return null;
 
-  for (let i = index + 1; i < tokens.length; i++) {
-    const token = tokens[i]!;
+  const rawHeadIndex = tokens.findIndex((token) => token.replace(/^.*\//, "") === head);
+  if (rawHeadIndex >= 0) {
+    for (let i = rawHeadIndex + 1; i < tokens.length; i++) {
+      const token = tokens[i]!;
+      if (token === "--") break;
+      if (token !== "-c" && !/^-[-\w]*c[^-]*$/.test(token)) continue;
+      const argument = parsed.args[i + 1];
+      if (!argument || argument.dynamic) return { payload: null, ambiguous: true };
+      if (argument.value.length > MAX_LANGUAGE_ARGUMENT_LENGTH) return { payload: null, ambiguous: true };
+      return { payload: argument.value, ambiguous: false };
+    }
+    return null;
+  }
+
+  for (let i = index + 1; i < normalized.argv.length; i++) {
+    const token = normalized.argv[i]!;
     if (token === "--") break;
     if (token !== "-c" && !/^-[^-]*c[^-]*$/.test(token)) continue;
-    const argument = parsed.args[i + 1];
-    if (!argument || argument.dynamic) return { payload: null, ambiguous: true };
-    if (argument.value.length > MAX_LANGUAGE_ARGUMENT_LENGTH) return { payload: null, ambiguous: true };
-    return { payload: argument.value, ambiguous: false };
+    const argument = normalized.argv[i + 1];
+    if (!argument || /[$`]/.test(argument)) return { payload: null, ambiguous: true };
+    if (argument.length > MAX_LANGUAGE_ARGUMENT_LENGTH) return { payload: null, ambiguous: true };
+    return { payload: argument, ambiguous: false };
   }
   return null;
 }
 
 /** Return a command-bearing assignment inherited by a shell `-c` payload. */
 function shellEnvironmentPrefixMutation(segment: string): string | null {
-  const tokens = shellWords(segment);
-  const index = effectiveHeadIndex(tokens);
-  return index === null ? null : gitEnvironmentPrefixMutation(tokens, index);
-}
-
-interface EnvSplitStringResult {
-  command: string | null;
-  ambiguous: boolean;
-}
-
-const ENV_OPTIONS_WITHOUT_ARGUMENT = new Set(["-i", "--ignore-environment", "-0", "--null", "-v", "--debug"]);
-
-function quoteShellWord(word: string): string {
-  if (/^[A-Za-z0-9_./:@%+,=-]+$/.test(word)) return word;
-  return `"${word.replace(/[\\$`"]|\n/g, (character) => `\\${character}`)}"`;
-}
-
-/** Return the command composed from env's split-string words and utility argv. */
-function envSplitStringPayload(tokens: string[]): EnvSplitStringResult {
-  let envSeen = false;
-  for (let i = 0; i < tokens.length; i++) {
-    const token = tokens[i]!;
-    const base = token.replace(/^.*\//, "");
-    if (!envSeen) {
-      if (base === "env") envSeen = true;
-      continue;
-    }
-    if (token === "--") return { command: null, ambiguous: false };
-    const option = envOption(token);
-    if (option.splitPayload !== undefined) {
-      let payload = option.splitPayload;
-      if (!option.attached) {
-        if (i + 1 >= tokens.length) return { command: null, ambiguous: true };
-        payload = tokens[++i]!;
-      }
-      const parsed = shellArguments(payload);
-      if (!parsed.complete || parsed.args.some((argument) => argument.dynamic)) {
-        return { command: null, ambiguous: true };
-      }
-      const merged = parsed.args.map((argument) => argument.value).concat(tokens.slice(i + 1));
-      const assignments: string[] = [];
-      let commandIndex = 0;
-      for (; commandIndex < merged.length; commandIndex++) {
-        const mergedToken = merged[commandIndex]!;
-        if (mergedToken === "--") {
-          commandIndex++;
-          break;
-        }
-        if (ENV_ASSIGNMENT_RE.test(mergedToken)) {
-          assignments.push(mergedToken);
-          continue;
-        }
-        const mergedOption = envOption(mergedToken);
-        if (mergedOption.splitPayload !== undefined) return { command: null, ambiguous: true };
-        if (mergedOption.takesArgument) {
-          if (!mergedOption.attached) commandIndex++;
-          if (commandIndex >= merged.length) return { command: null, ambiguous: true };
-          continue;
-        }
-        if (mergedToken.startsWith("-")) {
-          if (!ENV_OPTIONS_WITHOUT_ARGUMENT.has(mergedToken)) return { command: null, ambiguous: true };
-          continue;
-        }
-        break;
-      }
-      if (commandIndex >= merged.length) return { command: null, ambiguous: false };
-      return {
-        command: assignments.concat(merged.slice(commandIndex)).map(quoteShellWord).join(" "),
-        ambiguous: false,
-      };
-    }
-    if (option.takesArgument) {
-      if (!option.attached) {
-        if (i + 1 >= tokens.length) return { command: null, ambiguous: true };
-        i++;
-      }
-      continue;
-    }
-    if (ENV_ASSIGNMENT_RE.test(token)) continue;
-    if (ENV_OPTIONS_WITHOUT_ARGUMENT.has(token)) continue;
-    if (token.startsWith("-")) continue;
-    return { command: null, ambiguous: false };
-  }
-  return { command: null, ambiguous: false };
+  const normalized = normalizeEnvInvocation(shellWords(segment));
+  return normalized.complete ? gitEnvironmentPrefixMutation(normalized.assignments) : null;
 }
 
 function gitReadOnlySubformOption(
@@ -2246,23 +2196,18 @@ function gitReadOnlyOptionMutation(tokens: string[], start: number): string | nu
  */
 function findGitMutationToken(segment: string): string | null {
   const tokens = shellWords(segment);
-  const split = envSplitStringPayload(tokens);
-  if (split.ambiguous) return "ambiguous env split-string";
-  if (split.command !== null) return findGitMutationToken(split.command);
-  const index = effectiveHeadIndex(tokens);
-  if (index === null) return null;
-
-  const gitIndex = index;
-  if (tokens[gitIndex]!.replace(/^.*\//, "") !== "git") {
-    return hasAmbiguousGitEnvironmentPrefix(tokens, gitIndex) ? "ambiguous environment assignment" : null;
-  }
-  const environmentMutation = gitEnvironmentPrefixMutation(tokens, gitIndex);
+  const normalized = normalizeEnvInvocation(tokens);
+  if (!normalized.complete) return "ambiguous env invocation";
+  if (normalized.argv.length === 0) return null;
+  const gitIndex = 0;
+  if (normalized.argv[gitIndex]!.replace(/^.*\//, "") !== "git") return null;
+  const environmentMutation = gitEnvironmentPrefixMutation(normalized.assignments);
   if (environmentMutation) return environmentMutation;
 
   let verbIndex = gitIndex + 1;
   let readOnlyGlobalQuery = false;
-  while (verbIndex < tokens.length) {
-    const option = tokens[verbIndex]!;
+  while (verbIndex < normalized.argv.length) {
+    const option = normalized.argv[verbIndex]!;
     if (option === "--") {
       verbIndex++;
       break;
@@ -2270,7 +2215,7 @@ function findGitMutationToken(segment: string): string | null {
     if (option === "-p" || option === "--paginate") return `git ${option}`;
     if (GIT_GLOBAL_OPTIONS_WITH_VALUE.has(option)) {
       if (option === "-c" || option === "--config-env") {
-        const config = gitConfigOptionMutation(tokens, verbIndex);
+        const config = gitConfigOptionMutation(normalized.argv, verbIndex);
         if (config.token) return `git ${config.token}`;
         verbIndex += 2;
       } else {
@@ -2279,7 +2224,7 @@ function findGitMutationToken(segment: string): string | null {
       continue;
     }
     if (option.startsWith("--config-env=") || (option.startsWith("-c") && option.length > 2)) {
-      const config = gitConfigOptionMutation(tokens, verbIndex);
+      const config = gitConfigOptionMutation(normalized.argv, verbIndex);
       if (config.token) return `git ${config.token}`;
       verbIndex++;
       continue;
@@ -2301,7 +2246,7 @@ function findGitMutationToken(segment: string): string | null {
     }
     if (option === "--exec-path") {
       readOnlyGlobalQuery = true;
-      const value = tokens[verbIndex + 1];
+      const value = normalized.argv[verbIndex + 1];
       // Git's exec-path argument is optional. Consume only an unmistakable
       // path so a mutating-looking token such as `add` cannot disappear as a
       // purported option value.
@@ -2317,13 +2262,13 @@ function findGitMutationToken(segment: string): string | null {
     break;
   }
 
-  const verb = tokens[verbIndex];
+  const verb = normalized.argv[verbIndex];
   if (!verb) return readOnlyGlobalQuery ? null : "git";
   if (READ_ONLY_GIT_VERBS.has(verb)) {
-    const optionMutation = gitReadOnlyOptionMutation(tokens, verbIndex + 1);
+    const optionMutation = gitReadOnlyOptionMutation(normalized.argv, verbIndex + 1);
     return optionMutation ? `git ${optionMutation}` : null;
   }
-  if (isGitReadOnlySubform(tokens, verbIndex)) return null;
+  if (isGitReadOnlySubform(normalized.argv, verbIndex)) return null;
   return `git ${verb}`;
 }
 
@@ -2366,8 +2311,8 @@ function findInterpreterWriter(head: string, segment: string): string | null {
  */
 function findDestructiveTokenInternal(cmd: string, depth: number): string | null {
   if (depth >= 32) return "complex shell syntax";
-  const split = envSplitStringPayload(shellWords(cmd));
-  if (split.ambiguous) return "ambiguous env split-string";
+  const normalized = normalizeEnvInvocation(shellWords(cmd));
+  if (!normalized.complete) return "ambiguous env invocation";
   // Avoid sending oversized interpreter payloads through the recursive shell
   // inspection machinery. They cannot be parsed within the language-call
   // budget, so fail closed before any potentially quadratic traversal.
