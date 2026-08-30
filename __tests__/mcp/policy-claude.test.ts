@@ -220,6 +220,7 @@ describe("Claude wrapper policy — time option arguments", () => {
     "time --format %E curl https://example.invalid",
     "time -o timing.log curl https://example.invalid",
     "time --output timing.log curl https://example.invalid",
+    "time -ao timing.log curl https://example.invalid",
   ])("matches the inner command after time options: %s", (command) => {
     const check = createClaudePolicyChecker([{ pattern: "curl *", action: "deny" }]);
     expect(check(command)).toBe("curl *");

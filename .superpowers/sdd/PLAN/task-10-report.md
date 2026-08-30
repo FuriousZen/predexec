@@ -220,3 +220,52 @@ tests**:
 The packed-install smoke checks passed with the rebuilt production artifacts,
 and `git diff --check` passed. No ledger edit, dependency change, version bump,
 publish, push, merge, or release artifact staging was performed.
+
+## Integration fix round 3 — Important mutation and wrapper bypasses
+
+This round started from `a193f96`. Scoped review identified three related
+Important bypasses: time-output detection stopped at options belonging to a
+preceding `env`/`nice` wrapper, clustered GNU `time` flags such as `-ao` were
+not interpreted, and a parenthesized command group hid its executable body
+from the classifier.
+
+### RED evidence
+
+Before changing production code, the new regressions were run with:
+
+```text
+./node_modules/.bin/vitest run __tests__/core/destructive.test.ts __tests__/core/engine.test.ts __tests__/command-inspection.test.ts __tests__/mcp/policy-claude.test.ts __tests__/mcp/policy-codex.test.ts
+```
+
+Result: exit 1; **13 tests failed, 360 passed**. The failures covered
+`env -u X /usr/bin/time -o`, `nice -n 5 /usr/bin/time -o`, clustered `-ao`
+inspection and policy matching, parenthesized `/usr/bin/time` and `git add`
+groups, and the corresponding engine no-file-creation cases.
+
+### GREEN implementation and regressions
+
+- `timeOutputOption` now walks the full leading wrapper chain using each
+  wrapper's option/value grammar before resolving the wrapped command. This
+  covers `env -u`, `nice -n`, absolute time paths, and output options after
+  those wrappers.
+- Shared command inspection recognizes argument-taking short options inside
+  GNU-style clusters, so `time -ao timing.log curl ...` skips the output path
+  and reaches the inner command for Claude/Codex policy matching.
+- The destructive classifier recursively inspects quote-aware parenthesized
+  groups while excluding arithmetic `(( ... ))` and quoted literal
+  parentheses. Grouped `time -o`, `cp`, and `git add` commands now hard-stop.
+- Safe `time -p`, format-only `-f/--format`, append-only options, and quoted
+  literal parentheses remain non-mutating.
+
+The focused mutation/engine/command-inspection/Claude/Codex policy suite passed
+**373/373 tests**. `./node_modules/.bin/tsc --noEmit` passed and
+`pnpm run build` succeeded. The full suite passed **779/779 tests**. Release
+verification passed **9/9 tests**:
+
+```text
+./node_modules/.bin/vitest run __tests__/release-hygiene.test.ts __tests__/pack.test.ts
+```
+
+The packed-install smoke checks passed with rebuilt artifacts and
+`git diff --check` passed. No ledger edit, dependency change, version bump,
+publish, push, merge, or release artifact staging was performed.

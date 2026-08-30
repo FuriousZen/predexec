@@ -368,6 +368,7 @@ describe("createCodexPolicyChecker — leading env-assignment / wrapper bypass (
     "time --format %E curl https://example.invalid",
     "time -o timing.log curl https://example.invalid",
     "time --output timing.log curl https://example.invalid",
+    "time -ao timing.log curl https://example.invalid",
   ])("matches the inner command after time options: %s", (command) => {
     const check = createCodexPolicyChecker([{ pattern: ["curl"], decision: "forbidden" }], []);
     expect(check(command)).toBe("curl");

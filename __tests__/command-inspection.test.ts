@@ -43,6 +43,8 @@ describe("command inspection mechanics", () => {
     "time --format %E curl https://example.invalid",
     "time -o timing.log curl https://example.invalid",
     "time --output timing.log curl https://example.invalid",
+    "time -ao timing.log curl https://example.invalid",
+    "time -af %E curl https://example.invalid",
   ])("skips time wrapper option arguments before the inner command: %s", (command) => {
     const options = {
       optionArguments: new Map([["time", new Set(["-f", "--format", "-o", "--output"])]]),

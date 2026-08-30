@@ -285,10 +285,13 @@ describe("mutation classifier — wrapper options and command separators", () =>
     "time --output timing.log printf hi",
     "time -ofile printf hi",
     "time --output=file printf hi",
+    "env -u X /usr/bin/time -o timing.log printf hi",
+    "nice -n 5 /usr/bin/time -o timing.log printf hi",
     "env time -o timing.log printf hi",
     "env time --output=file printf hi",
     "time -a -o timing.log printf hi",
     "time -a --output timing.log printf hi",
+    "time -ao timing.log printf hi",
   ])("blocks time output files before resolving the inner command: %s", (command) => {
     expect(findDestructiveToken(command)).not.toBeNull();
   });
@@ -299,6 +302,21 @@ describe("mutation classifier — wrapper options and command separators", () =>
     "time --format %E printf hi",
     "env time -p printf hi",
   ])("keeps non-output time wrappers safe: %s", (command) => {
+    expect(findDestructiveToken(command)).toBeNull();
+  });
+
+  it.each([
+    "( /usr/bin/time -o timing.log printf hi )",
+    "( cp source.txt destination.txt )",
+    "( git add file.txt )",
+  ])("inspects commands inside a parenthesized group: %s", (command) => {
+    expect(findDestructiveToken(command)).not.toBeNull();
+  });
+
+  it.each([
+    "( time -p printf hi )",
+    "printf '( /usr/bin/time -o timing.log printf hi )'",
+  ])("does not treat safe or quoted parentheses as mutations: %s", (command) => {
     expect(findDestructiveToken(command)).toBeNull();
   });
 });

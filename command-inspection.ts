@@ -133,6 +133,13 @@ function optionArgument(
     if (name.startsWith("--") && token.startsWith(`${name}=`)) {
       return { takesArgument: true, attached: true };
     }
+    if (!name.startsWith("--") && token.startsWith("-") && !token.startsWith("--")) {
+      const short = name.slice(1);
+      const position = token.indexOf(short, 1);
+      if (position !== -1) {
+        return { takesArgument: true, attached: position < token.length - 1 };
+      }
+    }
     if (!name.startsWith("--") && token.startsWith(name) && token.length > name.length) {
       return { takesArgument: true, attached: true };
     }

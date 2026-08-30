@@ -144,7 +144,11 @@ describe("runPlanTree — traversal & stop reasons", () => {
     "time --output timing.log printf hi",
     "time -ofile printf hi",
     "time --output=file printf hi",
+    "env -u X /usr/bin/time -o timing.log printf hi",
+    "nice -n 5 /usr/bin/time -o timing.log printf hi",
     "env time -o timing.log printf hi",
+    "time -ao timing.log printf hi",
+    "( /usr/bin/time -o timing.log printf hi )",
   ])("mutationStop: %s stops before runNode creates the timing file", async (command) => {
     const dir = mkdtempSync(join(tmpdir(), "predexec-time-"));
     try {

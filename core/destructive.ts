@@ -275,18 +275,76 @@ function timeOutputOption(segment: string): string | null {
       continue;
     }
     if (wrapper === "time") {
-      if (token === "-o" || token === "--output" || token.startsWith("-o") && token.length > 2 || token.startsWith("--output=")) {
+      const isOutput = token === "-o" || token === "--output" || token.startsWith("-o") && token.length > 2 ||
+        token.startsWith("--output=") || (token.startsWith("-") && !token.startsWith("--") && token.slice(1).includes("o"));
+      if (isOutput) {
         return token;
       }
-      if (token.startsWith("-")) {
-        const optionSet = WRAPPER_OPTIONS_WITH_VALUE.time;
-        if (optionSet?.has(token) && i + 1 < tokens.length && !wrapperOptionHasAttachedValue("time", token)) i++;
-        continue;
-      }
+    }
+    if (token.startsWith("-")) {
+      const optionSet = WRAPPER_OPTIONS_WITH_VALUE[wrapper];
+      if (optionSet?.has(token) && i + 1 < tokens.length && !wrapperOptionHasAttachedValue(wrapper, token)) i++;
+      continue;
     }
     return null;
   }
   return null;
+}
+
+/** Extract unquoted parenthesized command groups for recursive inspection. */
+function parenthesizedGroups(command: string): string[] {
+  const groups: string[] = [];
+  let quote: "'" | '"' | null = null;
+  for (let i = 0; i < command.length; i++) {
+    const ch = command[i]!;
+    if (ch === "\\") {
+      i++;
+      continue;
+    }
+    if (quote) {
+      if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      quote = ch;
+      continue;
+    }
+    if (ch !== "(") continue;
+    // `(( ... ))` is arithmetic syntax, not a command group. Continue scanning
+    // after its opening pair so command substitutions nested inside it remain
+    // visible to the existing opaque-substitution defense.
+    if (command[i + 1] === "(") {
+      i++;
+      continue;
+    }
+    let depth = 1;
+    let innerQuote: "'" | '"' | null = null;
+    for (let j = i + 1; j < command.length; j++) {
+      const inner = command[j]!;
+      if (inner === "\\") {
+        j++;
+        continue;
+      }
+      if (innerQuote) {
+        if (inner === innerQuote) innerQuote = null;
+        continue;
+      }
+      if (inner === "'" || inner === '"') {
+        innerQuote = inner;
+        continue;
+      }
+      if (inner === "(") depth++;
+      else if (inner === ")") {
+        depth--;
+        if (depth === 0) {
+          groups.push(command.slice(i + 1, j));
+          i = j;
+          break;
+        }
+      }
+    }
+  }
+  return groups;
 }
 
 /**
@@ -494,6 +552,14 @@ export function findDestructiveToken(cmd: string): string | null {
   if (redirect) return redirect[0].trim() || ">";
 
   const segments = splitCommandSegments(cmd);
+
+  // Parenthesized groups execute their contents even though the outer shell
+  // segment starts with `(`. Inspect each group recursively, while the
+  // quote-aware extractor leaves literal parentheses untouched.
+  for (const group of parenthesizedGroups(cmd)) {
+    const nested = findDestructiveToken(group);
+    if (nested) return nested;
+  }
 
   // Check output-bearing `time` options before resolving the wrapped command's
   // head. The output file is a mutation even when the inner command is a pure
