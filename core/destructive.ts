@@ -194,6 +194,20 @@ const GIT_READ_ONLY_GLOBAL_OPTIONS = new Set([
 /** Git configuration keys whose values can invoke a process while reading. */
 const GIT_COMMAND_CONFIG_KEY_RE = /^(?:core\.pager(?:\..*)?|pager(?:\..*)?|core\.fsmonitor|diff\..*(?:external|textconv)|diff\..+\.command|filter(?:\..*)?|core\.(?:sshcommand|gitproxy)|credential\.helper(?:\..*)?)$/i;
 
+/**
+ * Environment variables that can make an otherwise read-only Git invocation
+ * execute caller-controlled programs. Git reads these before dispatching the
+ * verb, so they belong to the invocation prefix rather than the argument
+ * data. Config-file selectors are included because the selected config can
+ * install any of the command-bearing settings above.
+ */
+const GIT_COMMAND_ENV_NAME_RE = new RegExp(
+  "^(?:GIT_EXTERNAL_DIFF|GIT_CONFIG(?:_PARAMETERS|_(?:GLOBAL|SYSTEM))?|" +
+  "GIT_CONFIG_(?:COUNT|KEY_|VALUE_)[A-Za-z0-9_]*|(?:GIT_)?PAGER|" +
+  "GIT_(?:SSH|SSH_COMMAND|EDITOR|SEQUENCE_EDITOR|ASKPASS|PROXY_COMMAND|EXEC_PATH|DIFF_TOOL|MERGE_TOOL))$",
+  "i",
+);
+
 /** Shell builtins that evaluate or replace command text rather than reading it. */
 const SHELL_COMMAND_CONTROL_HEADS = new Set(["eval", "source", ".", "exec"]);
 
@@ -1825,6 +1839,63 @@ export function effectiveHead(segment: string): string | null {
   return base || null;
 }
 
+const ENV_ASSIGNMENT_RE = /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/s;
+
+/**
+ * Inspect only the prefix that launches Git. Assignment-looking text in Git
+ * arguments (especially after `--`) is data and must not trigger this check.
+ * Wrapper option values are skipped with the same grammar as
+ * `effectiveHeadIndex`, including nested `env`/`command` forms.
+ */
+function gitEnvironmentPrefixMutation(tokens: string[], gitIndex: number): string | null {
+  let wrapper: string | null = null;
+  for (let i = 0; i < gitIndex; i++) {
+    const token = tokens[i]!;
+    const assignment = ENV_ASSIGNMENT_RE.exec(token);
+    if (assignment) {
+      const name = assignment[1]!;
+      if (GIT_COMMAND_ENV_NAME_RE.test(name)) return name;
+      if (name.startsWith("GIT_CONFIG_KEY_") || name.startsWith("GIT_CONFIG_VALUE_")) return name;
+      continue;
+    }
+    const base = token.replace(/^.*\//, "");
+    if (WRAPPERS.has(base)) {
+      wrapper = base;
+      continue;
+    }
+    if (wrapper && token === "--") {
+      wrapper = null;
+      continue;
+    }
+    if (wrapper === "env") {
+      const option = envOption(token);
+      if (option.takesArgument) {
+        if (!option.attached) i++;
+        continue;
+      }
+    }
+    if (wrapper && token.startsWith("-")) {
+      const optionSet = WRAPPER_OPTIONS_WITH_VALUE[wrapper];
+      if (optionSet?.has(token) && i + 1 < tokens.length && !wrapperOptionHasAttachedValue(wrapper, token)) i++;
+      continue;
+    }
+  }
+  return null;
+}
+
+/** A malformed assignment-like token before Git is ambiguous command syntax. */
+function hasAmbiguousGitEnvironmentPrefix(tokens: string[], gitIndex: number): boolean {
+  if (!tokens[gitIndex]!.includes("=")) return false;
+  for (let i = gitIndex + 1; i < tokens.length; i++) {
+    const token = tokens[i]!;
+    if (ENV_ASSIGNMENT_RE.test(token) || token.includes("=")) continue;
+    const base = token.replace(/^.*\//, "");
+    if (WRAPPERS.has(base) || token.startsWith("-")) continue;
+    return base === "git";
+  }
+  return false;
+}
+
 /**
  * Split a command into shell words for Git's option/verb inspection. This is
  * intentionally narrower than a shell parser: quotes and escapes are kept
@@ -1835,8 +1906,11 @@ function shellWords(command: string): string[] {
   let current = "";
   let quote: "'" | '"' | null = null;
   let escaped = false;
+  let substitutionDepth = 0;
+  let backtickDepth = 0;
 
-  for (const ch of command) {
+  for (let i = 0; i < command.length; i++) {
+    const ch = command[i]!;
     if (escaped) {
       // In a double-quoted shell word, backslash only quotes $, `, ", \,
       // and newline. Preserve it for PHP namespaces and Perl single-quoted
@@ -1857,6 +1931,19 @@ function shellWords(command: string): string[] {
     }
     if (ch === "'" || ch === '"') {
       quote = ch;
+    } else if (ch === "$" && command[i + 1] === "(") {
+      current += "$(";
+      substitutionDepth++;
+      i++;
+    } else if (ch === "`") {
+      current += ch;
+      backtickDepth = backtickDepth === 0 ? 1 : 0;
+    } else if (substitutionDepth > 0 || backtickDepth > 0) {
+      if (substitutionDepth > 0) {
+        if (ch === "(") substitutionDepth++;
+        else if (ch === ")") substitutionDepth--;
+      }
+      current += ch;
     } else if (/\s/.test(ch)) {
       if (current) {
         words.push(current);
@@ -1969,6 +2056,13 @@ function shellEvalPayload(segment: string): ShellEvalPayload | null {
     return { payload: argument.value, ambiguous: false };
   }
   return null;
+}
+
+/** Return a command-bearing assignment inherited by a shell `-c` payload. */
+function shellEnvironmentPrefixMutation(segment: string): string | null {
+  const tokens = shellWords(segment);
+  const index = effectiveHeadIndex(tokens);
+  return index === null ? null : gitEnvironmentPrefixMutation(tokens, index);
 }
 
 /** Return the command string consumed by env's `-S`/`--split-string` option. */
@@ -2102,7 +2196,11 @@ function findGitMutationToken(segment: string): string | null {
   }
 
   const gitIndex = index;
-  if (tokens[gitIndex]!.replace(/^.*\//, "") !== "git") return null;
+  if (tokens[gitIndex]!.replace(/^.*\//, "") !== "git") {
+    return hasAmbiguousGitEnvironmentPrefix(tokens, gitIndex) ? "ambiguous environment assignment" : null;
+  }
+  const environmentMutation = gitEnvironmentPrefixMutation(tokens, gitIndex);
+  if (environmentMutation) return environmentMutation;
 
   let verbIndex = gitIndex + 1;
   let readOnlyGlobalQuery = false;
@@ -2319,6 +2417,14 @@ function findDestructiveTokenInternal(cmd: string, depth: number): string | null
     if (!shell) continue;
     if (shell.ambiguous) return "shell eval payload";
     if (shell.payload !== null) {
+      const inheritedEnvironmentMutation = shellEnvironmentPrefixMutation(segment);
+      if (inheritedEnvironmentMutation) {
+        const clauses = extractShellCommandClauses(shell.payload);
+        for (const clause of clauses.length > 0 ? clauses : [shell.payload]) {
+          const inherited = findGitMutationToken(`${inheritedEnvironmentMutation}=1 ${clause}`);
+          if (inherited) return inheritedEnvironmentMutation;
+        }
+      }
       const nested = findDestructiveTokenInternal(shell.payload, depth + 1);
       if (nested) return `shell ${nested}`;
       readOnlyShellSegments.add(i);

@@ -1313,6 +1313,62 @@ describe("mutation classifier — wrapper options and command separators", () =>
   });
 });
 
+describe("mutation classifier — Git command-bearing environment prefixes", () => {
+  it.each([
+    "GIT_EXTERNAL_DIFF=./diff-hook git diff",
+    "GIT_CONFIG_PARAMETERS='core.pager=./pager-hook' git status",
+    "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=diff.external GIT_CONFIG_VALUE_0=./diff-hook git diff",
+    "GIT_PAGER=./pager-hook git log",
+    "PAGER=./pager-hook git log",
+    "GIT_SSH=./ssh-wrapper git fetch",
+    "GIT_SSH_COMMAND='./ssh-wrapper' git status",
+    "GIT_EDITOR=./editor-hook git status",
+    "GIT_SEQUENCE_EDITOR=./editor-hook git status",
+    "GIT_ASKPASS=./askpass-hook git status",
+    "GIT_PROXY_COMMAND=./proxy-hook git status",
+    "GIT_EXEC_PATH=./git-core git diff",
+    "env GIT_EXTERNAL_DIFF=./diff-hook git diff",
+    "env -i GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.pager GIT_CONFIG_VALUE_0=./pager-hook git status",
+    "env -- GIT_SSH_COMMAND='./ssh-wrapper' git log",
+    "command GIT_PAGER=./pager-hook git show HEAD:README.md",
+    "/usr/bin/command /usr/bin/env GIT_EXTERNAL_DIFF=./diff-hook /usr/bin/git diff",
+  ])("blocks command-bearing Git environment prefix: %s", (command) => {
+    expect(findDestructiveToken(command)).not.toBeNull();
+  });
+
+  it.each([
+    "FOO='rm -rf' git status",
+    "GIT_DIR=/tmp/repo/.git git status",
+    "GIT_WORK_TREE=/tmp/repo git diff",
+    "env GIT_DIR=/tmp/repo/.git GIT_WORK_TREE=/tmp/repo git status",
+    "env -u GIT_CONFIG_NOSYSTEM git log -5",
+    "git diff -- GIT_EXTERNAL_DIFF=./not-a-prefix",
+    "echo 'GIT_EXTERNAL_DIFF=./diff-hook git diff'",
+    "grep 'GIT_CONFIG_PARAMETERS=core.pager=./hook' notes.txt",
+  ])("allows safe Git environment near-miss: %s", (command) => {
+    expect(findDestructiveToken(command)).toBeNull();
+  });
+
+  it.each([
+    "GIT_EXTERNAL_DIFF=$DIFF_HOOK git diff",
+    "GIT_CONFIG_KEY_$N=diff.external git status",
+    "env GIT_PAGER=$(printf ./pager-hook) git log",
+    "GIT_PAGER=`printf ./pager-hook` git log",
+  ])("fails closed for ambiguous command-bearing environment syntax: %s", (command) => {
+    expect(findDestructiveToken(command)).not.toBeNull();
+  });
+
+  it.each([
+    "bash -c 'GIT_EXTERNAL_DIFF=./diff-hook git diff'",
+    "sh -c 'env GIT_CONFIG_PARAMETERS=\"core.pager=./pager-hook\" git status'",
+    "echo \"$(GIT_SSH_COMMAND='./ssh-wrapper' git log)\"",
+    "GIT_EXTERNAL_DIFF=./diff-hook bash -c 'git diff'",
+    "env GIT_PAGER=./pager-hook sh -c 'git status'",
+  ])("checks command-bearing environment prefixes in recursive shell code: %s", (command) => {
+    expect(findDestructiveToken(command)).not.toBeNull();
+  });
+});
+
 describe("isDestructiveCommand — bypasses found in the 2026-08 audit", () => {
   // Each of these returned null before the fix. Grouped by the tier that failed.
   const bypasses: Record<string, string[]> = {
