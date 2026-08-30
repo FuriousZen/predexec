@@ -1451,3 +1451,76 @@ as eval extraction, so quoted payload extraction and wrapper behavior remain
 aligned. Changes are limited to `core/destructive.ts`, focused destructive and
 engine regressions, and this report. No ledger, release metadata, dependency,
 version, dist, publish, push, merge, or harness operation changed.
+
+## Extended integration fix round 20 — wrapped attached evals and bounded substitution scans
+
+This user-authorized extension starts from the round-19 verification commit
+`04bbc65`. It closes two Important review findings: attached Ruby/Perl eval
+writers were not extracted when the interpreter was behind `env`/`command` or
+inside a compound clause, and unmatched executable substitutions/backticks
+could cause repeated suffix rescans. No dependency, release metadata, version,
+publish, push, merge, or release-artifact staging changed.
+
+### RED evidence
+
+Before production changes, the focused regressions failed as expected:
+
+```text
+./node_modules/.bin/vitest run __tests__/core/destructive.test.ts __tests__/command-inspection.test.ts --testTimeout=10000
+```
+
+Result: exit 1; **14 tests failed, 578 passed**. The failures reproduced
+wrapped `env`/`command` Ruby and Perl attached writers, compound forms, loss
+of safe language-string quoting through control-clause extraction, and the
+unmatched-delimiter regression case.
+
+### GREEN implementation
+
+- `interpreterEvalPayload` now resolves the effective head before locating an
+  eval flag or attached Ruby/Perl `-e` token. `env` split-string payloads and
+  path-qualified interpreters therefore share the same attached-program
+  extraction and language scanner as direct invocations. Word scanning strips
+  shell control prefixes while retaining the original argument quoting, so
+  safe strings such as `if command perl -eprint("unlink('x')")` remain data.
+- Shell clause extraction removes reserved prefixes from the original source
+  span rather than rebuilding it from quote-erased tokens. This preserves
+  host-language string boundaries for recursive classifier calls while keeping
+  existing clause ordering and wrapper policy behavior intact.
+- `substitutionBodySpans` returns immediately when an executable `$(...)` or
+  backtick delimiter has no close. Complete bodies already found remain
+  available, but no later unmatched delimiter can rescan the same suffix.
+  Bounded non-timing regressions cover repeated unmatched substitutions and
+  backticks.
+
+### GREEN verification and safety checks
+
+```text
+./node_modules/.bin/vitest run __tests__/core/destructive.test.ts __tests__/command-inspection.test.ts --testTimeout=10000
+```
+
+Result: exit 0; **2 files, 592 tests passed**.
+
+```text
+./node_modules/.bin/tsc --noEmit
+./node_modules/.bin/vitest run __tests__/core __tests__/command-inspection.test.ts --testTimeout=10000
+./node_modules/.bin/vitest run --testTimeout=10000
+git diff --check
+```
+
+All commands passed. Typecheck succeeded; the core plus command-inspection
+run passed **716 tests with 1 skipped**; the full suite passed **21 files,
+1,279 tests with 1 skipped**; and `git diff --check` passed. No custom
+subprocess or background process was started. Generated `dist/` output from
+the release-oriented test setup remained ignored and unstaged.
+
+### Self-review and scope
+
+The effective-head change is limited to eval payload selection and preserves
+direct invocation behavior. Original source spans are retained only at the
+control-prefix seam needed to avoid turning quoted language data into code;
+the existing bounded clause/tree traversal still owns compound execution
+coverage. Immediate incomplete-delimiter return is fail-closed for all current
+consumers and preserves bodies preceding malformed syntax. Changes are limited
+to `core/destructive.ts`, `command-inspection.ts`, focused regressions, and
+this report. No ledger, release metadata, dependency, version, dist, publish,
+push, merge, or harness operation changed.
