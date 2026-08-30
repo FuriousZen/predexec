@@ -1162,3 +1162,52 @@ Mode parsing from round 14 remains unchanged. Changes are limited to
 `core/destructive.ts`, focused destructive/engine regressions, and this report;
 no dependency, ledger, release metadata, publish, push, merge, version, or
 dist staging changed.
+
+## Extended integration fix round 16 — interpreter shell bodies, heredocs, POD, and traversal bounds
+
+This user-authorized extension starts from `881c40f0f1d793bc87b16156faae3b1c59dccef1` and is implemented in code commit `e0608ba` (`fix: classify interpreter shell bodies safely`). It closes the remaining critical language-view gaps without changing the ledger, release metadata, dependency set, version, publish/push/merge state, or release-artifact staging.
+
+### RED evidence
+
+Before production changes, the new focused regressions were run with:
+
+```text
+./node_modules/.bin/vitest run __tests__/core/destructive.test.ts __tests__/core/engine.test.ts
+```
+
+Result: exit 1; **16 tests failed, 535 passed, 1 skipped**. Failures reproduced Perl `qx{}`/`qx()`/backtick shell writers and redirections, Ruby/PHP backticks, incomplete delimiters, quoted/indented Ruby heredoc masking, nested `%q`, Perl POD, and the large nested Ruby traversal case. The real temporary-directory probe confirmed the interpreter shell writer commands reached a leaf before the fix.
+
+### GREEN implementation
+
+- `core/destructive.ts` extracts bounded Perl `qx{...}`, `qx(...)`, and Perl/Ruby/PHP backtick bodies from the executable language view. Each complete body is recursively passed through the core shell mutation classifier, so redirects, `rm`, `cp`, Git mutations, timing-file options, substitutions, and shell control syntax remain visible. Escaped delimiters, shell quoting, nesting, malformed bodies, and over-budget views fail closed; qx is not treated as inert literal data.
+- Ruby heredocs now distinguish single-quoted and backslash-quoted delimiters from unquoted/double-quoted forms. `<<-` and `<<~` terminators with indentation are recognized, escaped `\\#{...}` markers remain literal, and executable interpolation bodies are re-entered by the same language view. Nested Ruby `%q` bodies are fully masked while `%Q` interpolation recursively remains executable.
+- Perl POD beginning at a line-boundary `=pod` or `=headN` is masked through a line-boundary `=cut`, while code after `=cut` remains visible.
+- Language-view traversal charges masking and recursive work against a deterministic budget and caps language-view character input at 32 KiB. Interpreter eval commands above a 24 KiB early limit fail closed before the quadratic shared shell preflight; the round-16 regression uses a 30K+ nested Ruby payload and completes without timing assertions.
+
+### GREEN verification and probes
+
+Focused mutation and engine verification:
+
+```text
+./node_modules/.bin/vitest run __tests__/core/destructive.test.ts __tests__/core/engine.test.ts
+```
+
+Result: exit 0; **2 files, 553 tests passed, 1 skipped**. Real temporary-directory probes on installed Perl/Ruby verify qx/backtick `rm` and redirect bodies stop before creating/deleting files; read-only qx/backtick bodies reach a leaf.
+
+Required release checks:
+
+```text
+./node_modules/.bin/tsc --noEmit
+pnpm run build
+./node_modules/.bin/vitest run
+./node_modules/.bin/vitest run __tests__/release-hygiene.test.ts __tests__/pack.test.ts
+git diff --check
+```
+
+All commands passed. The full suite passed **21 files, 1,223 tests with 1 skipped**; release/pack verification passed **9/9 tests**, including packed-install CLI/MCP smoke checks; and `git diff --check` passed. Generated `dist/` output remained ignored and unstaged.
+
+### Self-review, scope, and performance bound
+
+The shell-body parser is quote-aware and delimiter-bounded, preserves recursive shell classification through the existing depth/substitution guards, and returns an actionable eval-payload hard stop for incomplete language constructs. The language view's optional shell-body collection is only consumed by interpreter eval classification; existing Node/Python behavior and adapter policy precedence remain unchanged. Heredoc and POD masking is offset-preserving, and nested interpolation routes through the same parser rather than inserting raw text. The 30K+ nested `%Q` payload is a deterministic non-timing regression for the early 24 KiB interpreter-eval bound; no expensive shared shell-tree traversal runs for that input.
+
+Changes are limited to `core/destructive.ts`, focused destructive/engine regressions, and this report. No ledger, release metadata, dependency, version, dist, publish, push, merge, or harness operation changed.
