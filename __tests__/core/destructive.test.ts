@@ -221,6 +221,97 @@ describe("interpreter eval — fs-writer APIs are caught", () => {
   it.each(languageReaders)("allows read-only %s interpreter code", (cmd) => {
     expect(isDestructiveCommand(cmd)).toBe(false);
   });
+
+  // Extended language API coverage is deliberately table-driven so every
+  // namespace/mode spelling remains a static regression even when an
+  // interpreter is absent from the test host.
+  const extendedLanguageWriters = [
+    // Ruby File and FileUtils writers, including namespace separators.
+    `ruby -e "File::write('out', 'x')"`,
+    `ruby -e "File::binwrite('out', 'x')"`,
+    `ruby -e "File::delete('out')"`,
+    `ruby -e "File::unlink('out')"`,
+    `ruby -e "File::rename('a', 'b')"`,
+    `ruby -e "File::truncate('out', 0)"`,
+    `ruby -e "FileUtils::rm('out')"`,
+    `ruby -e "FileUtils.rm_f('out')"`,
+    `ruby -e "FileUtils::rm_rf('out')"`,
+    `ruby -e "FileUtils.mv('a', 'b')"`,
+    `ruby -e "FileUtils::cp('a', 'b')"`,
+    `ruby -e "FileUtils.cp_r('a', 'b')"`,
+    `ruby -e "FileUtils::mkdir('d')"`,
+    `ruby -e "FileUtils.mkdir_p('d')"`,
+    `ruby -e "FileUtils::touch('out')"`,
+    `ruby -e "FileUtils.ln('a', 'b')"`,
+    `ruby -e "FileUtils::ln_s('a', 'b')"`,
+    `ruby -e "FileUtils.install('a', 'b')"`,
+    `ruby -e "FileUtils::chmod(0o600, 'out')"`,
+    `ruby -e "FileUtils.chown(1, 1, 'out')"`,
+    `ruby -e "File.open('out', 'rb+') { |f| f.write('x') }"`,
+    `ruby -e "File::open('out', 'w') { |f| f.write('x') }"`,
+    `ruby -e "File.open('out', 'a') { |f| f.write('x') }"`,
+    `ruby -e "File.open('out', 'x') { |f| f.write('x') }"`,
+    // Perl open in parenthesized and bare-handle forms, including encoding
+    // suffixes, read-write modes, and pipes.
+    `perl -e "open(FH, '>:encoding(UTF-8)', 'out')"`,
+    `perl -e "open FH, '>>:encoding(UTF-8)', 'out'"`,
+    `perl -e "open my \$fh, '+<', 'out'"`,
+    `perl -e "open FH, '+>', 'out'"`,
+    `perl -e "open FH, '|-', 'touch out'"`,
+    `perl -e "open(FH, '| cat')"`,
+    `perl -e "sysopen(FH, 'out', O_WRONLY | O_CREAT)"`,
+    `perl -e "sysopen FH, 'out', O_RDWR | O_TRUNC"`,
+    `perl -e "rename('a', 'b')"`,
+    `perl -e "unlink('out')"`,
+    `perl -e "truncate('out', 0)"`,
+    `perl -e "mkdir('d')"`,
+    `perl -e "rmdir('d')"`,
+    `perl -e "chmod(0600, 'out')"`,
+    `perl -e "chown(1, 1, 'out')"`,
+    `perl -e "link('a', 'b')"`,
+    `perl -e "symlink('a', 'b')"`,
+    // PHP function names are case-insensitive and all listed mutators count.
+    `php -r "FWRITE(\$fh, 'x');"`,
+    `php -r "Fputs(\$fh, 'x');"`,
+    `php -r "FILE_PUT_CONTENTS('out', 'x');"`,
+    `php -r "UnLiNk('out');"`,
+    `php -r "ReNaMe('a', 'b');"`,
+    `php -r "CoPy('a', 'b');"`,
+    `php -r "ToUcH('out');"`,
+    `php -r "MkDiR('d');"`,
+    `php -r "RmDiR('d');"`,
+    `php -r "ChMoD('out', 0600);"`,
+    `php -r "ChOwN('out', 1);"`,
+    `php -r "LiNk('a', 'b');"`,
+    `php -r "SyMlInK('a', 'b');"`,
+    `php -r "MoVe_UpLoAdEd_FiLe('a', 'b');"`,
+    `php -r "fopen('out', 'rb+');"`,
+    `php -r "FOPEN('out', 'w');"`,
+    `php -r "fopen('out', 'a');"`,
+    `php -r "fopen('out', 'x');"`,
+    `php -r "fopen('out', 'c');"`,
+  ];
+  it.each(extendedLanguageWriters)("catches extended interpreter writer %s", (cmd) => {
+    expect(isDestructiveCommand(cmd)).toBe(true);
+  });
+
+  const extendedLanguageReaders = [
+    `ruby -e "File.read('in')"`,
+    `ruby -e "File.open('in', 'rb') { |f| f.read }"`,
+    `ruby -e "FileUtils.compare_file('a', 'b')"`,
+    `perl -e "open(FH, '<', 'in'); print <FH>"`,
+    `perl -e "open FH, '<:encoding(UTF-8)', 'in'"`,
+    `perl -e "sysopen(FH, 'in', O_RDONLY)"`,
+    `php -r "file_get_contents('in');"`,
+    `php -r "fopen('in', 'r');"`,
+    `php -r "FOPEN('in', 'rb');"`,
+    `ruby -e "puts 'File.write(\'out\', \'x\')' # FileUtils.rm_rf(\'d\')"`,
+    `perl -e "print '# open FH, \">\", \\"out\\"'; # unlink('out')"`,
+    `php -r "echo 'file_put_contents(\'out\', \'x\')'; // unlink('out');"`,
+  ];
+  it.each(extendedLanguageReaders)("allows extended interpreter read/data %s", (cmd) => {
+    expect(isDestructiveCommand(cmd)).toBe(false);
+  });
 });
 
 describe("splitCommandSegments", () => {

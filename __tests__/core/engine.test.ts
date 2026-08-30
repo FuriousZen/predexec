@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -159,6 +159,58 @@ describe("runPlanTree — traversal & stop reasons", () => {
       rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  it.skipIf(!existsSync("/usr/bin/ruby") && !existsSync("/opt/homebrew/bin/ruby"))(
+    "mutationStop: installed Ruby writers cannot create, delete, or modify temp files",
+    async () => {
+      const dir = mkdtempSync(join(tmpdir(), "predexec-ruby-probe-"));
+      try {
+        const victim = join(dir, "victim");
+        writeFileSync(victim, "keep\n");
+        const commands = [
+          "ruby -e \"FileUtils::mkdir_p('created')\"",
+          "ruby -e \"File::delete('victim')\"",
+          "ruby -e \"File.open('victim', 'rb+') { |f| f.write('changed') }\"",
+        ];
+        for (const command of commands) {
+          const result = await runPlanTree({ root: "a", nodes: [{ id: "a", commands: [command] }] }, { cwd: dir });
+          expect(result.stoppedReason).toBe("mutationStop");
+          expect(result.pathTaken).toEqual([]);
+        }
+        expect(existsSync(join(dir, "created"))).toBe(false);
+        expect(existsSync(victim)).toBe(true);
+        expect(readFileSync(victim, "utf8")).toBe("keep\n");
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.skipIf(!existsSync("/usr/bin/perl") && !existsSync("/opt/homebrew/bin/perl"))(
+    "mutationStop: installed Perl writers cannot create, delete, or modify temp files",
+    async () => {
+      const dir = mkdtempSync(join(tmpdir(), "predexec-perl-probe-"));
+      try {
+        const victim = join(dir, "victim");
+        writeFileSync(victim, "keep\n");
+        const commands = [
+          `perl -e "open(FH, '>:encoding(UTF-8)', 'created')"`,
+          `perl -e "unlink('victim')"`,
+          `perl -e "sysopen(FH, 'victim', O_WRONLY)"`,
+        ];
+        for (const command of commands) {
+          const result = await runPlanTree({ root: "a", nodes: [{ id: "a", commands: [command] }] }, { cwd: dir });
+          expect(result.stoppedReason).toBe("mutationStop");
+          expect(result.pathTaken).toEqual([]);
+        }
+        expect(existsSync(join(dir, "created"))).toBe(false);
+        expect(existsSync(victim)).toBe(true);
+        expect(readFileSync(victim, "utf8")).toBe("keep\n");
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    },
+  );
 
   it.each([
     "/usr/bin/time -o timing.log printf hi",

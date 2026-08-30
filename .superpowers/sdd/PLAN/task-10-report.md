@@ -753,3 +753,84 @@ are recursively inspected by the same shared tree consumed by core, Claude,
 and Codex. Changes are limited to `command-inspection.ts`, focused shared/core/
 adapter regressions, and this report; policy precedence, mutation rules,
 dependencies, ledger, and release metadata are unchanged.
+
+## Extended integration fix round 11 — Ruby, Perl, and PHP writer coverage
+
+This user-authorized extension starts from `5ffb131f9824f04b260e91452d96618507082511`.
+It closes the remaining Important interpreter-scanner gaps while preserving the
+prior policy, validation, traversal, and timing-output fixes. Ruby now covers
+`File` `.`/`::` writer methods, the requested `FileUtils` writer namespace, and
+all common write-capable `File.open` modes. Perl covers parenthesized and
+bare-handle `open`, encoded output modes, read-write modes, pipes, `sysopen`
+write flags, and common filesystem mutators. PHP coverage is case-insensitive
+for all requested mutators and write-capable `fopen` modes. Static tests run for
+all languages; this host has Ruby and Perl but no PHP executable, so PHP remains
+static-only as intended.
+
+### RED evidence
+
+Before changing production code, the extended classifier table was run with:
+
+```text
+./node_modules/.bin/vitest run __tests__/core/destructive.test.ts
+```
+
+Result: exit 1; **36 tests failed, 294 passed**. Failures reproduced the new
+Ruby namespace/FileUtils/mode cases, Perl open/sysopen and mutator cases, PHP
+case-insensitive API cases, and benign data/comment examples that motivated
+the lexical masking contract.
+
+### GREEN implementation and regressions
+
+- `core/destructive.ts` now uses bounded language call scanners. They mask
+  language string/comment data while preserving executable identifiers,
+  capture balanced call arguments, and keep interpreter eval payload extraction
+  separate from the shell's outer quoting.
+- Ruby scanners recognize `File.write`/`binwrite`/delete/unlink/rename/truncate
+  with either namespace separator; the full requested `FileUtils` writer set;
+  and `File.open`/`File::open` modes including `rb+`, `r+`, and `w`/`a`/`x`
+  variants.
+- Perl scanners recognize bare and parenthesized `open` with output,
+  append/read-write, encoding, and pipe modes; bare/parenthesized `sysopen`
+  with `O_WRONLY`/`O_RDWR`/creation/truncation/append flags; and the common
+  rename/unlink/truncate/mkdir/rmdir/chmod/chown/link/symlink mutators.
+- PHP scanners match function names case-insensitively for all requested
+  mutators and detect `fopen` modes `w`/`a`/`x`/`c`/`+`, including `rb+`.
+  Generic word scanning masks writer words in language string/comment data,
+  while the existing Node/Python writer scanner remains unchanged.
+- Read-only counterexamples cover Ruby `File.read`/`File.open rb`, Perl
+  `open '<'`/`sysopen O_RDONLY`, PHP `fopen r`/`file_get_contents`, plus writer
+  words in quoted data/comments. Real temporary-directory engine probes run
+  installed Ruby and Perl commands and confirm no create, delete, or modify
+  operation executes after mutation hard-stop.
+
+Focused core/policy/adapter verification:
+
+```text
+./node_modules/.bin/vitest run __tests__/core/destructive.test.ts __tests__/core/engine.test.ts
+```
+
+Result: exit 0; **2 test files, 402 tests passed**.
+
+```text
+./node_modules/.bin/vitest run __tests__/core __tests__/policy.test.ts __tests__/opencode.test.ts __tests__/adapter-runtime.test.ts
+```
+
+Result: exit 0; **7 test files, 588 tests passed**. Typechecking passed with
+`./node_modules/.bin/tsc --noEmit`, and `pnpm run build` succeeded.
+
+Full and release verification:
+
+```text
+./node_modules/.bin/vitest run
+```
+
+Result: exit 0; **21 test files, 1,070 tests passed**.
+
+```text
+./node_modules/.bin/vitest run __tests__/release-hygiene.test.ts __tests__/pack.test.ts
+```
+
+Result: exit 0; **2 test files, 9 tests passed**, including packed-install CLI
+and MCP smoke checks. `git diff --check` passed. No ledger, release metadata,
+dependency, dist, publish, push, merge, or version operation changed.

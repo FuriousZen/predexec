@@ -180,20 +180,167 @@ const EVAL_WRITER_RE =
  * than one broad regex: read-only snippets such as File.read, fopen(...,"r"),
  * and Perl open(...,"<") must remain in the safe tier.
  */
-const PERL_WRITER_PATTERNS = [
-  /\b(?:rename|unlink|truncate|sysopen)\s*\(/,
-  /\bopen(?:\s*\([^)]*|\s+[^;\n]*?)['"](?:>>?|\+>|\|>)['"]/,
-  /\bprint\s+[A-Za-z_$][\w$]*\s+/,
-];
-const RUBY_WRITER_PATTERNS = [
-  /\bFile\.(?:write|binwrite|delete|unlink|rename|truncate|symlink|link|utime)\s*\(/,
-  /\bFileUtils\.(?:touch|cp|mv|rm|rm_rf|remove|mkdir|mkdir_p|chmod|chown|ln|ln_s)\s*\(/,
-  /\bFile\.open\s*\([^)]*,[^)]*['"](?:w|a|x|c)(?:b|\+|b\+|\+b)?['"]|\bFile\.open\s*\([^)]*,[^)]*['"]r\+(?:b)?['"]|\bFile\.open\s*\([^)]*,[^)]*['"]r\+b['"]/
-];
-const PHP_WRITER_PATTERNS = [
-  /\b(?:file_put_contents|unlink|rename|mkdir|rmdir|touch|fwrite|ftruncate)\s*\(/,
-  /\bfopen\s*\([^)]*,\s*['"][^'"]*(?:w|a|x|c|\+)[^'"]*['"]/,
-];
+const PERL_WRITER_FUNCTIONS =
+  /\b(?:rename|unlink|truncate|mkdir|rmdir|chmod|chown|link|symlink)\s*\(/gi;
+const PERL_WRITER_KEYWORDS = ["rename", "unlink", "truncate", "mkdir", "rmdir", "chmod", "chown", "link", "symlink"];
+const RUBY_FILE_WRITER_FUNCTIONS = /\bFile\s*(?:\.|::)\s*(?:write|binwrite|delete|unlink|rename|truncate|symlink|link|utime)\s*\(/gi;
+const RUBY_FILEUTILS_WRITER_FUNCTIONS = /\bFileUtils\s*(?:\.|::)\s*(?:rm|rm_f|rm_rf|mv|cp|cp_r|mkdir|mkdir_p|touch|ln|ln_s|install|chmod|chown|remove)\s*\(/gi;
+const RUBY_FILE_OPEN = /\bFile\s*(?:\.|::)\s*open\s*\(/gi;
+const PHP_WRITER_FUNCTIONS = /\b(?:fwrite|fputs|file_put_contents|unlink|rename|copy|touch|mkdir|rmdir|chmod|chown|link|symlink|move_uploaded_file|ftruncate)\s*\(/gi;
+const PHP_FOPEN = /\bfopen\s*\(/gi;
+
+interface LanguageCall { match: string; args: string; }
+
+function maskLanguageCode(source: string, hashComments: boolean, slashComments: boolean): string {
+  // Keep UTF-16 offsets aligned with RegExp indices used by call extraction.
+  const chars = source.split("");
+  let quote: "'" | '"' | "`" | null = null;
+  let lineComment = false;
+  let blockComment = false;
+  let escaped = false;
+  for (let i = 0; i < chars.length; i++) {
+    const ch = chars[i]!;
+    const next = chars[i + 1];
+    if (lineComment) {
+      if (ch === "\n" || ch === "\r") lineComment = false;
+      else chars[i] = " ";
+      continue;
+    }
+    if (blockComment) {
+      if (ch === "*" && next === "/") {
+        chars[i] = " "; chars[++i] = " "; blockComment = false;
+      } else if (ch !== "\n" && ch !== "\r") chars[i] = " ";
+      continue;
+    }
+    if (quote) {
+      if (escaped) { if (ch !== "\n" && ch !== "\r") chars[i] = " "; escaped = false; }
+      else if (ch === "\\" && quote !== "'") { chars[i] = " "; escaped = true; }
+      else if (ch === quote) { chars[i] = " "; quote = null; }
+      else if (ch !== "\n" && ch !== "\r") chars[i] = " ";
+      continue;
+    }
+    if (hashComments && ch === "#") { chars[i] = " "; lineComment = true; continue; }
+    if (slashComments && ch === "/" && next === "/") {
+      chars[i] = " "; chars[++i] = " "; lineComment = true; continue;
+    }
+    if (slashComments && ch === "/" && next === "*") {
+      chars[i] = " "; chars[++i] = " "; blockComment = true; continue;
+    }
+    if (ch === "'" || ch === '"' || ch === "`") { chars[i] = " "; quote = ch; }
+  }
+  return chars.join("");
+}
+
+function captureLanguageCall(source: string, openIndex: number): string | null {
+  let depth = 0;
+  let quote: "'" | '"' | "`" | null = null;
+  let escaped = false;
+  for (let i = openIndex; i < source.length; i++) {
+    const ch = source[i]!;
+    if (quote) {
+      if (escaped) escaped = false;
+      else if (ch === "\\") escaped = true;
+      else if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === "'" || ch === '"' || ch === "`") { quote = ch; continue; }
+    if (ch === "(") depth++;
+    else if (ch === ")" && --depth === 0) return source.slice(openIndex + 1, i);
+  }
+  return null;
+}
+
+function findLanguageCalls(source: string, pattern: RegExp, hashComments: boolean, slashComments: boolean): LanguageCall[] {
+  const masked = maskLanguageCode(source, hashComments, slashComments);
+  const matcher = new RegExp(pattern.source, `${pattern.flags.replace("g", "")}g`);
+  const calls: LanguageCall[] = [];
+  for (let match = matcher.exec(masked); match; match = matcher.exec(masked)) {
+    const text = match[0]!;
+    const args = captureLanguageCall(source, match.index + text.lastIndexOf("("));
+    if (args !== null) calls.push({ match: text.trim(), args });
+  }
+  return calls;
+}
+
+function findLanguageKeywords(source: string, keyword: string, hashComments: boolean, slashComments: boolean): number[] {
+  const masked = maskLanguageCode(source, hashComments, slashComments);
+  const matcher = new RegExp(`\\b${keyword}\\b`, "g");
+  const indexes: number[] = [];
+  for (let match = matcher.exec(masked); match; match = matcher.exec(masked)) indexes.push(match.index);
+  return indexes;
+}
+
+function firstQuotedArgument(args: string): string | null {
+  return /,\s*(['"])([^'"]*)\1/.exec(args)?.[2] ?? null;
+}
+
+function rubyWriteMode(mode: string): boolean {
+  const normalized = mode.trim().toLowerCase();
+  return /^[waxc]/.test(normalized) || normalized.includes("+");
+}
+
+function phpWriteMode(mode: string): boolean {
+  const normalized = mode.trim().toLowerCase();
+  return /^[waxc]/.test(normalized) || normalized.includes("+");
+}
+
+function perlOpenWriteMode(mode: string): boolean {
+  const normalized = mode.trim();
+  return normalized.startsWith(">") || normalized.startsWith("+") || normalized.startsWith("|") || normalized.startsWith("-|");
+}
+
+function interpreterEvalPayload(segment: string): string {
+  const words = shellWords(segment);
+  const evalFlag = /^(?:--eval|--print|--run|-r|-[epnc]|-[pn]*e[pn]*)$/;
+  const index = words.findIndex((word) => evalFlag.test(word));
+  return index < 0 ? segment : words.slice(index + 1).join(" ");
+}
+
+function languageWordScanSegment(head: string, segment: string): string {
+  if (!isEvalInvocation(head, segment) || !["perl", "ruby", "php"].includes(head)) return segment;
+  const payload = interpreterEvalPayload(segment);
+  return `${head} ${maskLanguageCode(payload, true, head === "php")}`;
+}
+
+function findPerlWriter(payload: string): string | null {
+  const common = findLanguageCalls(payload, PERL_WRITER_FUNCTIONS, true, false)[0];
+  if (common) return common.match;
+  for (const keyword of PERL_WRITER_KEYWORDS) {
+    const index = findLanguageKeywords(payload, keyword, true, false)[0];
+    if (index !== undefined) return keyword;
+  }
+  for (const index of findLanguageKeywords(payload, "sysopen", true, false)) {
+    if (/\bO_(?:WRONLY|RDWR|CREAT|TRUNC|APPEND)\b/i.test(payload.slice(index, index + 600))) return "sysopen";
+  }
+  for (const index of findLanguageKeywords(payload, "open", true, false)) {
+    const mode = /['"]([^'"]*)['"]/.exec(payload.slice(index + 4, index + 600))?.[1];
+    if (mode && perlOpenWriteMode(mode)) return `open ${mode}`;
+  }
+  const print = /\bprint\s+[A-Za-z_$][\w$]*\s+/.exec(maskLanguageCode(payload, true, false));
+  return print?.[0]?.trim() ?? null;
+}
+
+function findRubyWriter(payload: string): string | null {
+  const direct = findLanguageCalls(payload, RUBY_FILE_WRITER_FUNCTIONS, true, false)[0];
+  if (direct) return direct.match;
+  const fileUtils = findLanguageCalls(payload, RUBY_FILEUTILS_WRITER_FUNCTIONS, true, false)[0];
+  if (fileUtils) return fileUtils.match;
+  for (const call of findLanguageCalls(payload, RUBY_FILE_OPEN, true, false)) {
+    const mode = firstQuotedArgument(call.args);
+    if ((mode && rubyWriteMode(mode)) || /\b(?:WRONLY|RDWR|CREAT|TRUNC|APPEND)\b/.test(call.args)) return call.match;
+  }
+  return null;
+}
+
+function findPhpWriter(payload: string): string | null {
+  const direct = findLanguageCalls(payload, PHP_WRITER_FUNCTIONS, false, true)[0];
+  if (direct) return direct.match;
+  for (const call of findLanguageCalls(payload, PHP_FOPEN, false, true)) {
+    const mode = firstQuotedArgument(call.args);
+    if (mode && phpWriteMode(mode)) return call.match;
+  }
+  return null;
+}
 
 /**
  * awk/gawk writes that never leave the program text: `awk 'BEGIN{print >
@@ -626,12 +773,10 @@ function isEvalInvocation(head: string, segment: string): boolean {
 }
 
 function findInterpreterWriter(head: string, segment: string): string | null {
-  const patterns = head === "perl" ? PERL_WRITER_PATTERNS :
-    head === "ruby" ? RUBY_WRITER_PATTERNS : head === "php" ? PHP_WRITER_PATTERNS : [];
-  for (const pattern of patterns) {
-    const match = pattern.exec(segment);
-    if (match) return match[0].trim();
-  }
+  const payload = interpreterEvalPayload(segment);
+  if (head === "perl") return findPerlWriter(payload);
+  if (head === "ruby") return findRubyWriter(payload);
+  if (head === "php") return findPhpWriter(payload);
   return null;
 }
 
@@ -735,7 +880,8 @@ function findDestructiveTokenInternal(cmd: string, depth: number): string | null
     });
   if (allSafe) return null;
 
-  const word = WORD_RE.exec(sanitized);
+  const wordScanText = segments.map((segment, i) => languageWordScanSegment(heads[i] ?? "", segment)).join(" | ");
+  const word = WORD_RE.exec(sanitizeForRedirect(wordScanText));
   if (word) return word[0].trim();
 
   // Interpreter eval payloads: scan the RAW segment — writer APIs live inside
