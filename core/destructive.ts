@@ -188,8 +188,14 @@ const RUBY_FILEUTILS_WRITER_FUNCTIONS = /\bFileUtils\s*(?:\.|::)\s*(?:rm|rm_f|rm
 const RUBY_FILE_OPEN = /\bFile\s*(?:\.|::)\s*open\s*\(/gi;
 const PHP_WRITER_FUNCTIONS = /\b(?:fwrite|fputs|file_put_contents|unlink|rename|copy|touch|mkdir|rmdir|chmod|chown|link|symlink|move_uploaded_file|ftruncate)\s*\(/gi;
 const PHP_FOPEN = /\bfopen\s*\(/gi;
+const MAX_LANGUAGE_ARGUMENT_LENGTH = 64 * 1024;
 
-interface LanguageCall { match: string; args: string; }
+interface LanguageCall { match: string; args: string | null; }
+
+interface LanguageSyntaxOptions {
+  hashComments: boolean;
+  slashComments: boolean;
+}
 
 function maskLanguageCode(source: string, hashComments: boolean, slashComments: boolean): string {
   // Keep UTF-16 offsets aligned with RegExp indices used by call extraction.
@@ -237,21 +243,92 @@ function maskLanguageCode(source: string, hashComments: boolean, slashComments: 
   return chars.join("");
 }
 
-function captureLanguageCall(source: string, openIndex: number): string | null {
-  let depth = 0;
+/** Remove language comments while retaining string literals and source shape. */
+function stripLanguageComments(source: string, options: LanguageSyntaxOptions): string | null {
+  const chars = source.split("");
   let quote: "'" | '"' | "`" | null = null;
+  let lineComment = false;
+  let blockComment = false;
   let escaped = false;
-  for (let i = openIndex; i < source.length; i++) {
-    const ch = source[i]!;
+  for (let i = 0; i < chars.length; i++) {
+    const ch = chars[i]!;
+    const next = chars[i + 1];
+    if (lineComment) {
+      if (ch === "\n" || ch === "\r") lineComment = false;
+      else chars[i] = " ";
+      continue;
+    }
+    if (blockComment) {
+      if (ch === "*" && next === "/") {
+        chars[i] = " "; chars[++i] = " "; blockComment = false;
+      } else if (ch !== "\n" && ch !== "\r") chars[i] = " ";
+      continue;
+    }
     if (quote) {
       if (escaped) escaped = false;
-      else if (ch === "\\" && (quote !== "'" || source[i + 1] === "'" || source[i + 1] === "\\")) escaped = true;
+      else if (ch === "\\" && (quote !== "'" || next === "'" || next === "\\")) escaped = true;
       else if (ch === quote) quote = null;
       continue;
     }
+    if (options.hashComments && ch === "#") {
+      chars[i] = " "; lineComment = true; continue;
+    }
+    if (options.slashComments && ch === "/" && next === "/") {
+      chars[i] = " "; chars[++i] = " "; lineComment = true; continue;
+    }
+    if (options.slashComments && ch === "/" && next === "*") {
+      chars[i] = " "; chars[++i] = " "; blockComment = true; continue;
+    }
+    if (ch === "'" || ch === '"' || ch === "`") quote = ch;
+  }
+  return quote === null && !blockComment ? chars.join("") : null;
+}
+
+/** Capture a balanced call, ignoring comments and preserving the raw argument text. */
+function captureLanguageCall(source: string, openIndex: number, options: LanguageSyntaxOptions): string | null {
+  let paren = 0;
+  let bracket = 0;
+  let brace = 0;
+  let quote: "'" | '"' | "`" | null = null;
+  let lineComment = false;
+  let blockComment = false;
+  let escaped = false;
+  for (let i = openIndex; i < source.length; i++) {
+    if (i - openIndex > MAX_LANGUAGE_ARGUMENT_LENGTH) return null;
+    const ch = source[i]!;
+    const next = source[i + 1];
+    if (lineComment) {
+      if (ch === "\n" || ch === "\r") lineComment = false;
+      continue;
+    }
+    if (blockComment) {
+      if (ch === "*" && next === "/") { blockComment = false; i++; }
+      continue;
+    }
+    if (quote) {
+      if (escaped) escaped = false;
+      else if (ch === "\\" && (quote !== "'" || next === "'" || next === "\\")) escaped = true;
+      else if (ch === quote) quote = null;
+      continue;
+    }
+    if (options.hashComments && ch === "#") { lineComment = true; continue; }
+    if (options.slashComments && ch === "/" && next === "/") { lineComment = true; i++; continue; }
+    if (options.slashComments && ch === "/" && next === "*") { blockComment = true; i++; continue; }
     if (ch === "'" || ch === '"' || ch === "`") { quote = ch; continue; }
-    if (ch === "(") depth++;
-    else if (ch === ")" && --depth === 0) return source.slice(openIndex + 1, i);
+    if (ch === "(") paren++;
+    else if (ch === ")") {
+      if (paren === 0) return null;
+      paren--;
+      if (paren === 0 && bracket === 0 && brace === 0) return source.slice(openIndex + 1, i);
+    } else if (ch === "[") bracket++;
+    else if (ch === "]") {
+      if (bracket === 0) return null;
+      bracket--;
+    } else if (ch === "{") brace++;
+    else if (ch === "}") {
+      if (brace === 0) return null;
+      brace--;
+    }
   }
   return null;
 }
@@ -262,8 +339,8 @@ function findLanguageCalls(source: string, pattern: RegExp, hashComments: boolea
   const calls: LanguageCall[] = [];
   for (let match = matcher.exec(masked); match; match = matcher.exec(masked)) {
     const text = match[0]!;
-    const args = captureLanguageCall(source, match.index + text.lastIndexOf("("));
-    if (args !== null) calls.push({ match: text.trim(), args });
+    const args = captureLanguageCall(source, match.index + text.lastIndexOf("("), { hashComments, slashComments });
+    calls.push({ match: text.trim(), args });
   }
   return calls;
 }
@@ -276,8 +353,55 @@ function findLanguageKeywords(source: string, keyword: string, hashComments: boo
   return indexes;
 }
 
-function firstQuotedArgument(args: string): string | null {
-  return /,\s*(['"])([^'"]*)\1/.exec(args)?.[2] ?? null;
+/** Split arguments at top-level commas, balancing all common expression delimiters. */
+function splitTopLevelArguments(args: string, options: LanguageSyntaxOptions): string[] | null {
+  if (args.length > MAX_LANGUAGE_ARGUMENT_LENGTH) return null;
+  const cleaned = stripLanguageComments(args, options);
+  if (cleaned === null) return null;
+  const fields: string[] = [];
+  let start = 0;
+  let paren = 0;
+  let bracket = 0;
+  let brace = 0;
+  let quote: "'" | '"' | "`" | null = null;
+  let escaped = false;
+  for (let i = 0; i < cleaned.length; i++) {
+    const ch = cleaned[i]!;
+    if (quote) {
+      if (escaped) escaped = false;
+      else if (ch === "\\" && (quote !== "'" || cleaned[i + 1] === "'" || cleaned[i + 1] === "\\")) escaped = true;
+      else if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === "'" || ch === '"' || ch === "`") { quote = ch; continue; }
+    if (ch === "(") paren++;
+    else if (ch === ")") { if (paren === 0) return null; paren--; }
+    else if (ch === "[") bracket++;
+    else if (ch === "]") { if (bracket === 0) return null; bracket--; }
+    else if (ch === "{") brace++;
+    else if (ch === "}") { if (brace === 0) return null; brace--; }
+    else if (ch === "," && paren === 0 && bracket === 0 && brace === 0) {
+      fields.push(cleaned.slice(start, i).trim()); start = i + 1;
+    }
+  }
+  if (quote !== null || paren !== 0 || bracket !== 0 || brace !== 0) return null;
+  fields.push(cleaned.slice(start).trim());
+  return fields;
+}
+
+/** Return a complete quoted literal, or null for expressions/ambiguous syntax. */
+function quotedArgumentValue(arg: string): string | null {
+  const text = arg.trim();
+  const quote = text[0];
+  if (quote !== "'" && quote !== '"') return null;
+  let escaped = false;
+  for (let i = 1; i < text.length; i++) {
+    const ch = text[i]!;
+    if (escaped) { escaped = false; continue; }
+    if (ch === "\\" && (quote !== "'" || text[i + 1] === "'" || text[i + 1] === "\\")) { escaped = true; continue; }
+    if (ch === quote) return /^\s*$/.test(text.slice(i + 1)) ? text.slice(1, i) : null;
+  }
+  return null;
 }
 
 function rubyWriteMode(mode: string): boolean {
@@ -308,11 +432,20 @@ function languageWordScanSegment(head: string, segment: string): string {
   return `${head} ${maskLanguageCode(payload, true, head === "php")}`;
 }
 
-function captureBarePerlArguments(masked: string, start: number): string {
+/** Capture bare Perl arguments, continuing across newline comments only while incomplete. */
+function captureBarePerlArguments(
+  source: string,
+  masked: string,
+  start: number,
+  options: LanguageSyntaxOptions,
+  minimumArguments: number,
+): string | null {
   let paren = 0;
   let bracket = 0;
   let brace = 0;
+  let lastComma = start - 1;
   for (let i = start; i < masked.length; i++) {
+    if (i - start > MAX_LANGUAGE_ARGUMENT_LENGTH) return null;
     const ch = masked[i]!;
     if (ch === "(") paren++;
     else if (ch === ")") {
@@ -322,34 +455,18 @@ function captureBarePerlArguments(masked: string, start: number): string {
     else if (ch === "]") bracket = Math.max(0, bracket - 1);
     else if (ch === "{") brace++;
     else if (ch === "}") brace = Math.max(0, brace - 1);
-    else if ((ch === ";" || ch === "\n" || ch === "\r") && paren === 0 && bracket === 0 && brace === 0) {
-      return masked.slice(start, i);
-    }
-  }
-  return masked.slice(start);
-}
-
-function splitTopLevelArguments(args: string): string[] {
-  const fields: string[] = [];
-  let start = 0;
-  let paren = 0;
-  let bracket = 0;
-  let brace = 0;
-  for (let i = 0; i < args.length; i++) {
-    const ch = args[i]!;
-    if (ch === "(") paren++;
-    else if (ch === ")") paren = Math.max(0, paren - 1);
-    else if (ch === "[") bracket++;
-    else if (ch === "]") bracket = Math.max(0, bracket - 1);
-    else if (ch === "{") brace++;
-    else if (ch === "}") brace = Math.max(0, brace - 1);
     else if (ch === "," && paren === 0 && bracket === 0 && brace === 0) {
-      fields.push(args.slice(start, i).trim());
-      start = i + 1;
+      lastComma = i;
+    } else if ((ch === ";" || ch === "\n" || ch === "\r") && paren === 0 && bracket === 0 && brace === 0) {
+      if (ch === ";") return source.slice(start, i);
+      const beforeBoundary = masked.slice(start, i);
+      const fields = splitTopLevelArguments(beforeBoundary, options);
+      const lastField = masked.slice(lastComma + 1, i).trim();
+      const incomplete = !fields || fields.length < minimumArguments || lastField.length === 0 || /(?:[,|&+\-*/%?:=]|\\)$/.test(lastField);
+      if (!incomplete) return source.slice(start, i);
     }
   }
-  fields.push(args.slice(start).trim());
-  return fields;
+  return source.slice(start);
 }
 
 function findPerlWriter(payload: string): string | null {
@@ -365,17 +482,32 @@ function findPerlWriter(payload: string): string | null {
     let cursor = afterKeyword;
     while (/\s/.test(masked[cursor] ?? "")) cursor++;
     const args = masked[cursor] === "("
-      ? captureLanguageCall(masked, cursor)
-      : captureBarePerlArguments(masked, cursor);
-    if (args === null) continue;
-    const fields = splitTopLevelArguments(args);
+      ? captureLanguageCall(payload, cursor, { hashComments: true, slashComments: false })
+      : captureBarePerlArguments(payload, masked, cursor, { hashComments: true, slashComments: false }, 3);
+    if (args === null) return "sysopen";
+    const fields = splitTopLevelArguments(args, { hashComments: true, slashComments: false });
     // sysopen's third argument is the flags expression. Never inspect the
     // filename, trailing permissions, printed text, or comments for flags.
-    if (fields.length >= 3 && /\bO_(?:WRONLY|RDWR|CREAT|TRUNC|APPEND)\b/i.test(fields[2]!)) return "sysopen";
+    if (fields === null || fields.length < 3) return "sysopen";
+    const flags = fields[2]!;
+    if (/\bO_(?:WRONLY|RDWR|CREAT|TRUNC|APPEND)\b/i.test(flags)) return "sysopen";
+    // Unknown flags are ambiguous and therefore fail closed. O_RDONLY may
+    // be combined with the non-mutating descriptor flags.
+    if (!/\bO_RDONLY\b/i.test(flags)) return "sysopen";
   }
   for (const index of findLanguageKeywords(payload, "open", true, false)) {
-    const mode = /['"]([^'"]*)['"]/.exec(payload.slice(index + 4, index + 600))?.[1];
-    if (mode && perlOpenWriteMode(mode)) return `open ${mode}`;
+    const afterKeyword = index + "open".length;
+    let cursor = afterKeyword;
+    while (/\s/.test(masked[cursor] ?? "")) cursor++;
+    const args = masked[cursor] === "("
+      ? captureLanguageCall(payload, cursor, { hashComments: true, slashComments: false })
+      : captureBarePerlArguments(payload, masked, cursor, { hashComments: true, slashComments: false }, 2);
+    if (args === null) return "open";
+    const fields = splitTopLevelArguments(args, { hashComments: true, slashComments: false });
+    if (fields === null || fields.length < 2) return "open";
+    const mode = quotedArgumentValue(fields[1]!);
+    if (mode === null) return "open";
+    if (perlOpenWriteMode(mode)) return `open ${mode}`;
   }
   const print = /\bprint\s+[A-Za-z_$][\w$]*\s+/.exec(maskLanguageCode(payload, true, false));
   return print?.[0]?.trim() ?? null;
@@ -387,8 +519,11 @@ function findRubyWriter(payload: string): string | null {
   const fileUtils = findLanguageCalls(payload, RUBY_FILEUTILS_WRITER_FUNCTIONS, true, false)[0];
   if (fileUtils) return fileUtils.match;
   for (const call of findLanguageCalls(payload, RUBY_FILE_OPEN, true, false)) {
-    const mode = firstQuotedArgument(call.args);
-    if ((mode && rubyWriteMode(mode)) || /\b(?:WRONLY|RDWR|CREAT|TRUNC|APPEND)\b/.test(call.args)) return call.match;
+    if (call.args === null) return call.match;
+    const fields = splitTopLevelArguments(call.args, { hashComments: true, slashComments: false });
+    if (fields === null || fields.length < 2) return call.match;
+    const mode = quotedArgumentValue(fields[1]!);
+    if (mode === null || rubyWriteMode(mode) || /\b(?:WRONLY|RDWR|CREAT|TRUNC|APPEND)\b/.test(fields[1]!)) return call.match;
   }
   return null;
 }
@@ -397,8 +532,11 @@ function findPhpWriter(payload: string): string | null {
   const direct = findLanguageCalls(payload, PHP_WRITER_FUNCTIONS, true, true)[0];
   if (direct) return direct.match;
   for (const call of findLanguageCalls(payload, PHP_FOPEN, true, true)) {
-    const mode = firstQuotedArgument(call.args);
-    if (mode && phpWriteMode(mode)) return call.match;
+    if (call.args === null) return call.match;
+    const fields = splitTopLevelArguments(call.args, { hashComments: true, slashComments: true });
+    if (fields === null || fields.length < 2) return call.match;
+    const mode = quotedArgumentValue(fields[1]!);
+    if (mode === null || phpWriteMode(mode)) return call.match;
   }
   return null;
 }
@@ -838,6 +976,7 @@ function isEvalInvocation(head: string, segment: string): boolean {
 }
 
 function findInterpreterWriter(head: string, segment: string): string | null {
+  if (segment.length > MAX_LANGUAGE_ARGUMENT_LENGTH) return `${head} eval payload`;
   const payload = interpreterEvalPayload(segment);
   if (head === "perl") return findPerlWriter(payload);
   if (head === "ruby") return findRubyWriter(payload);
@@ -851,6 +990,13 @@ function findInterpreterWriter(head: string, segment: string): string | null {
  */
 function findDestructiveTokenInternal(cmd: string, depth: number): string | null {
   if (depth >= 32) return "complex shell syntax";
+  // Avoid sending oversized interpreter payloads through the recursive shell
+  // inspection machinery. They cannot be parsed within the language-call
+  // budget, so fail closed before any potentially quadratic traversal.
+  if (
+    cmd.length > MAX_LANGUAGE_ARGUMENT_LENGTH &&
+    /\b(?:node|deno|bun|python3?|ruby|perl|php)\b[^\n]*\s(?:-\w*[ecnp]\w*|--eval|--print|--run|-r)\b/.test(cmd)
+  ) return "oversized interpreter eval";
   // Use the shared bounded traversal as a structural preflight so executable
   // control clauses and substitution bodies cannot disappear between the
   // core classifier and host policy adapters. Incomplete or over-budget shell
@@ -962,9 +1108,13 @@ function findDestructiveTokenInternal(cmd: string, depth: number): string | null
     if (isEvalInvocation(head, segment)) {
       const languageWriter = findInterpreterWriter(head, segment);
       if (languageWriter) return languageWriter;
+      const writerPayload = interpreterEvalPayload(segment);
       const writerSource = head === "php"
-        ? maskLanguageCode(interpreterEvalPayload(segment), true, true)
-        : segment;
+        ? maskLanguageCode(writerPayload, true, true)
+        : stripLanguageComments(writerPayload, {
+            hashComments: !["node", "deno", "bun"].includes(head),
+            slashComments: ["node", "deno", "bun"].includes(head),
+          }) ?? writerPayload;
       const writer = EVAL_WRITER_RE.exec(writerSource);
       if (writer) return writer[0].trim();
     }

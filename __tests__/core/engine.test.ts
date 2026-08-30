@@ -208,6 +208,60 @@ describe("runPlanTree — traversal & stop reasons", () => {
   );
 
   it.skipIf(!existsSync("/usr/bin/perl") && !existsSync("/opt/homebrew/bin/perl"))(
+    "allows a real Perl bare sysopen reader with an unfinished commented argument",
+    async () => {
+      const dir = mkdtempSync(join(tmpdir(), "predexec-perl-bare-read-probe-"));
+      try {
+        const victim = join(dir, "victim");
+        writeFileSync(victim, "keep\n");
+        const command = `perl -e "use Fcntl qw(O_RDONLY); sysopen FH, 'victim', # O_TRUNC\n O_RDONLY; print <FH>"`;
+        const result = await runPlanTree({ root: "a", nodes: [{ id: "a", commands: [command] }] }, { cwd: dir });
+        expect(result.stoppedReason).toBe("leaf");
+        expect(result.pathTaken).toEqual(["a"]);
+        expect(readFileSync(victim, "utf8")).toBe("keep\n");
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.skipIf(!existsSync("/usr/bin/ruby") && !existsSync("/opt/homebrew/bin/ruby"))(
+    "allows a real Ruby File.open reader when a comment precedes the mode",
+    async () => {
+      const dir = mkdtempSync(join(tmpdir(), "predexec-ruby-read-probe-"));
+      try {
+        const victim = join(dir, "victim");
+        writeFileSync(victim, "keep\n");
+        const command = `ruby -e "File.open('victim', # 'w' hidden\n 'rb') { |f| puts f.read }"`;
+        const result = await runPlanTree({ root: "a", nodes: [{ id: "a", commands: [command] }] }, { cwd: dir });
+        expect(result.stoppedReason).toBe("leaf");
+        expect(result.pathTaken).toEqual(["a"]);
+        expect(readFileSync(victim, "utf8")).toBe("keep\n");
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.skipIf(!existsSync("/usr/bin/php") && !existsSync("/opt/homebrew/bin/php"))(
+    "allows a real PHP fopen reader when a comment precedes the mode",
+    async () => {
+      const dir = mkdtempSync(join(tmpdir(), "predexec-php-read-probe-"));
+      try {
+        const victim = join(dir, "victim");
+        writeFileSync(victim, "keep\n");
+        const command = `php -r "fopen('victim', // 'w' hidden\n 'r');"`;
+        const result = await runPlanTree({ root: "a", nodes: [{ id: "a", commands: [command] }] }, { cwd: dir });
+        expect(result.stoppedReason).toBe("leaf");
+        expect(result.pathTaken).toEqual(["a"]);
+        expect(readFileSync(victim, "utf8")).toBe("keep\n");
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.skipIf(!existsSync("/usr/bin/perl") && !existsSync("/opt/homebrew/bin/perl"))(
     "mutationStop: installed Perl writers cannot create, delete, or modify temp files",
     async () => {
       const dir = mkdtempSync(join(tmpdir(), "predexec-perl-probe-"));

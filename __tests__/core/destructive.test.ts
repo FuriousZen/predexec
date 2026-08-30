@@ -391,6 +391,86 @@ describe("interpreter eval — fs-writer APIs are caught", () => {
   ])("catches PHP namespaced/case-insensitive writer %s", (cmd) => {
     expect(isDestructiveCommand(cmd)).toBe(true);
   });
+
+  describe("round 13 comment-aware argument parsing", () => {
+    it.each([
+      `perl -e "sysopen FH, 'victim', # comment O_RDONLY\n O_TRUNC"`,
+      `perl -e "sysopen FH, 'victim', # comment\n O_WRONLY; print 'O_RDONLY'"`,
+      `perl -e "sysopen(FH, 'victim', # comment O_RDONLY\n O_RDWR)"`,
+    ])("catches a writer flag after comment/newline whitespace: %s", (cmd) => {
+      expect(isDestructiveCommand(cmd)).toBe(true);
+    });
+
+    it.each([
+      `perl -e "sysopen(FH, 'victim', O_RDONLY); print 'O_TRUNC'"`,
+      `perl -e "sysopen FH, 'victim', O_RDONLY # O_TRUNC\n print 'O_WRONLY'"`,
+      `perl -e "sysopen FH, 'victim', O_RDONLY; sysopen FH, 'other', O_RDONLY"`,
+    ])("does not let later statements/comments become sysopen flags: %s", (cmd) => {
+      expect(isDestructiveCommand(cmd)).toBe(false);
+    });
+
+    it.each([
+      `perl -e "open FH, # '<' in comment\n '>:encoding(UTF-8)', 'victim'"`,
+      `perl -e "open(FH, # '<' in comment\n '+<', 'victim')"`,
+      `perl -e "open FH, # harmless\n '| cat', 'victim'"`,
+      `perl -e "open FH, '<:encoding(UTF-8)', # '> hidden in comment'\n 'victim'"`,
+    ])("uses Perl open's actual mode after comments: %s", (cmd) => {
+      expect(isDestructiveCommand(cmd)).toBe(cmd.includes("<:encoding" ) ? false : true);
+    });
+
+    it.each([
+      `ruby -e "File.open('victim', # 'rb' in comment\n 'r+') { |f| f.read }"`,
+      `ruby -e "File::open('victim', # 'rb' in comment\n 'w') { |f| f.write('x') }"`,
+      `ruby -e "File.open((['victim'])[0], 'r+') { |f| f.read }"`,
+    ])("catches Ruby File.open writer modes in actual second arguments: %s", (cmd) => {
+      expect(isDestructiveCommand(cmd)).toBe(true);
+    });
+
+    it.each([
+      `ruby -e "File.open('victim', # 'r+' in comment\n 'rb') { |f| f.read }"`,
+      `ruby -e "File::open('victim', # 'w' in comment\n 'r') { |f| f.read }"`,
+      `ruby -e "File.open((['victim'])[0], 'rb') { |f| f.read }"`,
+    ])("keeps Ruby File.open read modes safe despite comments/expressions: %s", (cmd) => {
+      expect(isDestructiveCommand(cmd)).toBe(false);
+    });
+
+    it.each([
+      `php -r "fopen('victim', // 'r' in comment\n 'w');"`,
+      `php -r "fopen /* gap */ ('victim', /* 'r' */ 'r+');"`,
+      `php -r "\\NS\\FOPEN /* gap */ ((['victim'])[0], 'r+');"`,
+    ])("catches PHP fopen writer modes after comments: %s", (cmd) => {
+      expect(isDestructiveCommand(cmd)).toBe(true);
+    });
+
+    it.each([
+      `php -r "fopen('victim', // 'w' in comment\n 'r');"`,
+      `php -r "\\NS\\fopen /* gap */ ((['victim'])[0], 'rb');"`,
+      `php -r "FOPEN('victim', /* 'w' in comment */ 'rb');"`,
+    ])("keeps PHP fopen read modes safe despite comments/expressions: %s", (cmd) => {
+      expect(isDestructiveCommand(cmd)).toBe(false);
+    });
+
+    it.each([
+      `ruby -e "File.open('victim', 'rb'); File.open('other', 'r+')"`,
+      `php -r "fopen('victim', 'r'); fopen('other', 'w');"`,
+    ])("does not stop at a safe call when a later call is a writer: %s", (cmd) => {
+      expect(isDestructiveCommand(cmd)).toBe(true);
+    });
+
+    it.each([
+      `perl -e "open FH, \$mode, 'victim'"`,
+      `perl -e "sysopen FH, 'victim', \$flags"`,
+      `ruby -e "File.open('victim', mode"`,
+      `php -r "fopen('victim', mode"`,
+    ])("fails closed for ambiguous or malformed mode calls: %s", (cmd) => {
+      expect(isDestructiveCommand(cmd)).toBe(true);
+    });
+
+    it("fails closed when a language call exceeds the bounded argument scan", () => {
+      const oversizedPath = "x".repeat(64 * 1024);
+      expect(isDestructiveCommand(`ruby -e "File.open('${oversizedPath}', 'r')"`)).toBe(true);
+    });
+  });
 });
 
 describe("splitCommandSegments", () => {
