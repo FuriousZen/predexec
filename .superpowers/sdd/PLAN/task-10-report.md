@@ -1885,3 +1885,62 @@ pager/filter/credential and unknown-key behavior is unchanged. The shared
 description is consumed by canonical, MCP, OpenCode, and Pi model-facing
 surfaces. No payload over 4 KiB, background process, dependency, version,
 dist staging, publish, push, or merge change was made.
+
+## Extended integration fix round 26 — MCP `ls` cancellation and scan bound
+
+This user-authorized extension closes the final MCP resource/cancellation gap:
+`ls` previously enumerated an entire directory without receiving the runner's
+abort signal or enforcing a directory-entry ceiling. The bounded evidence also
+confirmed that Git aliases cannot override the built-in `status` command and
+that unknown alias verbs are already blocked; no Git alias change was made.
+
+### RED evidence
+
+Two deterministic regressions were added before the production change. The
+initial focused run exited 1 with **2 failed, 97 passed**: the dispatcher did
+not stop the injected async enumeration on abort, and the scan-cap seam was
+not available. The tests use an injected async directory iterator and a small
+synthetic cap; no large filesystem, stress probe, payload over 2 KiB, or
+background process was used.
+
+### GREEN implementation
+
+- `createToolExecutor` now threads `runOpts.signal` into `lsOp`, matching the
+  existing read/grep/find cancellation contract. `lsOp` checks before opening
+  and during iteration, closes the directory on abort, preserves `aborted`
+  semantics if closing causes a pending iterator read to reject, and allows the
+  async iterator's `return()` cleanup to run.
+- A fixed `MAX_LS_SCAN_ENTRIES` ceiling reuses the shared 100,000-entry walk
+  bound and cannot be raised by the caller's result `limit`. The listing keeps
+  its existing bounded `limit + 1` lexicographic retention; when the scan cap
+  proves more entries exist, it returns exit 0 with `stdoutTruncated: true` and
+  a truthful incomplete-results notice. Result-limit and scan-cap notices are
+  reported independently.
+- Narrow opendir/scan-limit seams make cancellation, iterator closure, cap
+  metadata, normal ordering, and containment-safe target handling testable
+  without materializing a huge directory.
+- The implementation and regression tests were committed as `dd84c21`
+  (`fix: bound and cancel MCP ls enumeration`).
+
+### GREEN verification and self-review
+
+```text
+pnpm exec vitest run __tests__/mcp/tool-ops.test.ts __tests__/mcp/server.test.ts __tests__/core/runner.test.ts --pool=threads --maxWorkers=1 --testTimeout=10000
+```
+
+Result: exit 0; **3 test files, 140 tests passed**.
+
+```text
+pnpm run typecheck
+pnpm run build
+pnpm exec vitest run --pool=threads --maxWorkers=1 --testTimeout=10000
+git diff --check
+```
+
+Typecheck and build passed. The full suite passed **22 test files, 1,533
+tests with 1 skipped**; the diff check passed. The `ls` production ceiling is
+fixed independently of caller result limits, cancellation closes both the
+directory handle and iterator path, and existing exit-0 listing semantics,
+ordering, symlink classification, containment checks, and result-limit output
+remain unchanged. No dependency, version, dist staging, publish, push, merge,
+Git alias, stress probe, or background-process change was made.
