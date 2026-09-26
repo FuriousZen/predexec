@@ -747,6 +747,22 @@ describe("Claude Read rules — tool ops and shell readers", () => {
     ["wc -l README.md && cat .env"],
     ["timeout 5 cat .env"],
     ["while read l; do echo $l; done < .env"],
+    ["cat {.env,x}"],
+    ["cat {.env,}"],
+    ["cat .{e,f}nv"],
+    ["cat .e?v"],
+    ["cat .en[v]"],
+    ["diff .env /dev/null"],
+    ["cmp .env README.md"],
+    ["base64 .env"],
+    ["strings .env"],
+    ["hexdump -C .env"],
+    ["od -c .env"],
+    ["bat .env"],
+    ["nl .env"],
+    ["jq . .env"],
+    ["jq --arg k v . -- .env"],
+    ["yq eval . .env"],
   ])("Read(./.env) deny hard-stops the shell read `%s`", async (command) => {
     const { repo, check } = setup({ deny: ["Read(./.env)"] });
     const r = await run(repo, check, [command]);
@@ -759,6 +775,8 @@ describe("Claude Read rules — tool ops and shell readers", () => {
     ["grep .env README.md"],
     ["echo hi 2>&1"],
     ["awk '{print $1}' README.md"],
+    ["cat {README,x}.md 2>/dev/null || true"],
+    ["jq .env README.md 2>/dev/null || true"],
   ])("a Read(./.env) deny still runs the unrelated shell read `%s`", async (command) => {
     const { repo, check } = setup({ deny: ["Read(./.env)"] });
     const r = await run(repo, check, [command]);
@@ -769,6 +787,22 @@ describe("Claude Read rules — tool ops and shell readers", () => {
     const { repo, check } = setup({ deny: ["Read(./.env)"] });
     const r = await run(repo, check, ["F=.env; cat $F"]);
     expect(r.stoppedReason).toBe("policyStop");
+  });
+
+  it("stops a brace expansion too large to check", async () => {
+    const { repo, check } = setup({ deny: ["Read(./.env)"] });
+    const r = await run(repo, check, ["cat {a,b,c,d}{a,b,c,d}{a,b,c,d}{a,b,c,d}"]);
+    expect(r.stoppedReason).toBe("policyStop");
+    expect(r.transcript).toContain("unresolvable shell read operand");
+  });
+
+  it("an invalid Read pattern fails closed with a reason naming the rule", async () => {
+    const { repo, check, ctx } = setup({ deny: ["Read([z-a].env)"] });
+    const why = check({ tool: "read", path: "README.md" }, ctx);
+    expect(why).toContain("[z-a].env");
+    expect(why).toMatch(/cannot parse/);
+    expect(check("echo hi", ctx)).toContain("[z-a].env");
+    expect((await run(repo, check, ["cat README.md"])).stoppedReason).toBe("policyStop");
   });
 
   it("no Read rules => shell readers are not inspected", async () => {
@@ -816,6 +850,18 @@ describe("Claude settings sources — CLAUDE_CONFIG_DIR and managed policy", () 
     } finally {
       rmSync(tmp, { recursive: true, force: true });
     }
+  });
+
+  it("caches the default Windows registry probe per process", () => {
+    let calls = 0;
+    const probe = (key: string) => {
+      calls++;
+      return key.startsWith("HKLM");
+    };
+    const first = detectManagedPolicySources({ platform: "win32", registryHasValue: probe, cacheRegistry: true });
+    const second = detectManagedPolicySources({ platform: "win32", registryHasValue: probe, cacheRegistry: true });
+    expect(first).toEqual(second);
+    expect(calls).toBe(2); // two keys, probed once each
   });
 
   it("detects a Windows registry policy by presence and skips other platforms", () => {

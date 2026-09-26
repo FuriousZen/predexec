@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { compileGitignorePattern, createGitignoreMatcher } from "../../mcp/gitignore-match.ts";
+import { compileGitignorePattern, createGitignoreMatcher, gitignorePatternError } from "../../mcp/gitignore-match.ts";
 
 // Semantics per https://git-scm.com/docs/gitignore, which Claude Code's Read
 // and Edit rules follow (https://code.claude.com/docs/en/permissions).
@@ -48,6 +48,23 @@ describe("createGitignoreMatcher — single patterns", () => {
     ["\\*.txt", "a.txt", false, false],
     // An unclosed class is literal rather than a crash.
     ["[abc", "[abc", false, true],
+    // POSIX classes (git wildmatch supports them; verified with
+    // `git check-ignore --no-index`).
+    ["[[:alpha:]]x", "bx", false, true],
+    ["[[:alpha:]]x", "1x", false, false],
+    ["[[:digit:]].log", "7.log", false, true],
+    ["[![:digit:]].log", "7.log", false, false],
+    ["[[:upper:][:digit:]]", "Q", false, true],
+    ["[[:space:]]", "a", false, false],
+    // Repeated `**` segments collapse, as in git: `a/**/**/b` matches `a/b`.
+    ["a/**/**/b", "a/b", false, true],
+    ["a/**/**/b", "a/x/y/b", false, true],
+    ["**/**/.env", ".env", false, true],
+    // A non-segment `**` is a plain `*`.
+    ["a**b", "axxb", false, true],
+    ["a**b", "ax/b", false, false],
+    // `]` first in a class is literal.
+    ["[]a]", "]", false, true],
   ];
   it.each(cases)("%s vs %s (dir=%s) → %s", (pattern, path, isDir, expected) => {
     expect(createGitignoreMatcher([pattern])(path, isDir)).toBe(expected);
@@ -96,5 +113,44 @@ describe("compileGitignorePattern", () => {
   it("ignores blank and comment lines", () => {
     expect(compileGitignorePattern("")).toBeNull();
     expect(compileGitignorePattern("# note")).toBeNull();
+  });
+});
+
+describe("gitignore matcher — termination (patterns come from settings, paths from the model)", () => {
+  // Each of these took 16-65 s with a backtracking-regex compilation.
+  const timed = (fn: () => boolean) => {
+    const start = performance.now();
+    const value = fn();
+    return { value, ms: performance.now() - start };
+  };
+
+  it("`*a*a*a*a*b` vs a 255-char name", () => {
+    const { value, ms } = timed(() => createGitignoreMatcher(["*a*a*a*a*b"])("a".repeat(255), false));
+    expect(value).toBe(false);
+    expect(ms).toBeLessThan(50);
+  });
+
+  it("`*a*a*a*a*a*a*a*a*b` vs a 60-char name", () => {
+    const { value, ms } = timed(() => createGitignoreMatcher(["*a*a*a*a*a*a*a*a*b"])("a".repeat(60), false));
+    expect(value).toBe(false);
+    expect(ms).toBeLessThan(50);
+    expect(createGitignoreMatcher(["*a*a*a*a*a*a*a*a*b"])(`${"a".repeat(60)}b`, false)).toBe(true);
+  });
+
+  it("`**/a/**/a/**/a/**/b` vs a 300-segment path", () => {
+    const path = Array(300).fill("a").join("/");
+    const { value, ms } = timed(() => createGitignoreMatcher(["**/a/**/a/**/a/**/b"])(path, false));
+    expect(value).toBe(false);
+    expect(ms).toBeLessThan(50);
+    expect(createGitignoreMatcher(["**/a/**/a/**/a/**/b"])(`${path}/b`, false)).toBe(true);
+  });
+});
+
+describe("gitignorePatternError — invalid patterns are reported, never thrown", () => {
+  it("flags a reversed range and an unknown POSIX class", () => {
+    expect(gitignorePatternError("[z-a].env")).toMatch(/range/);
+    expect(gitignorePatternError("[[:nope:]]")).toMatch(/class/);
+    expect(gitignorePatternError(".env")).toBeNull();
+    expect(() => createGitignoreMatcher(["[z-a].env"])("b.env", false)).not.toThrow();
   });
 });

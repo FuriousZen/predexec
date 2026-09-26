@@ -54,7 +54,7 @@ import {
   type PolicyVerdict,
   type WrapperInspectionOptions,
 } from "../core/index.ts";
-import { createGitignoreMatcher } from "./gitignore-match.ts";
+import { createGitignoreMatcher, gitignorePatternError } from "./gitignore-match.ts";
 
 export type ClaudePolicyAction = "allow" | "ask" | "deny";
 
@@ -499,7 +499,7 @@ const ANY_CHILD = "\u0000predexec-any-child";
  * deny/ask semantics into an absolute-path test. See `compileClaudePathRules`.
  */
 export function compileClaudePathRule(rule: string, anchor: ClaudePathAnchor): PathTest {
-  const test = compileClaudePathRules([rule], [anchor.settingsDir], anchor.projectDir, anchor.home);
+  const { test } = compileClaudePathRules([rule], [anchor.settingsDir], anchor.projectDir, anchor.home);
   return (absPath, isDir) => test(absPath, isDir) !== null;
 }
 
@@ -515,27 +515,43 @@ export function compileClaudePathRule(rule: string, anchor: ClaudePathAnchor): P
  * `~/`, or `//` follows the `!`, so the pattern can't reach a rule anchored
  * with one of those prefixes"; a `!~/…` or `!//…` is dropped outright, which
  * carves nothing — the conservative reading.
+ *
+ * `error` names the first pattern that is not a usable gitignore pattern (a
+ * reversed range, an unknown POSIX class). The caller fails closed on it:
+ * guessing what a broken deny rule meant to protect is the wrong default.
  */
 function compileClaudePathRules(
   patterns: readonly string[],
   settingsDirs: readonly string[],
   projectDir: string,
   home: string,
-): (absPath: string, isDir?: boolean) => string | null {
+): { test: (absPath: string, isDir?: boolean) => string | null; error: string | null } {
   const standalone: { label: string; test: PathTest }[] = [];
   const relativeLines: string[] = [];
   const relativeRules: { label: string; line: string }[] = [];
+  let error: string | null = null;
+  const screen = (raw: string, line: string): void => {
+    const why = error === null ? gitignorePatternError(line) : null;
+    if (why) {
+      error =
+        `cannot parse Claude Code Read rule '${raw}' (${why}) — ` +
+        `predexec stops rather than guess what it protects; fix that rule to continue`;
+    }
+  };
 
   for (const raw of patterns) {
     const pattern = raw.trim();
     if (pattern.startsWith("!")) {
       const rest = pattern.slice(1);
       if (rest.startsWith("~") || rest.startsWith("//")) continue;
-      relativeLines.push(`!${rest.startsWith("./") ? `/${rest.slice(2)}` : rest}`);
+      const line = `!${rest.startsWith("./") ? `/${rest.slice(2)}` : rest}`;
+      screen(raw, line);
+      relativeLines.push(line);
       continue;
     }
     const anchored = anchoredForm(pattern, settingsDirs, home);
     if (anchored) {
+      for (const { line } of anchored) screen(raw, line);
       const tests = anchored.flatMap(({ base, line }) => withRealPrefix(base, line)).map(({ base, line }) =>
         underBases([base], createGitignoreMatcher([line])),
       );
@@ -543,6 +559,7 @@ function compileClaudePathRules(
       continue;
     }
     const line = relativeLine(pattern);
+    screen(raw, line);
     relativeLines.push(line);
     relativeRules.push({ label: raw, line });
   }
@@ -551,7 +568,7 @@ function compileClaudePathRules(
   const list = underBases(projectBases, createGitignoreMatcher(relativeLines));
   const singles = relativeRules.map(({ label, line }) => ({ label, test: underBases(projectBases, createGitignoreMatcher([line])) }));
 
-  return (absPath, isDir) => {
+  const test = (absPath: string, isDir?: boolean): string | null => {
     for (const rule of standalone) if (rule.test(absPath, isDir)) return rule.label;
     if (singles.length > 0 && list(absPath, isDir)) {
       // The list decided "matched"; name the first positive rule that matches on its own.
@@ -559,6 +576,7 @@ function compileClaudePathRules(
     }
     return null;
   };
+  return { test, error };
 }
 
 /** `//x`, `~/x`, `/x` → (base, anchored gitignore line)s, or null for a project-relative pattern. */
@@ -649,6 +667,8 @@ interface CompiledReadRule {
   tool: ClaudeOperationPolicyRule["tool"];
   action: ClaudePolicyAction;
   test: (absPath: string, isDir?: boolean) => string | null;
+  /** Set when a pattern in the group could not be parsed: every operation stops with this reason. */
+  invalid?: string;
 }
 
 function ruleApplies(rule: CompiledReadRule, kind: OpKind): boolean {
@@ -671,11 +691,8 @@ function compileReadRules(rules: readonly ClaudeOperationPolicyRule[], projectDi
   }
   for (const group of groups.values()) {
     const first = group[0]!;
-    compiled.push({
-      tool: first.tool,
-      action: first.action,
-      test: compileClaudePathRules(group.map((r) => r.pattern), first.settingsDirs ?? [projectDir], projectDir, home),
-    });
+    const { test, error } = compileClaudePathRules(group.map((r) => r.pattern), first.settingsDirs ?? [projectDir], projectDir, home);
+    compiled.push({ tool: first.tool, action: first.action, test, ...(error ? { invalid: error } : {}) });
   }
   // Deny before ask, so a stop names the deny that caught it.
   return compiled.sort((a, b) => (a.action === b.action ? 0 : a.action === "deny" ? -1 : 1));
@@ -704,9 +721,24 @@ function matchTargets(rules: readonly CompiledReadRule[], kind: OpKind, targets:
 const SHELL_READERS = new Set([
   "cat", "head", "tail", "less", "more", "sed", "awk", "grep", "rg", "wc", "sort", "uniq",
   "cut", "tr", "nl", "od", "xxd", "file", "stat",
+  // Beyond the brief's list: other commands that print or digest a named
+  // file. `tee` is deliberately absent — it reads stdin; its FILE args are
+  // written, which is Edit's business (and a mutation stop here).
+  "diff", "cmp", "base64", "strings", "hexdump", "bat", "jq", "yq",
 ]);
-/** Readers whose first operand is a script/pattern unless one is given by option. */
-const SCRIPT_FIRST = new Set(["sed", "awk", "grep", "rg"]);
+/** Readers whose first operand is a script/pattern/filter unless one is given by option. */
+const SCRIPT_FIRST = new Set(["sed", "awk", "grep", "rg", "jq", "yq"]);
+/** yq v4 subcommands that may precede the expression. */
+const YQ_SUBCOMMANDS = new Set(["eval", "e", "eval-all", "ea"]);
+/** Options taking TWO values; `file` says whether the second is a file the command reads. */
+const PAIR_OPTIONS: Record<string, Record<string, { file: boolean }>> = {
+  jq: {
+    "--arg": { file: false },
+    "--argjson": { file: false },
+    "--slurpfile": { file: true },
+    "--rawfile": { file: true },
+  },
+};
 /** Options whose value is the script/pattern (so no positional script follows). */
 const SCRIPT_OPTIONS: Record<string, ReadonlySet<string>> = {
   grep: new Set(["-e", "--regexp"]),
@@ -719,6 +751,11 @@ const FILE_OPTIONS: Record<string, ReadonlySet<string>> = {
   rg: new Set(["-f", "--file"]),
   sed: new Set(["-f", "--file"]),
   awk: new Set(["-f", "--file"]),
+  jq: new Set(["-f", "--from-file"]),
+  hexdump: new Set(["-f"]),
+  // macOS `base64 -i FILE` reads FILE (GNU's `-i` is a flag; taking the next
+  // word as a file there only adds a check).
+  base64: new Set(["-i", "--input"]),
 };
 /** Options that take a separate non-file value, skipped so it is not taken for an operand. */
 const VALUE_OPTIONS: Record<string, ReadonlySet<string>> = {
@@ -731,6 +768,14 @@ const VALUE_OPTIONS: Record<string, ReadonlySet<string>> = {
   tail: new Set(["-n", "-c"]),
   od: new Set(["-A", "-t", "-j", "-N"]),
   xxd: new Set(["-l", "-s", "-c", "-g"]),
+  diff: new Set(["-U", "-C", "-L", "--label", "-I", "--ignore-matching-lines", "-x", "--exclude"]),
+  cmp: new Set(["-i", "-n", "--ignore-initial", "--bytes"]),
+  hexdump: new Set(["-n", "-s", "-e"]),
+  strings: new Set(["-n", "-t", "--bytes", "--radix"]),
+  base64: new Set(["-w", "-b", "--wrap", "--break", "-o", "--output"]),
+  bat: new Set(["-l", "-r", "-H", "-m", "--language", "--line-range", "--highlight-line", "--map-syntax", "--theme", "--style"]),
+  jq: new Set(["--indent", "--tab-width"]),
+  yq: new Set(["-p", "-o", "-I", "--input-format", "--output-format", "--indent"]),
 };
 
 const INPUT_REDIRECT_RE = /^\d*<(?!<|&|\()>?(.*)$/s;
@@ -789,7 +834,12 @@ function readerOperands(head: string, args: readonly string[]): string[] {
       endOfOptions = true;
     } else if (!endOfOptions && arg.startsWith("-") && arg !== "-") {
       const [name, inline] = arg.startsWith("--") && arg.includes("=") ? [arg.slice(0, arg.indexOf("=")), arg.slice(arg.indexOf("=") + 1)] : [arg, undefined];
-      if (SCRIPT_OPTIONS[head]?.has(name)) {
+      const pair = PAIR_OPTIONS[head]?.[name];
+      if (pair) {
+        const value = args[i + 2];
+        i += 2;
+        if (pair.file && value !== undefined) out.push(value);
+      } else if (SCRIPT_OPTIONS[head]?.has(name)) {
         scriptGiven = true;
         if (inline === undefined) i++;
       } else if (FILE_OPTIONS[head]?.has(name)) {
@@ -807,7 +857,79 @@ function readerOperands(head: string, args: readonly string[]): string[] {
       out.push(arg);
     }
   }
+  if (head === "yq" && YQ_SUBCOMMANDS.has(out[0] ?? "")) out.shift();
   if (SCRIPT_FIRST.has(head) && !scriptGiven) out.shift();
+  return out;
+}
+
+/** Most words one operand's brace expansion may produce before it counts as unresolvable. */
+const MAX_BRACE_WORDS = 64;
+/** Most brace groups expanded (nested or in sequence) within one operand. */
+const MAX_BRACE_DEPTH = 4;
+
+/**
+ * Bash brace expansion — `{a,b}` lists and `{1..3}` / `{a..c}` sequences — so
+ * `cat {.env,x}` cannot slip a denied name past the check. Bounded: null when
+ * the expansion exceeds MAX_BRACE_WORDS words or MAX_BRACE_DEPTH groups, and
+ * the caller treats the operand as unresolvable. A brace group that is not an
+ * expansion (`{}`, `{x}`) is literal, as in bash. Quoting is already stripped
+ * by the tokenizer, so a quoted brace is expanded too — that only adds checks.
+ */
+function expandBraces(word: string, depth = 0): string[] | null {
+  for (let open = word.indexOf("{"); open !== -1; open = word.indexOf("{", open + 1)) {
+    let nesting = 0;
+    let close = -1;
+    const commas: number[] = [];
+    for (let i = open; i < word.length; i++) {
+      const ch = word[i];
+      if (ch === "{") nesting++;
+      else if (ch === "}" && --nesting === 0) {
+        close = i;
+        break;
+      } else if (ch === "," && nesting === 1) commas.push(i);
+    }
+    if (close === -1) return [word];
+    const inner = word.slice(open + 1, close);
+    let alternatives: string[] | null = null;
+    if (commas.length > 0) {
+      alternatives = [];
+      let start = open + 1;
+      for (const comma of [...commas, close]) {
+        alternatives.push(word.slice(start, comma));
+        start = comma + 1;
+      }
+    } else {
+      const seq = /^(-?\d+|[A-Za-z])\.\.(-?\d+|[A-Za-z])(?:\.\.(-?\d+))?$/.exec(inner);
+      if (seq) alternatives = braceSequence(seq[1]!, seq[2]!, seq[3]);
+      else continue; // literal braces; look for a later group
+      if (alternatives === null) return null;
+    }
+    if (depth >= MAX_BRACE_DEPTH) return null;
+    const prefix = word.slice(0, open);
+    const suffix = word.slice(close + 1);
+    const out: string[] = [];
+    for (const alternative of alternatives) {
+      const expanded = expandBraces(prefix + alternative + suffix, depth + 1);
+      if (expanded === null) return null;
+      out.push(...expanded);
+      if (out.length > MAX_BRACE_WORDS) return null;
+    }
+    return out;
+  }
+  return [word];
+}
+
+function braceSequence(from: string, to: string, stepText: string | undefined): string[] | null {
+  const numeric = /^-?\d+$/.test(from) && /^-?\d+$/.test(to);
+  if (!numeric && (/\d/.test(from) || /\d/.test(to))) return null;
+  const a = numeric ? Number(from) : from.charCodeAt(0);
+  const b = numeric ? Number(to) : to.charCodeAt(0);
+  const step = Math.abs(Number(stepText ?? 1)) || 1;
+  if (Math.abs(b - a) / step + 1 > MAX_BRACE_WORDS) return null;
+  const out: string[] = [];
+  for (let v = a; a <= b ? v <= b : v >= b; v += a <= b ? step : -step) {
+    out.push(numeric ? String(v) : String.fromCharCode(v));
+  }
   return out;
 }
 
@@ -815,6 +937,19 @@ function readerOperands(head: string, args: readonly string[]): string[] {
 function resolveShellOperand(operand: string, cwd: string, home: string, afterCd: boolean): string[] | { unresolved: string } {
   if (operand === "-" || operand === "") return [];
   if (/[$`]/.test(operand)) return { unresolved: operand };
+  if (operand.includes("{")) {
+    const words = expandBraces(operand);
+    if (words === null) return { unresolved: operand };
+    if (words.length > 1 || words[0] !== operand) {
+      const out: string[] = [];
+      for (const word of words) {
+        const resolved = resolveShellOperand(word, cwd, home, afterCd);
+        if (!Array.isArray(resolved)) return { unresolved: operand };
+        out.push(...resolved);
+      }
+      return out;
+    }
+  }
   let path = operand;
   if (path === "~" || path.startsWith("~/")) path = join(home, path.slice(1));
   else if (path.startsWith("~")) return { unresolved: operand };
@@ -880,6 +1015,8 @@ export function createClaudeOperationPolicyChecker(
     const projectDir = ctx?.sessionRoot ?? opts.projectDir ?? process.cwd();
     const compiled = compiledFor(projectDir);
     if (compiled.length === 0) return null;
+    const invalid = compiled.find((rule) => rule.invalid !== undefined)?.invalid;
+    if (invalid) return invalid;
 
     const shell = typeof operation === "string"
       ? operation
@@ -935,7 +1072,17 @@ export interface ManagedPolicyDetectionOptions {
   user?: string;
   /** Windows: does `key` hold a `Settings` value? Defaults to `reg query`. */
   registryHasValue?: (key: string) => boolean;
+  /**
+   * Cache registry answers per process (per probe function). Defaults to true
+   * for the built-in `reg query` probe — `createClaudeHostPolicyChecker` runs
+   * on every tool call and each probe spawns a subprocess — and false for an
+   * injected probe.
+   */
+  cacheRegistry?: boolean;
 }
+
+/** Per-process registry answers, keyed by probe function then registry key. */
+const registryCache = new WeakMap<(key: string) => boolean, Map<string, boolean>>();
 
 /**
  * Managed-policy sources that exist but that predexec cannot parse: the macOS
@@ -962,8 +1109,16 @@ export function detectManagedPolicySources(opts: ManagedPolicyDetectionOptions =
     return candidates.filter((path) => existsSync(path));
   }
   if (os === "win32") {
-    const has = opts.registryHasValue ?? registryHasSettingsValue;
-    return REGISTRY_KEYS.filter((key) => has(key));
+    const probe = opts.registryHasValue ?? registryHasSettingsValue;
+    if (!(opts.cacheRegistry ?? opts.registryHasValue === undefined)) return REGISTRY_KEYS.filter((key) => probe(key));
+    let cache = registryCache.get(probe);
+    if (!cache) registryCache.set(probe, (cache = new Map()));
+    const known = cache;
+    return REGISTRY_KEYS.filter((key) => {
+      let has = known.get(key);
+      if (has === undefined) known.set(key, (has = probe(key)));
+      return has;
+    });
   }
   return [];
 }
