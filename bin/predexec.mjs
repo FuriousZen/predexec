@@ -1767,7 +1767,13 @@ export function installSkill(harness, opts = {}) {
       mkdirSync(dirname(destPath), { recursive: true });
       writeFileSync(destPath, content);
     }
-    results.push({ path: destPath, action: existing === null ? "installed" : "overwritten" });
+    let action;
+    if (dryRun) {
+      action = existing === null ? "would-install" : "would-overwrite";
+    } else {
+      action = existing === null ? "installed" : "overwritten";
+    }
+    results.push({ path: destPath, action });
   }
 
   return { ok: !results.some((r) => r.action === "conflict"), target, results };
@@ -1913,9 +1919,10 @@ function installSkillCli(args) {
     return 1;
   }
 
+  const dryRun = flags.has("--dry-run");
   const result = installSkill(harness, {
     project: flags.has("--project"),
-    dryRun: flags.has("--dry-run"),
+    dryRun,
     force: flags.has("--force"),
   });
 
@@ -1925,12 +1932,17 @@ function installSkillCli(args) {
   }
 
   for (const r of result.results) {
-    console.log(`${r.action}: ${r.path}`);
+    // Transform action names for display: "would-install" -> "would install"
+    const displayAction = r.action.replace("-", " ");
+    console.log(`${displayAction}: ${r.path}`);
     if (r.action === "conflict") {
       console.log("  differs from the packaged skill — pass --force to overwrite, or --dry-run to preview");
     }
   }
   console.log(`destination: ${result.target}`);
+  if (dryRun) {
+    console.log("dry run — nothing written");
+  }
   return result.ok ? 0 : 1;
 }
 

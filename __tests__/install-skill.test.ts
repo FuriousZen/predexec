@@ -114,13 +114,26 @@ describe("installSkill", () => {
     },
   );
 
-  it("prints the destination and writes nothing on --dry-run", () => {
+  it("reports would-install and writes nothing on --dry-run", () => {
     scratch();
     const result = installSkill("claude", opts({ dryRun: true }));
     expect(result.ok).toBe(true);
     const target = skillInstallTarget("claude", opts());
     expect(() => readFileSync(join(target, "SKILL.md"), "utf8")).toThrow();
-    expect(result.results[0]!.action).toBe("installed");
+    expect(result.results[0]!.action).toBe("would-install");
+  });
+
+  it("reports would-overwrite with --force --dry-run and does not modify existing file", () => {
+    scratch();
+    const target = skillInstallTarget("claude", opts());
+    mkdirSync(target, { recursive: true });
+    const originalContent = "--- original ---";
+    writeFileSync(join(target, "SKILL.md"), originalContent);
+
+    const result = installSkill("claude", opts({ force: true, dryRun: true }));
+    expect(result.ok).toBe(true);
+    expect(result.results[0]!.action).toBe("would-overwrite");
+    expect(readFileSync(join(target, "SKILL.md"), "utf8")).toBe(originalContent);
   });
 
   it("is a no-op (ok) when the destination already has the identical packaged content", () => {
@@ -185,5 +198,42 @@ describe("install-skill CLI", () => {
     const run = spawnSync(process.execPath, [bin, "install-skill", "nonsense"], { encoding: "utf8" });
     expect(run.status).toBe(1);
     expect(run.stdout).toContain("unknown harness");
+  });
+
+  it("prints would install and dry run message with --dry-run", () => {
+    scratch();
+    const home = join(tmp, "home");
+    const proj = join(tmp, "proj");
+    mkdirSync(proj, { recursive: true });
+    const run = spawnSync(process.execPath, [bin, "install-skill", "claude", "--dry-run"], {
+      encoding: "utf8",
+      cwd: proj,
+      env: { ...process.env, HOME: home },
+    });
+    expect(run.status).toBe(0);
+    expect(run.stdout).toContain("would install:");
+    expect(run.stdout).toContain("dry run — nothing written");
+    expect(() => readFileSync(join(home, ".claude", "skills", "predexec", "SKILL.md"), "utf8")).toThrow();
+  });
+
+  it("prints would overwrite with --force --dry-run and does not modify file", () => {
+    scratch();
+    const home = join(tmp, "home");
+    const proj = join(tmp, "proj");
+    const skillDir = join(home, ".claude", "skills", "predexec");
+    mkdirSync(skillDir, { recursive: true });
+    mkdirSync(proj, { recursive: true });
+    const originalContent = "--- original ---";
+    writeFileSync(join(skillDir, "SKILL.md"), originalContent);
+
+    const run = spawnSync(process.execPath, [bin, "install-skill", "claude", "--force", "--dry-run"], {
+      encoding: "utf8",
+      cwd: proj,
+      env: { ...process.env, HOME: home },
+    });
+    expect(run.status).toBe(0);
+    expect(run.stdout).toContain("would overwrite:");
+    expect(run.stdout).toContain("dry run — nothing written");
+    expect(readFileSync(join(skillDir, "SKILL.md"), "utf8")).toBe(originalContent);
   });
 });
