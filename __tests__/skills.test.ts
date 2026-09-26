@@ -86,6 +86,16 @@ describe("skills — single source (steering.ts → SKILL.md)", () => {
     expect(renderSkill("antigravity")).toMatch(/Deny ?> ?Ask ?> ?Allow/);
   });
 
+  it("opencode's ask sentence is version-accurate: 1.x may prompt, 2.x (no plugin ask) hard-stops", () => {
+    // The same packaged skill is registered on both majors (v1 config hook,
+    // v2 ctx.skill.transform), so it must not promise a prompt on 2.x.
+    const body = renderSkill("opencode");
+    expect(body).toMatch(/opencode 1\.x[^.]*prompt/i);
+    expect(body).toMatch(/opencode 2\.x[^.]*(hard-)?stops?/i);
+    // The pre-fix sentence promised a prompt with no version qualifier.
+    expect(body).not.toContain("stops immediately (`policyStop`); an ask is forwarded");
+  });
+
   it.each(SKILL_HARNESSES)("%s: never hardcodes the MCP tool id outside the 'varies by install' sentence", (h) => {
     const stripped = renderSkill(h).replace(VARIES_SENTENCE, "");
     expect(stripped).not.toContain(MCP_ID);

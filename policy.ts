@@ -38,9 +38,9 @@
  * least defensible. opencode itself refuses to start on such a config.
  */
 
-import { existsSync, readFileSync, statSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { inspectCommandSubstitutionTree, lexShellWords, splitCommandSegments } from "./core/index.ts";
 import type { HostPolicyDenial, Operation, PolicyCheckContext, PolicyVerdict } from "./core/types.ts";
 
@@ -368,34 +368,10 @@ export interface OpencodeRulesetOptions {
   /** The project worktree (`ToolContext.worktree`); derived from `.git` when absent. */
   worktree?: string;
   /**
-   * The opencode major the ruleset is for. `2` rejects v2-native rule shapes
-   * this reader does not model (see `v2NativeRulesError`); default `1`.
+   * The opencode major the ruleset is for; default `1`. `2` builds the ruleset
+   * with opencode v2's own model instead (`readOpencodeV2Ruleset`).
    */
   hostMajor?: 1 | 2;
-}
-
-/**
- * opencode v2 (2.0.16) still migrates the v1 `permission` object and legacy
- * `tools` map into its ruleset (core `config/normalize.ts:180-183`), so this
- * reader's v1 model covers those. It does NOT model v2's native rule shapes —
- * a top-level `permissions: [{action, resource, effect}]` array or
- * `agents.<name>.permissions` — which v2 composes per document rather than via
- * mergeDeep (core `config/plugin/agent.ts:83-124`). Guessing at their order
- * could turn a deny into an allow, so on a v2 host their presence is an
- * unreadable policy: every operation stops (fail-closed).
- */
-function v2NativeRulesError(merged: Json): string | null {
-  if (merged.permissions !== undefined) {
-    return "opencode v2 `permissions` rules are not evaluated by predexec yet — express them in the v1 `permission` object form";
-  }
-  if (isPlainObject(merged.agents)) {
-    for (const [name, agent] of Object.entries(merged.agents)) {
-      if (isPlainObject(agent) && agent.permissions !== undefined) {
-        return `opencode v2 \`agents.${name}.permissions\` rules are not evaluated by predexec yet — express them in the v1 \`agent.${name}.permission\` object form`;
-      }
-    }
-  }
-  return null;
 }
 
 /** Build the agent ruleset from an already-merged config (`agent/agent.ts:108-310`). */
@@ -463,6 +439,7 @@ export function readOpencodeRuleset(
   env: NodeJS.ProcessEnv = process.env,
   options: OpencodeRulesetOptions = {},
 ): OpencodeRuleset {
+  if (options.hostMajor === 2) return readOpencodeV2Ruleset(projectDir, env, options.agent);
   const paths = opencodePaths(env);
   const worktree = options.worktree ?? findWorktree(projectDir);
   let merged: Json = {};
@@ -493,11 +470,330 @@ export function readOpencodeRuleset(
       return { error: "OPENCODE_PERMISSION is not valid opencode permission JSON" };
     }
   }
-  if (options.hostMajor === 2) {
-    const nativeError = v2NativeRulesError(merged);
-    if (nativeError) return { error: nativeError };
-  }
   return buildOpencodeRuleset(merged, env, options.agent);
+}
+
+// ---------------------------------------------------------------------------
+// opencode v2 ruleset model (tag v2.0.16, commit 3a103fe; citations below are
+// into that tree's `packages/`). v2 does NOT mergeDeep config layers: every
+// document is normalized to its own ordered rule list and the lists are
+// concatenated in load order; evaluation is still last-match-wins.
+// ---------------------------------------------------------------------------
+
+/** OpencodePaths plus v2's global config dir (`OPENCODE_CONFIG_DIR` replaces it — util `global.ts:79`). */
+type V2Paths = OpencodePaths & { v2Config: string };
+
+type V2Source = { path: string } | { inline: string; source: string };
+
+const realOrResolved = (p: string): string => {
+  try {
+    return realpathSync(p);
+  } catch {
+    return resolve(p);
+  }
+};
+
+/**
+ * Every config document v2 loads, lowest priority first (core `config.ts:196-237`
+ * `load`: global dir files, `OPENCODE_CONFIG`, direct project files,
+ * `.opencode` dirs, `OPENCODE_CONFIG_CONTENT`), with discovery from
+ * `config/discovery.ts:23-84`: the walk runs from the session directory to the
+ * FILESYSTEM ROOT (`fs.up` with no stop, util `fs-util.ts:162-178`), each
+ * directory contributing `.claude`/`.agents`/`.opencode`/`opencode.jsonc`/
+ * `opencode.json` when they exist; entries resolving to a global root or global
+ * file are dropped; direct files and `.opencode` dirs are then ordered farthest
+ * first. Within a directory `opencode.json` loads before `opencode.jsonc`
+ * (`discovery.ts:11`, `config.ts:185-192`). Env names from cli
+ * `server-process.ts:108-115` and util `global.ts:79`.
+ * Not mirrored: well-known (Console/integration) configs, which need network
+ * and credentials.
+ */
+function v2ConfigSources(directory: string, env: NodeJS.ProcessEnv, paths: V2Paths): V2Source[] {
+  const names = ["opencode.json", "opencode.jsonc"];
+  const globalDir = paths.v2Config;
+  const globalRoots = [globalDir, join(paths.home, ".claude"), join(paths.home, ".agents")].map(realOrResolved);
+  const globalFiles = names.map((n) => realOrResolved(join(globalDir, n)));
+  const disableRaw = env.OPENCODE_CONFIG_PROJECT_DISABLE ?? env.OPENCODE_DISABLE_PROJECT_CONFIG;
+  const projectEnabled = !truthy(disableRaw);
+  const found: string[] = [];
+  if (projectEnabled && realOrResolved(directory) !== globalRoots[0]) {
+    let current = resolve(directory);
+    for (;;) {
+      for (const name of [".claude", ".agents", ".opencode", ...[...names].reverse()]) {
+        const candidate = join(current, name);
+        if (existsSync(candidate)) found.push(candidate);
+      }
+      const parent = dirname(current);
+      if (parent === current) break;
+      current = parent;
+    }
+  }
+  const visible = found.filter((item) => {
+    const resolved = realOrResolved(item);
+    return !globalRoots.includes(resolved) && !globalFiles.includes(resolved);
+  });
+  const isDir = (p: string): boolean => {
+    try {
+      return statSync(p).isDirectory();
+    } catch {
+      return false;
+    }
+  };
+  const out: V2Source[] = names.map((n) => ({ path: join(globalDir, n) }));
+  if (env.OPENCODE_CONFIG) out.push({ path: resolve(env.OPENCODE_CONFIG) });
+  for (const file of visible.filter((i) => ![".claude", ".agents", ".opencode"].includes(basename(i))).reverse()) {
+    out.push({ path: file });
+  }
+  for (const dir of visible.filter((i) => basename(i) === ".opencode").reverse()) {
+    if (!isDir(dir)) continue;
+    for (const n of names) out.push({ path: join(dir, n) });
+  }
+  if (env.OPENCODE_CONFIG_CONTENT !== undefined) out.push({ inline: env.OPENCODE_CONFIG_CONTENT, source: "OPENCODE_CONFIG_CONTENT" });
+  return out;
+}
+
+/** core `v1/config/migrate.ts:117-122`. */
+function v2NormalizeAction(action: string): string {
+  if (action === "write" || action === "patch") return "edit";
+  if (action === "task") return "subagent";
+  if (action === "bash") return "shell";
+  return action;
+}
+
+/** core `config/plugin/agent.ts:141-162` — only path actions get `~`/`$HOME` expanded. */
+function v2ExpandHome(rule: PolicyRule, home: string): PolicyRule {
+  if (!["external_directory", "read", "edit"].includes(rule.permission)) return rule;
+  const r = rule.pattern;
+  if (r === "~" || r === "$HOME") return { ...rule, pattern: home };
+  const rest = r.startsWith("~/") ? r.slice(2) : r.startsWith("$HOME/") || r.startsWith("$HOME\\") ? r.slice(6) : undefined;
+  return rest === undefined ? rule : { ...rule, pattern: join(home, rest) };
+}
+
+/** A v1-form `permission` value as v2 migrates it (core `config/normalize.ts:496-522`). */
+function v2MigratePermission(value: unknown, where: string): PolicyRule[] {
+  if (value === undefined) return [];
+  if (isAction(value)) return [{ permission: "*", pattern: "*", action: value }];
+  if (!isPlainObject(value)) throw new Error(`${where}: permission must be an action or an object`);
+  const out: PolicyRule[] = [];
+  for (const [key, raw] of Object.entries(value)) {
+    const permission = v2NormalizeAction(key);
+    if (isAction(raw)) {
+      out.push({ permission, pattern: "*", action: raw });
+      continue;
+    }
+    if (!isPlainObject(raw)) throw new Error(`${where}: permission.${key} is not a valid rule`);
+    for (const [pattern, action] of Object.entries(raw)) {
+      if (!isAction(action)) throw new Error(`${where}: permission.${key}["${pattern}"] is not allow/ask/deny`);
+      out.push({ permission, pattern, action });
+    }
+  }
+  return out;
+}
+
+/** Native `permissions: [{action, resource, effect}]` (schema `permission.ts:55-66`); NOT action-normalized. */
+function v2NativePermissions(value: unknown, where: string): PolicyRule[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) throw new Error(`${where}: permissions must be an array`);
+  return value.map((rule, i) => {
+    if (!isPlainObject(rule) || typeof rule.action !== "string" || typeof rule.resource !== "string" || !isAction(rule.effect)) {
+      throw new Error(`${where}: permissions[${i}] is not a valid {action, resource, effect} rule`);
+    }
+    return { permission: rule.action, pattern: rule.resource, action: rule.effect };
+  });
+}
+
+/** Legacy `tools: {name: boolean}` (core `config/normalize.ts:484-494`). */
+function v2MigrateTools(value: unknown, where: string): PolicyRule[] {
+  if (value === undefined) return [];
+  if (!isPlainObject(value)) throw new Error(`${where}: tools must be an object`);
+  return Object.entries(value).map(([key, enabled]) => {
+    if (typeof enabled !== "boolean") throw new Error(`${where}: tools.${key} must be a boolean`);
+    return { permission: v2NormalizeAction(key), pattern: "*", action: enabled ? "allow" : "deny" } as PolicyRule;
+  });
+}
+
+interface V2Document {
+  /** `[...tools, ...permission, ...permissions]` — core `config/normalize.ts:179-183`. */
+  rules: PolicyRule[];
+  /** name → agent rules, or `null` when the document disables that agent. */
+  agents: Map<string, PolicyRule[] | null>;
+  defaultAgent?: string;
+}
+
+/**
+ * One document's agent section: legacy `agent` then `mode` (mode wins per
+ * name), then native `agents` replacing a name wholesale (core
+ * `config/normalize.ts:131-166` + `mergeMaps` `:731-743`). Legacy agents carry
+ * only their `permission` block into `permissions` (core `v1/config/migrate.ts:140-161`).
+ */
+function v2DocumentAgents(config: Json, where: string): Map<string, PolicyRule[] | null> {
+  const merged = new Map<string, { legacy: boolean; value: Json }>();
+  for (const section of ["agent", "mode"] as const) {
+    const entries = config[section];
+    if (entries === undefined) continue;
+    if (!isPlainObject(entries)) throw new Error(`${where}: ${section} must be an object`);
+    for (const [name, value] of Object.entries(entries)) {
+      if (isPlainObject(value)) merged.set(name, { legacy: true, value });
+    }
+  }
+  if (config.agents !== undefined) {
+    if (!isPlainObject(config.agents)) throw new Error(`${where}: agents must be an object`);
+    for (const [name, value] of Object.entries(config.agents)) {
+      if (isPlainObject(value)) merged.set(name, { legacy: false, value });
+    }
+  }
+  const out = new Map<string, PolicyRule[] | null>();
+  for (const [name, { legacy, value }] of merged) {
+    const disabled = legacy ? value.disable === true : value.disabled === true;
+    out.set(
+      name,
+      disabled
+        ? null
+        : legacy
+          ? v2MigratePermission(value.permission, `${where} agent.${name}`)
+          : v2NativePermissions(value.permissions, `${where} agents.${name}`),
+    );
+  }
+  return out;
+}
+
+function v2Document(config: Json, where: string): V2Document {
+  return {
+    rules: [
+      ...v2MigrateTools(config.tools, where),
+      ...v2MigratePermission(config.permission, where),
+      ...v2NativePermissions(config.permissions, where),
+    ],
+    agents: v2DocumentAgents(config, where),
+    ...(typeof config.default_agent === "string" ? { defaultAgent: config.default_agent } : {}),
+  };
+}
+
+/** Built-in agent pushes (core `plugin/agent.ts:85-156`, `plugin/plan.ts:32-42`), after `Info.default`. */
+function v2BuiltinAgentRules(agent: string, paths: V2Paths): PolicyRule[] | undefined {
+  const r = (permission: string, pattern: string, action: PolicyAction): PolicyRule => ({ permission, pattern, action });
+  switch (agent) {
+    case "build":
+      return [r("question", "*", "allow")];
+    case "general":
+      return [r("question", "*", "deny"), r("subagent", "*", "deny")];
+    case "explore":
+      return [
+        r("*", "*", "deny"),
+        r("grep", "*", "allow"),
+        r("glob", "*", "allow"),
+        r("webfetch", "*", "allow"),
+        r("websearch", "*", "allow"),
+        r("read", "*", "allow"),
+        r("read", "*.env", "ask"),
+        r("read", "*.env.*", "ask"),
+        r("read", "*.env.example", "allow"),
+        r("subagent", "*", "deny"),
+        r("external_directory", "*", "ask"),
+        ...v2GlobalExternals(paths),
+      ];
+    case "compaction":
+      return [];
+    case "title":
+    case "summary":
+      return [r("*", "*", "deny")];
+    case "plan": {
+      const planDir = join(paths.home, ".opencode", "plan");
+      return [
+        r("question", "*", "allow"),
+        r("edit", "*", "deny"),
+        r("edit", join(planDir, "*"), "allow"),
+        r("external_directory", join(planDir, "*"), "allow"),
+      ];
+    }
+    default:
+      return undefined;
+  }
+}
+
+/** core `agent.ts:59-64` — external-directory allows every agent starts with. */
+function v2GlobalExternals(paths: V2Paths): PolicyRule[] {
+  return [
+    join(paths.data, "shell", "*", "*"),
+    join(paths.data, "tool-output", "*"),
+    join(paths.tmp, "*"),
+    join(paths.v2Config, "*"),
+  ].map((pattern) => ({ permission: "external_directory", pattern, action: "allow" as const }));
+}
+
+/** `Agent.Info.default` (schema `agent.ts:39-54`) + the global externals. */
+function v2AgentDefaults(paths: V2Paths): PolicyRule[] {
+  return [
+    { permission: "*", pattern: "*", action: "allow" },
+    { permission: "external_directory", pattern: "*", action: "ask" },
+    { permission: "read", pattern: "*.env", action: "ask" },
+    { permission: "read", pattern: "*.env.*", action: "ask" },
+    { permission: "read", pattern: "*.env.example", action: "allow" },
+    ...v2GlobalExternals(paths),
+  ];
+}
+
+/**
+ * The ruleset opencode v2 evaluates for `agent` (core `config/plugin/agent.ts:83-124`):
+ * every agent that already exists (the built-ins) gets ALL documents'
+ * top-level rules appended; then, document by document, each `agents.<name>`
+ * entry creates the agent if needed (defaults + all top-level rules) and
+ * appends its own rules, or removes it when disabled. An agent that does not
+ * exist at the end evaluates as `[* * deny]` (core `permission.ts:19,162`).
+ * The session's own `session.permissions` (`permission.ts:162`) are runtime
+ * state and are not modeled.
+ */
+function buildOpencodeV2Ruleset(documents: V2Document[], paths: V2Paths, agent?: string): PolicyRule[] {
+  const top = documents.flatMap((d) => d.rules).map((rule) => v2ExpandHome(rule, paths.home));
+  const name = agent ?? documents.findLast((d) => d.defaultAgent !== undefined)?.defaultAgent ?? "build";
+  const builtin = v2BuiltinAgentRules(name, paths);
+  let rules: PolicyRule[] | null = builtin ? [...v2AgentDefaults(paths), ...builtin, ...top] : null;
+  for (const document of documents) {
+    if (!document.agents.has(name)) continue;
+    const own = document.agents.get(name) ?? null;
+    if (own === null) {
+      rules = null;
+      continue;
+    }
+    if (rules === null) rules = [...v2AgentDefaults(paths), ...top];
+    rules.push(...own.map((rule) => v2ExpandHome(rule, paths.home)));
+  }
+  return rules ?? [{ permission: "*", pattern: "*", action: "deny" }];
+}
+
+/** v2 counterpart of `readOpencodeRuleset`; `{ error }` (stop everything) on any unparseable source. */
+function readOpencodeV2Ruleset(directory: string, env: NodeJS.ProcessEnv, agent?: string): OpencodeRuleset {
+  const base = opencodePaths(env);
+  const paths: V2Paths = { ...base, v2Config: env.OPENCODE_CONFIG_DIR || base.config };
+  const documents: V2Document[] = [];
+  for (const source of v2ConfigSources(directory, env, paths)) {
+    const where = "path" in source ? source.path : source.source;
+    let text: string;
+    if ("path" in source) {
+      try {
+        text = readFileSync(source.path, "utf8");
+      } catch (err) {
+        const code = (err as NodeJS.ErrnoException).code;
+        if (code === "ENOENT" || code === "ENOTDIR" || code === "EISDIR") continue;
+        return { error: `${where} could not be read` };
+      }
+    } else text = source.inline;
+    // v2 logs and SKIPS an unparseable document (core `config.ts:104-133`);
+    // predexec fails closed instead — dropping it could drop a deny.
+    try {
+      documents.push(v2Document(parseV2Config(text, where), where));
+    } catch (err) {
+      return { error: `${where} is not a valid opencode v2 config (${err instanceof Error ? err.message : String(err)})` };
+    }
+  }
+  return buildOpencodeV2Ruleset(documents, paths, agent);
+}
+
+function parseV2Config(text: string, where: string): Json {
+  if (!text.trim()) return {};
+  const parsed: unknown = JSON.parse(stripJsonComments(text));
+  if (!isPlainObject(parsed)) throw new Error(`${where}: config must be a JSON object`);
+  return parsed;
 }
 
 // ---------------------------------------------------------------------------
@@ -679,6 +975,14 @@ export interface PolicyCheckerOptions {
   /** Project worktree; derived from `.git` when absent. */
   worktree?: string;
   inspectCommand?: CommandPolicyInspector;
+  /**
+   * `2` evaluates requests the way opencode v2 names and scopes them: the
+   * shell tool asks as `shell` (core `tool/plugin/shell.ts:22,133-141`) and
+   * file reads use directory-relative resources (core `file-access.ts:100-111`)
+   * — so every spelling predexec computes is checked for deny AND ask, never
+   * only the v1 worktree-relative one. Default `1`.
+   */
+  hostMajor?: 1 | 2;
 }
 
 /** A static verdict for one operation: the strictest over every request and pattern. */
@@ -694,8 +998,14 @@ function describeRule(request: OpencodeAskRequest, rule: PolicyRule): string {
   return request.permission === "bash" ? rule.pattern : `${request.permission}:${rule.pattern}`;
 }
 
-function staticVerdict(requests: OpencodeAskRequest[], ruleset: PolicyRule[]): StaticVerdict {
+function staticVerdict(requests: OpencodeAskRequest[], ruleset: PolicyRule[], hostMajor: 1 | 2 = 1): StaticVerdict {
   let ask: string | undefined;
+  if (hostMajor === 2) {
+    requests = requests.map((r) => ({
+      permission: r.permission === "bash" ? "shell" : r.permission,
+      patterns: [...r.patterns, ...(r.denyOnlyPatterns ?? [])],
+    }));
+  }
   for (const request of requests) {
     for (const pattern of request.patterns) {
       const rule = evaluatePermission(request.permission, pattern, ruleset);
@@ -738,7 +1048,7 @@ export function evaluateOperation(
   try {
     const requests = opencodeAsksFor(operation, resolveContext(options, context), options.inspectCommand);
     if (requests === null) return { action: "deny", rule: INCOMPLETE };
-    return staticVerdict(requests, ruleset);
+    return staticVerdict(requests, ruleset, options.hostMajor);
   } catch {
     return { action: "deny", rule: "incomplete shell syntax (policy inspection failed)" };
   }

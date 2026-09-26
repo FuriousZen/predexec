@@ -1108,6 +1108,9 @@ describe.each(variants)("opencode plugin ($name) — v2 setup registrations", ({
     expect(tool.input.type).toBe("object");
     expect(tool.input.properties.plan.description).toContain(PLAN_SHAPE_DESCRIPTION);
     expect(tool.input.properties.plan.description).toContain('"exit == 0"');
+    // R42: the shared node:fs executor's exit codes differ from the v1 SDK path's.
+    expect(tool.input.properties.plan.description).toMatch(/read\/ls 1 = failed/);
+    expect(tool.input.properties.plan.description).toMatch(/opencode 1\.x every op that never ran exits 2/);
     // No zod on the v2 path: a zod instance would be introspected cross-instance
     // by the host's pinned zod 4.1.8 (core/src/tool/runtime.ts:165-169).
     expect(tool.input._zod).toBeUndefined();
@@ -1198,7 +1201,7 @@ describe.each(variants)("opencode plugin ($name) — v2 tool execution + permiss
     const dir = project({ permission: { bash: { "cat *": "deny" } } });
     const out = await execute(dir, catPlan);
     expect(out.content).toContain("POLICY HARD-STOP (not run)");
-    expect(out.content).toContain("'cat *'");
+    expect(out.content).toContain("'shell:cat *'");
     expect(out.content).not.toContain("marker-content");
   });
 
@@ -1215,15 +1218,34 @@ describe.each(variants)("opencode plugin ($name) — v2 tool execution + permiss
     expect((await execute(dir, catPlan, "build")).content).toContain("node a (exit 0)");
   });
 
-  it.each([
-    ["top-level permissions", { permissions: [{ action: "bash", resource: "cat *", effect: "deny" }] }],
-    ["agent permissions", { agents: { build: { permissions: [{ action: "bash", resource: "*", effect: "allow" }] } } }],
-  ])("v2-native %s cannot be evaluated statically, so every operation stops (fail-closed)", async (_label, config) => {
-    const dir = project(config);
+  it("v2-native top-level `permissions` are evaluated (last match wins) and can deny", async () => {
+    const dir = project({ permissions: [{ action: "shell", resource: "cat *", effect: "deny" }] });
+    const out = await execute(dir, catPlan);
+    expect(out.content).toContain("POLICY HARD-STOP (not run)");
+    expect(out.content).toContain("'shell:cat *'");
+    expect(out.content).not.toContain("marker-content");
+  });
+
+  it("v2-native agent `permissions` apply to that agent only", async () => {
+    const dir = project({ agents: { review: { permissions: [{ action: "shell", resource: "cat *", effect: "deny" }] } } });
+    expect((await execute(dir, catPlan, "review")).content).toContain("POLICY HARD-STOP (not run)");
+    expect((await execute(dir, catPlan, "build")).content).toContain("marker-content");
+  });
+
+  it("a deny from one config layer survives a later layer's catch-all (v2 concatenates, it does not mergeDeep)", async () => {
+    const dir = project({ permission: { bash: { "*": "deny" } } });
+    const cfg = join(process.env.XDG_CONFIG_HOME!, "opencode");
+    mkdirSync(cfg, { recursive: true });
+    writeFileSync(join(cfg, "opencode.json"), JSON.stringify({ permission: { bash: { "*": "deny", "cat *": "allow" } } }));
+    const out = await execute(dir, catPlan);
+    expect(out.content).toContain("POLICY HARD-STOP (not run)");
+  });
+
+  it("an unparseable native `permissions` entry stops every operation (fail-closed)", async () => {
+    const dir = project({ permissions: [{ action: "shell", resource: "cat *", effect: "maybe" }] });
     const out = await execute(dir, catPlan);
     expect(out.content).toContain("POLICY HARD-STOP (not run)");
     expect(out.content).toContain("cannot read your opencode permission rules");
-    expect(out.content).toContain("permissions");
     expect(out.content).not.toContain("marker-content");
   });
 });

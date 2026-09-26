@@ -105,7 +105,11 @@ export function createOperationPolicy(input: PolicyInput): OperationPolicyChecke
     ...(input.worktree ? { worktree: input.worktree } : {}),
     hostMajor: input.hostMajor,
   });
-  const checkerOptions = { directory: input.directory, ...(input.worktree ? { worktree: input.worktree } : {}) };
+  const checkerOptions = {
+    directory: input.directory,
+    ...(input.worktree ? { worktree: input.worktree } : {}),
+    hostMajor: input.hostMajor,
+  };
   return input.ask
     ? createOpencodeAskBridge(input.ask, ruleset, { ...checkerOptions, signal: input.signal })
     : createPolicyChecker(ruleset, checkerOptions);

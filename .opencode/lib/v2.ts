@@ -29,9 +29,10 @@
  *  - permissions: the v2 tool context carries no `ask` (schema `tool.ts:14-20`,
  *    plugin `promise/tool.ts:11-14`), and `ctx.permission` exposes only
  *    list/get/reply of pending requests. The static reader is the whole check,
- *    so a deny OR ask rule hard-stops (fail-closed) — never a prompt. v2-native
- *    `permissions` arrays are not modeled and stop everything (see policy.ts
- *    `v2NativeRulesError`).
+ *    so a deny OR ask rule hard-stops (fail-closed) — never a prompt. The
+ *    ruleset is built with v2's own model (`readOpencodeRuleset(..., {hostMajor: 2})`:
+ *    per-document concatenation, discovery to the filesystem root, native
+ *    `permissions` evaluated); an unparseable source stops everything.
  *  - native tool ops: the v2 plugin context exposes no file/find API, so
  *    read/grep/find/ls run through ../../mcp/tool-ops.ts (node:fs, rg/fd as
  *    accelerators) — the same executor as Claude Code / Codex, with its exit
@@ -56,7 +57,9 @@ const PLAN_ARG_DESCRIPTION =
   PLAN_SHAPE_DESCRIPTION +
   WHEN_SYNTAX_LINE +
   "Note: tool ops read the filesystem directly (opencode v2 gives plugins no file API), paths may not escape the session root, " +
-  "and grep/find fall back to a pure-Node walk that ignores .gitignore when ripgrep/fd are absent.";
+  "grep/find fall back to a pure-Node walk that ignores .gitignore when ripgrep/fd are absent, " +
+  "and exit codes are: grep/find 1 = searched, found nothing, 2 = never ran; read/ls 1 = failed " +
+  "(on opencode 1.x every op that never ran exits 2 — gate on `exit == 0`, not on a specific failure code).";
 
 /**
  * Local structural stand-ins for the slice of `@opencode/plugin` (v2 Promise

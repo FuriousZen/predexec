@@ -226,18 +226,6 @@ describe("opencode 1.18.32 parity — flattened ruleset, wildcard keys, last mat
 });
 
 describe("readOpencodeRuleset — fail closed", () => {
-  it("hostMajor 2: v2-native `permissions` / `agents.<n>.permissions` are unreadable (fail-closed); v1 mode ignores them", () => {
-    const ctx = setup();
-    ctx.projectConfig({ permissions: [{ action: "bash", resource: "*", effect: "allow" }] });
-    expect(readOpencodeRuleset(ctx.project, ctx.env, { hostMajor: 2 })).toEqual({ error: expect.stringContaining("`permissions`") });
-    expect(Array.isArray(readOpencodeRuleset(ctx.project, ctx.env))).toBe(true);
-    ctx.projectConfig({ agents: { build: { permissions: [] } }, permission: { bash: { "rm *": "deny" } } });
-    expect(readOpencodeRuleset(ctx.project, ctx.env, { hostMajor: 2 })).toEqual({ error: expect.stringContaining("agents.build.permissions") });
-    ctx.projectConfig({ agents: { build: { mode: "primary" } }, permission: { bash: { "rm *": "deny" } } });
-    const ruleset = readOpencodeRuleset(ctx.project, ctx.env, { hostMajor: 2 });
-    expect(evaluateOperation("rm -rf x", ruleset, { directory: ctx.project }).action).toBe("deny");
-  });
-
   it("a config that exists but does not parse is an error, and the checker stops everything", () => {
     const ctx = setup();
     writeFileSync(join(ctx.project, "opencode.json"), "{ this is not json");
@@ -601,5 +589,118 @@ describe("engine — policyStop", () => {
     const plan: PlanTree = { root: "a", nodes: [{ id: "a", commands: ["echo hi"] }] };
     const r = await runPlanTree(plan, { cwd });
     expect(r.stoppedReason).toBe("leaf");
+  });
+});
+
+
+// opencode v2 (tag v2.0.16) model: every config document's rules are
+// concatenated in load order (core `config/normalize.ts:179-183` per document,
+// `config/plugin/agent.ts:84-91` across documents), discovery walks to the
+// FILESYSTEM root (`config/discovery.ts:34-36`), and evaluation is findLast
+// (`permission.ts:87-95`).
+describe("readOpencodeRuleset — hostMajor 2 (opencode v2 model)", () => {
+  const v2 = (ctx: ReturnType<typeof setup>, operation: Operation, agent?: string): string => {
+    const ruleset = readOpencodeRuleset(ctx.project, ctx.env, { hostMajor: 2, ...(agent ? { agent } : {}) });
+    return evaluateOperation(operation, ruleset, { directory: ctx.project, hostMajor: 2 }).action;
+  };
+
+  it("concatenates per document (review repro): global {*:deny,cat *:allow} + project {*:deny} ⇒ deny", () => {
+    const ctx = setup();
+    ctx.globalConfig({ permission: { bash: { "*": "deny", "cat *": "allow" } } });
+    ctx.projectConfig({ permission: { bash: { "*": "deny" } } });
+    expect(v2(ctx, "cat marker.txt")).toBe("deny");
+    // v1 mergeDeep semantics are unchanged for hostMajor 1.
+    expect(verdict(ctx, "cat marker.txt")).toBe("allow");
+  });
+
+  it("reads configs above the git root (v2 walks to the filesystem root)", () => {
+    const ctx = setup();
+    writeFileSync(join(ctx.tmp, "opencode.json"), JSON.stringify({ permission: { bash: { "cat *": "deny" } } }));
+    expect(v2(ctx, "cat marker.txt")).toBe("deny");
+    expect(verdict(ctx, "cat marker.txt")).toBe("allow");
+  });
+
+  it("orders nearer project files after farther ones, and .opencode dirs after direct files", () => {
+    const ctx = setup();
+    writeFileSync(join(ctx.tmp, "opencode.json"), JSON.stringify({ permission: { bash: { "cat *": "deny" } } }));
+    ctx.projectConfig({ permission: { bash: { "cat *": "allow" } } });
+    expect(v2(ctx, "cat x")).toBe("allow");
+    mkdirSync(join(ctx.project, ".opencode"));
+    writeFileSync(join(ctx.project, ".opencode", "opencode.json"), JSON.stringify({ permission: { bash: { "cat *": "deny" } } }));
+    expect(v2(ctx, "cat x")).toBe("deny");
+  });
+
+  it("evaluates the native `permissions` array (last match wins), after the same document's v1 rules", () => {
+    const ctx = setup();
+    ctx.projectConfig({
+      permission: { bash: { "cat *": "allow" } },
+      permissions: [{ action: "shell", resource: "cat *", effect: "deny" }],
+    });
+    expect(v2(ctx, "cat x")).toBe("deny");
+    ctx.projectConfig({ permissions: [{ action: "shell", resource: "*", effect: "deny" }, { action: "shell", resource: "ls *", effect: "allow" }] });
+    expect(v2(ctx, "ls -la")).toBe("allow");
+    expect(v2(ctx, "cat x")).toBe("deny");
+  });
+
+  it("maps predexec's shell requests to v2's `shell` action; a native `bash` action is not normalized by v2", () => {
+    const ctx = setup();
+    ctx.projectConfig({ permissions: [{ action: "bash", resource: "cat *", effect: "deny" }] });
+    expect(v2(ctx, "cat x")).toBe("allow");
+    ctx.projectConfig({ tools: { bash: false } });
+    expect(v2(ctx, "cat x")).toBe("deny");
+  });
+
+  it("an ask anywhere stops (no v2 plugin prompt)", () => {
+    const ctx = setup();
+    ctx.projectConfig({ permissions: [{ action: "shell", resource: "cat *", effect: "ask" }] });
+    expect(v2(ctx, "cat x")).toBe("ask");
+    expect(createPolicyChecker(readOpencodeRuleset(ctx.project, ctx.env, { hostMajor: 2 }), { directory: ctx.project, hostMajor: 2 })("cat x")).toBeTruthy();
+  });
+
+  it("agent rules: native agents.<n>.permissions and legacy agent.<n>.permission apply after all top-level rules", () => {
+    const ctx = setup();
+    ctx.projectConfig({
+      agents: { review: { permissions: [{ action: "shell", resource: "cat *", effect: "deny" }] } },
+      agent: { build: { permission: { bash: { "cat *": "deny" } } } },
+      permission: { bash: { "cat *": "allow" } },
+    });
+    expect(v2(ctx, "cat x", "review")).toBe("deny");
+    expect(v2(ctx, "cat x", "build")).toBe("deny");
+    expect(v2(ctx, "ls", "build")).toBe("allow");
+  });
+
+  it("an agent opencode does not know resolves to v2's missing-agent ruleset (deny everything)", () => {
+    const ctx = setup();
+    expect(v2(ctx, "ls", "nosuchagent")).toBe("deny");
+    ctx.projectConfig({ agents: { build: { disabled: true } } });
+    expect(v2(ctx, "ls", "build")).toBe("deny");
+  });
+
+  it("built-in defaults: *.env reads ask, ordinary commands allow", () => {
+    const ctx = setup();
+    expect(v2(ctx, "ls")).toBe("allow");
+    expect(v2(ctx, { tool: "read", path: ".env" })).toBe("ask");
+  });
+
+  it("fails closed on a native entry it cannot parse, and on malformed JSON", () => {
+    const ctx = setup();
+    ctx.projectConfig({ permissions: [{ action: "shell", resource: "cat *", effect: "maybe" }] });
+    expect(readOpencodeRuleset(ctx.project, ctx.env, { hostMajor: 2 })).toHaveProperty("error");
+    ctx.projectConfig({ permissions: "nope" });
+    expect(readOpencodeRuleset(ctx.project, ctx.env, { hostMajor: 2 })).toHaveProperty("error");
+    writeFileSync(join(ctx.project, "opencode.json"), "{ nope");
+    expect(readOpencodeRuleset(ctx.project, ctx.env, { hostMajor: 2 })).toHaveProperty("error");
+  });
+
+  it("OPENCODE_CONFIG_DIR replaces the global dir; OPENCODE_CONFIG_CONTENT loads last", () => {
+    const ctx = setup();
+    const alt = join(ctx.tmp, "altcfg");
+    mkdirSync(alt);
+    writeFileSync(join(alt, "opencode.json"), JSON.stringify({ permission: { bash: { "cat *": "deny" } } }));
+    const env = { ...ctx.env, OPENCODE_CONFIG_DIR: alt };
+    const check = (e: NodeJS.ProcessEnv) =>
+      evaluateOperation("cat x", readOpencodeRuleset(ctx.project, e, { hostMajor: 2 }), { directory: ctx.project, hostMajor: 2 }).action;
+    expect(check(env)).toBe("deny");
+    expect(check({ ...env, OPENCODE_CONFIG_CONTENT: JSON.stringify({ permission: { bash: { "cat *": "allow" } } }) })).toBe("allow");
   });
 });

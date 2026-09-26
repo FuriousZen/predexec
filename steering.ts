@@ -158,7 +158,8 @@ const POLICY_PARAGRAPH: Readonly<Record<SkillHarness, string | null>> = Object.f
     "read/grep/find/ls tool ops are not host-policy mapped (Codex has no persisted file-operation policy).",
   opencode:
     "Permissions: shell commands and read/grep/find/ls tool ops respect your opencode permission rules. " +
-    "A static deny stops immediately (`policyStop`); an ask is forwarded to opencode's own permission service, so the user may be prompted mid-walk, and a rejection stops the walk. " +
+    "A static deny stops immediately (`policyStop`). On opencode 1.x an ask is forwarded to opencode's own permission service, so the user may be prompted mid-walk, and a rejection stops the walk. " +
+    "On opencode 2.x plugins cannot prompt, so an ask match hard-stops the walk — run that step with the host's own tool (`shell`/`read`) instead. " +
     "Known gap: rules visible only to the host are not applied to inner `sh -c` spellings.",
   antigravity:
     "Permissions: shell commands and file reads are re-checked against your Antigravity grants (`command(...)` / `read_file(...)`, Deny > Ask > Allow). " +

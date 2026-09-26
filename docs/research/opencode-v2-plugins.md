@@ -101,19 +101,57 @@ parses the packaged `skills/opencode/predexec/SKILL.md` the way v2's directory l
   tools are visible (`core/src/tool/AGENTS.md:50-54`).
 - **Degradation:** on v2 the static reader (`policy.ts`) is the whole check. A `deny` **or** `ask`
   match hard-stops before running. There is never a prompt.
-- **Rule shapes.** v2 still migrates v1 `permission` objects and the legacy `tools` map into its
-  ordered ruleset (`core/src/config/normalize.ts:180-183`). It evaluates last-match-wins, like v1
-  (`core/src/permission.ts:87-91`, `findLast`). The reader's v1 model therefore covers those.
-  It does not model v2-native `permissions: [{action, resource, effect}]` arrays or
-  `agents.<name>.permissions`. v2 appends those per document rather than via mergeDeep
-  (`core/src/config/plugin/agent.ts:83-124`), and it normalizes some action names
-  (`bash` → `shell`, `write`/`patch` → `edit`; `core/src/v1/config/migrate.ts:117-122`). A wrong guess about their order could turn a deny into an allow. On a v2 host
-  their mere presence is therefore an unreadable policy (`readOpencodeRuleset(..., { hostMajor: 2 })`
-  → `{ error }`), and every operation stops (fail-closed). The message names the v1 form as the
-  workaround.
-- Not mirrored either: v2 walks config files up to the filesystem root and also reads
-  `.claude/` and `.agents/` dirs (`core/src/config/discovery.ts:23-84`). The reader keeps v1's
-  git-root-bounded walk. Bundled v2 agent defaults may also differ from v1's.
+- **v2 ruleset model (Task 17a fix round 1).** v2 does not mergeDeep config layers the way v1
+  does. `readOpencodeRuleset(dir, env, { hostMajor: 2 })` builds the ruleset with v2's own model,
+  as follows:
+  - **Discovery and load order.** The global dir comes first (`OPENCODE_CONFIG_DIR` replaces it:
+    util `global.ts:79`, cli `server-process.ts:108-115`), then `OPENCODE_CONFIG`, then the project
+    `opencode.json`/`opencode.jsonc` files, then `.opencode/` dirs, then `OPENCODE_CONFIG_CONTENT`
+    (core `config.ts:196-237`).
+    - Project files and `.opencode/` dirs are found by walking from the session directory to the
+      **filesystem root**, not the git root (`config/discovery.ts:23-84`; `fs.up` with no stop,
+      util `fs-util.ts:162-178`).
+    - Within those, farthest comes first, and `opencode.json` loads before `opencode.jsonc`.
+    - Entries that resolve to a global root (the global config dir, `~/.claude`, `~/.agents`) or to
+      a global file are dropped.
+    - `OPENCODE_CONFIG_PROJECT_DISABLE` / `OPENCODE_DISABLE_PROJECT_CONFIG` skip the walk.
+  - **Per-document rules.** Each document's rules are `[...tools, ...permission, ...permissions]`
+    (`config/normalize.ts:179-183`).
+    - Legacy keys go through `normalizeAction` (`bash`→`shell`, `write`/`patch`→`edit`,
+      `task`→`subagent`; `v1/config/migrate.ts:117-122`).
+    - The native `permissions: [{action, resource, effect}]` array (schema `permission.ts:55-66`)
+      is taken verbatim. A native `bash` action is **not** renamed, so it never matches v2's `shell`
+      requests; that matches the host.
+  - **Agent ruleset.** It is built in this order (`config/plugin/agent.ts:83-124`):
+    1. `Agent.Info.default` (schema `agent.ts:39-54`) plus the global external-directory allows
+       (`agent.ts:59-64`).
+    2. The built-in agent's pushes (`plugin/agent.ts:85-156`, `plugin/plan.ts:32-42`).
+    3. **All** documents' top-level rules, concatenated.
+    4. That agent's own rules from each document in order. For each document, legacy
+       `agent`/`mode` entries are replaced wholesale by native `agents.<name>`
+       (`normalize.ts:131-166, 731-743`).
+    - `~`/`$HOME` are expanded only for the path actions (`agent.ts:141-162`).
+    - A disabled agent, or an agent opencode does not know, evaluates as `[* * deny]`
+      (`permission.ts:19,162`).
+  - **Evaluation.** It is last-match-wins (`permission.ts:87-95`). predexec's shell requests are
+    renamed `bash`→`shell` to match v2's shell tool (`tool/plugin/shell.ts:22,133-141`). Every path
+    spelling predexec computes (worktree-relative, directory-relative, absolute) is checked for
+    both deny and ask, because v2 file resources are directory-relative (`file-access.ts:100-111`).
+  - **Fail-closed.** Any source that exists but cannot be parsed stops every operation. That
+    includes malformed JSON, a native entry that is not `{action: string, resource: string,
+    effect: allow|ask|deny}`, and a non-boolean `tools` value. v2 itself logs and *skips* such a
+    document (`config.ts:104-133`); skipping could drop a deny.
+- **Unmodeled runtime and remote state.** These are not modeled:
+  - `session.permissions`, which v2 merges into each evaluation after the agent's rules
+    (`core/src/permission.ts:162`). It is per-session runtime state that a plugin cannot read.
+  - Well-known (Console/integration) configs, which need network and credentials.
+  - Console managed-policy statements, applied through a `permission.evaluate` hook
+    (`core/src/config/plugin/policy.ts:44-51`).
+  - `{env:…}`/`{file:…}` variable substitution inside config files.
+  - The ordering of built-in agent transforms relative to the config agent transform is taken
+    from plugin registration order. It was not measured.
+  - All of these can make the host stricter than predexec's view, but only through state predexec
+    cannot see. The live run in §8 exercised the modeled path.
 
 ## 7. File / find / grep client API — **absent**
 
@@ -122,7 +160,9 @@ The Promise context (§2) has no file, find or filesystem client. v1's `client.f
 run through `mcp/tool-ops.ts`, the same node:fs executor Claude Code and Codex use. It is rooted
 at `location.directory`, keeps realpath containment, and marks truncation explicitly. Its exit
 conventions are grep/find `1` = searched, found nothing; `2` = never ran; read/ls `1` = failure.
-`exit == 0` branches identically on every harness. The v1 SDK path's 10-match grep cap and
+`exit == 0` branches identically on every harness. On v1-opencode, by contrast, every op that
+never ran exits 2 (read/ls included). The v2 `plan` argument description states this, so plans
+gate on `exit == 0` rather than on a specific failure code. The v1 SDK path's 10-match grep cap and
 200-result find ceiling do not apply on v2.
 
 ## 8. Live verification — opencode v2.0.16 on the measuring machine
@@ -154,7 +194,9 @@ rsync of the source checkout (`.opencode/plugins/predexec.ts`, loaded as TypeScr
 | Steering fallback | **PASS**: with the skill visible, the routing text appears once (the skill description) and the hook stays silent. With `permission.skill = "deny"`, the skill disappears from the prompt and the hook injects `STEERING_LINE` (still exactly one occurrence) |
 | Static deny | **PASS**: `permission.bash["cat *"] = "deny"` → `POLICY HARD-STOP (not run)` … `'cat *'` |
 | `ask` with no host prompt | **PASS**: `"ask"` → the same hard-stop, and no prompt |
-| v2-native `permissions` | **PASS**: fail-closed stop naming the unsupported `permissions` rules |
+| v2-native `permissions` (fix round 1, re-packed build) | **PASS**: `[{shell, cat *, deny}]` → hard-stop `'shell:cat *'`. Adding a later `{shell, cat marker.txt, allow}` → runs (last match wins) |
+| Per-document layering (review repro) | **PASS**: global `bash {*:deny, cat *:allow}` + project `bash {*:deny}` → hard-stop `'shell:*'` (v1 mergeDeep would have allowed it) |
+| Config above the git root | **PASS**: an `opencode.json` in the scratch project's parent (outside its git repo) with `bash {cat *: deny}` → hard-stop |
 
 **UNVERIFIED:** npm-name resolution (`plugins: ["predexec"]` → `Host.resolve` → `main`). It needs
 the registry and would install the published version, not this build. It rests on the source read
