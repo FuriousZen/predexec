@@ -1201,7 +1201,10 @@ export function readSkillIdentity(path) {
   } catch {
     return null;
   }
-  const frontmatter = text.match(/^---\r?\n([\s\S]*?)\r?\n---/);
+  // A leading BOM (common from a Windows editor) must not hide the frontmatter
+  // delimiter from this anchored match; comparison-time normalization (see
+  // normalizeSkillText) handles the BOM for content equality separately.
+  const frontmatter = text.replace(/^﻿/, "").match(/^---\r?\n([\s\S]*?)\r?\n---/);
   if (!frontmatter) return null;
   const name = frontmatter[1].match(/^name:\s*(.+?)\s*$/m);
   if (!name || name[1] !== "predexec") return null;
@@ -1363,6 +1366,21 @@ export function readCanonicalSkillText(harness, opts = {}) {
   }
 }
 
+/**
+ * Normalizes SKILL.md text for equality comparison: strips a leading BOM,
+ * unifies line endings to `\n`, drops trailing per-line whitespace, and trims
+ * trailing whitespace at end of file. A CRLF checkout or an editor-added
+ * trailing newline on an otherwise byte-identical install must not read as
+ * "a different skill" — see task-15-rereview-1 Important #1.
+ */
+function normalizeSkillText(text) {
+  return text
+    .replace(/^﻿/, "")
+    .replace(/\r\n?/g, "\n")
+    .replace(/[ \t]+$/gm, "")
+    .trimEnd();
+}
+
 function duplicateOrOkChecks(label, skills) {
   return skills.length > 1
     ? [
@@ -1409,7 +1427,7 @@ export function skillCheck(label, installName, roots, registered, opts = {}) {
     // Can't load this harness's own packaged skill to compare against (a
     // corrupted install) — fall back to comparing found copies against each
     // other rather than silently skipping the check.
-    const distinct = new Set(skills.map((s) => s.text));
+    const distinct = new Set(skills.map((s) => normalizeSkillText(s.text)));
     if (distinct.size > 1) {
       return [
         {
@@ -1423,7 +1441,8 @@ export function skillCheck(label, installName, roots, registered, opts = {}) {
     return duplicateOrOkChecks(label, skills);
   }
 
-  const mismatched = skills.filter((s) => s.text !== canonical);
+  const normalizedCanonical = normalizeSkillText(canonical);
+  const mismatched = skills.filter((s) => normalizeSkillText(s.text) !== normalizedCanonical);
   if (mismatched.length > 0) {
     return mismatched.map((s) => ({
       name: `${label}: skill at ${s.path} is not the ${label} skill (wrong harness or stale)`,

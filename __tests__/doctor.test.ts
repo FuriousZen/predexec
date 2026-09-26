@@ -812,6 +812,68 @@ describe("skillCheck — canonical-content comparison (I1 fix)", () => {
   });
 });
 
+describe("skillCheck — line-ending/whitespace-tolerant comparison (rereview-1 Important)", () => {
+  it("a CRLF copy of the canonical content is still ok", () => {
+    scratch();
+    const pkg = writeCanonicalPackageFixture();
+    write("root/predexec/SKILL.md", canonicalSkill("opencode").replace(/\n/g, "\r\n"));
+    const checks = skillCheck("opencode", "opencode", [join(tmp, "root")], true, { packageRoot: pkg });
+    expect(checks[0]!.status).toBe("ok");
+  });
+
+  it("an extra trailing newline is still ok", () => {
+    scratch();
+    const pkg = writeCanonicalPackageFixture();
+    write("root/predexec/SKILL.md", canonicalSkill("opencode") + "\n\n\n");
+    const checks = skillCheck("opencode", "opencode", [join(tmp, "root")], true, { packageRoot: pkg });
+    expect(checks[0]!.status).toBe("ok");
+  });
+
+  it("a leading BOM is still ok", () => {
+    scratch();
+    const pkg = writeCanonicalPackageFixture();
+    write("root/predexec/SKILL.md", "﻿" + canonicalSkill("opencode"));
+    const checks = skillCheck("opencode", "opencode", [join(tmp, "root")], true, { packageRoot: pkg });
+    expect(checks[0]!.status).toBe("ok");
+  });
+
+  it("trailing spaces on a line are still ok", () => {
+    scratch();
+    const pkg = writeCanonicalPackageFixture();
+    write("root/predexec/SKILL.md", canonicalSkill("opencode").replace("---\n\n", "---   \n\n"));
+    const checks = skillCheck("opencode", "opencode", [join(tmp, "root")], true, { packageRoot: pkg });
+    expect(checks[0]!.status).toBe("ok");
+  });
+
+  it("a genuinely different word is still [!], normalization doesn't mask real drift", () => {
+    scratch();
+    const pkg = writeCanonicalPackageFixture();
+    write("root/predexec/SKILL.md", canonicalSkill("opencode").replace("canonical", "DIFFERENT"));
+    const checks = skillCheck("opencode", "opencode", [join(tmp, "root")], true, { packageRoot: pkg });
+    expect(checks[0]!.status).toBe("fail");
+  });
+
+  it("normalizes the identical-duplicates comparison too (CRLF vs LF copies of the same skill)", () => {
+    scratch();
+    const pkg = writeCanonicalPackageFixture();
+    write("a/predexec/SKILL.md", canonicalSkill("opencode"));
+    write("b/predexec/SKILL.md", canonicalSkill("opencode").replace(/\n/g, "\r\n"));
+    const checks = skillCheck("opencode", "opencode", [join(tmp, "a"), join(tmp, "b")], true, { packageRoot: pkg });
+    expect(checks[0]!.status).toBe("info");
+    expect(checks[0]!.name).toContain("duplicate copies");
+  });
+
+  it("normalizes the fallback (canonical-unreadable) pairwise comparison too", () => {
+    scratch();
+    write("a/predexec/SKILL.md", skillFrontmatter("same"));
+    write("b/predexec/SKILL.md", skillFrontmatter("same").replace(/\n/g, "\r\n"));
+    // "x" has no SKILL_SOURCE_PATHS entry, forcing the fallback path.
+    const checks = skillCheck("x", "x", [join(tmp, "a"), join(tmp, "b")], true);
+    expect(checks[0]!.status).toBe("info");
+    expect(checks[0]!.name).toContain("duplicate copies");
+  });
+});
+
 describe("readCanonicalSkillText", () => {
   it("reads a harness's packaged canonical text from a given package root", () => {
     scratch();
