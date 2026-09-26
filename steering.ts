@@ -2,12 +2,14 @@
  * Shared steering text for the predexec adapters.
  *
  * Harness-facing (NOT part of pure `core/`) — the constants the adapters
- * import their routing prose from. The two skills (`.pi/skills/predexec/SKILL.md`,
- * `skills/predexec-claude/SKILL.md`) restate the same rules as static markdown
- * and must be updated by hand when this changes.
+ * import their routing prose from. Every harness's routing SKILL.md is
+ * RENDERED from these constants by `renderSkill` (`pnpm skills` writes them to
+ * `SKILL_PATHS`); never edit a SKILL.md by hand — __tests__/skills.test.ts
+ * fails on drift.
  */
 
 import { escapeRegExp } from "./core/index.ts";
+import { TOOL_OP_SYNTAX } from "./plan-language.ts";
 export { JSON_PATH_SINGLE_OP_LINE } from "./plan-language.ts";
 
 /** The one-line routing rule opencode injects when the host prompt lacks it. */
@@ -28,16 +30,15 @@ export const DESCRIPTION_BASE =
 
 /**
  * The "use parallel:true / cwd / edges" usage sentence. Shared by the MCP and
- * opencode DESCRIPTIONs; pi carries the same sentence too, but embedded inside
- * its promptGuidelines rather than its (shorter) DESCRIPTION.
+ * opencode DESCRIPTIONs; pi carries it through the rendered skill rather than
+ * its (shorter) DESCRIPTION.
  */
 export const USAGE_LINE =
   "Use parallel:true for independent reads, cwd for a shared base dir, and edges to branch. ";
 
 /**
  * The mutationStop/noEdgeMatch recovery sentence. Shared by the MCP and
- * opencode DESCRIPTIONs and by pi's second promptGuidelines entry (there
- * prefixed locally with "predexec: ").
+ * opencode DESCRIPTIONs and by every rendered skill.
  */
 export const RECOVERY_LINE =
   "mutationStop/noEdgeMatch is recoverable — read the transcript and resume with bash. Never retry the same plan blindly. ";
@@ -107,4 +108,115 @@ export function systemHasRoutingInstructions(system: string[]): boolean {
     // Never break the chat turn on guard failure; err on the side of injecting.
     return false;
   }
+}
+
+// ---------------------------------------------------------------------------
+// Skill rendering — one source for every harness's routing SKILL.md.
+// ---------------------------------------------------------------------------
+
+export const SKILL_HARNESSES = ["pi", "claude", "codex", "opencode", "antigravity"] as const;
+export type SkillHarness = (typeof SKILL_HARNESSES)[number];
+
+/**
+ * Repo-relative output path per harness. Each lives in its own subtree so a
+ * host's recursive `**\/SKILL.md` scan of one plugin's skills dir never picks
+ * up another harness's skill. pi's is found through package.json `pi.skills`;
+ * Antigravity's is written straight into its plugin dir.
+ */
+export const SKILL_PATHS: Readonly<Record<SkillHarness, string>> = Object.freeze({
+  pi: ".pi/skills/predexec/SKILL.md",
+  claude: "skills/claude/predexec/SKILL.md",
+  codex: "skills/codex/predexec/SKILL.md",
+  opencode: "skills/opencode/predexec/SKILL.md",
+  antigravity: "antigravity-plugin/skills/predexec/SKILL.md",
+});
+
+/** Always-resident: the frontmatter description every host keeps in context. */
+const SKILL_DESCRIPTION =
+  STEERING_LINE +
+  " Use it for ls/cat/grep/find-style reads, read/grep/find/ls tool calls, and predictable multi-step read sequences " +
+  "(one plan tree, one round-trip); it hard-stops before anything that mutates.";
+
+/** Where the tool id comes from — MCP hosts namespace it, so never hardcode the full id. */
+const MCP_TOOL_ID_LINE =
+  "Call the `predexec` tool (its full id varies by install, e.g. `mcp__predexec__predexec` or a plugin-namespaced id).";
+
+/**
+ * Per-harness permission behavior (carries the `policyStop` token). pi has no
+ * permission layer predexec consults, so it gets none.
+ */
+const POLICY_PARAGRAPH: Readonly<Record<SkillHarness, string | null>> = Object.freeze({
+  pi: null,
+  claude:
+    "Permissions: shell commands and read/grep/find/ls tool ops are re-checked against your Claude Code permission rules. " +
+    "A deny OR ask match hard-stops the walk (`policyStop`), because predexec cannot prompt mid-walk — run that step with your own Bash/Read tool instead. " +
+    "`Read(...)` deny rules use gitignore-style paths and also cover shell readers (cat, head, …).",
+  codex:
+    "Permissions: shell commands are re-checked against your Codex execpolicy rules (`/etc/codex/rules`, `~/.codex/rules`, and a trusted project's `.codex/rules`; most-restrictive wins). " +
+    "A forbidden OR prompt match hard-stops the walk (`policyStop`), because predexec cannot prompt mid-walk — run that step with your own shell tool instead. " +
+    "An unreadable rules file stops every shell command until it is fixed. " +
+    "read/grep/find/ls tool ops are not host-policy mapped (Codex has no persisted file-operation policy).",
+  opencode:
+    "Permissions: shell commands and read/grep/find/ls tool ops respect your opencode permission rules. " +
+    "A static deny stops immediately (`policyStop`); an ask is forwarded to opencode's own permission service, so the user may be prompted mid-walk, and a rejection stops the walk. " +
+    "Known gap: rules visible only to the host are not applied to inner `sh -c` spellings.",
+  antigravity:
+    "Permissions: shell commands and file reads are re-checked against your Antigravity grants (`command(...)` / `read_file(...)`, Deny > Ask > Allow). " +
+    "A deny OR ask match hard-stops the walk (`policyStop`), because predexec cannot prompt mid-walk — run that step with your own tools instead.",
+});
+
+/** The host's own shell tool, named the way that host names it. */
+const SHELL_TOOL: Readonly<Record<SkillHarness, string>> = Object.freeze({
+  pi: "bash",
+  claude: "Bash",
+  codex: "your shell tool",
+  opencode: "bash",
+  antigravity: "your terminal tool",
+});
+
+const HARNESS_TITLE: Readonly<Record<SkillHarness, string>> = Object.freeze({
+  pi: "pi",
+  claude: "Claude Code",
+  codex: "Codex",
+  opencode: "opencode",
+  antigravity: "Antigravity",
+});
+
+/** Hosts whose tool ops are predexec's own filesystem code (the MCP tool-ops module). */
+const OWN_TOOL_OPS: ReadonlySet<SkillHarness> = new Set<SkillHarness>(["claude", "codex", "antigravity"]);
+
+/**
+ * Render one harness's complete SKILL.md (frontmatter + body). Pure and
+ * deterministic: `scripts/gen-skills.mjs` writes this to `SKILL_PATHS[h]`.
+ */
+export function renderSkill(h: SkillHarness): string {
+  const shell = SHELL_TOOL[h];
+  const policy = POLICY_PARAGRAPH[h];
+  const bullets = [
+    OWN_TOOL_OPS.has(h) ? MCP_TOOL_ID_LINE : "Call the `predexec` tool.",
+    USAGE_LINE.trim(),
+    `A node's \`commands\` mixes shell strings and tool ops: \`${TOOL_OP_SYNTAX}\`.`,
+    `Edge conditions — ${WHEN_SYNTAX_LINE.trim()}`,
+    VERIFY_FIRST_LINE.trim(),
+    "predexec hard-stops (`mutationStop`) before any write/install/delete/exec — including interpreter one-liners that write, " +
+      `shell scripts (\`bash x.sh\`), and \`sh -c\` with writes. Run those, and interactive commands, with ${shell}.`,
+    ...(policy ? [policy] : []),
+    RECOVERY_LINE.trim() +
+      (policy ? " `policyStop` recovers the same way." : "") +
+      (shell.toLowerCase() === "bash" ? "" : ` ("bash" here means ${shell}.)`),
+    "A tool op exiting 2 means the search never ran (bad path or scope); exit 1 means it ran and found nothing.",
+    "Truncated output is always flagged (`…[truncated`) — never branch on it as if it were complete.",
+    ...(OWN_TOOL_OPS.has(h)
+      ? [
+          "predexec's read/grep/find/ls are its own filesystem implementations, not the host's native tools — line numbering, " +
+            "truncation and .gitignore handling differ. Use the native tool when exact fidelity matters.",
+        ]
+      : []),
+  ];
+  const text =
+    `---\nname: predexec\ndescription: ${SKILL_DESCRIPTION}\n---\n\n` +
+    `# predexec routing (${HARNESS_TITLE[h]})\n\n` +
+    bullets.map((b) => `- ${b}`).join("\n") +
+    "\n";
+  return text;
 }

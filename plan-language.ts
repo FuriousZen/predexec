@@ -66,11 +66,15 @@ export {
   MAX_GREP_CONTEXT,
 };
 
+/** The native tool-op call shapes a node's `commands` array accepts (also rendered into every SKILL.md). */
+export const TOOL_OP_SYNTAX =
+  '{tool:"read",path,offset?,limit?} | {tool:"grep",pattern,path?,glob?,ignoreCase?,literal?,context?,limit?} | ' +
+  '{tool:"find",pattern,path?,limit?} | {tool:"ls",path?,limit?}';
+
 /** Canonical facts shared by model-facing plan descriptions. */
 export const PLAN_SHAPE_DESCRIPTION =
-  `Plan tree object: {${PLAN_FIELD_NAMES.root}, ${PLAN_FIELD_NAMES.nodes}:[{${PLAN_FIELD_NAMES.id}, ${PLAN_FIELD_NAMES.commands}:[<shell string> | {tool:"read",path,offset?,limit?} | ` +
-  '{tool:"grep",pattern,path?,glob?,ignoreCase?,literal?,context?,limit?} | {tool:"find",pattern,path?,limit?} | ' +
-  `{tool:"ls",path?,limit?}], ${PLAN_FIELD_NAMES.parallel}?, ${PLAN_FIELD_NAMES.mutates}?, ${PLAN_FIELD_NAMES.edges}?:[{${PLAN_FIELD_NAMES.when},${PLAN_FIELD_NAMES.to}]}]}], ${PLAN_FIELD_NAMES.cwd}?, ${PLAN_FIELD_NAMES.maxDepth}?}. ` +
+  `Plan tree object: {${PLAN_FIELD_NAMES.root}, ${PLAN_FIELD_NAMES.nodes}:[{${PLAN_FIELD_NAMES.id}, ${PLAN_FIELD_NAMES.commands}:[<shell string> | ${TOOL_OP_SYNTAX}` +
+  `], ${PLAN_FIELD_NAMES.parallel}?, ${PLAN_FIELD_NAMES.mutates}?, ${PLAN_FIELD_NAMES.edges}?:[{${PLAN_FIELD_NAMES.when},${PLAN_FIELD_NAMES.to}]}]}], ${PLAN_FIELD_NAMES.cwd}?, ${PLAN_FIELD_NAMES.maxDepth}?}. ` +
   'Conditions: exitCode, fileExists, jsonPath, numeric, match, always. ' +
   `Each node has at most ${MAX_OPERATIONS_PER_NODE} operations; parallel execution is capped at ${MAX_PARALLEL_CONCURRENCY} concurrent operations; ` +
   `maxDepth is capped at ${DEFAULT_MAX_DEPTH}; plans have at most ${MAX_PLAN_NODES} nodes and ${MAX_PLAN_EDGES} edges; ` +

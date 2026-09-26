@@ -28,6 +28,7 @@
     "bin",
     ".pi/skills",
     "skills",
+    "antigravity-plugin",
     "configs",
     ".claude-plugin",
     "README.md",
@@ -46,6 +47,7 @@
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit",
     "build": "tsc -p tsconfig.build.json",
+    "skills": "pnpm run build && node scripts/gen-skills.mjs",
     "version": "node scripts/sync-plugin-version.mjs && git add .claude-plugin/plugin.json",
     "prepack": "npm run typecheck && npm run build"
   },

@@ -335,16 +335,16 @@ describe("mcp server — packaging and plugin wiring", () => {
   });
 
   it("the Claude Code skill's frontmatter name matches its directory", () => {
-    const skill = readFileSync(join(root, "skills", "predexec-claude", "SKILL.md"), "utf8");
-    expect(skill).toMatch(/^---\n(?:[\s\S]*?\n)?name: predexec-claude\n/);
+    const skill = readFileSync(join(root, "skills", "claude", "predexec", "SKILL.md"), "utf8");
+    expect(skill).toMatch(/^---\n(?:[\s\S]*?\n)?name: predexec\n/);
     expect(skill).toMatch(/\ndescription: \S/);
   });
 
   /**
-   * The pi skill lives under `.pi/skills/` and the root `skills/` dir (Claude
-   * Code's auto-discovered plugin root) holds ONLY the Claude Code skill — so
-   * pi's skill loader and Claude Code's `skills/` root are isolated from each
-   * other and neither harness receives the other's prompt instructions.
+   * The pi skill lives under `.pi/skills/`; the root `skills/` dir holds one
+   * subtree per MCP/opencode harness (claude, codex, opencode) — so pi's skill
+   * loader never sees them and a recursive scan of one harness's subtree never
+   * picks up another harness's skill.
    */
   it("pi.skills resolves to real directories under .pi/skills, isolated from the Claude Code skills root", () => {
     const pkg = readJson("package.json");
@@ -359,7 +359,8 @@ describe("mcp server — packaging and plugin wiring", () => {
     expect(piSkillEntries).toEqual(["predexec"]);
 
     const rootSkillEntries = readdirSync(join(root, "skills")).sort();
-    expect(rootSkillEntries).toEqual(["predexec-claude"]);
+    expect(rootSkillEntries).toEqual(["claude", "codex", "opencode"]);
+    for (const h of rootSkillEntries) expect(readdirSync(join(root, "skills", h))).toEqual(["predexec"]);
   });
 });
 

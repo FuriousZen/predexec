@@ -418,14 +418,15 @@ mcp/                               Claude Code / Codex adapter (stdio MCP), dele
   policy-codex.ts                  reads Codex's config.toml + execpolicy rules → policyStop, fail-closed
 core/                              PURE TS, zero harness imports (promotable to a standalone package)
   types.ts conditions.ts runner.ts engine.ts destructive.ts coerce.ts index.ts
-steering.ts                        shared steering text/marker (harness-facing; not in core/)
+steering.ts                        shared steering text/marker + renderSkill (harness-facing; not in core/)
 stats.ts                           request-accounting recorder (append-only JSONL; harness-facing)
 policy.ts                          opencode permission reader/checker (harness-facing)
 adapter-runtime.ts                 shared adapter execution & stats runtime
 bin/predexec.mjs                   CLI: doctor + stats (node builtins only)
 bin/predexec-mcp.mjs               Claude Code / Codex MCP entrypoint (`--host codex` selects Codex)
-.pi/skills/predexec/SKILL.md       declarative pi routing skill (loaded via pi.skills)
-skills/predexec-claude/SKILL.md    Claude Code routing skill (shipped with the plugin wrapper)
+.pi/skills/predexec/SKILL.md       pi routing skill (loaded via pi.skills)       } generated from steering.ts
+skills/<harness>/predexec/SKILL.md claude / codex / opencode routing skills     } by `pnpm skills`;
+antigravity-plugin/skills/predexec/SKILL.md  Antigravity routing skill          } never edit by hand
 .claude-plugin/plugin.json         optional Claude Code plugin wrapper
 configs/opencode/AGENTS.md         drop-in routing block for opencode projects
 configs/codex/AGENTS.md            drop-in routing block for Codex projects

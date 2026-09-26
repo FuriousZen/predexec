@@ -93,6 +93,9 @@ describe.each(variants)("pi extension ($name) — registration contract (fake Ex
       expect(tool.parameters.properties.nodes.items.properties.edges.items.properties.when.description).toContain(kind);
     }
     expect(tool.promptGuidelines.join("\n")).toContain("mutationStop/noEdgeMatch");
+    // Guidelines are a pointer; the syntax itself lives in the generated skill.
+    expect(tool.promptGuidelines.join("\n")).toContain("predexec skill");
+    expect(tool.promptSnippet).toMatch(/\S/);
     expect(events.has("tool_result")).toBe(true);
   });
 });

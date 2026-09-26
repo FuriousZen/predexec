@@ -22,7 +22,7 @@ import { coercePlan, isDestructiveCommand, OUTPUT_CAP, validateOperation, type T
 import { TRUNCATION_MARKER } from "../../core/runner.ts";
 import type { ProgressEvent } from "../../core/types.ts";
 import { executeAdapterPlan } from "../../adapter-runtime.ts";
-import { BASH_NUDGE, JSON_PATH_SINGLE_OP_LINE, RECOVERY_LINE, USAGE_LINE, VERIFY_FIRST_LINE } from "../../steering.ts";
+import { BASH_NUDGE, JSON_PATH_SINGLE_OP_LINE, VERIFY_FIRST_LINE } from "../../steering.ts";
 import {
   CONDITION_KINDS,
   DEFAULT_MAX_DEPTH,
@@ -276,8 +276,9 @@ export function prepareArguments(args: unknown): Record<string, unknown> {
 
 export default function predexec(pi: ExtensionAPI): void {
   // Routing steering is delivered declaratively via the `predexec` skill
-  // (.pi/skills/predexec/SKILL.md, registered through package.json `pi.skills`) plus
-  // the tool's promptSnippet/promptGuidelines below — pi surfaces both natively.
+  // (.pi/skills/predexec/SKILL.md, generated from steering.ts and registered through
+  // package.json `pi.skills`) plus the tool's promptSnippet below, which pi needs to
+  // list the tool — pi surfaces both natively.
   // No imperative system-prompt mutation here (that coupled to pi's internal
   // wording and broke silently when it changed).
 
@@ -305,10 +306,10 @@ export default function predexec(pi: ExtensionAPI): void {
     label: "predexec",
     description: DESCRIPTION,
     promptSnippet: "Default tool for read-only work — shell commands, tool calls (read/grep/find/ls), and branching sequences",
+    // A pointer only: tool-op syntax, edge conditions and stop/recovery rules
+    // live in the predexec skill (rendered from steering.ts), which pi loads.
     promptGuidelines: [
-      'predexec: shell strings for bash; {tool:"read",path:...}, {tool:"grep",pattern:...}, {tool:"find",pattern:...}, {tool:"ls",path:...} for tool calls. ' +
-        USAGE_LINE.trimEnd(),
-      "predexec: " + RECOVERY_LINE.trimEnd(),
+      "predexec: see the predexec skill for tool-op syntax, edge conditions, and mutationStop/noEdgeMatch recovery.",
     ],
     parameters: PlanTreeSchema as any,
     prepareArguments,
