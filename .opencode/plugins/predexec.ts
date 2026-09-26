@@ -11,8 +11,13 @@
  * has no offset/limit (sliced client-side), and find.text (grep) is
  * directory-scoped with no glob.
  *
- * Export shape: opencode's plugin loader (readV1Plugin, ≥1.17.x) reads ONLY the
- * default export and requires `{ server() }` — see the bottom of this file.
+ * Export shape: ONE default export, `{ id, server, setup }`, loads on both
+ * opencode majors. 1.x (readV1Plugin, ≥1.17.x) reads only `{ server() }` and
+ * never inspects other keys; 2.x decodes `{ id, setup }` through an Effect
+ * Schema whose default strips unknown keys (opencode v2.0.16 core
+ * `plugin/module.ts:60-116`). `setup` is the v2 shim in ../lib/v2.ts; logic
+ * both majors share lives in ../lib/shared.ts. See the bottom of this file and
+ * docs/research/opencode-v2-plugins.md.
  * Runtime imports are zod + our own modules only; `@opencode-ai/plugin` is not
  * a dependency at all (npm-installed plugins get production deps only, and the
  * host does not provide that package at import time) — the `Plugin`/`ToolContext`
@@ -35,41 +40,28 @@
  * deny is a policyStop naming opencode's reason. The static reader in
  * ../../policy.ts still runs first: a static `deny` stops at once without a
  * prompt. Without `context.ask` (older hosts) the static reader is the whole
- * check and both deny and ask hard-stop, as before. Claude Code, Codex and pi
+ * check and both deny and ask hard-stop, as before — which is also ALWAYS the
+ * case on opencode 2.x, whose plugin API has no ask (../lib/v2.ts). Claude Code, Codex and pi
  * cannot prompt mid-walk and keep hard-stopping on ask.
  */
 
-import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
-import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
-import { fileURLToPath } from "node:url";
+import { existsSync, realpathSync, statSync } from "node:fs";
+import { isAbsolute, relative, resolve, sep } from "node:path";
 import { z } from "zod";
-import {
-  isDestructiveCommand,
-  validateOperation,
-  type ToolOp,
-  type ToolExecutor,
-} from "../../core/index.ts";
-import { executeAdapterPlan } from "../../adapter-runtime.ts";
-import {
-  BASH_NUDGE,
-  DESCRIPTION_BASE,
-  RECOVERY_LINE,
-  STEERING_LINE,
-  USAGE_LINE,
-  VERIFY_FIRST_LINE,
-  WHEN_SYNTAX_LINE,
-  systemHasRoutingInstructions,
-} from "../../steering.ts";
+import { validateOperation, type ToolOp, type ToolExecutor } from "../../core/index.ts";
+import { BASH_NUDGE, STEERING_LINE, WHEN_SYNTAX_LINE, systemHasRoutingInstructions } from "../../steering.ts";
 import { PLAN_SHAPE_DESCRIPTION } from "../../plan-language.ts";
 // PLAN_SHAPE_DESCRIPTION includes JSON_PATH_SINGLE_OP_LINE for the plan argument.
-import { createOpencodeAskBridge, createPolicyChecker, readOpencodeRuleset, type OpencodeAsk } from "../../policy.ts";
-
-const DESCRIPTION =
-  DESCRIPTION_BASE +
-  USAGE_LINE +
-  RECOVERY_LINE +
-  "Shell and mapped file operations respect your opencode permission rules — a deny stops before running; an ask prompts through opencode when it can, else stops. " +
-  VERIFY_FIRST_LINE;
+import type { OpencodeAsk } from "../../policy.ts";
+import {
+  DESCRIPTION,
+  PACKAGED_OPENCODE_SKILL_DIR,
+  createOperationPolicy,
+  errText,
+  runPlan,
+  shouldNudge,
+} from "../lib/shared.ts";
+import { setupV2 } from "../lib/v2.ts";
 
 /**
  * Local structural stand-ins for the `@opencode-ai/plugin` types this file
@@ -170,46 +162,6 @@ function realpathOrNull(p: string): string | null {
     return null;
   }
 }
-
-const errText = (e: unknown): string =>
-  typeof e === "string" ? e : e instanceof Error ? e.message : JSON.stringify(e);
-
-/**
- * Walks up from `startDir` to the nearest ancestor directory whose
- * `package.json` declares `"name": "predexec"`, rather than counting a fixed
- * number of `..` segments. This file lives at `.opencode/plugins/predexec.ts`
- * in a source checkout (package root two levels up) but at
- * `dist/.opencode/plugins/predexec.js` in an npm install (package root three
- * levels up) — a fixed-depth relative path silently breaks the moment either
- * layout changes; resolving by content is layout-independent.
- */
-function findPackageRoot(startDir: string): string | null {
-  let dir = startDir;
-  for (;;) {
-    try {
-      const pkg = JSON.parse(readFileSync(join(dir, "package.json"), "utf8"));
-      if (pkg && pkg.name === "predexec") return dir;
-    } catch {
-      // No package.json at this level, or it's unreadable/malformed — keep walking up.
-    }
-    const parent = dirname(dir);
-    if (parent === dir) return null; // reached the filesystem root without a match
-    dir = parent;
-  }
-}
-
-/**
- * Absolute path to the packaged opencode skill directory (`skills/opencode`,
- * containing `predexec/SKILL.md`), or null if the package root couldn't be
- * located or the directory doesn't exist on disk. Computed once at module
- * load — this file's own location never changes at runtime.
- */
-const PACKAGED_OPENCODE_SKILL_DIR: string | null = (() => {
-  const root = findPackageRoot(dirname(fileURLToPath(import.meta.url)));
-  if (!root) return null;
-  const dir = join(root, "skills", "opencode");
-  return existsSync(dir) ? dir : null;
-})();
 
 /**
  * Registers the packaged opencode skill (`skills/opencode/predexec/SKILL.md`)
@@ -598,28 +550,16 @@ const server: Plugin = async ({ client }) => ({
       },
       async execute(args: { plan: unknown }, context: PluginToolContext) {
         const executeToolOp = createToolExecutor(client as unknown as OpencodeClient, context.directory);
-        // Re-read per call (a few small JSON reads): config edits apply
-        // immediately. One bridge per call = one walk, so its dedupe and
-        // stop-after-rejection state never leaks across tool calls.
         const worktree = typeof context.worktree === "string" ? context.worktree : undefined;
-        const ruleset = readOpencodeRuleset(context.directory, process.env, {
-          ...(typeof context.agent === "string" ? { agent: context.agent } : {}),
+        const checkOperationPolicy = createOperationPolicy({
+          directory: context.directory,
           ...(worktree ? { worktree } : {}),
-        });
-        const checkerOptions = { directory: context.directory, ...(worktree ? { worktree } : {}) };
-        const ask = typeof context.ask === "function" ? context.ask.bind(context) : undefined;
-        const checkOperationPolicy = ask
-          ? createOpencodeAskBridge(ask, ruleset, { ...checkerOptions, signal: context.abort })
-          : createPolicyChecker(ruleset, checkerOptions);
-
-        const result = await executeAdapterPlan(args.plan, "opencode", {
-          cwd: context.directory,
+          ...(typeof context.agent === "string" ? { agent: context.agent } : {}),
+          ...(typeof context.ask === "function" ? { ask: context.ask.bind(context) } : {}),
           signal: context.abort,
-          executeToolOp,
-          checkOperationPolicy,
+          hostMajor: 1,
         });
-
-        return result.transcript || "(no output)";
+        return runPlan(args.plan, { cwd: context.directory, signal: context.abort, executeToolOp, checkOperationPolicy });
       },
     },
   },
@@ -684,21 +624,15 @@ const server: Plugin = async ({ client }) => ({
   },
 
   "tool.execute.after": async (input, output) => {
-    const nudge = "\n" + BASH_NUDGE;
-    if (["read", "grep", "glob"].includes(input.tool)) {
-      output.output += nudge;
-    } else if (input.tool === "bash") {
-      const cmd = input.args?.command ?? "";
-      if (cmd && !isDestructiveCommand(cmd)) {
-        output.output += nudge;
-      }
-    }
+    if (shouldNudge(input.tool, input.args?.command)) output.output += "\n" + BASH_NUDGE;
   },
 });
 
-// What current opencode loaders (readV1Plugin) actually read: ONLY the
-// default export's `{ id, server() }` shape. `server` above is intentionally
-// not a named export — nothing in this codebase's supported loader path reads
-// it that way (see the file header), and tests reach it through this default
-// export (`plugin.server`).
-export default { id: "predexec", server };
+// What opencode loaders actually read: ONLY the default export. 1.x
+// (readV1Plugin) needs `{ id, server() }` and ignores `setup`; 2.x decodes
+// `{ id, setup }` and strips `server` (v2.0.16 core `plugin/module.ts:60-116`).
+// `server`/`setup` are intentionally not named exports — nothing in either
+// loader path reads them that way (a v1 module with non-function named
+// exports would even trip the legacy loader), and tests reach them through
+// this default export (`plugin.server` / `plugin.setup`).
+export default { id: "predexec", server, setup: setupV2 };

@@ -226,6 +226,18 @@ describe("opencode 1.18.32 parity — flattened ruleset, wildcard keys, last mat
 });
 
 describe("readOpencodeRuleset — fail closed", () => {
+  it("hostMajor 2: v2-native `permissions` / `agents.<n>.permissions` are unreadable (fail-closed); v1 mode ignores them", () => {
+    const ctx = setup();
+    ctx.projectConfig({ permissions: [{ action: "bash", resource: "*", effect: "allow" }] });
+    expect(readOpencodeRuleset(ctx.project, ctx.env, { hostMajor: 2 })).toEqual({ error: expect.stringContaining("`permissions`") });
+    expect(Array.isArray(readOpencodeRuleset(ctx.project, ctx.env))).toBe(true);
+    ctx.projectConfig({ agents: { build: { permissions: [] } }, permission: { bash: { "rm *": "deny" } } });
+    expect(readOpencodeRuleset(ctx.project, ctx.env, { hostMajor: 2 })).toEqual({ error: expect.stringContaining("agents.build.permissions") });
+    ctx.projectConfig({ agents: { build: { mode: "primary" } }, permission: { bash: { "rm *": "deny" } } });
+    const ruleset = readOpencodeRuleset(ctx.project, ctx.env, { hostMajor: 2 });
+    expect(evaluateOperation("rm -rf x", ruleset, { directory: ctx.project }).action).toBe("deny");
+  });
+
   it("a config that exists but does not parse is an error, and the checker stops everything", () => {
     const ctx = setup();
     writeFileSync(join(ctx.project, "opencode.json"), "{ this is not json");

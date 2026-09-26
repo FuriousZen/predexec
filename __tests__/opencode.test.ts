@@ -977,3 +977,253 @@ describe.each(variants)("opencode plugin ($name) — system.transform defers to 
     expect(output.system).toHaveLength(1);
   });
 });
+
+// ---------------------------------------------------------------------------
+// opencode v2 (2.0.x) plugin API
+// ---------------------------------------------------------------------------
+
+/**
+ * Transcription of opencode 1.18.32's `readV1Plugin(mod, spec, "server", "detect")`
+ * (packages/opencode/src/plugin/shared.ts:272-304): the default export must be
+ * an object; extra keys are never inspected. Returns the value it would use.
+ */
+const v1LoaderRead = (mod: Record<string, unknown>) => {
+  const value = mod.default as Record<string, unknown> | undefined;
+  if (value === null || typeof value !== "object" || Array.isArray(value)) throw new TypeError("must default export an object with server()");
+  if (!("id" in value) && !("server" in value) && !("tui" in value)) return undefined;
+  const server = "server" in value ? value.server : undefined;
+  const tui = "tui" in value ? value.tui : undefined;
+  if (server !== undefined && typeof server !== "function") throw new TypeError("invalid server export");
+  if (tui !== undefined && typeof tui !== "function") throw new TypeError("invalid tui export");
+  if (server !== undefined && tui !== undefined) throw new TypeError("either server() or tui(), not both");
+  if (server === undefined) throw new TypeError("must default export an object with server()");
+  return value;
+};
+
+/**
+ * Transcription of opencode 2.0.16's `PluginModule` decode
+ * (packages/core/src/plugin/module.ts:60-73,107-116): `default` must decode as
+ * `{id: string, effect: fn}` or `{id: string, setup: fn}` — an Effect
+ * `Schema.Struct` union whose default `onExcessProperty: "ignore"` STRIPS every
+ * other key (effect 4.0.0-rc.112 SchemaAST.ts:445). The decoded (stripped)
+ * object is what the host then calls, so `setup` must not depend on `this`.
+ */
+const v2LoaderDecode = (mod: Record<string, unknown>) => {
+  const value = mod.default as Record<string, unknown> | undefined;
+  const fail = () => {
+    throw new Error('Plugin must export a default definition with an id and an effect or setup function. Missing key ["default"]["effect"] Missing key ["default"]["setup"]');
+  };
+  if (value === null || typeof value !== "object" || Array.isArray(value) || typeof value.id !== "string") return fail();
+  if (typeof value.effect === "function") return { id: value.id, effect: value.effect as Function };
+  if (typeof value.setup === "function") return { id: value.id, setup: value.setup as (ctx: unknown) => unknown };
+  return fail();
+};
+
+/** A recording stand-in for the opencode v2 Promise plugin context the adapter touches. */
+const fakeV2Context = (directory: string, projectDirectory = directory) => {
+  const toolTransforms: Array<(editor: any) => void> = [];
+  const skillTransforms: Array<(editor: any) => void> = [];
+  const sessionHooks: Record<string, Array<(event: any) => unknown>> = {};
+  const toolHooks: Record<string, Array<(event: any) => unknown>> = {};
+  const registration = { dispose: async () => {} };
+  const ctx = {
+    app: { name: "opencode", version: "2.0.16", channel: "latest" },
+    location: { directory, project: { id: "p", directory: projectDirectory, canonical: projectDirectory } },
+    options: {},
+    tool: {
+      transform: async (cb: (editor: any) => void) => (toolTransforms.push(cb), registration),
+      hook: async (name: string, cb: (event: any) => unknown) => ((toolHooks[name] ??= []).push(cb), registration),
+    },
+    skill: { transform: async (cb: (editor: any) => void) => (skillTransforms.push(cb), registration) },
+    session: {
+      hook: async (name: string, cb: (event: any) => unknown) => ((sessionHooks[name] ??= []).push(cb), registration),
+    },
+  };
+  const tools = () => {
+    const added: any[] = [];
+    for (const cb of toolTransforms) cb({ add: (t: any) => added.push(t), list: () => added, get: () => undefined, namespace() {}, update() {}, remove() {} });
+    return added;
+  };
+  const skills = () => {
+    const added: any[] = [];
+    for (const cb of skillTransforms) cb({ add: (s: any) => added.push(s), list: () => added, get: () => undefined, update() {}, remove() {} });
+    return added;
+  };
+  return { ctx, tools, skills, sessionHooks, toolHooks };
+};
+
+const v2ToolContext = (agent = "build") => ({
+  sessionID: "ses_1",
+  agent,
+  messageID: "msg_1",
+  id: "call_1",
+  signal: new AbortController().signal,
+  progress: async () => {},
+});
+
+describe.each(variants)("opencode plugin ($name) — v2 loader contract", ({ plugin }) => {
+  const mod = { default: plugin } as Record<string, unknown>;
+
+  it("the ONE default export passes the v1 readV1Plugin shape check", () => {
+    const read = v1LoaderRead(mod);
+    expect(read).toBe(plugin);
+    expect(typeof (read as any).server).toBe("function");
+  });
+
+  it("the SAME default export decodes under the v2 PluginModule schema as { id, setup }", () => {
+    const decoded = v2LoaderDecode(mod);
+    expect(decoded.id).toBe("predexec");
+    expect(typeof (decoded as any).setup).toBe("function");
+  });
+
+  it("the v1 bare { id, server } shape is what v2.0.16 rejected (regression guard for the transcription)", () => {
+    expect(() => v2LoaderDecode({ default: { id: "predexec", server: () => ({}) } })).toThrow(/effect.*setup/);
+  });
+
+  it("setup works when called detached from the export object (v2 calls the stripped decode)", async () => {
+    const decoded = v2LoaderDecode(mod) as { setup: (ctx: unknown) => unknown };
+    const dir = mkdtempSync(join(tmpdir(), "px-oc-v2-"));
+    const fake = fakeV2Context(dir);
+    const detached = decoded.setup;
+    await detached(fake.ctx);
+    expect(fake.tools().map((t) => t.name)).toEqual(["predexec"]);
+  });
+});
+
+describe.each(variants)("opencode plugin ($name) — v2 setup registrations", ({ plugin }) => {
+  const setupWith = async (dir = mkdtempSync(join(tmpdir(), "px-oc-v2-"))) => {
+    const fake = fakeV2Context(dir);
+    await (plugin as any).setup(fake.ctx);
+    return fake;
+  };
+
+  it("registers the predexec tool on the native tool list with a JSON-Schema plan input", async () => {
+    const fake = await setupWith();
+    const [tool] = fake.tools();
+    expect(tool.name).toBe("predexec");
+    // codemode defaults true in v2 (core/src/tool/AGENTS.md "Registration"),
+    // which would hide the tool behind CodeMode's `execute`; built-ins opt out.
+    expect(tool.options).toEqual({ codemode: false });
+    expect(tool.description).toContain("Do not build depth on unverified paths");
+    expect(tool.input.type).toBe("object");
+    expect(tool.input.properties.plan.description).toContain(PLAN_SHAPE_DESCRIPTION);
+    expect(tool.input.properties.plan.description).toContain('"exit == 0"');
+    // No zod on the v2 path: a zod instance would be introspected cross-instance
+    // by the host's pinned zod 4.1.8 (core/src/tool/runtime.ts:165-169).
+    expect(tool.input._zod).toBeUndefined();
+    expect(tool.output).toBeUndefined();
+    expect(typeof tool.execute).toBe("function");
+  });
+
+  it("registers the packaged opencode skill through the skill domain", async () => {
+    const fake = await setupWith();
+    const skills = fake.skills();
+    expect(skills).toHaveLength(1);
+    const [skill] = skills;
+    expect(skill.id).toBe("predexec");
+    expect(skill.name).toBe("predexec");
+    expect(skill.description).toBe(renderSkill("opencode").match(/^description: (.+)$/m)?.[1]);
+    expect(skill.path).toMatch(/skills[\\/]opencode[\\/]predexec[\\/]SKILL\.md$/);
+    expect(skill.content).not.toMatch(/^---/);
+    expect(skill.content).toContain("# predexec routing (opencode)");
+  });
+
+  it("the session context hook injects the steering line as a system part when absent", async () => {
+    const fake = await setupWith();
+    expect(fake.sessionHooks.context).toHaveLength(1);
+    const event = { sessionID: "ses_1", agent: "build", system: [{ type: "text", text: "existing" }] };
+    await fake.sessionHooks.context![0]!(event);
+    expect(event.system).toEqual([{ type: "text", text: "existing" }, { type: "text", text: STEERING_LINE }]);
+  });
+
+  it("the session context hook stays silent when the skill description already carries the routing rule", async () => {
+    const fake = await setupWith();
+    const description = renderSkill("opencode").match(/^description: (.+)$/m)?.[1] ?? "";
+    const event = { sessionID: "ses_1", agent: "build", system: [{ type: "text", text: `<available_skills><skill><name>predexec</name><description>${description}</description></skill></available_skills>` }] };
+    await fake.sessionHooks.context![0]!(event);
+    expect(event.system).toHaveLength(1);
+  });
+
+  it("the tool execute.after hook nudges read-only shell and native read tools, not destructive shell", async () => {
+    const fake = await setupWith();
+    const after = fake.toolHooks["execute.after"]![0]!;
+    const completed = (tool: string, input: unknown) => ({ tool, input, status: "completed", result: { content: "out" } }) as any;
+    const read = completed("read", { filePath: "a" });
+    await after(read);
+    expect(read.result.content).toContain("predexec");
+    const shell = completed("shell", { command: "ls" });
+    await after(shell);
+    expect(shell.result.content).toContain("predexec");
+    const rm = completed("shell", { command: "rm -rf build" });
+    await after(rm);
+    expect(rm.result.content).toBe("out");
+    const failed = { tool: "read", input: {}, status: "error", error: new Error("x") } as any;
+    await after(failed);
+    expect(failed.result).toBeUndefined();
+  });
+});
+
+describe.each(variants)("opencode plugin ($name) — v2 tool execution + permission bridge", ({ plugin }) => {
+  isolateOpencodeEnv();
+  const project = (config?: unknown) => {
+    const dir = mkdtempSync(join(tmpdir(), "px-oc-v2-policy-"));
+    if (config !== undefined) writeFileSync(join(dir, "opencode.json"), JSON.stringify(config));
+    writeFileSync(join(dir, "marker.txt"), "marker-content");
+    return dir;
+  };
+  const execute = async (dir: string, plan: unknown, agent = "build") => {
+    const fake = fakeV2Context(dir);
+    await (plugin as any).setup(fake.ctx);
+    const [tool] = fake.tools();
+    return tool.execute({ plan }, v2ToolContext(agent));
+  };
+  const catPlan = { root: "a", nodes: [{ id: "a", commands: ["cat marker.txt"] }] };
+
+  it("runs a read-only plan against the location directory and returns the transcript as content", async () => {
+    const dir = project();
+    const out = await execute(dir, catPlan);
+    expect(out.output).toBeUndefined();
+    expect(out.content).toContain("node a (exit 0)");
+    expect(out.content).toContain("marker-content");
+  });
+
+  it("native tool ops run through the node:fs executor rooted at the location directory", async () => {
+    const dir = project();
+    const out = await execute(dir, { root: "a", nodes: [{ id: "a", commands: [{ tool: "read", path: "marker.txt" }, { tool: "ls" }] }] });
+    expect(out.content).toContain("marker-content");
+    expect(out.content).toContain("marker.txt");
+  });
+
+  it("a v1-form permission deny rule hard-stops (v2 still migrates the v1 `permission` key)", async () => {
+    const dir = project({ permission: { bash: { "cat *": "deny" } } });
+    const out = await execute(dir, catPlan);
+    expect(out.content).toContain("POLICY HARD-STOP (not run)");
+    expect(out.content).toContain("'cat *'");
+    expect(out.content).not.toContain("marker-content");
+  });
+
+  it("an ask rule hard-stops: the v2 plugin context has no ask equivalent", async () => {
+    const dir = project({ permission: { bash: { "cat *": "ask" } } });
+    const out = await execute(dir, catPlan);
+    expect(out.content).toContain("POLICY HARD-STOP (not run)");
+    expect(out.content).not.toContain("marker-content");
+  });
+
+  it("the tool context's agent selects the agent permission block", async () => {
+    const dir = project({ agent: { review: { permission: { bash: { "cat *": "deny" } } } } });
+    expect((await execute(dir, catPlan, "review")).content).toContain("POLICY HARD-STOP (not run)");
+    expect((await execute(dir, catPlan, "build")).content).toContain("node a (exit 0)");
+  });
+
+  it.each([
+    ["top-level permissions", { permissions: [{ action: "bash", resource: "cat *", effect: "deny" }] }],
+    ["agent permissions", { agents: { build: { permissions: [{ action: "bash", resource: "*", effect: "allow" }] } } }],
+  ])("v2-native %s cannot be evaluated statically, so every operation stops (fail-closed)", async (_label, config) => {
+    const dir = project(config);
+    const out = await execute(dir, catPlan);
+    expect(out.content).toContain("POLICY HARD-STOP (not run)");
+    expect(out.content).toContain("cannot read your opencode permission rules");
+    expect(out.content).toContain("permissions");
+    expect(out.content).not.toContain("marker-content");
+  });
+});

@@ -97,6 +97,8 @@ the load fails at the schema-validation step, before opencode would ever call `c
 skill` subcommand in this v2.0.16 build either (`opencode debug --help` lists only
 `agents`, `config`, `paths`); the closest available signal was this plugin-load log line.
 
+**Superseded (Task 17a):** v2 support landed; on v2 the skill is registered through `ctx.skill.transform` rather than the `config` hook, and was verified live on v2.0.16 — see [opencode-v2-plugins.md](opencode-v2-plugins.md). Original Task 17 finding follows.
+
 **Status: UNVERIFIED for opencode v2.0.16.** The `config`-hook skill-registration
 mechanism could not be exercised live on this machine because the installed opencode CLI
 already can't load ANY plugin in this adapter's current export shape — a pre-existing,

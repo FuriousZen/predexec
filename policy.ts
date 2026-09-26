@@ -367,6 +367,35 @@ export interface OpencodeRulesetOptions {
   agent?: string;
   /** The project worktree (`ToolContext.worktree`); derived from `.git` when absent. */
   worktree?: string;
+  /**
+   * The opencode major the ruleset is for. `2` rejects v2-native rule shapes
+   * this reader does not model (see `v2NativeRulesError`); default `1`.
+   */
+  hostMajor?: 1 | 2;
+}
+
+/**
+ * opencode v2 (2.0.16) still migrates the v1 `permission` object and legacy
+ * `tools` map into its ruleset (core `config/normalize.ts:180-183`), so this
+ * reader's v1 model covers those. It does NOT model v2's native rule shapes —
+ * a top-level `permissions: [{action, resource, effect}]` array or
+ * `agents.<name>.permissions` — which v2 composes per document rather than via
+ * mergeDeep (core `config/plugin/agent.ts:83-124`). Guessing at their order
+ * could turn a deny into an allow, so on a v2 host their presence is an
+ * unreadable policy: every operation stops (fail-closed).
+ */
+function v2NativeRulesError(merged: Json): string | null {
+  if (merged.permissions !== undefined) {
+    return "opencode v2 `permissions` rules are not evaluated by predexec yet — express them in the v1 `permission` object form";
+  }
+  if (isPlainObject(merged.agents)) {
+    for (const [name, agent] of Object.entries(merged.agents)) {
+      if (isPlainObject(agent) && agent.permissions !== undefined) {
+        return `opencode v2 \`agents.${name}.permissions\` rules are not evaluated by predexec yet — express them in the v1 \`agent.${name}.permission\` object form`;
+      }
+    }
+  }
+  return null;
 }
 
 /** Build the agent ruleset from an already-merged config (`agent/agent.ts:108-310`). */
@@ -463,6 +492,10 @@ export function readOpencodeRuleset(
     } catch {
       return { error: "OPENCODE_PERMISSION is not valid opencode permission JSON" };
     }
+  }
+  if (options.hostMajor === 2) {
+    const nativeError = v2NativeRulesError(merged);
+    if (nativeError) return { error: nativeError };
   }
   return buildOpencodeRuleset(merged, env, options.agent);
 }
