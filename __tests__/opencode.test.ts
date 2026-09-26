@@ -19,6 +19,7 @@ import {
   type ToolOp,
 } from "../core/index.ts";
 import { PLAN_SHAPE_DESCRIPTION } from "../plan-language.ts";
+import { STEERING_LINE } from "../steering.ts";
 
 // read/ls pre-check path existence against the cwd, so mocked-client tests
 // need a real directory with the paths their ops name.
@@ -128,7 +129,10 @@ describe.each(variants)("opencode createToolExecutor ($name) — SDK response ma
       { tool: "grep", pattern: "x".repeat(MAX_GREP_PATTERN_LENGTH + 1) },
     ]) {
       const result = await executor(operation, { cwd: repo });
-      expect(result.exitCode).toBe(1);
+      // A rejected operation never reaches the SDK — it never ran, so it
+      // takes the shared "never ran" exit code (2), not the "ran, found
+      // nothing" code (1). See the exit-code convention block above runToolOp.
+      expect(result.exitCode).toBe(2);
       expect(result.stderr).toMatch(/at most|maximum length/);
     }
     expect(calls).toEqual([]);
@@ -179,22 +183,36 @@ describe.each(variants)("opencode createToolExecutor ($name) — SDK response ma
     expect(r.exitCode).toBe(0);
   });
 
-  it("maps an SDK error to a non-zero exit, attributed to the op", async () => {
+  it("maps an SDK error to exit 2 (the op never ran), attributed to the op", async () => {
     const client = { file: { read: async () => ({ error: "boom" }) } };
     const r = await run(client, { tool: "read", path: "a.ts" });
-    expect(r).toEqual({ stdout: "", stderr: "read a.ts: boom", exitCode: 1 });
+    expect(r).toEqual({ stdout: "", stderr: "read a.ts: boom", exitCode: 2 });
   });
 
-  it("unknown tool => error result", async () => {
+  it("unknown tool => exit 2 (the op never ran)", async () => {
     const r = await run({}, { tool: "deploy" } as ToolOp);
-    expect(r.exitCode).toBe(1);
+    expect(r.exitCode).toBe(2);
     expect(r.stderr).toContain("unknown tool: deploy");
   });
 
-  it("a thrown SDK call is caught and reported", async () => {
+  it("a thrown SDK call is caught and reported as exit 2", async () => {
     const client = { file: { read: async () => { throw new Error("network down"); } } };
     const r = await run(client, { tool: "read", path: "a.ts" });
-    expect(r).toEqual({ stdout: "", stderr: "read: network down", exitCode: 1 });
+    expect(r).toEqual({ stdout: "", stderr: "read: network down", exitCode: 2 });
+  });
+
+  it("read: a {type:'binary'} response is exit 2, never treated as text content", async () => {
+    const client = { file: { read: async () => ({ data: { type: "binary", content: "AAA=", encoding: "base64", mimeType: "image/png" } }) } };
+    const r = await run(client, { tool: "read", path: "a.ts" });
+    expect(r.exitCode).toBe(2);
+    expect(r.stderr).toContain("binary file");
+    expect(r.stdout).toBe("");
+  });
+
+  it("read: a {type:'text'} response still passes content through (real-shape parity)", async () => {
+    const client = { file: { read: async () => ({ data: { type: "text", content: "hello" } }) } };
+    const r = await run(client, { tool: "read", path: "a.ts" });
+    expect(r).toEqual({ stdout: "hello", stderr: "", exitCode: 0 });
   });
 });
 
@@ -208,32 +226,45 @@ describe.each(variants)("opencode createToolExecutor ($name) — grep/find arg h
     line_number: line,
   });
 
-  it("grep: `path` scopes the SDK query to the resolved directory", async () => {
+  it("grep: `path` queries the SESSION ROOT (never a subdirectory) and scopes client-side by prefix", async () => {
+    // A subdirectory `directory` value routes to a DIFFERENT opencode instance
+    // (workspace-routing.ts's defaultDirectory() keys instance selection off
+    // this exact query param — measured against 1.18.32), so every call must
+    // send the fixed session root; subdirectory scoping happens by filtering
+    // the root-wide results by path prefix instead.
     let seen: any;
-    const client = { find: { text: async (o: any) => ((seen = o), { data: [matchRow("a.ts", 1)] }) } };
+    const client = {
+      find: {
+        text: async (o: any) => (
+          (seen = o),
+          { data: [matchRow("src/a.ts", 1), matchRow("other/b.ts", 2)] }
+        ),
+      },
+    };
     const r = await run(client, { tool: "grep", pattern: "x", path: "src" });
-    expect(seen.query.directory).toBe(join(repo, "src"));
+    expect(seen.query.directory).toBe(repo);
+    expect(r.stdout).toBe("src/a.ts:1:const x = 1");
     expect(r.exitCode).toBe(0);
   });
 
-  it("grep: a FILE `path` fails loudly instead of silently searching the repo", async () => {
+  it("grep: a FILE `path` fails loudly instead of silently searching the repo (op never ran)", async () => {
     const client = { find: { text: async () => ({ data: [] }) } };
     const r = await run(client, { tool: "grep", pattern: "x", path: "a.ts" });
-    expect(r.exitCode).toBe(1);
+    expect(r.exitCode).toBe(2);
     expect(r.stderr).toContain('"a.ts" is a file');
   });
 
-  it("grep: a missing `path` fails with the resolved location", async () => {
+  it("grep: a missing `path` fails with the resolved location (op never ran)", async () => {
     const client = { find: { text: async () => ({ data: [] }) } };
     const r = await run(client, { tool: "grep", pattern: "x", path: "nope/" });
-    expect(r.exitCode).toBe(1);
+    expect(r.exitCode).toBe(2);
     expect(r.stderr).toContain("path not found: nope/");
   });
 
-  it("grep: unsupported args error loudly, naming them", async () => {
+  it("grep: unsupported args error loudly, naming them (op never ran)", async () => {
     const client = { find: { text: async () => ({ data: [] }) } };
     const r = await run(client, { tool: "grep", pattern: "x", glob: "*.ts", ignoreCase: true });
-    expect(r.exitCode).toBe(1);
+    expect(r.exitCode).toBe(2);
     expect(r.stderr).toContain("unsupported arg(s) in opencode adapter: glob, ignoreCase");
   });
 
@@ -256,15 +287,19 @@ describe.each(variants)("opencode createToolExecutor ($name) — grep/find arg h
     expect(r.stdoutTruncated).toBe(true);
   });
 
-  it("find: `path` scopes, and the limit is sent server-side as well as sliced", async () => {
+  it("find: `path` queries the SESSION ROOT (never a subdirectory) and scopes client-side by prefix", async () => {
     let seen: any;
-    const client = { find: { files: async (o: any) => ((seen = o), { data: ["a.ts", "b.ts", "c.ts"] }) } };
+    const client = {
+      find: { files: async (o: any) => ((seen = o), { data: ["src/a.ts", "other/b.ts", "src/c.ts"] }) },
+    };
     const r = await run(client, { tool: "find", pattern: "*.ts", path: "src", limit: 1 });
-    expect(seen.query.directory).toBe(join(repo, "src"));
+    expect(seen.query.directory).toBe(repo);
     // Regression: omitting `limit` from the query let opencode apply its own
-    // default of 10, silently truncating every larger result set.
-    expect(seen.query.limit).toBe(1);
-    expect(r.stdout).toBe("a.ts");
+    // default of 10, silently truncating every larger result set. The plugin
+    // peeks one row past what it needs (min(limit,200)+1) to tell "exactly
+    // enough" from "truncated" — see the truncation test below.
+    expect(seen.query.limit).toBe(2);
+    expect(r.stdout).toBe("src/a.ts");
   });
 
   it("find: sends a limit above opencode's default of 10 when the op omits one", async () => {
@@ -272,6 +307,34 @@ describe.each(variants)("opencode createToolExecutor ($name) — grep/find arg h
     const client = { find: { files: async (o: any) => ((seen = o), { data: [] }) } };
     await run(client, { tool: "find", pattern: "*.ts" });
     expect(seen.query.limit).toBeGreaterThan(10);
+  });
+
+  it("find: caps the server-side limit at 200 and peeks one extra row to detect truncation", async () => {
+    // FindFileQuery.limit is bounded 1..200 server-side (opencode 1.18.32
+    // packages/opencode/src/server/routes/instance/httpapi/groups/file.ts:27-32);
+    // a raw request for 201 is rejected outright, so the peek itself must never
+    // cross the ceiling.
+    let seen: any;
+    const rows = Array.from({ length: 200 }, (_, i) => `f${i}.ts`);
+    const client = { find: { files: async (o: any) => ((seen = o), { data: rows }) } };
+    const r = await run(client, { tool: "find", pattern: "*.ts", limit: 500 });
+    expect(seen.query.limit).toBeLessThanOrEqual(200);
+    expect(r.stdout.split("\n")).toHaveLength(200);
+    expect(r.stdoutTruncated).toBe(true);
+    expect(r.stderr).toContain("caps results at 200");
+    expect(r.exitCode).toBe(0);
+  });
+
+  it("find: flags truncation when the peeked extra row comes back, within the 200 ceiling", async () => {
+    let seen: any;
+    const client = {
+      find: { files: async (o: any) => ((seen = o), { data: ["a.ts", "b.ts", "c.ts"] }) },
+    };
+    const r = await run(client, { tool: "find", pattern: "*.ts", limit: 2 });
+    expect(seen.query.limit).toBe(3);
+    expect(r.stdout.split("\n")).toHaveLength(2);
+    expect(r.stdoutTruncated).toBe(true);
+    expect(r.stderr).toContain("more than 2 matches exist");
   });
 
   it("grep: warns when opencode's hard 10-match cap may have truncated results", async () => {
@@ -523,5 +586,39 @@ describe.each(variants)("opencode plugin ($name) — prompting surfaces", ({ plu
     expect(desc).toContain('"file exists <path>"');
     expect(desc).toContain('"always"');
     expect(desc).toContain(PLAN_SHAPE_DESCRIPTION);
+  });
+});
+
+describe.each(variants)("opencode plugin ($name) — system.transform no-op for non-chat prompts", ({ plugin }) => {
+  const transform = async (input: unknown) => {
+    const hooks = await plugin.server({ client: {} } as any);
+    const output = { system: ["existing system prompt"] };
+    await (hooks as any)["experimental.chat.system.transform"](input, output);
+    return output;
+  };
+
+  // opencode 1.18.32 fires this hook from exactly two call sites:
+  //  - session/llm/request.ts:56-72 (`prepare()`, used for every chat turn —
+  //    and, with `small:true`, for in-session "small" completions such as
+  //    title generation too) always includes `sessionID`.
+  //  - agent/agent.ts:381 (`Agent.generate`, which synthesizes a NEW agent
+  //    config from a natural-language description and is instructed to
+  //    "Return ONLY the JSON object, no other text") fires with NO `sessionID`
+  //    at all. `sessionID` presence is the only field the hook's documented
+  //    input shape (`{ sessionID?: string; model: Model }`,
+  //    packages/plugin/src/index.ts:292) exposes to tell the two apart.
+  it("is a no-op for a sessionID-less input (agent.ts:381's Agent.generate)", async () => {
+    const output = await transform({ model: { id: "m" } });
+    expect(output.system).toEqual(["existing system prompt"]);
+  });
+
+  it("still injects the routing line for a real chat turn (sessionID present, request.ts:70-72)", async () => {
+    const output = await transform({ sessionID: "ses_1", model: { id: "m" } });
+    expect(output.system).toContain(STEERING_LINE);
+  });
+
+  it("treats an empty-string sessionID the same as absent", async () => {
+    const output = await transform({ sessionID: "", model: { id: "m" } });
+    expect(output.system).toEqual(["existing system prompt"]);
   });
 });

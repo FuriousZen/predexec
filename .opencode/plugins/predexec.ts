@@ -32,7 +32,7 @@
  */
 
 import { existsSync, statSync } from "node:fs";
-import { isAbsolute, resolve } from "node:path";
+import { isAbsolute, relative, resolve, sep } from "node:path";
 import { z } from "zod";
 import {
   isDestructiveCommand,
@@ -103,7 +103,9 @@ type Plugin = (input: { client: unknown }) => Promise<PluginHooks>;
 /** opencode v1 SDK client (the subset predexec calls). Loosely typed to avoid a hard SDK dep. */
 type OpencodeClient = {
   file: {
-    read(opts: { query: { path: string; directory?: string } }): Promise<{ data?: { content?: string }; error?: unknown }>;
+    read(opts: {
+      query: { path: string; directory?: string };
+    }): Promise<{ data?: { type?: "text" | "binary"; content?: string }; error?: unknown }>;
     list(opts: { query: { path: string; directory?: string } }): Promise<{ data?: Array<{ name?: string; path?: string }>; error?: unknown }>;
   };
   find: {
@@ -115,10 +117,25 @@ type OpencodeClient = {
 /**
  * opencode's /find (grep) endpoint passes a literal `limit: 10` to ripgrep and
  * accepts no override — measured against opencode 1.18.14. /find/file defaults
- * to 10 but honours an explicit `limit`.
+ * to 10 but honours an explicit `limit`, bounded 1..200 server-side
+ * (`FindFileQuery.limit`, opencode 1.18.32
+ * packages/opencode/src/server/routes/instance/httpapi/groups/file.ts:27-32 —
+ * `Schema.NumberFromString.check(..., Schema.isLessThanOrEqualTo(200))`); a
+ * raw request above 200 is rejected outright, not clamped.
  */
 const OPENCODE_GREP_CAP = 10;
 const DEFAULT_FIND_LIMIT = 100;
+const OPENCODE_FIND_CEILING = 200;
+
+/**
+ * True when `relPath` (POSIX-relative to the session root) sits at or under
+ * `prefix` (also POSIX-relative, no trailing slash, "" meaning "no scope").
+ */
+function withinPrefix(relPath: string, prefix: string): boolean {
+  if (!prefix) return true;
+  const p = relPath.replace(/\\/g, "/").replace(/^\.\//, "");
+  return p === prefix || p.startsWith(prefix + "/");
+}
 
 const errText = (e: unknown): string =>
   typeof e === "string" ? e : e instanceof Error ? e.message : JSON.stringify(e);
@@ -139,24 +156,38 @@ export function createToolExecutor(client: OpencodeClient, cwd: string): ToolExe
       existsSync(isAbsolute(p) ? p : resolve(directory, p))
         ? null
         : { stdout: "", stderr: `path not found: ${p} (resolved against ${directory})`, exitCode: 1 };
-    const fail = (label: string, e: unknown) => ({ stdout: "", stderr: `${label}: ${errText(e)}`, exitCode: 1 });
+    // "Never ran" (invalid arg, unknown tool, an SDK error/throw, a rejected
+    // find limit, a binary read) is exit 2; a search that ran and found
+    // nothing stays exit 1 — the same split mcp/tool-ops.ts uses for grep/find,
+    // generalized here to every op so a validation failure can never be read
+    // as "ran, found nothing" on any of them.
+    const NEVER_RAN = 2;
+    const fail = (label: string, e: unknown) => ({ stdout: "", stderr: `${label}: ${errText(e)}`, exitCode: NEVER_RAN });
     const requiredArgMissing =
       (op.tool === "read" && op.path === undefined) ||
       ((op.tool === "grep" || op.tool === "find") && op.pattern === undefined);
     const supportedTool = ["read", "grep", "find", "ls", "bash", "edit", "write"].includes(op.tool);
     const validationError = supportedTool && !requiredArgMissing ? validateOperation(op) : null;
     if (validationError) return fail(String(op.tool), `invalid operation: ${validationError}`);
-    // grep/find scope by DIRECTORY in opencode's v1 SDK. Honor an op's `path`
-    // by resolving it into the query directory; a FILE path fails loudly — the
-    // silent alternative (searching the whole repo) is false-hit fuel for edges.
+    // grep/find always query the SESSION ROOT — never a subdirectory. opencode's
+    // workspace-routing middleware keys instance selection off this exact
+    // `directory` query param (defaultDirectory(), middleware/workspace-routing.ts:87
+    // in opencode 1.18.32: `url.searchParams.get("directory") || ... || process.cwd()`),
+    // so sending a resolved subdirectory here would risk booting/routing to a
+    // DIFFERENT opencode instance per subdirectory (config/plugins/LSP reload)
+    // instead of merely narrowing the search. A `path` arg is honored instead
+    // by computing a POSIX-relative prefix and filtering the root-wide SDK
+    // response client-side (see withinPrefix above); a FILE path still fails
+    // loudly — the silent alternative (searching the whole repo) is false-hit
+    // fuel for edges.
     const scopeDir = (
       p: unknown,
       tool: string,
-    ): { dir: string; err?: undefined } | { dir?: undefined; err: { stdout: string; stderr: string; exitCode: number } } => {
-      if (p === undefined) return { dir: directory };
+    ): { prefix: string; err?: undefined } | { prefix?: undefined; err: { stdout: string; stderr: string; exitCode: number } } => {
+      if (p === undefined) return { prefix: "" };
       const path = String(p);
       const gone = missing(path);
-      if (gone) return { err: gone };
+      if (gone) return { err: { ...gone, exitCode: NEVER_RAN } };
       const abs = isAbsolute(path) ? path : resolve(directory, path);
       try {
         if (!statSync(abs).isDirectory()) {
@@ -164,14 +195,15 @@ export function createToolExecutor(client: OpencodeClient, cwd: string): ToolExe
             err: {
               stdout: "",
               stderr: `${tool}: opencode can only scope by directory; "${path}" is a file — use a shell command for single files`,
-              exitCode: 1,
+              exitCode: NEVER_RAN,
             },
           };
         }
       } catch {
         /* stat raced away; missing() already vetted existence */
       }
-      return { dir: abs };
+      const prefix = relative(directory, abs).split(sep).join("/");
+      return { prefix: prefix === "." ? "" : prefix };
     };
     const sliceLimit = <T>(items: T[], limit: unknown): T[] =>
       typeof limit === "number" && limit >= 0 ? items.slice(0, limit) : items;
@@ -183,6 +215,14 @@ export function createToolExecutor(client: OpencodeClient, cwd: string): ToolExe
           if (gone) return gone;
           const r = await client.file.read({ query: { path, directory } });
           if (r.error) return fail(`read ${path}`, r.error);
+          // v1 file.read returns { type: "binary", content: <base64>, ... } for
+          // any file whose bytes don't decode as UTF-8 (handlers/file.ts:113-119
+          // in opencode 1.18.32). An MCP-style text result cannot carry that
+          // usefully, and treating the base64 blob as text would poison every
+          // regex condition downstream — refuse loudly instead.
+          if (r.data?.type === "binary") {
+            return { stdout: "", stderr: `read ${path}: binary file — this adapter reads text only`, exitCode: NEVER_RAN };
+          }
           let content = r.data?.content ?? "";
           let stdoutTruncated = false;
           // v1 file.read has no offset/limit — apply line-slicing client-side (offset is 1-based).
@@ -202,35 +242,44 @@ export function createToolExecutor(client: OpencodeClient, cwd: string): ToolExe
             return {
               stdout: "",
               stderr: `grep: unsupported arg(s) in opencode adapter: ${unsupported.join(", ")} — use a shell grep instead`,
-              exitCode: 1,
+              exitCode: NEVER_RAN,
             };
           }
           const scoped = scopeDir(op.path, "grep");
           if (scoped.err) return scoped.err;
-          const r = await client.find.text({ query: { pattern, directory: scoped.dir } });
+          const r = await client.find.text({ query: { pattern, directory } });
           if (r.error) return fail(`grep ${pattern}`, r.error);
           const raw = r.data ?? [];
-          const matches = sliceLimit(raw, op.limit);
+          // `directory` above is always the session root (never scoped.prefix's
+          // resolved path — see scopeDir's comment), so a `path` arg is applied
+          // by filtering the root-wide response to that prefix instead.
+          const scopedRaw = scoped.prefix ? raw.filter((m) => withinPrefix(m.path.text, scoped.prefix)) : raw;
+          const matches = sliceLimit(scopedRaw, op.limit);
           const stdout = matches.map((m) => `${m.path.text}:${m.line_number}:${m.lines.text}`).join("\n");
-          const callerCapped = raw.length > matches.length;
+          const callerCapped = scopedRaw.length > matches.length;
           // opencode's /find endpoint hard-codes limit:10 server-side and takes
           // no limit parameter, so a hit count of exactly 10 is indistinguishable
           // from "truncated". Silent truncation feeding a match/numeric edge is
           // false-hit fuel, so say so instead of letting the model assume it saw
-          // everything. Verified against opencode 1.18.14.
-          // Keep caller-side slicing separate from the host cap: the former is
-          // known truncation even when the SDK returned fewer than ten rows;
-          // the latter is only inferable from a complete ten-row page.
-          const hostCapped = !callerCapped && raw.length >= OPENCODE_GREP_CAP && matches.length === raw.length;
+          // everything. Verified against opencode 1.18.14. The cap applies to the
+          // RAW (unscoped) response — a `path` prefix can only ever narrow what
+          // survived that root-wide cap, so a full ten-row raw page is a warning
+          // sign regardless of how many rows the prefix filter kept.
+          const hostCapped = raw.length >= OPENCODE_GREP_CAP;
+          let stderr = "";
+          if (callerCapped) {
+            stderr = `grep: caller limit ${String(op.limit)} reached — results may be incomplete; use a larger limit or narrow the pattern`;
+          } else if (hostCapped) {
+            stderr = scoped.prefix
+              ? `grep: opencode caps results at ${OPENCODE_GREP_CAP} matches searched across the whole session root ` +
+                `(directory scoping is applied client-side) — matches under "${scoped.prefix}" may be crowded out by ` +
+                `matches elsewhere; use a shell \`rg\`/\`grep\` scoped to the directory for an exhaustive search`
+              : `grep: opencode caps results at ${OPENCODE_GREP_CAP} matches and cannot raise it — ` +
+                `results may be incomplete; use a shell \`rg\`/\`grep\` for an exhaustive search`;
+          }
           return {
             stdout,
-            stderr: callerCapped
-              ? `grep: caller limit ${String(op.limit)} reached — results may be incomplete; ` +
-                `use a larger limit or narrow the pattern`
-              : hostCapped
-                ? `grep: opencode caps results at ${OPENCODE_GREP_CAP} matches and cannot raise it — ` +
-                  `results may be incomplete; use a shell \`rg\`/\`grep\` for an exhaustive search`
-                : "",
+            stderr,
             exitCode: stdout ? 0 : 1,
             ...(callerCapped || hostCapped ? { stdoutTruncated: true } : {}),
           };
@@ -241,17 +290,47 @@ export function createToolExecutor(client: OpencodeClient, cwd: string): ToolExe
           if (scoped.err) return scoped.err;
           // The endpoint defaults to 10 results but DOES accept a limit — the
           // adapter previously omitted it and then sliced client-side, so every
-          // find silently returned at most 10 regardless of op.limit.
-          const limit = typeof op.limit === "number" && op.limit > 0 ? op.limit : DEFAULT_FIND_LIMIT;
-          const r = await client.find.files({ query: { query: pattern, directory: scoped.dir, limit } });
+          // find silently returned at most 10 regardless of op.limit. It also
+          // REJECTS (not clamps) anything above 200 (OPENCODE_FIND_CEILING), so
+          // the effective ask is capped there before it ever reaches the SDK.
+          const requestedLimit = typeof op.limit === "number" && op.limit > 0 ? op.limit : DEFAULT_FIND_LIMIT;
+          const effectiveLimit = Math.min(requestedLimit, OPENCODE_FIND_CEILING);
+          // Peek one row past what's needed so a full page reads as "exactly
+          // enough" vs. "truncated" — but never past the server's own ceiling:
+          // asking for 201 when the ceiling is 200 gets the WHOLE request
+          // rejected, not clamped.
+          const probeLimit = Math.min(effectiveLimit + 1, OPENCODE_FIND_CEILING);
+          const r = await client.find.files({ query: { query: pattern, directory, limit: probeLimit } });
           if (r.error) return fail(`find ${pattern}`, r.error);
-          // Send the limit AND slice: the query limit stops the server capping
-          // us at its default of 10, the slice keeps op.limit exact regardless
-          // of how the server interprets it.
-          const stdout = sliceLimit(r.data ?? [], op.limit).join("\n");
-          const requested = typeof op.limit === "number" && op.limit >= 0 ? op.limit : undefined;
-          const truncated = requested !== undefined && (r.data?.length ?? 0) > requested;
-          return { stdout, stderr: "", exitCode: stdout ? 0 : 1, ...(truncated ? { stdoutTruncated: true } : {}) };
+          const raw = r.data ?? [];
+          // `directory` above is always the session root — a `path` arg is
+          // applied by filtering the root-wide response to its prefix, same as grep.
+          const filtered = scoped.prefix ? raw.filter((p) => withinPrefix(p, scoped.prefix)) : raw;
+          const results = filtered.slice(0, effectiveLimit);
+          const stdout = results.join("\n");
+          const probedMore = filtered.length > effectiveLimit;
+          const ceilingHit = requestedLimit > OPENCODE_FIND_CEILING;
+          // A `path` scope can only ever narrow a root-wide fetch; if that fetch
+          // itself came back full, matches under the scope may have been pushed
+          // out of the fetched window entirely — flag it, don't guess quietly.
+          const scopeMayUndercount = Boolean(scoped.prefix) && raw.length >= probeLimit;
+          const notes: string[] = [];
+          if (ceilingHit) {
+            notes.push(
+              `find: opencode's server caps results at ${OPENCODE_FIND_CEILING} per request — asked for ${requestedLimit}; results are truncated`,
+            );
+          } else if (probedMore) {
+            notes.push(
+              `find: more than ${effectiveLimit} matches exist — results are truncated; narrow the pattern or path, or raise limit up to ${OPENCODE_FIND_CEILING}`,
+            );
+          }
+          if (scopeMayUndercount) {
+            notes.push(
+              `find: "${String(op.path)}" scoping is applied client-side after a root-wide search — matches outside the fetched window may be missing`,
+            );
+          }
+          const truncated = ceilingHit || probedMore || scopeMayUndercount;
+          return { stdout, stderr: notes.join(" "), exitCode: stdout ? 0 : 1, ...(truncated ? { stdoutTruncated: true } : {}) };
         }
         case "ls": {
           const path = String(op.path ?? ".");
@@ -265,7 +344,7 @@ export function createToolExecutor(client: OpencodeClient, cwd: string): ToolExe
           return { stdout, stderr: "", exitCode: 0, ...(truncated ? { stdoutTruncated: true } : {}) };
         }
         default:
-          return { stdout: "", stderr: `unknown tool: ${op.tool}`, exitCode: 1 };
+          return { stdout: "", stderr: `unknown tool: ${op.tool}`, exitCode: NEVER_RAN };
       }
     } catch (err) {
       return fail(String(op.tool), err);
@@ -281,7 +360,7 @@ const server: Plugin = async ({ client }) => ({
         plan: z.any().describe(
           PLAN_SHAPE_DESCRIPTION +
           WHEN_SYNTAX_LINE +
-          "Note: grep/find scope by a directory `path` (grep glob/ignoreCase/literal/context are unsupported here and error loudly); read offset/limit and grep/find/ls `limit` are applied client-side.",
+          "Note: grep/find scope by a directory `path`, filtered client-side against the session root (grep glob/ignoreCase/literal/context are unsupported here and error loudly); find is capped at 200 results per call; read offset/limit and grep/find/ls `limit` are applied client-side.",
         ),
       },
       async execute(args: { plan: unknown }, context: PluginToolContext) {
@@ -316,7 +395,29 @@ const server: Plugin = async ({ client }) => ({
   // inject the routing line here — but only as a guarded fallback. When the host
   // already carries the rule (e.g. a project AGENTS.md/CLAUDE.md with the same
   // block — see configs/opencode/AGENTS.md), we stay silent to avoid duplication.
-  "experimental.chat.system.transform": async (_input, output) => {
+  //
+  // opencode 1.18.32 fires this hook from exactly two call sites, and their
+  // payloads are the only signal available to tell them apart:
+  //  - session/llm/request.ts:56-72 (`prepare()`) triggers with
+  //    `{ sessionID: input.sessionID, model: input.model }` for every chat
+  //    turn — INCLUDING in-session "small" completions such as title
+  //    generation (session/prompt.ts's `small: true` stream), which still
+  //    carry the conversation's real sessionID. The documented hook input type
+  //    (`{ sessionID?: string; model: Model }`, packages/plugin/src/index.ts:292)
+  //    exposes nothing else to single those small completions out.
+  //  - agent/agent.ts:381 (`Agent.generate`) triggers with `{ model: resolved }`
+  //    and NO `sessionID` — a one-shot utility completion that synthesizes a
+  //    brand-new agent config from a text description and is told to "Return
+  //    ONLY the JSON object, no other text." There is no session for predexec
+  //    routing to matter here, and injected prose risks corrupting that strict
+  //    output contract.
+  // `sessionID` presence is therefore the only reliable no-op signal: it
+  // silences the sessionID-less Agent.generate path, but a real chat session's
+  // own small/title completions are not (and, per this payload shape, cannot
+  // be) distinguished from a full turn.
+  "experimental.chat.system.transform": async (input, output) => {
+    const sessionID = (input as { sessionID?: unknown } | null | undefined)?.sessionID;
+    if (typeof sessionID !== "string" || sessionID === "") return;
     if (!systemHasRoutingInstructions(output.system)) {
       output.system.push(STEERING_LINE);
     }
