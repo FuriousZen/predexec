@@ -1928,3 +1928,47 @@ describe("extended shell family and multicall binaries (task 7 R24)", () => {
   it.each([`fish --command='ls'`, `fish --command 'ls'`, `busybox cat f`, `busybox ls`])(
     "read-only: %s", (c) => expect(isDestructiveCommand(c)).toBe(false));
 });
+
+describe("dynamic command names (final review #3)", () => {
+  // A command name the shell produces by expansion is unknowable statically:
+  // it may be any program, so the segment is mutating.
+  it.each([
+    "$(printf '\\x72m') -rf zz",
+    "c=$(echo cm0= | base64 -d); $c -rf zz",
+    "$(echo r)m -rf zz",
+    "a=r b=m; $a$b zz",
+    "IFS=_; c=rm_zz; $c",
+    "${!v} zz",
+    "${X:-cat} .env",
+    "c=cat; $c .env",
+    "`echo rm` -rf zz",
+    "\"$CMD\" zz",
+    "env $CMD zz",
+    "command $c zz",
+    "if true; then $c zz; fi",
+    "echo ok && $c zz",
+    "/bin/r? -rf zz",
+    "/bin/r[m] -rf zz",
+    "{r,}m -rf zz",
+    "\"$HOME\"/bin/tool --flag",
+  ])("mutating: %s", (c) => {
+    expect(findDestructiveToken(c)).toBe("dynamic command name");
+  });
+
+  // Expansion in ARGUMENT positions stays data; only the command name matters.
+  it.each([
+    "cat \"$HOME\"/notes.txt",
+    "ls $DIR",
+    "echo $(cat README.md)",
+    "grep -r \"${PATTERN}\" src",
+    "x=$(cat f); echo \"$x\"",
+    "[ -f x ] && echo yes",
+    "[[ -n $x ]] && echo yes",
+    "for f in *.ts; do wc -l \"$f\"; done",
+    "ls *.ts",
+    "cat '$literal'",
+    "\\$not-expanded",
+  ])("read-only: %s", (c) => {
+    expect(findDestructiveToken(c)).toBeNull();
+  });
+});

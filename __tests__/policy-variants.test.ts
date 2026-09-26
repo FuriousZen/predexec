@@ -5,7 +5,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { runPlanTree } from "../core/engine.ts";
+import { policyShellVariants, runPlanTree } from "../core/engine.ts";
 import type { PlanTree, PolicyCheckContext, PolicyVerdict } from "../core/types.ts";
 import type { Operation } from "../core/types.ts";
 import { createClaudePolicyChecker, parseClaudeBashRules } from "../mcp/policy-claude.ts";
@@ -76,5 +76,27 @@ describe.each(checkers)("policy variants through the engine — %s", (_name, mak
     const r = await run(nestShells(9).replace("cat .env", "echo ok"), make());
     expect(r.stoppedReason).toBe("policyStop");
     expect(r.transcript).toMatch(/policy check failed: .*nest/);
+  });
+});
+
+describe.each(checkers)("dynamic command names never reach a run — %s", (_name, make) => {
+  it.each(["c=cat; $c .env", "${X:-cat} .env", "$(echo cat) .env", "sh -c 'c=cat; $c .env'"])("%s", async (command) => {
+    const r = await run(command, make());
+    expect(r.stoppedReason).not.toBe("leaf");
+    expect(r.pathTaken).toEqual([]);
+    expect(r.transcript).not.toContain("SECRET=1");
+  });
+});
+
+describe("policyShellVariants — dynamic command names", () => {
+  // The classifier already stops these as mutating; the policy layer must
+  // also refuse on its own, so neither gate relies on the other.
+  it.each(["c=cat; $c .env", "${X:-cat} .env", "$(echo cat) .env", "echo \"$(sh -c '$c .env')\"", "{c,}at .env"])(
+    "throws for %s", (command) => {
+      expect(() => policyShellVariants(command)).toThrow(/command name/);
+    });
+
+  it.each(["cat \"$HOME\"/.env", "ls $DIR", "echo $(cat README.md)"])("expansion in arguments is fine: %s", (command) => {
+    expect(() => policyShellVariants(command)).not.toThrow();
   });
 });

@@ -33,6 +33,7 @@ import {
   envOption,
   extractShellCommandClauses,
   hasAnsiCEscapedQuote,
+  hasDynamicCommandName,
   inspectCommandSubstitutions,
   inspectCommandSubstitutionTree,
   inspectShellCommandClauses,
@@ -403,6 +404,15 @@ function findDestructiveTokenInternal(cmd: string, depth: number): string | null
     // this check also runs on recursively extracted -c/control/function
     // clauses, while quoted words remain data because they are not heads.
     if (head && SHELL_COMMAND_CONTROL_HEADS.has(head)) return head;
+  }
+
+  // A command name produced by expansion (`$c`, `$(printf rm)`, `/bin/r?`)
+  // can be any program; nothing below can vouch for it.
+  for (const segment of segments) {
+    // Unstripped too: the prefix stripper also eats a brace expansion's `{`.
+    if (hasDynamicCommandName(segment) || hasDynamicCommandName(stripShellControlPrefix(segment))) {
+      return "dynamic command name";
+    }
   }
 
   // An environment variable that makes a later reader run a command

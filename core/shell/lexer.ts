@@ -1772,3 +1772,65 @@ export function effectiveHead(segment: string): string | null {
   const base = normalized.argv[0]!.replace(/^.*\//, "");
   return base || null;
 }
+
+/**
+ * True when an unquoted character of a word's source spelling makes the shell
+ * expand it into something else: a glob (`*`, `?`, a `[...]` bracket) or a
+ * brace expansion (`{a,b}`, `{1..3}`). The bare `[`/`[[` test commands are
+ * words, not brackets.
+ */
+function sourceWordExpands(source: string): boolean {
+  if (source === "[" || source === "[[") return false;
+  let quote: "'" | '"' | null = null;
+  let bracketOpen = false;
+  let braceOpen = false;
+  let braceList = false;
+  for (let i = 0; i < source.length; i++) {
+    const ch = source[i]!;
+    if (quote === "'") {
+      if (ch === "'") quote = null;
+      continue;
+    }
+    if (ch === "\\") {
+      i++;
+      continue;
+    }
+    if (quote === '"') {
+      if (ch === '"') quote = null;
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      quote = ch;
+      continue;
+    }
+    if (ch === "*" || ch === "?") return true;
+    if (ch === "[") bracketOpen = true;
+    else if (ch === "]" && bracketOpen) return true;
+    else if (ch === "{") braceOpen = true;
+    else if (braceOpen && (ch === "," || (ch === "." && source[i + 1] === "."))) braceList = true;
+    else if (ch === "}" && braceList) return true;
+  }
+  return false;
+}
+
+/**
+ * True when a segment's effective command name (after assignments, `env` and
+ * wrappers) is not a literal: it holds a parameter expansion, a command
+ * substitution or backtick, or a glob/brace expansion. The program such a
+ * word runs is decided at run time (`$c`, `$(printf rm)`, `/bin/r?`), so no
+ * static check can vouch for it. Arguments are never inspected. A segment
+ * whose head cannot be placed at all is false here; callers already treat it
+ * as incomplete.
+ */
+export function hasDynamicCommandName(segment: string): boolean {
+  const lex = lexShellWords(segment, ARGV);
+  const values = lex.words.map((word) => word.value);
+  const normalized = normalizeEnvInvocation(values);
+  if (!normalized.complete || normalized.argv.length === 0) return false;
+  const offset = values.length - normalized.argv.length;
+  // A head spliced in from an `env -S` payload came from literal words only
+  // (a dynamic payload is already incomplete), so it is not dynamic.
+  if (offset < 0 || values[offset] !== normalized.argv[0]) return false;
+  const head = lex.words[offset]!;
+  return head.dynamic || sourceWordExpands(segment.slice(head.start, head.end));
+}

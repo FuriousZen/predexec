@@ -20,8 +20,8 @@ import { isAbsolute, relative, resolve, sep } from "node:path";
 import { conditionStringBudget, evaluateConditionWithDetail, isInsideRoot } from "./conditions.ts";
 import { READ_ONLY_TOOLS, MUTATING_TOOLS, findDestructiveToken } from "./destructive.ts";
 import { runNode, isToolOp, formatToolOpLabel } from "./runner.ts";
-import { ARGV, extractShellCommandClauses, inspectCommandSubstitutionTree, normalizeEnvInvocation, splitCommandSegments, tokenizeShellWords } from "./shell/lexer.ts";
-import { shellEvalPayload } from "./shell/interpreters.ts";
+import { ARGV, extractShellCommandClauses, hasDynamicCommandName, inspectCommandSubstitutionTree, normalizeEnvInvocation, splitCommandSegments, tokenizeShellWords } from "./shell/lexer.ts";
+import { shellEvalPayload, stripShellControlPrefix } from "./shell/interpreters.ts";
 import { validateOperation } from "./validation.ts";
 import {
   DEFAULT_MAX_DEPTH,
@@ -358,10 +358,10 @@ const MAX_POLICY_SHELL_DEPTH = 8;
  * wrappers dropped, head reduced to its basename (`/usr/bin/env '/bin/cat'
  * .env` → `cat .env`). The command itself is not included, and nothing is
  * returned for a command with neither form. Throws (fail closed) when the
- * substitution tree cannot be fully inspected or the shell nesting exceeds
- * MAX_POLICY_SHELL_DEPTH.
+ * substitution tree cannot be fully inspected, the shell nesting exceeds
+ * MAX_POLICY_SHELL_DEPTH, or a clause's command name is an expansion.
  */
-function policyShellVariants(command: string): string[] {
+export function policyShellVariants(command: string): string[] {
   const variants: string[] = [];
   const seen = new Set<string>([command.trim()]);
   const add = (text: string): void => {
@@ -379,6 +379,10 @@ function policyShellVariants(command: string): string[] {
     for (const body of tree.commands) {
       for (const piece of splitCommandSegments(body)) {
         for (const clause of new Set([piece, ...extractShellCommandClauses(piece)])) {
+          // No host rule can match a program chosen at run time (`$c .env`).
+          if (hasDynamicCommandName(clause) || hasDynamicCommandName(stripShellControlPrefix(clause))) {
+            throw new Error("unresolvable command name (an expansion in the command position)");
+          }
           const argvForm = decodedArgvForm(clause);
           if (argvForm !== null) add(argvForm);
           const shell = shellEvalPayload(clause);
