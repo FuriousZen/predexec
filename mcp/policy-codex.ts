@@ -383,7 +383,12 @@ function parseStarlarkString(text: string): string | null {
   const q = t[0];
   if (q !== '"' && q !== "'") return null;
   const delim = t.startsWith(q.repeat(3)) ? q.repeat(3) : q;
-  if (t.length < delim.length * 2 || !t.endsWith(delim)) return null;
+  // The literal ends at its FIRST unescaped closing delimiter (Starlark
+  // semantics); anything after it — `+ str(prefix_rule(...)) + """b"""`, an
+  // `if ... else`, another token — means `text` is an expression, not one
+  // literal. Checking only `endsWith(delim)` accepted such a chain as a single
+  // string and silently dropped the rule nested in it (review I2, round 2).
+  if (stringEnd(t, 0) !== t.length) return null;
   const body = t.slice(delim.length, t.length - delim.length);
   let out = "";
   for (let i = 0; i < body.length; i++) {

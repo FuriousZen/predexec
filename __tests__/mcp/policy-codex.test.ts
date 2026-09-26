@@ -916,3 +916,21 @@ describe("readCodexRules — project-root search has no ceiling (review R37)", (
     expect(rules).toEqual([{ pattern: ["rm"], decision: "forbidden" }]);
   });
 });
+
+describe("readCodexRules — a triple-quoted literal ends at its FIRST closing delimiter (review I2, round 2)", () => {
+  const nested = 'str(prefix_rule(pattern=["rm"], decision="forbidden"))';
+  it.each([
+    ["network_rule justification (\"\"\")", `network_rule(host="a", protocol="https", decision="allow", justification="""a""" + ${nested} + """b""")`],
+    ["network_rule justification (''')", `network_rule(host="a", protocol="https", decision="allow", justification='''a''' + ${nested} + '''b''')`],
+    ["prefix_rule justification", `prefix_rule(pattern=["ls"], justification="""a""" + ${nested} + """b""")`],
+    ["a pattern element", 'prefix_rule(pattern=["""ls""" if prefix_rule(pattern=["rm"], decision="forbidden") else """ls"""])'],
+    ["an assignment right-hand side", `X = """a""" + ${nested} + """b"""`],
+  ])("%s: the nested forbidden rule is never silently dropped", (_name, body) => {
+    const { projectDir, codexHome, opts } = setupLayers();
+    writeRule(join(codexHome, "rules"), "a.rules", `${body}\n`);
+    const { rules, unreadable } = readCodexRules(projectDir, opts);
+    const check = createCodexPolicyChecker(rules, unreadable);
+    expect(check("rm x")).not.toBe(null);
+    expect(unreadable).toEqual([join(codexHome, "rules", "a.rules")]);
+  });
+});
