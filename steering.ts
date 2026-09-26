@@ -135,7 +135,7 @@ export const SKILL_PATHS: Readonly<Record<SkillHarness, string>> = Object.freeze
 const SKILL_DESCRIPTION =
   STEERING_LINE +
   " Use it for ls/cat/grep/find-style reads, read/grep/find/ls tool calls, and predictable multi-step read sequences " +
-  "(one plan tree, one round-trip); it hard-stops before anything that mutates.";
+  "(one plan tree, one round-trip); it hard-stops before the writes, installs and deletes it detects.";
 
 /** Where the tool id comes from — MCP hosts namespace it, so never hardcode the full id. */
 const MCP_TOOL_ID_LINE =
@@ -210,8 +210,11 @@ export function renderSkill(h: SkillHarness): string {
     `A node's \`commands\` mixes shell strings and tool ops: \`${TOOL_OP_SYNTAX}\`.`,
     `Edge conditions — ${WHEN_SYNTAX_LINE.trim()}`,
     VERIFY_FIRST_LINE.trim(),
-    "predexec hard-stops (`mutationStop`) before any write/install/delete/exec — including interpreter one-liners that write, " +
-      `shell scripts (\`bash x.sh\`), and \`sh -c\` with writes. Run those, and interactive commands, with ${shell}.`,
+    "predexec hard-stops (`mutationStop`) before writes, installs and deletes — including interpreter one-liners that write, " +
+      "shell scripts (`bash x.sh`), `sh -c` with writes, and commands whose name is computed at run time (`$c`). " +
+      "It does NOT stop an interpreter running an existing script file (`python3 script.py`, `node x.js`, `node --test`): " +
+      `that code is not inspected, so run a script you do not know to be read-only with ${shell}. ` +
+      `Run writes, installs, deletes and interactive commands with ${shell}.`,
     ...(policy ? [policy] : []),
     RECOVERY_LINE.trim() +
       (policy ? " `policyStop` recovers the same way." : "") +

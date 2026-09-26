@@ -84,6 +84,15 @@ describe("skills — single source (steering.ts → SKILL.md)", () => {
     expect(body).toMatch(/exit 1 means it ran and found nothing/);
   });
 
+  it.each(SKILL_HARNESSES)("%s: states precisely what is stopped, and that script files are not (R15/R23)", (h) => {
+    const skill = renderSkill(h);
+    expect(skill).not.toMatch(/before any write\/install\/delete\/exec/);
+    expect(skill).not.toContain("before anything that mutates");
+    expect(skill).toMatch(/interpreter one-liners that write/);
+    expect(skill).toMatch(/shell scripts \(`bash x\.sh`\)/);
+    expect(skill).toMatch(/does NOT stop an interpreter running an existing script file \(`python3 script\.py`, `node x\.js`/);
+  });
+
   it("pi omits policyStop; every other harness has a policy paragraph", () => {
     expect(renderSkill("pi")).not.toContain("policyStop");
     for (const h of SKILL_HARNESSES.filter((x) => x !== "pi")) expect(renderSkill(h)).toContain("policyStop");

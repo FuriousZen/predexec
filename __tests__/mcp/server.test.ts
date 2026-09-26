@@ -102,7 +102,12 @@ describe("mcp server — tool registration", () => {
     expect(plan.description).toContain('"file exists <path>"');
     expect(plan.description).toContain(PLAN_SHAPE_DESCRIPTION);
     expect(plan.description).toContain('{tool:"read"');
-    expect(plan.description).toContain("dependency symlinks below node_modules are the sole exception");
+    // The node_modules symlink exemption was removed (CC-1); the text must not
+    // promise an escape hatch that now refuses, and it serves every MCP host.
+    expect(plan.description).not.toContain("node_modules");
+    expect(plan.description).not.toContain("Claude Code");
+    expect(plan.description).toContain("not the host's native file tools");
+    expect(plan.description).toMatch(/paths \(and symlinks\) may not resolve outside the session root/);
     expect(plan.description).toContain("do not provide kernel-atomic protection against concurrent parent-directory replacement");
   });
 
