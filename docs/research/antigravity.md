@@ -28,6 +28,9 @@ The server configs used an absolute `node` path and `env: {PROBE, PROBE_SRC, PRO
 PROBE_WRITE_TARGET}`. Four model-backed prompt runs were used, each wrapped in a 120 s alarm.
 `/skills`, `/config`, and `/permissions` print-mode runs cost no quota and are not counted.
 
+Paths in the excerpts below are redacted: `~` stands for the home directory and
+`.../scratchpad` or `<scratchpad>` for the session scratch directory. The raw values were absolute paths.
+
 ## Headless invocation that worked
 
 ```sh
@@ -56,7 +59,7 @@ and still discovers `.agents/` from the enclosing repo root.
 Run 2, launched from `agy-ws/sub/deeper`:
 
 ```
-run2.log: Creating CLI server backend: product=antigravity workspaceDirs=[.../scratchpad/agy-ws/sub/deeper] appDataDir=/Users/williamwo/.gemini/antigravity-cli
+run2.log: Creating CLI server backend: product=antigravity workspaceDirs=[.../scratchpad/agy-ws/sub/deeper] appDataDir=~/.gemini/antigravity-cli
 tool_info: {"ServerName":"predexec-probe","ToolName":"probe"} output: {"pid":6890,"ppid":6791,"cwd":".../scratchpad/agy-ws/sub/deeper", ...}
 ```
 
@@ -102,7 +105,7 @@ grants live in `~/.gemini/config/projects/<id>.json`, also global. There is no C
 either: `--mode` accepts only `accept-edits|plan`, and the binary warns that
 `--mode %s is not supported in print mode`. Changing the setting would mean editing global
 state, which R47 forbids. The one override that exists, `JETSKI_APP_DATA_DIR`, was ignored
-(the log still said `CLI app data directory: /Users/williamwo/.gemini/antigravity-cli`).
+(the log still said `CLI app data directory: ~/.gemini/antigravity-cli`).
 `HOME=<scratch>` relocates all of `~/.gemini`, but it breaks auth: the keyring login is not
 found (`Error: authentication timed out.`).
 
@@ -129,12 +132,12 @@ needed. Run 3, `agy --sandbox -p ...` from the workspace root:
 
 ```
 run3.log: Print mode: enabling terminal sandbox for this session
-call_mcp_tool predexec-probe → {"cwd":".../agy-ws","write":{"target":"/Users/williamwo/predexec-probe-write-test-ws","ok":true},
-                                "callWrite":{"target":"/Users/williamwo/predexec-probe-write-test-ws","ok":true}, ...}
-call_mcp_tool probeplug_predexec-probe → {"write":{"target":"/Users/williamwo/predexec-probe-write-test-plugin","ok":true},
+call_mcp_tool predexec-probe → {"cwd":".../agy-ws","write":{"target":"~/predexec-probe-write-test-ws","ok":true},
+                                "callWrite":{"target":"~/predexec-probe-write-test-ws","ok":true}, ...}
+call_mcp_tool probeplug_predexec-probe → {"write":{"target":"~/predexec-probe-write-test-plugin","ok":true},
                                 "callWrite":{... "ok":true}, ...}
-run_command "touch /Users/williamwo/predexec-sbx-shell-test; echo EXIT=$?"
-   → "touch: /Users/williamwo/predexec-sbx-shell-test: Operation not permitted\r\nEXIT=1"
+run_command "touch ~/predexec-sbx-shell-test; echo EXIT=$?"
+   → "touch: ~/predexec-sbx-shell-test: Operation not permitted\r\nEXIT=1"
 ```
 
 In the same session, with the sandbox confirmed on, the agent's own shell could not write to
@@ -176,7 +179,23 @@ were verified instead: `.agents/skills/probe-ws-skill` and the workspace plugin'
   so everything user-authored lives under `~/.gemini/config/`.
 
 The best-supported answer is `~/.gemini/config/skills/`. It stays unverified until someone
-places a skill there and lists it.
+runs this on a machine where `~/.gemini` can be edited:
+
+```sh
+mkdir -p ~/.gemini/config/skills/probe-config-skill ~/.gemini/antigravity-cli/skills/probe-cli-skill
+printf -- '---\nname: probe-config-skill\ndescription: Probe skill. Never use.\n---\n# probe\n' \
+  > ~/.gemini/config/skills/probe-config-skill/SKILL.md
+printf -- '---\nname: probe-cli-skill\ndescription: Probe skill. Never use.\n---\n# probe\n' \
+  > ~/.gemini/antigravity-cli/skills/probe-cli-skill/SKILL.md
+# 1) free listing: it showed global PLUGIN skills with their path (workspace skills were absent)
+agy -p "/skills" --output-format json | jq -r '.command.data.skills[] | "\(.name)\t\(.path)"' | grep probe-
+# 2) one real turn, in case the listing and the agent's view differ
+cd <any-git-repo> && agy -p "List every skill whose name starts with probe- (or say NONE). Do nothing else." \
+  --output-format json | jq -r .response
+rm -rf ~/.gemini/config/skills/probe-config-skill ~/.gemini/antigravity-cli/skills/probe-cli-skill
+```
+
+Whichever of `probe-config-skill` and `probe-cli-skill` appears is the directory that gets loaded.
 
 ## (e) Plugin tool namespacing, and whether `mcp(predexec-probe/*)` matches: namespacing VERIFIED, grant matching UNVERIFIED
 
@@ -201,6 +220,30 @@ syntax is `mcp(server/tool)`, and the only server identity the runtime ever show
 prefixed `ServerName`. **Expect a plugin-shipped predexec (plugin `predexec`, server `predexec`)
 to need `mcp(predexec_predexec/predexec)` or `mcp(predexec_predexec/*)`, not `mcp(predexec/*)`.
 This is inferred, not measured.**
+
+**To close grant matching,** on a machine where `~/.gemini` can be edited, use a scratch git
+workspace containing only `.agents/plugins/probeplug/` (as above, with no workspace
+`mcp_config.json`, so that only `probeplug_predexec-probe` exists):
+
+```sh
+cp ~/.gemini/antigravity-cli/settings.json <scratchpad>/settings.json.bak
+# A: short-name grant
+jq '.toolPermission="request-review" | .permissions.allow=["mcp(predexec-probe/*)"]' \
+  <scratchpad>/settings.json.bak > ~/.gemini/antigravity-cli/settings.json
+cd <scratch-ws> && agy -p "Call the MCP tool probe once, no arguments, and print its raw output." \
+  --output-format stream-json | jq -c 'select(.step_update.step_type=="tool") | .step_update | {state, tool_info}'
+# B: namespaced grant
+jq '.toolPermission="request-review" | .permissions.allow=["mcp(probeplug_predexec-probe/*)"]' \
+  <scratchpad>/settings.json.bak > ~/.gemini/antigravity-cli/settings.json
+cd <scratch-ws> && agy -p "Call the MCP tool probe once, no arguments, and print its raw output." \
+  --output-format stream-json | jq -c 'select(.step_update.step_type=="tool") | .step_update | {state, tool_info}'
+cp <scratchpad>/settings.json.bak ~/.gemini/antigravity-cli/settings.json
+```
+
+A grant matches when its run shows a `call_mcp_tool` step that reaches `DONE` with the probe's
+JSON as `output`. A grant does not match when the run shows a denial or permission-request step
+instead. Run (b)'s ungranted `request-review` baseline first, so it is known what "not granted"
+looks like in headless mode.
 
 ## Summary
 

@@ -10,7 +10,7 @@
 
 **Spec:** `docs/superpowers/specs/2026-09-25-harness-refresh-audit.md`. Finding IDs such as `CORE-1` and `CX-2` refer to it. Read the finding before starting a task that cites it.
 
-**Project context:** `/Users/williamwo/Development/personal/predexec/CLAUDE.md` sits in the parent directory, outside this git repo. Its "Invariants" and "Hard-won details" sections are binding: do not undo any hard-won detail unless a task below explicitly changes it.
+**Project context:** `../CLAUDE.md` (parent directory, outside this repo). Its "Invariants" and "Hard-won details" sections are binding: do not undo any hard-won detail unless a task below explicitly changes it.
 
 ## Global Constraints
 
@@ -835,7 +835,7 @@ Deferred, not in this plan: TypeScript 7 and Vitest 5 (major bumps; each needs i
 
 Covers DOC-1 and the stale claims.
 
-**Files:** `/Users/williamwo/Development/personal/predexec/CLAUDE.md` (outside the repo; edit in place, not committed), `README.md`, `steering.ts` header comment
+**Files:** `../CLAUDE.md` (parent directory, outside this repo; edit in place, not committed), `README.md`, `steering.ts` header comment
 
 - [ ] **Step 1:** Update CLAUDE.md:
   - Layout: add `core/shell/*`, `plan-language.ts`, `core/validation.ts`, `mcp/toml-lite.ts`, `mcp/gitignore-match.ts`, `mcp/policy-antigravity.ts`, `skills/<h>/predexec/`, `.codex-plugin/`, `antigravity-plugin/`, `docs/`, `scripts/gen-skills.mjs`.

@@ -198,3 +198,26 @@ describe("release hygiene", () => {
     execFileSync(process.execPath, ["--input-type=module", "-e", script], { stdio: "pipe" });
   });
 });
+
+describe("no local machine paths in tracked docs", () => {
+  // The repo has a PUBLIC remote. Research notes and plans are written from live
+  // measurements, so an absolute home or scratch path (which carries the OS
+  // username) is easy to paste in by accident. Use ~/…, <repo>/…, <scratchpad>/… instead.
+  it("docs/, scripts/, README.md and PLAN.md contain no /Users/ or /private/tmp/ paths", () => {
+    const tracked = execFileSync("git", ["ls-files", "-z", "--", "docs", "scripts", "README.md", "PLAN.md"], {
+      encoding: "utf8",
+    })
+      .split("\0")
+      .filter(Boolean);
+    expect(tracked.length).toBeGreaterThan(0);
+    const hits: string[] = [];
+    for (const file of tracked) {
+      readFileSync(file, "utf8")
+        .split("\n")
+        .forEach((line, i) => {
+          if (line.includes("/Users/") || line.includes("/private/tmp/")) hits.push(`${file}:${i + 1}`);
+        });
+    }
+    expect(hits).toEqual([]);
+  });
+});

@@ -21,6 +21,11 @@ import { serveStdio } from "@modelcontextprotocol/server/stdio";
 
 const LOG = process.env.PROBE_LOG || join(tmpdir(), "predexec-probe.log");
 const WRITE_TARGET = process.env.PROBE_WRITE_TARGET || join(homedir(), "predexec-probe-write-test");
+// Env vars whose VALUES are logged (everything else is logged by name only).
+// ANTIGRAVITY_* / GEMINI_* answer "does the host identify itself to the child?".
+// PROBE* echoes the probe's own config-supplied env (PROBE, PROBE_SRC, PROBE_LOG,
+// PROBE_WRITE_TARGET), confirming which config entry spawned this process.
+// PLUGIN_ROOT is the extra var agy injects into plugin-bundled servers.
 const VALUE_RE = /^(ANTIGRAVITY_|GEMINI_|PROBE|PLUGIN_ROOT$)/;
 
 function writeTest() {

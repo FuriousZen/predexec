@@ -118,13 +118,13 @@ server (our case), now cited to real source instead of a missing file.
 scratchpad for the whole check.
 
 ```
-$ codex plugin marketplace add /Users/williamwo/Development/personal/predexec/predexec
-Added marketplace `predexec` from /Users/williamwo/Development/personal/predexec/predexec.
-Installed marketplace root: /Users/williamwo/Development/personal/predexec/predexec
+$ codex plugin marketplace add <repo>
+Added marketplace `predexec` from <repo>.
+Installed marketplace root: <repo>
 
 $ codex plugin list
 PLUGIN             STATUS         VERSION  SOURCE
-predexec@predexec  not installed           /Users/williamwo/Development/personal/predexec/predexec
+predexec@predexec  not installed           <repo>
 
 $ codex plugin add predexec@predexec     # bare `codex plugin add predexec` errors:
                                           # "plugin requires --marketplace unless passed as <plugin>@<marketplace>"
@@ -133,7 +133,7 @@ Installed plugin root: $CODEX_HOME/plugins/cache/predexec/predexec/0.4.1
 
 $ codex plugin list
 PLUGIN             STATUS              VERSION  SOURCE
-predexec@predexec  installed, enabled  0.4.1    /Users/williamwo/Development/personal/predexec/predexec
+predexec@predexec  installed, enabled  0.4.1    <repo>
 
 $ codex mcp list
 Name      Command  Args                                                   Env               Cwd  Status   Auth
