@@ -280,8 +280,10 @@ describe("no local machine paths in tracked docs", () => {
   // The repo has a PUBLIC remote. Research notes and plans are written from live
   // measurements, so an absolute home or scratch path (which carries the OS
   // username) is easy to paste in by accident. Use ~/…, <repo>/…, <scratchpad>/… instead.
-  it("docs/, scripts/, README.md and PLAN.md contain no /Users/ or /private/tmp/ paths", () => {
-    const tracked = execFileSync("git", ["ls-files", "-z", "--", "docs", "scripts", "README.md", "PLAN.md"], {
+  it("docs/, scripts/ and README.md contain no /Users/ or /private/tmp/ paths", () => {
+    // PLAN.md at the repo root was archived under docs/superpowers/plans/ (see
+    // CLAUDE.md's Current state), so it's already covered by the "docs" pathspec below.
+    const tracked = execFileSync("git", ["ls-files", "-z", "--", "docs", "scripts", "README.md"], {
       encoding: "utf8",
     })
       .split("\0")
