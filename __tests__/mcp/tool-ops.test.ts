@@ -2,7 +2,7 @@ import { chmodSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, w
 import { EventEmitter } from "node:events";
 import type { ChildProcess } from "node:child_process";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { afterAll, describe, expect, it, vi } from "vitest";
 import {
   isSafeRegex,
@@ -34,6 +34,13 @@ import {
 const root = mkdtempSync(join(tmpdir(), "px-toolops-"));
 const outside = mkdtempSync(join(tmpdir(), "px-outside-"));
 const symlinkRoot = mkdtempSync(join(tmpdir(), "px-symlink-root-"));
+// CC-1 regression roots: the top-level `node_modules` entry ITSELF is a
+// symlink outside the session root — the shape a committed `node_modules ->
+// /` or `-> ..` would take. These must be refused just as completely as the
+// sub-symlink case above; no realpath outside the root gets a pass.
+const evilNodeModulesRoot = mkdtempSync(join(tmpdir(), "px-evil-node-modules-"));
+const parentNodeModulesRoot = mkdtempSync(join(tmpdir(), "px-parent-node-modules-"));
+const parentSiblingSecret = join(dirname(parentNodeModulesRoot), "px-parent-sibling-secret.txt");
 
 const write = (rel: string, content: string | Buffer): void => {
   const path = join(root, rel);
@@ -68,6 +75,14 @@ try {
   mkdirSync(join(symlinkRoot, "node_modules", ".pnpm", "x", "node_modules"), { recursive: true });
   writeFileSync(join(symlinkRoot, "node_modules", ".pnpm", "x", "package.json"), '{"name":"pnpm-style"}\n');
   symlinkSync("../../x", join(symlinkRoot, "node_modules", ".pnpm", "x", "node_modules", "pkg"), "junction");
+  // Top-level `node_modules -> outside`: the whole entry is a symlink, not a
+  // sub-path under a real directory.
+  symlinkSync(outside, join(evilNodeModulesRoot, "node_modules"), "junction");
+  // `node_modules -> ..`: resolves to this root's OWN parent directory — a
+  // plausible, minimal escape that needs no cooperating "outside" fixture at
+  // all, since every session root already has a parent.
+  symlinkSync("..", join(parentNodeModulesRoot, "node_modules"), "junction");
+  writeFileSync(parentSiblingSecret, "parent sibling secret\n");
   symlinksAvailable = true;
 } catch {
   // Some platforms require elevated privileges for symlink creation.
@@ -77,6 +92,9 @@ afterAll(() => {
   rmSync(root, { recursive: true, force: true });
   rmSync(outside, { recursive: true, force: true });
   rmSync(symlinkRoot, { recursive: true, force: true });
+  rmSync(evilNodeModulesRoot, { recursive: true, force: true });
+  rmSync(parentNodeModulesRoot, { recursive: true, force: true });
+  rmSync(parentSiblingSecret, { force: true });
 });
 
 /** Forces the pure-Node path regardless of what is installed on this machine. */
@@ -267,6 +285,38 @@ describe("mcp tool-ops — path containment", () => {
       expect(r.stdout).toBe('{"name":"pnpm-style"}\n');
     },
   );
+
+  it.skipIf(!symlinksAvailable)(
+    "refuses a TOP-LEVEL node_modules that is itself a symlink outside the root (CC-1: no exceptions)",
+    async () => {
+      // The shape a committed `node_modules -> /somewhere/else` would take —
+      // not a sub-symlink under a real node_modules directory, the whole
+      // entry. Any special-case keyed on "what node_modules itself resolves
+      // to" reopens CC-1 exactly this way.
+      const executor = createToolExecutor({ cwd: evilNodeModulesRoot });
+      const runEvil = (op: ToolOp) => executor(op, { cwd: evilNodeModulesRoot });
+      for (const [op, exitCode] of [
+        [{ tool: "read", path: "node_modules/secret.txt" }, 1],
+        [{ tool: "ls", path: "node_modules" }, 1],
+        [{ tool: "grep", pattern: "secret", path: "node_modules" }, 2],
+        [{ tool: "find", pattern: "*.txt", path: "node_modules" }, 2],
+      ] as [ToolOp, number][]) {
+        const r = await runEvil(op);
+        expect(r.exitCode, op.tool).toBe(exitCode);
+        expect(r.stderr, op.tool).toContain("outside");
+      }
+    },
+  );
+
+  it.skipIf(!symlinksAvailable)("refuses node_modules -> .. (parent-directory escape)", async () => {
+    const r = await createToolExecutor({ cwd: parentNodeModulesRoot })(
+      { tool: "read", path: "node_modules/px-parent-sibling-secret.txt" },
+      { cwd: parentNodeModulesRoot },
+    );
+    expect(r.exitCode).toBe(1);
+    expect(r.stderr).toContain("outside");
+    expect(r.stdout).toBe("");
+  });
 
   it.skipIf(!symlinksAvailable)("uses the canonical match file for context after a lexical alias is swapped", async () => {
     const contextRoot = mkdtempSync(join(tmpdir(), "px-context-root-"));
@@ -844,6 +894,36 @@ describe("mcp tool-ops — bounded fallback scans", () => {
     expect(r.exitCode).toBe(2);
     expect(r.stdout).toBe("");
     expect(r.stderr).toContain("time budget");
+  });
+
+  it("aborts on a shared cumulative budget, not a fresh per-line window (many moderate-cost lines)", async () => {
+    // Each line here is individually "moderate" — nowhere near catastrophic,
+    // and nowhere near REGEX_EVAL_TIMEOUT_MS on its own — but a per-line-reset
+    // deadline lets an unbounded number of such lines run forever, since none
+    // of them individually trips it. A shared budget across a batch of lines
+    // must still abort once their combined cost crosses it.
+    const pattern = "a*a*a*a*b";
+    expect(isSafeRegex(pattern)).toBe(true);
+    write("moderate-regex.txt", `${Array.from({ length: 1500 }, () => "a".repeat(80)).join("\n")}\n`);
+    const start = Date.now();
+    const r = await run({ tool: "grep", pattern, path: "moderate-regex.txt" }, NODE_ONLY);
+    expect(Date.now() - start).toBeLessThan(2000);
+    expect(r.exitCode).toBe(2);
+    expect(r.stdout).toBe("");
+    expect(r.stderr).toContain("time budget");
+  });
+
+  it("keeps an ordinary large-file fallback grep fast (regression guard for vm-entry overhead)", async () => {
+    // Measured on the naive per-line-vm design: a 100k-line fallback grep took
+    // ~4.5s (vs ~5ms for a bare, unwrapped RegExp#test loop) — an ~800x tax
+    // from entering node:vm once per line. Batching many lines into each vm
+    // invocation must keep an ordinary, non-adversarial large-file grep fast.
+    write("large-fallback.txt", `${Array.from({ length: 50_000 }, (_, i) => `line ${i}`).join("\n")}\n`);
+    const start = Date.now();
+    const r = await run({ tool: "grep", pattern: "line 49999", path: "large-fallback.txt" }, NODE_ONLY);
+    expect(Date.now() - start).toBeLessThan(1500);
+    expect(r.exitCode).toBe(0);
+    expect(r.stdout).toBe("large-fallback.txt:50000:line 49999");
   });
 
   it("refuses an unterminated line over the fallback scan bound", async () => {

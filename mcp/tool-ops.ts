@@ -30,13 +30,13 @@
 
 import { execFile } from "node:child_process";
 import type { ChildProcess } from "node:child_process";
-import { accessSync, constants, realpathSync } from "node:fs";
+import { accessSync, constants } from "node:fs";
 import { open, opendir, realpath, stat } from "node:fs/promises";
 import { delimiter, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { StringDecoder } from "node:string_decoder";
+import { createContext, Script, type Context } from "node:vm";
 import {
   escapeRegExp,
-  execWithDeadline,
   isSafeRegex,
   MAX_GREP_PATTERN_LENGTH,
   REGEX_EVAL_TIMEOUT_MS,
@@ -189,29 +189,6 @@ export function findOnPath(bin: string): string | null {
 }
 
 /**
- * The one directory a session's own `node_modules` may legitimately point
- * OUTSIDE the session root (CC-1). Some package managers place the WHOLE
- * `node_modules` entry behind a symlink into an external, shared store
- * (pnpm's hoisted/shared-store layouts are the measured case) — that single
- * resolved directory is the only realpath `target()` accepts outside `root`.
- *
- * Resolved once, synchronously, at executor construction — not per
- * operation — the same way `findOnPath`'s rg/fd lookup is. This is
- * deliberately narrow: an arbitrary symlink placed a few levels under an
- * otherwise-REAL `node_modules` directory (e.g. a planted `node_modules/evil`)
- * gets no exemption at all and must resolve inside `root` like anything else.
- */
-function resolveNodeModulesStore(root: string): string | null {
-  try {
-    const realRoot = realpathSync(root);
-    const store = realpathSync(join(root, "node_modules"));
-    return isWithin(realRoot, store) ? null : store;
-  } catch {
-    return null; // no node_modules, or it could not be resolved — nothing to allow
-  }
-}
-
-/**
  * Translate the glob subset `find` accepts (`*`, `**`, `?`, `[abc]`, `[!abc]`)
  * into a RegExp.
  *
@@ -263,11 +240,18 @@ export function globToRegExp(glob: string): RegExp {
  * Lexical containment precheck: `abs` must BE the root or sit under it.
  *
  * The trailing separator is what stops /repo-evil passing for root /repo. The
- * existing target is then checked again through realpath in `target()`, which
- * additionally allows the single resolved directory a session's own
- * `node_modules` may itself point at outside the root (see
- * `resolveNodeModulesStore`) — nothing else resolves outside the session root,
- * no matter how many `node_modules` segments are lexically in its path.
+ * existing target is then checked again through realpath in `target()`, with
+ * NO exceptions: containment is strictly realpath(target) inside
+ * realpath(root). (CC-1: an earlier revision special-cased a lexical
+ * `node_modules` segment, then — after that was removed — special-cased the
+ * one realpath a session's own top-level `node_modules` symlink resolved to.
+ * Both were exploitable: a repo-committed `node_modules -> /` (or `-> ..`,
+ * `-> ~`) turned the second one into a whole-filesystem allowlist, since
+ * `isWithin(store, x)` is true for every path once `store` is `/` or an
+ * ancestor of the root. There is no exception here; if a real external-store
+ * case is ever needed it must be pinned to a location outside the session's
+ * own control — never derived from a symlink the session's own filesystem
+ * contents can point anywhere.)
  */
 function isWithin(root: string, abs: string): boolean {
   return abs === root || abs.startsWith(root.endsWith(sep) ? root : root + sep);
@@ -320,12 +304,6 @@ async function target(
   root: string,
   base: string,
   label: string,
-  /**
-   * The one realpath allowed outside `root` (see `resolveNodeModulesStore`),
-   * or `null` when this session's `node_modules` is not itself a symlink
-   * pointing outside the session root.
-   */
-  nodeModulesStore: string | null,
 ): Promise<
   | { abs: string; lexicalAbs: string; isDir: boolean; err?: undefined }
   | { abs?: undefined; lexicalAbs?: undefined; isDir?: undefined; err: OpResult }
@@ -337,14 +315,14 @@ async function target(
   if (!info) return { err: fail(label, `path not found: ${raw} (resolved against ${base})`) };
   const [realRoot, realTarget] = await Promise.all([realpathOrNull(root), realpathOrNull(found.abs)]);
   if (!realRoot || !realTarget) return { err: fail(label, `path not found: ${raw} (resolved against ${base})`) };
-  // CC-1: there is no longer a lexical `node_modules` exemption here. A path
-  // segment named `node_modules` earns nothing on its own — an arbitrary
-  // symlink planted a few levels under an otherwise-real `node_modules`
-  // directory must resolve inside the root exactly like anything else. The
-  // ONLY realpath allowed outside the root is `nodeModulesStore`: the single
-  // directory the session's own top-level `node_modules` resolves to, when
-  // that entry is itself a symlink into an external package-manager store.
-  if (!isWithin(realRoot, realTarget) && !(nodeModulesStore !== null && isWithin(nodeModulesStore, realTarget))) {
+  // CC-1: no exceptions. A path segment named `node_modules` — lexically, or
+  // as the resolved target of a symlink literally named `node_modules` —
+  // earns nothing on its own. Every target must resolve inside `root`,
+  // full stop. (A prior revision exempted the realpath of the session's own
+  // top-level `node_modules` when IT was a symlink outside the root; that
+  // was itself exploitable via a committed `node_modules -> /` or `-> ..`
+  // and has been removed — see the comment on `isWithin` above.)
+  if (!isWithin(realRoot, realTarget)) {
     return { err: outsideSymlinkError(label, raw, realTarget, root) };
   }
   return { abs: realTarget, lexicalAbs: found.abs, isDir: info.isDirectory() };
@@ -353,7 +331,8 @@ async function target(
 /**
  * Keep result paths in the lexical namespace the model supplied, even when
  * operation I/O uses a canonical realpath (notably macOS /var aliases and
- * dependency symlinks). This also keeps accelerated and fallback output equal.
+ * any in-root symlink, e.g. pnpm's `.pnpm/x/node_modules/pkg -> ../../x`).
+ * This also keeps accelerated and fallback output equal.
  */
 function displayRel(base: string, operationRoot: string, lexicalRoot: string, abs: string): string {
   const rel = relative(operationRoot, abs);
@@ -527,16 +506,10 @@ export async function walkFiles(dir: string, signal?: AbortSignal, limits: WalkL
 
 // ── read ────────────────────────────────────────────────────────────────────
 
-async function readOp(
-  op: ToolOp,
-  root: string,
-  base: string,
-  nodeModulesStore: string | null,
-  signal?: AbortSignal,
-): Promise<OpResult> {
+async function readOp(op: ToolOp, root: string, base: string, signal?: AbortSignal): Promise<OpResult> {
   const raw = String(op.path ?? "");
   if (!raw) return fail("read", "missing required arg `path`");
-  const found = await target(op, root, base, "read", nodeModulesStore);
+  const found = await target(op, root, base, "read");
   if (found.err) return found.err;
   if (found.isDir) return fail("read", `${raw} is a directory — use {tool:"ls"} to list it`);
 
@@ -699,7 +672,6 @@ async function grepOp(
   op: ToolOp,
   root: string,
   base: string,
-  nodeModulesStore: string | null,
   rg: string | null,
   signal?: AbortSignal,
 ): Promise<OpResult> {
@@ -708,7 +680,7 @@ async function grepOp(
   if (pattern.length > MAX_GREP_PATTERN_LENGTH) {
     return fail("grep", `pattern exceeds the maximum length of ${MAX_GREP_PATTERN_LENGTH} characters`);
   }
-  const scope = await target(op, root, base, "grep", nodeModulesStore);
+  const scope = await target(op, root, base, "grep");
   if (scope.err) return scope.err;
 
   const limit = positiveInt(op.limit) ?? DEFAULT_GREP_LIMIT;
@@ -730,7 +702,7 @@ async function grepOp(
   // or the fallback. This closes the ordinary alias-swap window while the
   // local options above are being prepared (the remaining pathname race is
   // documented below).
-  const currentScope = await target(op, root, base, "grep", nodeModulesStore);
+  const currentScope = await target(op, root, base, "grep");
   if (currentScope.err) return currentScope.err;
 
   const notes: string[] = [];
@@ -854,6 +826,57 @@ async function grepViaRg(
   return { matches: sortMatches(matches) };
 }
 
+/**
+ * Lines batched into one vm invocation per JS-fallback regex match. A bare
+ * `.test()` costs nanoseconds, but node:vm's sandboxed execution has a fixed
+ * per-call entry cost on the order of tens of microseconds — testing ONE line
+ * per vm call measured ~800x a bare `.test()` (100k lines: 5ms bare vs 4011ms
+ * wrapped), turning an ordinary large-file grep into a multi-second stall.
+ * Testing a whole chunk inside ONE vm invocation amortizes that fixed cost
+ * across many lines. It also makes REGEX_EVAL_TIMEOUT_MS a genuinely
+ * cumulative budget across them: a per-line-reset deadline lets N lines that
+ * are each merely slow (well under the deadline individually, never
+ * catastrophic on their own) run forever, since none of them individually
+ * trips it — sharing one vm invocation (and therefore one clock) across a
+ * chunk closes that gap for any chunk-sized run of such lines.
+ */
+const REGEX_MATCH_CHUNK_LINES = 1000;
+
+let grepChunkSandbox: { context: Context; script: Script } | undefined;
+
+/**
+ * Test `re` against every string in `lines`, ALL inside one vm invocation
+ * under one REGEX_EVAL_TIMEOUT_MS deadline for the whole chunk. `timedOut`
+ * means the budget ran out somewhere inside the chunk; a killed vm script
+ * loses its progress entirely, so the caller cannot know (and must not
+ * assume) which lines had already been checked — the whole chunk is
+ * unresolved, not partially matched.
+ */
+function execChunkWithDeadline(
+  re: RegExp,
+  lines: readonly string[],
+): { timedOut: false; matchedIndices: number[] } | { timedOut: true } {
+  grepChunkSandbox ??= {
+    context: createContext({}),
+    script: new Script(
+      "(function () { const hits = []; for (let i = 0; i < lines.length; i++) { if (regex.test(lines[i])) hits.push(i); } return hits; })()",
+    ),
+  };
+  const { context, script } = grepChunkSandbox;
+  context.regex = re;
+  context.lines = lines;
+  try {
+    const hits = script.runInContext(context, { timeout: REGEX_EVAL_TIMEOUT_MS }) as number[];
+    return { timedOut: false, matchedIndices: hits };
+  } catch (error) {
+    if ((error as { code?: unknown } | null)?.code === "ERR_SCRIPT_EXECUTION_TIMEOUT") return { timedOut: true };
+    throw error;
+  } finally {
+    context.regex = undefined;
+    context.lines = undefined;
+  }
+}
+
 async function grepViaNode(
   pattern: string,
   abs: string,
@@ -895,28 +918,60 @@ async function grepViaNode(
     const rel = displayRel(base, abs, lexicalAbs, file);
     if (globRe && !matchesGlob(globRe, rel, flags.glob!)) continue;
     const pending: Match[] = [];
-    let timedOutAt: number | undefined;
+    let chunkText: string[] = [];
+    let chunkLineNos: number[] = [];
+    let timedOut = false;
+    // Test the accumulated chunk in ONE vm invocation; returns whether
+    // scanning this file should continue (false = limit reached or timeout).
+    // A `false` return deactivates scanTextLines's callback, which — same as
+    // the old per-line design — also stops it from reading any further than
+    // it has to: a file that turns out to be binary or have an oversized line
+    // PAST the point where the limit was already exceeded doesn't need that
+    // fact discovered, since the matches found so far are being kept anyway.
+    const flushChunk = (): boolean => {
+      if (chunkText.length === 0) return true;
+      const result = execChunkWithDeadline(re, chunkText);
+      if (result.timedOut) {
+        timedOut = true;
+        chunkText = [];
+        chunkLineNos = [];
+        return false;
+      }
+      for (const idx of result.matchedIndices) {
+        pending.push({ path: rel, canonicalPath: file, line: chunkLineNos[idx]!, text: chunkText[idx]! });
+      }
+      chunkText = [];
+      chunkLineNos = [];
+      return matches.length + pending.length <= limit;
+    };
     try {
       const scan = await scanTextLines(file, (text, line) => {
-        const run = execWithDeadline(re, text);
-        if (run.timedOut) {
-          timedOutAt = line;
-          return false;
-        }
-        if (run.match !== null) {
-          pending.push({ path: rel, canonicalPath: file, line, text });
-          if (matches.length + pending.length > limit) return false;
-        }
+        chunkText.push(text);
+        chunkLineNos.push(line);
+        // The chunk target shrinks as accumulated matches approach `limit`,
+        // down to 1 (i.e. per-line, exactly the old granularity) right at the
+        // boundary where crossing it matters, and grows back up to
+        // REGEX_MATCH_CHUNK_LINES while there's plenty of room — most of an
+        // ordinary large-file scan runs at the big end of that range (there
+        // are no matches yet), so the vm-entry-overhead win from batching
+        // still applies to the bulk of the file; only the final handful of
+        // lines around the limit pay per-line overhead, same as before.
+        const roomLeft = limit - (matches.length + pending.length) + 1;
+        const chunkTarget = Math.max(1, Math.min(REGEX_MATCH_CHUNK_LINES, roomLeft));
+        if (chunkText.length >= chunkTarget) return flushChunk();
       }, signal);
+      // Flush whatever partial chunk is left (a no-op if a mid-scan flush
+      // above already stopped the callback with an empty chunk).
+      flushChunk();
       // A timeout establishes nothing about the rest of the file (or tree) —
       // returning the matches found so far would be a silent partial result
       // presented as complete. Abort the whole op instead, the same way a
       // rejected pattern does.
-      if (timedOutAt !== undefined) {
+      if (timedOut) {
         return {
           err: fail(
             "grep",
-            `${rel}:${timedOutAt}: regex exceeded its ${REGEX_EVAL_TIMEOUT_MS}ms time budget — narrow the pattern or scope it with \`path\``,
+            `${rel}: regex exceeded its ${REGEX_EVAL_TIMEOUT_MS}ms time budget — narrow the pattern or scope it with \`path\``,
           ),
         };
       }
@@ -992,13 +1047,12 @@ async function findOp(
   op: ToolOp,
   root: string,
   base: string,
-  nodeModulesStore: string | null,
   fd: string | null,
   signal?: AbortSignal,
 ): Promise<OpResult> {
   const pattern = String(op.pattern ?? "");
   if (!pattern) return fail("find", "missing required arg `pattern`");
-  const scope = await target(op, root, base, "find", nodeModulesStore);
+  const scope = await target(op, root, base, "find");
   if (scope.err) return scope.err;
   if (!scope.isDir) return fail("find", `"${String(op.path)}" is a file — find searches a directory`);
 
@@ -1011,7 +1065,7 @@ async function findOp(
 
   // Glob compilation is local work between the initial locate and the walk;
   // close that gap with one final realpath check at the operation boundary.
-  const currentScope = await target(op, root, base, "find", nodeModulesStore);
+  const currentScope = await target(op, root, base, "find");
   if (currentScope.err) return currentScope.err;
   if (!currentScope.isDir) return fail("find", `"${String(op.path)}" is a file — find searches a directory`);
 
@@ -1093,8 +1147,6 @@ export interface LsOpOptions {
   maxScanEntries?: number;
   /** Test seam only; production uses node:fs/promises.opendir. */
   opendir?: LsOpendirLike;
-  /** See `target()`'s `nodeModulesStore` parameter. Defaults to `null`. */
-  nodeModulesStore?: string | null;
 }
 
 const compareEntryNames = (a: ListedEntry, b: ListedEntry): number => {
@@ -1129,7 +1181,7 @@ export async function lsOp(
   options: LsOpOptions = {},
 ): Promise<OpResult> {
   if (signal?.aborted) throw new Error("aborted");
-  const scope = await target(op, root, base, "ls", options.nodeModulesStore ?? null);
+  const scope = await target(op, root, base, "ls");
   if (scope.err) return scope.err;
   if (!scope.isDir) return fail("ls", `${String(op.path ?? ".")} is not a directory — use {tool:"read"} for files`);
 
@@ -1214,8 +1266,6 @@ export function createToolExecutor(opts: ToolExecutorOptions): ToolExecutor {
   // null from the caller pins the pure-Node path.
   const rg = opts.rgPath === undefined ? findOnPath("rg") : opts.rgPath;
   const fd = opts.fdPath === undefined ? findOnPath("fd") : opts.fdPath;
-  // Resolved once, not per op — see `target()`'s `nodeModulesStore` parameter.
-  const nodeModulesStore = resolveNodeModulesStore(root);
 
   return async (op: ToolOp, runOpts: { cwd: string; signal?: AbortSignal }): Promise<OpResult> => {
     const label = String(op.tool);
@@ -1236,13 +1286,13 @@ export function createToolExecutor(opts: ToolExecutorOptions): ToolExecutor {
     try {
       switch (op.tool) {
         case "read":
-          return await readOp(op, root, base, nodeModulesStore, runOpts.signal);
+          return await readOp(op, root, base, runOpts.signal);
         case "grep":
-          return await grepOp(op, root, base, nodeModulesStore, rg, runOpts.signal);
+          return await grepOp(op, root, base, rg, runOpts.signal);
         case "find":
-          return await findOp(op, root, base, nodeModulesStore, fd, runOpts.signal);
+          return await findOp(op, root, base, fd, runOpts.signal);
         case "ls":
-          return await lsOp(op, root, base, runOpts.signal, { ...(opts.lsOpendir ? { opendir: opts.lsOpendir } : {}), nodeModulesStore });
+          return await lsOp(op, root, base, runOpts.signal, opts.lsOpendir ? { opendir: opts.lsOpendir } : undefined);
         default:
           return { stdout: "", stderr: `unknown tool: ${op.tool}`, exitCode: 1 };
       }
