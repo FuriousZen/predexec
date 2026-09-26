@@ -37,18 +37,21 @@ export const EVAL_SHELLS = new Set([
 ]);
 
 /**
- * Versioned and distro-alias interpreter executables (`python3.12`,
- * `python3.12-dbg`, `pypy3`, `nodejs`, `perl5.36.0`, `ruby3.3`, `php8.2`) run
- * the same eval grammar and read the same preload variables as their family.
- * Checking only the canonical spelling let `python3.12 -c "os.system(...)"`
- * skip every interpreter screen.
+ * Versioned, distro-alias and alternate-implementation interpreter executables
+ * (`python3.12`, `python3.12-dbg`, `pypy3`, `ipython3`, `node22`, `nodejs22`,
+ * `perl5.36.0`, `ruby3.3`, `jruby`, `php8.2`, `bun1`, `deno2`) run the same
+ * eval grammar and read the same preload variables as their family. Checking
+ * only the canonical spelling let `python3.12 -c "os.system(...)"` and
+ * `node18 -e 'require("fs").writeFileSync(...)'` skip every interpreter screen.
  */
 const INTERPRETER_ALIAS_RE: ReadonlyArray<readonly [RegExp, string]> = [
-  [/^(?:python|pypy)\d*(?:\.\d+)*[a-z]?(?:-dbg)?$/, "python"],
-  [/^nodejs$/, "node"],
+  [/^(?:i?python|pypy)\d*(?:\.\d+)*[a-z]?(?:-dbg)?$/, "python"],
+  [/^node(?:js)?\d*(?:\.\d+)*$/, "node"],
   [/^perl\d+(?:\.\d+)*$/, "perl"],
-  [/^ruby\d+(?:\.\d+)*$/, "ruby"],
+  [/^(?:j|truffle)?ruby\d*(?:\.\d+)*$/, "ruby"],
   [/^php\d+(?:\.\d+)*$/, "php"],
+  [/^bun(?:\d+(?:\.\d+)*|-canary)?$/, "bun"],
+  [/^deno(?:\d+(?:\.\d+)*|-canary)?$/, "deno"],
 ];
 
 /** The interpreter family a (basename) head belongs to; other heads are returned unchanged. */

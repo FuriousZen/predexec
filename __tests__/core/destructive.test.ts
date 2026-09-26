@@ -1972,3 +1972,29 @@ describe("dynamic command names (final review #3)", () => {
     expect(findDestructiveToken(c)).toBeNull();
   });
 });
+
+describe("interpreter alias families (final review #4)", () => {
+  it.each([
+    `node18 -e 'require("fs").writeFileSync("pwn","")'`,
+    `node22 -e 'require("fs").writeFileSync("pwn","")'`,
+    `nodejs22 -e 'require("fs").writeFileSync("pwn","")'`,
+    `node22 --eval 'require("child_process").execSync("id")'`,
+    `ipython -c 'open("pwn","w")'`,
+    `ipython3 -c 'open("pwn","w")'`,
+    `jruby -e 'File.write("pwn","")'`,
+    `pypy -c 'open("pwn","w")'`,
+    `python3.12-dbg -c 'open("pwn","w")'`,
+    `bun1 -e 'require("fs").writeFileSync("pwn","")'`,
+    `deno2 eval 'Deno.writeTextFileSync("pwn","")'`,
+    `NODE_OPTIONS=--require=x node22 -e "1"`,
+    `node22 -r ./evil.js -e "console.log(1)"`,
+  ])("mutating: %s", (c) => expect(isDestructiveCommand(c)).toBe(true));
+
+  it.each([
+    `node22 -e 'console.log(1)'`,
+    `nodejs22 -e 'console.log(1)'`,
+    `ipython3 -c 'print(1)'`,
+    `jruby -e 'puts 1'`,
+    `pypy -c 'print(1)'`,
+  ])("read-only: %s", (c) => expect(isDestructiveCommand(c)).toBe(false));
+});
