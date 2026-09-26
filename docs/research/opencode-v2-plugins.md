@@ -133,6 +133,29 @@ parses the packaged `skills/opencode/predexec/SKILL.md` the way v2's directory l
     - `~`/`$HOME` are expanded only for the path actions (`agent.ts:141-162`).
     - A disabled agent, or an agent opencode does not know, evaluates as `[* * deny]`
       (`permission.ts:19,162`).
+  - **Agent markdown files (fix round 2).** v2 also defines agents from markdown under the
+    global config dir and under each `.opencode` dir. Each directory's files load at that
+    directory's position in the load order, right after its `opencode.json`/`.jsonc` (the Directory
+    entries in `config.ts:185-192`; `config/plugin/agent.ts:40-50`). The patterns are one sorted scan
+    of `{agent,agents}/**/*.md`, then one of `{mode,modes}/*.md` (`agent.ts:21-24, 164-176`).
+    - The agent name is the path minus the leading `agent(s)/`/`mode(s)/` and the `.md`, so nested
+      files give names like `team/lint`.
+    - Mode files are forced to `mode: primary`.
+    - Frontmatter containing any key outside the native agent schema is decoded as a legacy agent.
+      Its `tools` become permissions (`write`/`edit`/`patch` → `edit`), with `permission` assigned
+      over them (`v1/config/agent.ts:44-61`). Otherwise it is a native agent, and its `permissions`
+      are taken verbatim (`agent.ts:177-211`).
+    - v2 parses frontmatter with gray-matter/js-yaml, retrying top-level `a: b: c` values as
+      strings (`config/markdown.ts:3-38`). predexec uses a small subset parser
+      (`yaml-frontmatter.ts`). Where v2 would silently skip a file, and for anything outside that
+      subset (anchors, aliases, tags, ...), predexec **fails closed for that agent only**; other
+      agents are unaffected.
+    - **Default agent.** Without an explicit agent, the default is `default_agent` if it is
+      selectable (not a subagent, not hidden), else `build`, else the first selectable agent
+      (`agent.ts:94-104`).
+    - **Config parsing details.** An empty `OPENCODE_CONFIG_DIR` counts as a value (`??`, util
+      `global.ts:79`). JSONC trailing commas are accepted, as with jsonc-parser
+      `allowTrailingComma`.
   - **Evaluation.** It is last-match-wins (`permission.ts:87-95`). predexec's shell requests are
     renamed `bash`→`shell` to match v2's shell tool (`tool/plugin/shell.ts:22,133-141`). Every path
     spelling predexec computes (worktree-relative, directory-relative, absolute) is checked for
@@ -197,6 +220,7 @@ rsync of the source checkout (`.opencode/plugins/predexec.ts`, loaded as TypeScr
 | v2-native `permissions` (fix round 1, re-packed build) | **PASS**: `[{shell, cat *, deny}]` → hard-stop `'shell:cat *'`. Adding a later `{shell, cat marker.txt, allow}` → runs (last match wins) |
 | Per-document layering (review repro) | **PASS**: global `bash {*:deny, cat *:allow}` + project `bash {*:deny}` → hard-stop `'shell:*'` (v1 mergeDeep would have allowed it) |
 | Config above the git root | **PASS**: an `opencode.json` in the scratch project's parent (outside its git repo) with `bash {cat *: deny}` → hard-stop |
+| Agent markdown (fix round 2) | **PASS**: `.opencode/agent/build.md` with `permission: {bash: {"cat *": deny}}` → hard-stop `'shell:cat *'`. A markdown-only `review` agent (selected via `default_agent`; v2's `run` has no `--agent` flag) ran `cat` → exit 0, instead of the missing-agent deny-all |
 
 **UNVERIFIED:** npm-name resolution (`plugins: ["predexec"]` → `Host.resolve` → `main`). It needs
 the registry and would install the published version, not this build. It rests on the source read

@@ -704,3 +704,100 @@ describe("readOpencodeRuleset — hostMajor 2 (opencode v2 model)", () => {
     expect(check({ ...env, OPENCODE_CONFIG_CONTENT: JSON.stringify({ permission: { bash: { "cat *": "allow" } } }) })).toBe("allow");
   });
 });
+
+// opencode v2 loads agent definitions from markdown too: `{agent,agents}/**/*.md`
+// and `{mode,modes}/*.md` under the global config dir and every `.opencode`
+// dir (core `config/plugin/agent.ts:21-24,40-50,164-211`).
+describe("readOpencodeRuleset — hostMajor 2: agent/mode markdown files", () => {
+  const v2 = (ctx: ReturnType<typeof setup>, operation: Operation, agent?: string, env = ctx.env): string => {
+    const ruleset = readOpencodeRuleset(ctx.project, env, { hostMajor: 2, ...(agent ? { agent } : {}) });
+    return evaluateOperation(operation, ruleset, { directory: ctx.project, hostMajor: 2 }).action;
+  };
+  const md = (dir: string, rel: string, text: string) => {
+    mkdirSync(join(dir, rel, ".."), { recursive: true });
+    writeFileSync(join(dir, rel), text);
+  };
+
+  it("review repro: .opencode/agent/build.md with a flow `permission` frontmatter denies", () => {
+    const ctx = setup();
+    md(ctx.project, ".opencode/agent/build.md", '---\npermission: {bash: {"cat *": deny}}\n---\nYou build.\n');
+    expect(v2(ctx, "cat marker.txt", "build")).toBe("deny");
+    expect(v2(ctx, "ls", "build")).toBe("allow");
+  });
+
+  it("an agent defined ONLY in markdown exists (not the missing-agent deny-all)", () => {
+    const ctx = setup();
+    md(ctx.project, ".opencode/agent/review.md", "---\ndescription: Reviews code: carefully\nmode: subagent\n---\nReview.\n");
+    expect(v2(ctx, "ls", "review")).toBe("allow");
+    md(ctx.project, ".opencode/agents/plain.md", "No frontmatter at all.\n");
+    expect(v2(ctx, "ls", "plain")).toBe("allow");
+  });
+
+  it("block-style frontmatter, native `permissions` lists, nested names, and the global config dir", () => {
+    const ctx = setup();
+    md(
+      ctx.project,
+      ".opencode/agents/team/lint.md",
+      "---\npermissions:\n  - action: shell\n    resource: \"cat *\"\n    effect: deny\n---\n",
+    );
+    expect(v2(ctx, "cat x", "team/lint")).toBe("deny");
+    md(join(ctx.configHome, "opencode"), "agent/g.md", "---\npermission:\n  bash:\n    'cat *': deny # no cat\n---\n");
+    expect(v2(ctx, "cat x", "g")).toBe("deny");
+  });
+
+  it("mode files are primary agents; later sources win (project .opencode after global)", () => {
+    const ctx = setup();
+    md(ctx.project, ".opencode/mode/fast.md", "---\npermission:\n  bash:\n    \"cat *\": deny\n---\n");
+    expect(v2(ctx, "cat x", "fast")).toBe("deny");
+    md(join(ctx.configHome, "opencode"), "agent/build.md", "---\npermission: {bash: {\"cat *\": deny}}\n---\n");
+    md(ctx.project, ".opencode/agent/build.md", "---\npermission: {bash: {\"cat *\": allow}}\n---\n");
+    expect(v2(ctx, "cat x", "build")).toBe("allow");
+  });
+
+  it("legacy `tools` in an agent file become rules (write/edit/patch → edit), before `permission`", () => {
+    const ctx = setup();
+    md(ctx.project, ".opencode/agent/build.md", "---\ntools:\n  bash: false\n---\n");
+    expect(v2(ctx, "ls", "build")).toBe("deny");
+  });
+
+  it("malformed frontmatter fails closed for THAT agent only", () => {
+    const ctx = setup();
+    md(ctx.project, ".opencode/agent/broken.md", "---\npermission: {bash: [unclosed\n---\n");
+    expect(readOpencodeRuleset(ctx.project, ctx.env, { hostMajor: 2, agent: "broken" })).toEqual({ error: expect.stringContaining("broken.md") });
+    expect(v2(ctx, "ls", "build")).toBe("allow");
+    md(ctx.project, ".opencode/agent/badperm.md", "---\npermission:\n  bash: maybe\n---\n");
+    expect(readOpencodeRuleset(ctx.project, ctx.env, { hostMajor: 2, agent: "badperm" })).toHaveProperty("error");
+    md(ctx.project, ".opencode/agent/alias.md", "---\npermission: *ref\n---\n");
+    expect(readOpencodeRuleset(ctx.project, ctx.env, { hostMajor: 2, agent: "alias" })).toHaveProperty("error");
+  });
+
+  it("R43: default_agent naming a subagent or hidden agent falls back to build", () => {
+    const ctx = setup();
+    ctx.projectConfig({ default_agent: "general", agent: { build: { permission: { bash: { "cat *": "deny" } } } } });
+    expect(v2(ctx, "cat x")).toBe("deny");
+    ctx.projectConfig({
+      default_agent: "sneaky",
+      agents: { sneaky: { hidden: true }, build: { permissions: [{ action: "shell", resource: "cat *", effect: "deny" }] } },
+    });
+    expect(v2(ctx, "cat x")).toBe("deny");
+    ctx.projectConfig({ default_agent: "prim", agents: { prim: { mode: "primary", permissions: [{ action: "shell", resource: "ls *", effect: "deny" }] } } });
+    expect(v2(ctx, "ls -la")).toBe("deny");
+  });
+
+  it("R43: OPENCODE_CONFIG_DIR=\"\" is a value (??), so the XDG global dir is not read", () => {
+    const ctx = setup();
+    ctx.globalConfig({ permission: { bash: { "cat *": "deny" } } });
+    expect(v2(ctx, "cat x")).toBe("deny");
+    expect(v2(ctx, "cat x", undefined, { ...ctx.env, OPENCODE_CONFIG_DIR: "" })).toBe("allow");
+  });
+
+  it("R43: JSONC trailing commas are accepted like v2's jsonc-parser (allowTrailingComma)", () => {
+    const ctx = setup();
+    writeFileSync(join(ctx.project, "opencode.jsonc"), '{\n  "permission": {"bash": {"cat *": "deny",},},\n}\n');
+    expect(v2(ctx, "cat x")).toBe("deny");
+    // A `,}` inside a string is data, not a trailing comma.
+    writeFileSync(join(ctx.project, "opencode.jsonc"), '{"permission": {"bash": {"echo ,} *": "deny",},}}');
+    expect(readOpencodeRuleset(ctx.project, ctx.env, { hostMajor: 2 })).not.toHaveProperty("error");
+    expect(v2(ctx, "echo ,} x")).toBe("deny");
+  });
+});

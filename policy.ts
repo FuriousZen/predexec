@@ -38,11 +38,12 @@
  * least defensible. opencode itself refuses to start on such a config.
  */
 
-import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { inspectCommandSubstitutionTree, lexShellWords, splitCommandSegments } from "./core/index.ts";
 import type { HostPolicyDenial, Operation, PolicyCheckContext, PolicyVerdict } from "./core/types.ts";
+import { parseFrontmatter } from "./yaml-frontmatter.ts";
 
 export type PolicyAction = "allow" | "ask" | "deny";
 
@@ -483,7 +484,8 @@ export function readOpencodeRuleset(
 /** OpencodePaths plus v2's global config dir (`OPENCODE_CONFIG_DIR` replaces it — util `global.ts:79`). */
 type V2Paths = OpencodePaths & { v2Config: string };
 
-type V2Source = { path: string } | { inline: string; source: string };
+/** A config document, or `agentDir`: that directory's agent/mode markdown files (core `config.ts:185-192` Directory entries). */
+type V2Source = { path: string } | { inline: string; source: string } | { agentDir: string };
 
 const realOrResolved = (p: string): string => {
   try {
@@ -539,7 +541,7 @@ function v2ConfigSources(directory: string, env: NodeJS.ProcessEnv, paths: V2Pat
       return false;
     }
   };
-  const out: V2Source[] = names.map((n) => ({ path: join(globalDir, n) }));
+  const out: V2Source[] = [...names.map((n) => ({ path: join(globalDir, n) })), { agentDir: globalDir }];
   if (env.OPENCODE_CONFIG) out.push({ path: resolve(env.OPENCODE_CONFIG) });
   for (const file of visible.filter((i) => ![".claude", ".agents", ".opencode"].includes(basename(i))).reverse()) {
     out.push({ path: file });
@@ -547,6 +549,7 @@ function v2ConfigSources(directory: string, env: NodeJS.ProcessEnv, paths: V2Pat
   for (const dir of visible.filter((i) => basename(i) === ".opencode").reverse()) {
     if (!isDir(dir)) continue;
     for (const n of names) out.push({ path: join(dir, n) });
+    out.push({ agentDir: dir });
   }
   if (env.OPENCODE_CONFIG_CONTENT !== undefined) out.push({ inline: env.OPENCODE_CONFIG_CONTENT, source: "OPENCODE_CONFIG_CONTENT" });
   return out;
@@ -612,47 +615,104 @@ function v2MigrateTools(value: unknown, where: string): PolicyRule[] {
   });
 }
 
+/** One agent definition as a document contributes it (core `config/plugin/agent.ts:93-124`). */
+interface V2Agent {
+  rules: PolicyRule[];
+  mode?: string;
+  hidden?: boolean;
+}
+/** `null` = the document disables the agent; `{ error }` = predexec could not read it (fail closed for that agent). */
+type V2AgentEntry = V2Agent | null | { error: string };
+
 interface V2Document {
   /** `[...tools, ...permission, ...permissions]` — core `config/normalize.ts:179-183`. */
   rules: PolicyRule[];
-  /** name → agent rules, or `null` when the document disables that agent. */
-  agents: Map<string, PolicyRule[] | null>;
+  agents: Map<string, V2AgentEntry>;
   defaultAgent?: string;
+}
+
+const V2_AGENT_MODES = new Set(["subagent", "primary", "all"]);
+
+/** Field checks v2's agent schemas make on the fields predexec relies on (schema `config/agent.ts:11-22`, core `v1/config/agent.ts:8-41`). */
+function v2CheckAgentFields(value: Json, where: string, disabledKey: "disable" | "disabled"): void {
+  if (value.mode !== undefined && !V2_AGENT_MODES.has(value.mode as string)) throw new Error(`${where}: mode must be subagent|primary|all`);
+  for (const key of ["hidden", disabledKey] as const) {
+    if (value[key] !== undefined && typeof value[key] !== "boolean") throw new Error(`${where}: ${key} must be a boolean`);
+  }
+  for (const key of ["description", "system", "prompt"] as const) {
+    if (value[key] !== undefined && value[key] !== null && typeof value[key] !== "string") throw new Error(`${where}: ${key} must be a string`);
+  }
+  if (value.steps !== undefined && !(Number.isInteger(value.steps) && (value.steps as number) > 0)) throw new Error(`${where}: steps must be a positive integer`);
+}
+
+const v2AgentShape = (value: Json, disabled: boolean, rules: PolicyRule[]): V2Agent | null =>
+  disabled
+    ? null
+    : {
+        rules,
+        ...(typeof value.mode === "string" ? { mode: value.mode } : {}),
+        ...(typeof value.hidden === "boolean" ? { hidden: value.hidden } : {}),
+      };
+
+/**
+ * A legacy (v1-shaped) agent: its `tools` map becomes a permission object
+ * (`write`/`edit`/`patch` → `edit`), then `permission` is `Object.assign`ed
+ * over it (core `v1/config/agent.ts:44-61`), then migrated
+ * (`v1/config/migrate.ts:140-161`, `normalizeAction`).
+ */
+function v2LegacyAgent(value: Json, where: string): V2Agent | null {
+  v2CheckAgentFields(value, where, "disable");
+  const permission: Json = {};
+  if (value.tools !== undefined) {
+    if (!isPlainObject(value.tools)) throw new Error(`${where}: tools must be an object`);
+    for (const [tool, enabled] of Object.entries(value.tools)) {
+      if (typeof enabled !== "boolean") throw new Error(`${where}: tools.${tool} must be a boolean`);
+      permission[tool === "write" || tool === "edit" || tool === "patch" ? "edit" : tool] = enabled ? "allow" : "deny";
+    }
+  }
+  if (value.permission !== undefined) {
+    const own = isAction(value.permission) ? { "*": value.permission } : value.permission;
+    if (!isPlainObject(own)) throw new Error(`${where}: permission must be an action or an object`);
+    Object.assign(permission, own);
+  }
+  return v2AgentShape(value, value.disable === true, v2MigratePermission(permission, where));
+}
+
+/** A native `agents.<name>` value (schema `config/agent.ts:11-22`). */
+function v2NativeAgent(value: Json, where: string): V2Agent | null {
+  v2CheckAgentFields(value, where, "disabled");
+  if (value.color !== undefined && !(typeof value.color === "string" && /^#[0-9a-fA-F]{6}$/.test(value.color))) {
+    throw new Error(`${where}: color must be #rrggbb`);
+  }
+  return v2AgentShape(value, value.disabled === true, v2NativePermissions(value.permissions, where));
 }
 
 /**
  * One document's agent section: legacy `agent` then `mode` (mode wins per
- * name), then native `agents` replacing a name wholesale (core
- * `config/normalize.ts:131-166` + `mergeMaps` `:731-743`). Legacy agents carry
- * only their `permission` block into `permissions` (core `v1/config/migrate.ts:140-161`).
+ * name, and forces `mode: primary`), then native `agents` replacing a name
+ * wholesale (core `config/normalize.ts:131-166` + `mergeMaps` `:731-743`).
  */
-function v2DocumentAgents(config: Json, where: string): Map<string, PolicyRule[] | null> {
+function v2DocumentAgents(config: Json, where: string): Map<string, V2AgentEntry> {
   const merged = new Map<string, { legacy: boolean; value: Json }>();
   for (const section of ["agent", "mode"] as const) {
     const entries = config[section];
     if (entries === undefined) continue;
     if (!isPlainObject(entries)) throw new Error(`${where}: ${section} must be an object`);
     for (const [name, value] of Object.entries(entries)) {
-      if (isPlainObject(value)) merged.set(name, { legacy: true, value });
+      if (!isPlainObject(value)) throw new Error(`${where}: ${section}.${name} must be an object`);
+      merged.set(name, { legacy: true, value: section === "mode" ? { ...value, mode: "primary" } : value });
     }
   }
   if (config.agents !== undefined) {
     if (!isPlainObject(config.agents)) throw new Error(`${where}: agents must be an object`);
     for (const [name, value] of Object.entries(config.agents)) {
-      if (isPlainObject(value)) merged.set(name, { legacy: false, value });
+      if (!isPlainObject(value)) throw new Error(`${where}: agents.${name} must be an object`);
+      merged.set(name, { legacy: false, value });
     }
   }
-  const out = new Map<string, PolicyRule[] | null>();
+  const out = new Map<string, V2AgentEntry>();
   for (const [name, { legacy, value }] of merged) {
-    const disabled = legacy ? value.disable === true : value.disabled === true;
-    out.set(
-      name,
-      disabled
-        ? null
-        : legacy
-          ? v2MigratePermission(value.permission, `${where} agent.${name}`)
-          : v2NativePermissions(value.permissions, `${where} agents.${name}`),
-    );
+    out.set(name, legacy ? v2LegacyAgent(value, `${where} agent.${name}`) : v2NativeAgent(value, `${where} agents.${name}`));
   }
   return out;
 }
@@ -667,6 +727,85 @@ function v2Document(config: Json, where: string): V2Document {
     agents: v2DocumentAgents(config, where),
     ...(typeof config.default_agent === "string" ? { defaultAgent: config.default_agent } : {}),
   };
+}
+
+/** Frontmatter keys of a native agent file; any other key makes the file legacy (core `config/plugin/agent.ts:32,184`). */
+const V2_NATIVE_AGENT_KEYS = new Set(["variant", "model", "request", "system", "description", "mode", "hidden", "color", "steps", "disabled", "permissions"]);
+
+/**
+ * Agent/mode markdown files under one config directory, in v2's order: one
+ * sorted scan of `{agent,agents}/**\/*.md`, then one of `{mode,modes}/*.md`
+ * (mode files are primary) — core `config/plugin/agent.ts:21-24,164-176`
+ * (`fs.scan` with `dot: true, symlink: true`).
+ */
+function v2AgentFiles(directory: string): Array<{ file: string; primary: boolean }> {
+  const isFile = (p: string) => {
+    try {
+      return statSync(p).isFile();
+    } catch {
+      return false;
+    }
+  };
+  const list = (dir: string): string[] => {
+    try {
+      return readdirSync(dir);
+    } catch {
+      return [];
+    }
+  };
+  const agentFiles: string[] = [];
+  const seen = new Set<string>();
+  const walk = (dir: string) => {
+    const real = realOrResolved(dir);
+    if (seen.has(real)) return;
+    seen.add(real);
+    for (const name of list(dir)) {
+      const p = join(dir, name);
+      if (name.endsWith(".md") && isFile(p)) agentFiles.push(p);
+      else {
+        try {
+          if (statSync(p).isDirectory()) walk(p);
+        } catch {
+          /* dangling link */
+        }
+      }
+    }
+  };
+  for (const sub of ["agent", "agents"]) walk(join(directory, sub));
+  const modeFiles = ["mode", "modes"].flatMap((sub) =>
+    list(join(directory, sub))
+      .filter((name) => name.endsWith(".md"))
+      .map((name) => join(directory, sub, name))
+      .filter(isFile),
+  );
+  return [
+    ...agentFiles.sort().map((file) => ({ file, primary: false })),
+    ...modeFiles.sort().map((file) => ({ file, primary: true })),
+  ];
+}
+
+/**
+ * One agent markdown file as the document v2 makes of it (core
+ * `config/plugin/agent.ts:177-211`): the name is the path under the config dir
+ * minus the leading `agent(s)/`/`mode(s)/` and `.md`; frontmatter with any
+ * non-native key is decoded as a legacy agent. v2 silently skips a file it
+ * cannot decode; predexec fails closed for THAT agent instead.
+ */
+function v2MarkdownAgentDocument(directory: string, file: string, primary: boolean): V2Document {
+  const name = relative(directory, file)
+    .replaceAll("\\", "/")
+    .replace(/^(agent|agents|mode|modes)\//, "")
+    .replace(/\.md$/, "");
+  const agents = new Map<string, V2AgentEntry>();
+  try {
+    const { data } = parseFrontmatter(readFileSync(file, "utf8"));
+    const legacy = Object.keys(data).some((key) => !V2_NATIVE_AGENT_KEYS.has(key));
+    const agent = legacy ? v2LegacyAgent(data, file) : v2NativeAgent(data, file);
+    agents.set(name, agent && primary ? { ...agent, mode: "primary" } : agent);
+  } catch (err) {
+    agents.set(name, { error: `${file} could not be read as an opencode agent (${err instanceof Error ? err.message : String(err)})` });
+  }
+  return { rules: [], agents };
 }
 
 /** Built-in agent pushes (core `plugin/agent.ts:85-156`, `plugin/plan.ts:32-42`), after `Info.default`. */
@@ -734,39 +873,88 @@ function v2AgentDefaults(paths: V2Paths): PolicyRule[] {
 }
 
 /**
+ * Built-in agents in registration order with their mode/hidden (core
+ * `plugin/agent.ts:85-156`; `plan` from `plugin/plan.ts:32-42`, assumed to
+ * register after `opencode.agent`).
+ */
+const V2_BUILTIN_AGENTS: ReadonlyArray<[string, string, boolean]> = [
+  ["build", "primary", false],
+  ["general", "subagent", false],
+  ["explore", "subagent", false],
+  ["compaction", "primary", true],
+  ["title", "primary", true],
+  ["summary", "primary", true],
+  ["plan", "primary", false],
+];
+
+type V2AgentState = { rules: PolicyRule[]; mode: string; hidden: boolean } | { error: string };
+
+/**
  * The ruleset opencode v2 evaluates for `agent` (core `config/plugin/agent.ts:83-124`):
  * every agent that already exists (the built-ins) gets ALL documents'
- * top-level rules appended; then, document by document, each `agents.<name>`
- * entry creates the agent if needed (defaults + all top-level rules) and
- * appends its own rules, or removes it when disabled. An agent that does not
- * exist at the end evaluates as `[* * deny]` (core `permission.ts:19,162`).
- * The session's own `session.permissions` (`permission.ts:162`) are runtime
- * state and are not modeled.
+ * top-level rules appended; then, document by document (JSON configs and agent
+ * markdown files in load order), each agent entry creates the agent if needed
+ * (defaults + all top-level rules), updates its mode/hidden and appends its own
+ * rules, or removes it when disabled. An agent that does not exist at the end
+ * evaluates as `[* * deny]` (core `permission.ts:19,162`). Without an explicit
+ * agent the default is chosen like core `agent.ts:94-104`: `default_agent` if
+ * selectable (not a subagent, not hidden), else `build` if selectable, else the
+ * first selectable agent. An agent whose definition predexec could not read is
+ * `{ error }` (fail closed for that agent only). `session.permissions`
+ * (`permission.ts:162`) are runtime state and are not modeled.
  */
-function buildOpencodeV2Ruleset(documents: V2Document[], paths: V2Paths, agent?: string): PolicyRule[] {
+function buildOpencodeV2Ruleset(documents: V2Document[], paths: V2Paths, agent?: string): OpencodeRuleset {
   const top = documents.flatMap((d) => d.rules).map((rule) => v2ExpandHome(rule, paths.home));
-  const name = agent ?? documents.findLast((d) => d.defaultAgent !== undefined)?.defaultAgent ?? "build";
-  const builtin = v2BuiltinAgentRules(name, paths);
-  let rules: PolicyRule[] | null = builtin ? [...v2AgentDefaults(paths), ...builtin, ...top] : null;
-  for (const document of documents) {
-    if (!document.agents.has(name)) continue;
-    const own = document.agents.get(name) ?? null;
-    if (own === null) {
-      rules = null;
-      continue;
-    }
-    if (rules === null) rules = [...v2AgentDefaults(paths), ...top];
-    rules.push(...own.map((rule) => v2ExpandHome(rule, paths.home)));
+  const agents = new Map<string, V2AgentState>();
+  for (const [id, mode, hidden] of V2_BUILTIN_AGENTS) {
+    agents.set(id, { rules: [...v2AgentDefaults(paths), ...(v2BuiltinAgentRules(id, paths) ?? []), ...top], mode, hidden });
   }
-  return rules ?? [{ permission: "*", pattern: "*", action: "deny" }];
+  for (const document of documents) {
+    for (const [name, entry] of document.agents) {
+      const current = agents.get(name);
+      if (current && "error" in current) continue; // stays failed closed
+      if (entry === null) {
+        agents.delete(name);
+        continue;
+      }
+      if ("error" in entry) {
+        agents.set(name, entry);
+        continue;
+      }
+      const state = current ?? { rules: [...v2AgentDefaults(paths), ...top], mode: "primary", hidden: false };
+      if (!current) agents.set(name, state);
+      if (entry.mode !== undefined) state.mode = entry.mode;
+      if (entry.hidden !== undefined) state.hidden = entry.hidden;
+      state.rules.push(...entry.rules.map((rule) => v2ExpandHome(rule, paths.home)));
+    }
+  }
+  let name = agent;
+  if (name === undefined) {
+    const selectable = (id: string | undefined): boolean => {
+      const a = id === undefined ? undefined : agents.get(id);
+      return a !== undefined && ("error" in a || (a.mode !== "subagent" && !a.hidden));
+    };
+    const configured = documents.findLast((d) => d.defaultAgent !== undefined)?.defaultAgent;
+    name = selectable(configured) ? configured : selectable("build") ? "build" : [...agents.keys()].find((id) => selectable(id));
+  }
+  const state = name === undefined ? undefined : agents.get(name);
+  if (state === undefined) return [{ permission: "*", pattern: "*", action: "deny" }];
+  return "error" in state ? { error: state.error } : state.rules;
 }
 
-/** v2 counterpart of `readOpencodeRuleset`; `{ error }` (stop everything) on any unparseable source. */
+/** v2 counterpart of `readOpencodeRuleset`; `{ error }` (stop everything) on any unparseable config document. */
 function readOpencodeV2Ruleset(directory: string, env: NodeJS.ProcessEnv, agent?: string): OpencodeRuleset {
   const base = opencodePaths(env);
-  const paths: V2Paths = { ...base, v2Config: env.OPENCODE_CONFIG_DIR || base.config };
+  // `??`, not `||`: an empty OPENCODE_CONFIG_DIR is a value to v2 (util `global.ts:79`).
+  const paths: V2Paths = { ...base, v2Config: env.OPENCODE_CONFIG_DIR ?? base.config };
   const documents: V2Document[] = [];
   for (const source of v2ConfigSources(directory, env, paths)) {
+    if ("agentDir" in source) {
+      for (const { file, primary } of v2AgentFiles(source.agentDir)) {
+        documents.push(v2MarkdownAgentDocument(source.agentDir, file, primary));
+      }
+      continue;
+    }
     const where = "path" in source ? source.path : source.source;
     let text: string;
     if ("path" in source) {
@@ -789,9 +977,35 @@ function readOpencodeV2Ruleset(directory: string, env: NodeJS.ProcessEnv, agent?
   return buildOpencodeV2Ruleset(documents, paths, agent);
 }
 
+/**
+ * Drops commas that directly precede `}`/`]` outside strings — v2 parses with
+ * jsonc-parser `allowTrailingComma: true` (core `config.ts:104-106`).
+ */
+function stripTrailingCommas(text: string): string {
+  let out = "";
+  let inString = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i]!;
+    if (inString) {
+      out += c;
+      if (c === "\\") out += text[++i] ?? "";
+      else if (c === '"') inString = false;
+      continue;
+    }
+    if (c === '"') inString = true;
+    if (c === ",") {
+      let j = i + 1;
+      while (j < text.length && /\s/.test(text[j]!)) j++;
+      if (text[j] === "}" || text[j] === "]") continue;
+    }
+    out += c;
+  }
+  return out;
+}
+
 function parseV2Config(text: string, where: string): Json {
   if (!text.trim()) return {};
-  const parsed: unknown = JSON.parse(stripJsonComments(text));
+  const parsed: unknown = JSON.parse(stripTrailingCommas(stripJsonComments(text)));
   if (!isPlainObject(parsed)) throw new Error(`${where}: config must be a JSON object`);
   return parsed;
 }

@@ -1241,6 +1241,15 @@ describe.each(variants)("opencode plugin ($name) — v2 tool execution + permiss
     expect(out.content).toContain("POLICY HARD-STOP (not run)");
   });
 
+  it("agent markdown files define per-agent rules (.opencode/agent/<name>.md)", async () => {
+    const dir = project();
+    mkdirSync(join(dir, ".opencode", "agent"), { recursive: true });
+    writeFileSync(join(dir, ".opencode", "agent", "build.md"), '---\npermission: {bash: {"cat *": deny}}\n---\nBuild.\n');
+    writeFileSync(join(dir, ".opencode", "agent", "review.md"), "---\ndescription: Review\nmode: subagent\n---\nReview.\n");
+    expect((await execute(dir, catPlan, "build")).content).toContain("POLICY HARD-STOP (not run)");
+    expect((await execute(dir, catPlan, "review")).content).toContain("marker-content");
+  });
+
   it("an unparseable native `permissions` entry stops every operation (fail-closed)", async () => {
     const dir = project({ permissions: [{ action: "shell", resource: "cat *", effect: "maybe" }] });
     const out = await execute(dir, catPlan);
