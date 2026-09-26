@@ -42,6 +42,12 @@ const MORE_ESCAPES = [
   "less -So log f", "less -Olog f", "less --LOG-FILE=log f", "less --log=log f",
   // yq: in-place and split-exp
   "yq --inplace .a=1 f.yaml", "yq -Pi .a=1 f.yaml", "yq --split-exp .a f.yaml", "yq -s .a f.yaml",
+  // review round 1: dynamic find -exec payloads, gawk indirect calls, find
+  // options after an escaped `;` that the segment splitter cuts off
+  "find . -exec sh -c \"$CMD\" \\;", "find . -exec sh -c \"$CMD\" {} +", "find . -exec sh -c \"`id`\" \\;",
+  "gawk 'BEGIN{f=\"system\"; @f(\"id\")}'", "awk 'BEGIN{@f()}'",
+  "find . -exec grep x {} \\; -delete", "find . -exec grep x {} \\; -fprint out",
+  "find . -exec grep x {} \\; -fls out", "find . -exec grep x {} \\; -fprintf out %p", "find . -exec grep x {}",
   // wrappers resolve to the same heads
   "xargs sed -i s/a/b/", "env LC_ALL=C sort -o o.txt f",
 ];
@@ -60,7 +66,8 @@ const MORE_SAFE = [
   "awk '{print \"a>b|c\"}' f", "awk 'NR > 1 && $2 != \"\" {print $2}' f", "awk '$1 || $2' f",
   "xxd -l 32 f", "xxd -c 16 -g 1 f", "xxd -p f", "xxd -",
   "rg --pre-glob '*.gz' foo", "tree -a -I node_modules", "tree -d",
-  "find . -exec grep pat {} \\;", "find . -name '*.ts' -exec wc -l {} +", "find . -type f -print",
+  "find . -exec grep pat {} \\;", "find . -name '*.ts' -exec wc -l {} +", "find . -type f -print", "find . -exec grep x {} \\; | head", "find . -exec grep x {} \\; && echo done",
+  "gawk '@namespace \"x\"; BEGIN{print 1}'",
   "less -S f", "less -N --line-numbers f", "yq -o=json .a f.yaml", "yq -P .a f.yaml", "jq -n 'input' --rawfile x /dev/stdin",
 ];
 

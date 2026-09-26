@@ -232,10 +232,15 @@ const READ_ONLY_HEADS = new Set([
  * Decides whether one invocation of a read-only head writes or execs. Receives
  * the argv AFTER the head (wrappers and env assignments already stripped) and
  * returns the offending token for the hard-stop message, or null when the
- * invocation only reads. `inspect` runs a nested command argv (`find -exec`)
- * back through the full classifier.
+ * invocation only reads. `context.inspect` runs a nested command argv
+ * (`find -exec`) back through the full classifier; `context.followingText` is
+ * the raw command text after this segment (null when it cannot be located).
  */
-type ReadOnlyHeadWriteCheck = (args: string[], inspect: (argv: string[]) => string | null) => string | null;
+interface ReadOnlyHeadContext {
+  inspect: (argv: string[]) => string | null;
+  followingText: string | null;
+}
+type ReadOnlyHeadWriteCheck = (args: string[], context: ReadOnlyHeadContext) => string | null;
 
 type GetoptArity = "flag" | "value" | "optional";
 interface GetoptSpec {
@@ -538,7 +543,10 @@ function awkProgramWrite(program: string): string | null {
     const statement = /^[^;\n}]*/.exec(masked.slice(print.index))![0];
     if (statement.includes(">")) return `${print[0]} >`;
   }
-  const directive = /@(?:include|load)\b/.exec(masked);
+  // gawk `@`-syntax other than `@namespace` loads code (`@include`, `@load`)
+  // or makes an indirect call (`f = "system"; @f("id")`) that the `system(`
+  // check above cannot see.
+  const directive = /@(?!namespace\b)[A-Za-z_]*/.exec(masked);
   if (directive) return directive[0];
   return null;
 }
@@ -619,9 +627,13 @@ const READ_ONLY_HEAD_WRITES: Record<string, ReadOnlyHeadWriteCheck> = {
     return null;
   },
   // -exec/-execdir/-ok/-okdir run a command: classify that command in turn
-  // (`find -exec grep` still reads). A found file as the command, or a
-  // dynamic one, is never read-only.
-  find: (args, inspect) => {
+  // (`find -exec grep` still reads). A found file as the command, or any
+  // dynamic word (`$VAR`, backticks — re-quoting for the nested classifier
+  // would turn them into inert literals), is never read-only. So is an exec
+  // with no terminator, unless the missing `;` is an escaped `\;` the segment
+  // splitter cut at AND nothing but a separator follows it: otherwise the
+  // rest of the find expression (`\; -delete`) was split off unseen.
+  find: (args, { inspect, followingText }) => {
     for (let i = 0; i < args.length; i++) {
       const arg = args[i]!;
       if (/^-(?:delete|fprint0?|fprintf|fls)$/.test(arg)) return `find ${arg}`;
@@ -632,11 +644,18 @@ const READ_ONLY_HEAD_WRITES: Record<string, ReadOnlyHeadWriteCheck> = {
           const word = args[j]!;
           // A trailing lone `\` is what is left of `\;` once the segment
           // splitter (which ignores escapes) has cut at the `;`.
-          const escapedSemicolon = word === "\\" && j === args.length - 1;
-          if (word === ";" || escapedSemicolon || (word === "+" && args[j - 1] === "{}")) break;
+          if (word === "\\" && j === args.length - 1) {
+            const tail = followingText === null ? null : /^;[ \t]*(?:$|[|&;\n\r])/.exec(followingText);
+            if (tail === null) return `find ${arg} \\;`;
+            break;
+          }
+          if (word === ";" || (word === "+" && args[j - 1] === "{}")) break;
           command.push(word);
         }
-        if (command.length === 0 || /\{\}|\$/.test(command[0]!)) return `find ${arg}`;
+        if (j >= args.length) return `find ${arg}`;
+        if (command.length === 0 || command[0]!.includes("{}") || command.some((word) => /[$`]/.test(word))) {
+          return `find ${arg}`;
+        }
         const nested = inspect(command);
         if (nested) return nested;
         i = j;
@@ -2731,14 +2750,16 @@ function findInterpreterWriter(head: string, segment: string): string | null {
 }
 
 /** Run the segment's READ_ONLY_HEAD_WRITES predicate, if its effective head has one. */
-function readOnlyHeadWrite(segment: string, depth: number): string | null {
+function readOnlyHeadWrite(segment: string, depth: number, followingText: string | null): string | null {
   const normalized = normalizeEnvInvocation(shellWords(segment));
   if (!normalized.complete || normalized.argv.length === 0) return null;
   const head = normalized.argv[0]!.replace(/^.*\//, "");
   const check = Object.hasOwn(READ_ONLY_HEAD_WRITES, head) ? READ_ONLY_HEAD_WRITES[head]! : undefined;
   if (!check) return null;
-  return check(normalized.argv.slice(1), (argv) =>
-    findDestructiveTokenInternal(argv.map(shellQuoteWord).join(" "), depth + 1));
+  return check(normalized.argv.slice(1), {
+    inspect: (argv) => findDestructiveTokenInternal(argv.map(shellQuoteWord).join(" "), depth + 1),
+    followingText,
+  });
 }
 
 /**
@@ -2843,8 +2864,14 @@ function findDestructiveTokenInternal(cmd: string, depth: number): string | null
   // Read-only heads skip the word scan, so each one's own write/exec forms
   // (`sed -n 'w F'`, `sort --output=F`, awk `print | "sh"`, `find -okdir rm`)
   // are decided here from its argv, before the safe tier can wave it through.
+  // Segments are trimmed, in-order slices of shellCommand, so the text after
+  // each one can be located by a forward search.
+  let segmentCursor = 0;
   for (const segment of segments) {
-    const token = readOnlyHeadWrite(stripShellControlPrefix(segment), depth);
+    const at = shellCommand.indexOf(segment, segmentCursor);
+    const followingText = at === -1 ? null : shellCommand.slice(at + segment.length);
+    if (at !== -1) segmentCursor = at + segment.length;
+    const token = readOnlyHeadWrite(stripShellControlPrefix(segment), depth, followingText);
     if (token) return token;
   }
 
