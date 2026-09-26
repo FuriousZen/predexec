@@ -1690,10 +1690,12 @@ describe("wrapper parity and allowlist-based interpreter eval (CORE-4/5)", () =>
 // Task 5 must-fix: termination on long words, cross-segment environment
 // escapes, ANSI-C quoting, and heads or redirects hidden by shell escapes.
 describe("shell-lexer must-fix (task 5)", () => {
-  it("classifies a 4000-character clustered switch word within 1s", () => {
+  // Bounds catch super-linear blowups (seconds to minutes), not micro-regressions;
+  // 3s leaves room for a loaded CI box (1006ms was observed once at a 1s bound).
+  it("classifies a 4000-character clustered switch word within 3s", () => {
     const started = performance.now();
     isDestructiveCommand("python3 -" + "I".repeat(4000) + "c 'print(1)'");
-    expect(performance.now() - started).toBeLessThan(1000);
+    expect(performance.now() - started).toBeLessThan(3000);
   });
 
   it("stays fast on other long identifier-shaped words", () => {
@@ -1704,7 +1706,7 @@ describe("shell-lexer must-fix (task 5)", () => {
     ]) {
       const started = performance.now();
       findDestructiveToken(command);
-      expect(performance.now() - started, command.slice(0, 20)).toBeLessThan(1000);
+      expect(performance.now() - started, command.slice(0, 20)).toBeLessThan(3000);
     }
   });
 

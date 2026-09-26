@@ -18,7 +18,6 @@ export const EVAL_WRITER_RE =
   /\bfs\.\w*[Ww]rite\w*|writeFile\w*|appendFile\w*|rmSync|unlinkSync|mkdirSync|renameSync|rmdirSync|cpSync|createWriteStream|truncateSync|chmodSync|symlinkSync|os\.(remove|unlink|rename|mkdir|rmdir|makedirs)|shutil\.|write_text|write_bytes/;
 
 /** Command-execution APIs are destructive regardless of the command string. */
-const NODE_CHILD_PROCESS_RE = /\bchild_process\s*\.\s*(?:exec|execSync|spawn|spawnSync|fork)\s*\(/;
 const NODE_REQUIRED_CHILD_PROCESS_RE = /\brequire\s*\(\s*(['"])child_process\1\s*\)\s*\.\s*(?:exec|execSync|spawn|spawnSync|fork)\s*\(/g;
 const PYTHON_EXECUTION_RE = /\b(?:os\s*\.\s*(?:system|popen)|subprocess\s*\.\s*(?:run|call|Popen|check_[A-Za-z_][A-Za-z0-9_]*))\s*\(/;
 const RUBY_EXECUTION_RE = /\b(?:(?:Kernel\s*\.\s*)?(?:system|exec|spawn)|Open3\s*\.\s*[A-Za-z_][A-Za-z0-9_]*)\s*\(/;

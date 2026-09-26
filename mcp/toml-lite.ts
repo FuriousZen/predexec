@@ -41,13 +41,13 @@ const CRITICAL_TEXT_RE = /projects|project_root_markers/;
 const CRITICAL_ROOT_KEYS = new Set(["projects", "project_root_markers"]);
 
 class TomlError extends Error {
-  constructor(
-    public readonly pos: number,
-    message: string,
-    /** A hard error fails the read even outside `projects` (duplicate table headers). */
-    public readonly hard = false,
-  ) {
+  readonly pos: number;
+  /** A hard error fails the read even outside `projects` (duplicate table headers). */
+  readonly hard: boolean;
+  constructor(pos: number, message: string, hard = false) {
     super(message);
+    this.pos = pos;
+    this.hard = hard;
   }
 }
 
@@ -85,7 +85,11 @@ class Parser {
   /** Arrays created by `[[header]]` (a static array cannot be appended to). */
   private readonly tableArrays = new WeakSet<TomlValue[]>();
 
-  constructor(private readonly s: string) {}
+  private readonly s: string;
+
+  constructor(s: string) {
+    this.s = s;
+  }
 
   lineOf(pos: number): number {
     let line = 1;

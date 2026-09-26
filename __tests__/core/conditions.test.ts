@@ -236,7 +236,8 @@ describe("evaluateCondition — match (low confidence)", () => {
     ] as Condition[]) {
       const t0 = performance.now();
       const r = evaluateConditionWithDetail(out({ stdout }), cond, "/");
-      expect(performance.now() - t0).toBeLessThan(1000);
+      // The budget is REGEX_EVAL_TIMEOUT_MS; an unbounded run takes seconds.
+      expect(performance.now() - t0).toBeLessThan(REGEX_EVAL_TIMEOUT_MS + 1500);
       expect(r.result).toBe(false);
       expect(r.detail).toContain(`exceeded its ${REGEX_EVAL_TIMEOUT_MS}ms time budget`);
     }

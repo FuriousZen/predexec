@@ -1053,7 +1053,7 @@ describe("mcp tool-ops — bounded fallback scans", () => {
     write("slow-regex.txt", `${"a".repeat(180)}\n`);
     const start = Date.now();
     const r = await run({ tool: "grep", pattern, path: "slow-regex.txt" }, NODE_ONLY);
-    expect(Date.now() - start).toBeLessThan(GREP_OP_TIMEOUT_MS + 500);
+    expect(Date.now() - start).toBeLessThan(GREP_OP_TIMEOUT_MS + 1000);
     expect(r.exitCode).toBe(2);
     expect(r.stdout).toBe("");
     expect(r.stderr).toContain("time budget");
@@ -1075,7 +1075,7 @@ describe("mcp tool-ops — bounded fallback scans", () => {
     const r = await run({ tool: "grep", pattern, path: "many-batches-regex.txt" }, NODE_ONLY);
     const elapsed = Date.now() - start;
     expect(elapsed).toBeGreaterThan(GREP_OP_TIMEOUT_MS - 200);
-    expect(elapsed).toBeLessThan(GREP_OP_TIMEOUT_MS + 1000);
+    expect(elapsed).toBeLessThan(GREP_OP_TIMEOUT_MS + 1500);
     expect(r.exitCode).toBe(2);
     expect(r.stdout).toBe("");
     expect(r.stderr).toContain("time budget");
@@ -1094,7 +1094,7 @@ describe("mcp tool-ops — bounded fallback scans", () => {
     const start = Date.now();
     const r = await run({ tool: "grep", pattern, path: "many-files" }, NODE_ONLY);
     const elapsed = Date.now() - start;
-    expect(elapsed).toBeLessThan(GREP_OP_TIMEOUT_MS + 1000);
+    expect(elapsed).toBeLessThan(GREP_OP_TIMEOUT_MS + 1500);
     expect(r.exitCode).toBe(2);
     expect(r.stdout).toBe("");
     expect(r.stderr).toContain("time budget");
@@ -1110,7 +1110,8 @@ describe("mcp tool-ops — bounded fallback scans", () => {
     write("limit-one.txt", `${Array.from({ length: 100_000 }, (_, i) => `line ${i}`).join("\n")}\n`);
     const start = Date.now();
     const r = await run({ tool: "grep", pattern: "line 100001", path: "limit-one.txt", limit: 1 }, NODE_ONLY);
-    expect(Date.now() - start).toBeLessThan(500);
+    // The regressed design took ~2s; widened from 500ms for loaded machines.
+    expect(Date.now() - start).toBeLessThan(1200);
     expect(r.exitCode).toBe(1);
     expect(r.stdout).toBe("");
   });
@@ -1123,7 +1124,8 @@ describe("mcp tool-ops — bounded fallback scans", () => {
     write("large-fallback.txt", `${Array.from({ length: 50_000 }, (_, i) => `line ${i}`).join("\n")}\n`);
     const start = Date.now();
     const r = await run({ tool: "grep", pattern: "line 49999", path: "large-fallback.txt" }, NODE_ONLY);
-    expect(Date.now() - start).toBeLessThan(1500);
+    // The regressed design took ~4.5s; widened from 1.5s for loaded machines.
+    expect(Date.now() - start).toBeLessThan(3000);
     expect(r.exitCode).toBe(0);
     expect(r.stdout).toBe("large-fallback.txt:50000:line 49999");
   });

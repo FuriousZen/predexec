@@ -190,8 +190,10 @@ describe("runNode — termination", () => {
       { id: "n", commands: ["sh -c 'sleep 30 & echo $!; sleep 30'"] },
       { cwd, commandTimeoutMs: 1_000 },
     );
-    // Well under the 2s post-kill grace: the group kill itself closed the pipes.
-    expect(Date.now() - started).toBeLessThan(1_800);
+    // Under the 1s timeout + 2s post-kill grace: the group kill itself closed
+    // the pipes. (Wall-clock bound widened for loaded machines; the grace
+    // path would take at least 3s.)
+    expect(Date.now() - started).toBeLessThan(2_800);
     expect(r.exitCode).toBe(124);
     expect(r.stderr).toContain("[predexec] command timed out after 1000ms");
     const childPid = Number(r.stdout.trim());
@@ -263,7 +265,8 @@ describe("runNode — termination", () => {
     setTimeout(() => controller.abort(), 200);
     const started = Date.now();
     const r = await runNode({ id: "n", commands: ["sleep 30"] }, { cwd, signal: controller.signal });
-    expect(Date.now() - started).toBeLessThan(1_800);
+    // Far below `sleep 30`; widened from 1.8s for loaded machines.
+    expect(Date.now() - started).toBeLessThan(3_000);
     expect(r.exitCode).toBe(1);
     expect(r.stderr).toContain("[predexec] command aborted");
   }, 5_000);

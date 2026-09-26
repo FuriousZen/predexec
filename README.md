@@ -434,6 +434,10 @@ curl -fsSL https://raw.githubusercontent.com/FuriousZen/predexec/main/configs/co
 appending it straight into an existing `AGENTS.md` — or a fresh one — works either way; keep the
 block as shipped rather than padding it.
 
+**Don't combine the plugin with the `AGENTS.md` fallback.** The plugin already bundles the routing
+skill, so adding the block as well loads the same routing rules twice; pick one. If you move from
+the fallback to the plugin, remove the block from `AGENTS.md`.
+
 #### Sandbox — read this one
 
 > **Codex runs MCP servers OUTSIDE its sandbox.** Measured directly: under a `read-only`

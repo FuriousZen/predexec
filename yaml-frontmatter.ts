@@ -218,10 +218,12 @@ function inlineValue(raw: string, topLevel: boolean, inPermission: boolean): unk
 /** Single-line flow collections. Whitespace is the ASCII space only (tabs never get here). */
 class FlowParser {
   private i = 0;
-  constructor(
-    private readonly s: string,
-    private readonly inPermission: boolean,
-  ) {}
+  private readonly s: string;
+  private readonly inPermission: boolean;
+  constructor(s: string, inPermission: boolean) {
+    this.s = s;
+    this.inPermission = inPermission;
+  }
   private ws(): void {
     while (this.s[this.i] === " ") this.i++;
   }

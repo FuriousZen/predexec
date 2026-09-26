@@ -298,3 +298,23 @@ describe("no local machine paths in tracked docs", () => {
     expect(hits).toEqual([]);
   });
 });
+
+describe("source loads under node's strip-only TypeScript mode", () => {
+  // CLAUDE.md: local source commands run TypeScript directly. Node's type
+  // stripping rejects non-erasable syntax (parameter properties, enums), so
+  // one `constructor(private readonly s)` broke importing policy.ts and the
+  // MCP server from source. tsconfig's erasableSyntaxOnly keeps it that way.
+  it.each(["policy.ts", "mcp/server.ts", "mcp/toml-lite.ts", "yaml-frontmatter.ts", "core/index.ts"])("%s", (file) => {
+    const out = execFileSync(
+      process.execPath,
+      ["--experimental-strip-types", "--no-warnings", "--input-type=module", "-e", `await import(${JSON.stringify(pathToFileURL(resolve(file)).href)}); console.log("loaded")`],
+      { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
+    );
+    expect(out.trim()).toBe("loaded");
+  });
+
+  it("tsconfig enforces erasableSyntaxOnly", () => {
+    const tsconfig = JSON.parse(readFileSync("tsconfig.json", "utf8")) as { compilerOptions: Record<string, unknown> };
+    expect(tsconfig.compilerOptions.erasableSyntaxOnly).toBe(true);
+  });
+});
