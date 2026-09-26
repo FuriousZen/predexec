@@ -162,3 +162,32 @@ describe("data-derived values used as variable names (R5)", () => {
   it.each(TAINTED_NAMES)("mutating: %s", (c) => expect(isDestructiveCommand(c)).toBe(true));
   it.each(UNTAINTED_NAMES)("read-only: %s", (c) => expect(isDestructiveCommand(c)).toBe(false));
 });
+
+// Fix round 1: data reaching an evaluation context through a direct
+// substitution, an integer declaration, a default assignment, the positional
+// parameters, a glob array, an attached option, or a bash 4+ name operand.
+const ROUND1_MUTATING = [
+  "echo $(( $(cat f) ))", "(( $(cat f) ))", "echo $[ $(cat f) ]", "arr[$(cat f)]=1", "echo ${arr[$(cat f)]}",
+  "let \"$(cat f)\"", "[[ $(cat f) -eq 1 ]]", "echo $(( $(<f) ))",
+  "echo $(( `cat f` ))", "(( `cat f` ))", "echo $[ `cat f` ]", "arr[`cat f`]=1", "echo ${arr[`cat f`]}",
+  "let \"`cat f`\"", "[[ `cat f` -eq 1 ]]",
+  "bash -c 'echo $(( $(cat f) ))'", "bash -c '(( $(cat f) ))'",
+  "declare -i n=$(cat f)", "declare -i n; n=$(cat f)", "declare -i n; read n < f", "typeset -i n=$(cat f)",
+  "g() { local -i n=$(cat f); }; g",
+  ": ${c:=$(cat f)}; echo $((c))", ": ${c=$(cat f)}; ((c))", ": ${c:=$(cat f)}; echo ${!c}",
+  "set -- \"$(cat f)\"; (( $1 ))", "set -- \"$(cat f)\"; c=$1; ((c))", "set -- \"$(cat f)\"; echo ${!1}",
+  "set -- *; echo $(($1))", "g() { echo $(($1)); }; g \"$(cat f)\"", "sh -c 'echo $(($1))' _ \"$(cat f)\"",
+  "x=(*); echo $((x))", "arr=(*); ((arr))", "for x in *; do ((x)); done",
+  "c=$(cat f); printf -v\"$c\" x", "c=$(cat f); read -a\"$c\" <<< x",
+  "c=$(cat f); mapfile -t \"$c\" < f", "c=$(cat f); readarray -t \"$c\" < f", "c=$(cat f); [[ -R $c ]]",
+  "c=$(cat f); wait -p \"$c\"",
+];
+const ROUND1_READ_ONLY = [
+  "x=5; echo $((x+1))", "echo $((3*4))", "echo $((RANDOM % 10))", "n=$(wc -l < f); echo \"$n\"", "echo ${#arr[@]}",
+  "c=$(cat f); echo \"$c\"", "echo ${!prefix*}", "declare -n r=literal", "(( a <(echo 1) ))",
+];
+
+describe("taint fix round 1", () => {
+  it.each(ROUND1_MUTATING)("mutating: %s", (c) => expect(isDestructiveCommand(c)).toBe(true));
+  it.each(ROUND1_READ_ONLY)("read-only: %s", (c) => expect(isDestructiveCommand(c)).toBe(false));
+});

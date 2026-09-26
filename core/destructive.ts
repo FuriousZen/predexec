@@ -74,7 +74,7 @@ import {
 import {
   interpreterReaderViolation,
 } from "./shell/reader-allowlists.ts";
-import { findTaintedArithmetic } from "./shell/taint.ts";
+import { findTaintedEvaluation } from "./shell/taint.ts";
 import {
   EVAL_INTERPRETERS,
   interpreterFamily,
@@ -487,7 +487,7 @@ function findDestructiveTokenInternal(cmd: string, depth: number): string | null
       const gitReadOnly = head === "git" && gitTokens[i] === null;
       return head !== null && (READ_ONLY_HEADS.has(head) || gitReadOnly);
     });
-  if (allSafe) return findTaintedArithmetic(cmd);
+  if (allSafe) return findTaintedEvaluation(cmd);
 
   const caseInspection = inspectShellCommandClauses(shellCommand);
   const wordScanSegments = /^case\b/.test(shellCommand.trim()) && caseInspection.complete && caseInspection.clauses.length > 0
@@ -578,10 +578,11 @@ function findDestructiveTokenInternal(cmd: string, depth: number): string | null
     }
   }
 
-  // Last, so it only turns a read-only verdict into a stop: arithmetic that
-  // evaluates a data-derived variable's value can run a command substitution.
+  // Last, so it only turns a read-only verdict into a stop: an arithmetic
+  // context or variable name that evaluates a data-derived value can run a
+  // command substitution.
   // It reads the unmasked command: an unquoted heredoc body expands `$((…))`.
-  return findTaintedArithmetic(cmd);
+  return findTaintedEvaluation(cmd);
 }
 
 /**

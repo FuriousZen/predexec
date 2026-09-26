@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { findTaintedArithmetic } from "../../../core/shell/taint.ts";
+import { findTaintedEvaluation } from "../../../core/shell/taint.ts";
 
 // E-A: in an arithmetic context bash evaluates a variable's VALUE as an
 // expression, so `c='a[$(cmd)]'; echo $((c))` runs cmd. A value that comes
@@ -63,45 +63,63 @@ const CLEAN = [
   "",
 ];
 
-describe("findTaintedArithmetic", () => {
+describe("findTaintedEvaluation", () => {
   it.each(TAINTED)("tainted: %s", (command, name) => {
-    expect(findTaintedArithmetic(command)).toBe(`arithmetic over data-derived variable ${name}`);
+    expect(findTaintedEvaluation(command)).toBe(`arithmetic over data-derived variable ${name}`);
   });
   it.each(CLEAN)("clean: %s", (command) => {
-    expect(findTaintedArithmetic(command)).toBeNull();
+    expect(findTaintedEvaluation(command)).toBeNull();
   });
 
   it("falls back to any arithmetic identifier when a context cannot be parsed", () => {
     // an unterminated `$[` hides where its expression ends
-    expect(findTaintedArithmetic("read c; echo $[n")).toBe("arithmetic over data-derived variable n");
+    expect(findTaintedEvaluation("read c; echo $[n")).toBe("arithmetic over data-derived variable n");
     // no data construct: nothing to fall back on
-    expect(findTaintedArithmetic("echo $[n")).toBeNull();
+    expect(findTaintedEvaluation("echo $[n")).toBeNull();
   });
 
   it("stays linear on deeply nested arithmetic", () => {
+    // A generous guard, not a benchmark: a quadratic scan of 40k nested
+    // brackets takes far longer, while CI jitter stays well inside it.
     const deep = `c=$(cat f); echo ${"$((".repeat(20_000)}c${"))".repeat(20_000)}`;
     const started = performance.now();
-    expect(findTaintedArithmetic(deep)).toBe("arithmetic over data-derived variable c");
-    expect(performance.now() - started).toBeLessThan(2_000);
+    expect(findTaintedEvaluation(deep)).toBe("arithmetic over data-derived variable c");
+    expect(performance.now() - started).toBeLessThan(10_000);
   });
 });
 
 // R5: a data-derived value used as a variable NAME. Bash parses the name, and
 // a subscript in it (`a[$(cmd)]`) runs cmd. Every row was verified to run the
 // subscript on /bin/bash 3.2 and /bin/sh (macOS) with c='a[$(echo PWNED >&2)]'.
-const TAINTED_NAMES = [
-  "c=$(cat f); echo ${!c}", "c=$(cat f); echo \"${!c}\"", "c=$(cat f); echo ${!c:-x}", "c=$(cat f); echo ${!c#x}",
-  "c=$(cat f); [[ -v $c ]]", "c=$(cat f); [[ -v \"$c\" ]]",
-  "c=$(cat f); printf -v \"$c\" x", "c=$(cat f); printf -v \"${c}\" x",
-  "c=$(cat f); read \"$c\" <<< x", "c=$(cat f); read -r \"$c\" <<< x", "c=$(cat f); read -a \"$c\" <<< x",
-  "c=$(cat f); getopts a \"$c\" -a",
-  "c=$(cat f); declare \"$c=1\"", "c=$(cat f); typeset \"$c=1\"", "c=$(cat f); export \"$c=1\"",
-  "c=$(cat f); f(){ local \"$c=1\"; }; f", "c=$(cat f); export \"$c\"", "c=$(cat f); readonly \"$c\"",
-  "c=$(cat f); declare -p \"$c\"", "c=$(cat f); unset -f \"$c\"",
-  "for c in *; do echo ${!c}; done",
+const TAINTED_NAMES: Array<[string, string]> = [
+  ["c=$(cat f); echo ${!c}", "c"],
+  ["c=$(cat f); echo \"${!c}\"", "c"],
+  ["c=$(cat f); echo ${!c:-x}", "c"],
+  ["c=$(cat f); echo ${!c#x}", "c"],
+  ["c=$(cat f); [[ -v $c ]]", "c"],
+  ["c=$(cat f); [[ -v \"$c\" ]]", "c"],
+  ["c=$(cat f); printf -v \"$c\" x", "c"],
+  ["c=$(cat f); printf -v \"${c}\" x", "c"],
+  ["c=$(cat f); read \"$c\" <<< x", "c"],
+  ["c=$(cat f); read -r \"$c\" <<< x", "c"],
+  ["c=$(cat f); read -a \"$c\" <<< x", "c"],
+  ["c=$(cat f); getopts a \"$c\" -a", "c"],
+  ["c=$(cat f); declare \"$c=1\"", "c"],
+  ["c=$(cat f); typeset \"$c=1\"", "c"],
+  ["c=$(cat f); export \"$c=1\"", "c"],
+  ["c=$(cat f); f(){ local \"$c=1\"; }; f", "c"],
+  ["c=$(cat f); export \"$c\"", "c"],
+  ["c=$(cat f); readonly \"$c\"", "c"],
+  ["c=$(cat f); declare -p \"$c\"", "c"],
+  ["c=$(cat f); unset -f \"$c\"", "c"],
+  ["for c in *; do echo ${!c}; done", "c"],
   // R6: bash >= 4.3 semantics, unverifiable on bash 3.2 — flagged fail-closed.
-  "c=$(cat f); declare -n r=$c", "c=$(cat f); f(){ local -n r=\"$c\"; }; f", "c=$(cat f); typeset -n r=$c",
-  "c=$(cat f); declare -n \"$c\"", "c=$(cat f); unset \"$c\"", "c=$(cat f); unset -v \"$c\"",
+  ["c=$(cat f); declare -n r=$c", "c"],
+  ["c=$(cat f); f(){ local -n r=\"$c\"; }; f", "c"],
+  ["c=$(cat f); typeset -n r=$c", "c"],
+  ["c=$(cat f); declare -n \"$c\"", "c"],
+  ["c=$(cat f); unset \"$c\"", "c"],
+  ["c=$(cat f); unset -v \"$c\"", "c"],
 ];
 
 // Measured NOT to evaluate on bash 3.2 / sh (`test -v` is unsupported there),
@@ -114,10 +132,95 @@ const CLEAN_NAMES = [
 ];
 
 describe("data-derived values used as variable names", () => {
-  it.each(TAINTED_NAMES)("tainted: %s", (command) => {
-    expect(findTaintedArithmetic(command)).toMatch(/^data-derived variable (c|OPTARG) used as a variable name$/);
+  it.each(TAINTED_NAMES)("tainted: %s", (command, name) => {
+    expect(findTaintedEvaluation(command)).toBe(`data-derived variable ${name} used as a variable name`);
   });
   it.each(CLEAN_NAMES)("clean: %s", (command) => {
-    expect(findTaintedArithmetic(command)).toBeNull();
+    expect(findTaintedEvaluation(command)).toBeNull();
+  });
+});
+
+// Fix round 1: shapes where data reached an evaluation context unseen.
+const ROUND1_ARITHMETIC: Array<[string, string]> = [
+  // C1: a substitution's output used directly as an arithmetic expression
+  ["echo $(( $(cat f) ))", "command substitution output"],
+  ["(( $(cat f) ))", "command substitution output"],
+  ["echo $[ $(cat f) ]", "command substitution output"],
+  ["arr[$(cat f)]=1", "command substitution output"],
+  ["echo ${arr[$(cat f)]}", "command substitution output"],
+  ["let \"$(cat f)\"", "command substitution output"],
+  ["[[ $(cat f) -eq 1 ]]", "command substitution output"],
+  ["echo $(( $(<f) ))", "command substitution output"],
+  ["echo $(( `cat f` ))", "command substitution output"],
+  ["(( `cat f` ))", "command substitution output"],
+  ["echo $[ `cat f` ]", "command substitution output"],
+  ["arr[`cat f`]=1", "command substitution output"],
+  ["echo ${arr[`cat f`]}", "command substitution output"],
+  ["let \"`cat f`\"", "command substitution output"],
+  ["[[ `cat f` -eq 1 ]]", "command substitution output"],
+  ["bash -c 'echo $(( $(cat f) ))'", "command substitution output"],
+  ["bash -c '[[ $(cat f) -eq 1 ]]'", "command substitution output"],
+  // C2: an assignment to an integer-declared variable evaluates its value
+  ["declare -i n=$(cat f)", "data-derived variable n"],
+  ["declare -i n; n=$(cat f)", "data-derived variable n"],
+  ["declare -i n; read n < f", "data-derived variable n"],
+  ["typeset -i n=$(cat f)", "data-derived variable n"],
+  ["g() { local -i n=$(cat f); }; g", "data-derived variable n"],
+  // C3: default-assignment expansions assign data
+  [": ${c:=$(cat f)}; echo $((c))", "data-derived variable c"],
+  [": ${c=$(cat f)}; ((c))", "data-derived variable c"],
+  // C4: positional parameters set from data
+  ["set -- \"$(cat f)\"; (( $1 ))", "data-derived variable $@"],
+  ["set -- \"$(cat f)\"; c=$1; ((c))", "data-derived variable c"],
+  ["set -- *; echo $(($1))", "data-derived variable $@"],
+  ["g() { echo $(($1)); }; g \"$(cat f)\"", "data-derived variable $@"],
+  ["sh -c 'echo $(($1))' _ \"$(cat f)\"", "data-derived variable $@"],
+  // C5: filenames are data
+  ["x=(*); echo $((x))", "data-derived variable x"],
+  ["arr=(*); ((arr))", "data-derived variable arr"],
+  ["x=($(cat f)); echo $((x))", "data-derived variable x"],
+  ["for x in *; do ((x)); done", "data-derived variable x"],
+];
+
+const ROUND1_NAMES: Array<[string, string]> = [
+  [": ${c:=$(cat f)}; echo ${!c}", "c"],
+  ["set -- \"$(cat f)\"; echo ${!1}", "$@"],
+  // M4: attached option forms
+  ["c=$(cat f); printf -v\"$c\" x", "c"],
+  ["c=$(cat f); read -a\"$c\" <<< x", "c"],
+  // I1: bash 4+ builtins that take a variable name, fail closed
+  ["c=$(cat f); mapfile -t \"$c\" < f", "c"],
+  ["c=$(cat f); readarray -t \"$c\" < f", "c"],
+  ["c=$(cat f); [[ -R $c ]]", "c"],
+  ["c=$(cat f); wait -p \"$c\"", "c"],
+];
+
+const ROUND1_CLEAN = [
+  "x=5; echo $((x+1))",
+  "echo $((3*4))",
+  "echo $((RANDOM % 10))",
+  "n=$(wc -l < f); echo \"$n\"",
+  "echo ${#arr[@]}",
+  "c=$(cat f); echo \"$c\"",
+  "echo ${!prefix*}",
+  "declare -n r=literal",
+  "(( a <(echo 1) ))",
+  "x=(a b); echo $((x))",
+  "set -- a b; echo $(($1))",
+  "echo $(($1))",
+  "declare -i n=5; n=6",
+  ": ${c:=5}; echo $((c))",
+  "mapfile -t lines < f",
+];
+
+describe("fix round 1: direct, integer, default, positional and glob sources", () => {
+  it.each(ROUND1_ARITHMETIC)("tainted: %s", (command, name) => {
+    expect(findTaintedEvaluation(command)).toBe(`arithmetic over ${name}`);
+  });
+  it.each(ROUND1_NAMES)("tainted name: %s", (command, name) => {
+    expect(findTaintedEvaluation(command)).toBe(`data-derived variable ${name} used as a variable name`);
+  });
+  it.each(ROUND1_CLEAN)("clean: %s", (command) => {
+    expect(findTaintedEvaluation(command)).toBeNull();
   });
 });
