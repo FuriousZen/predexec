@@ -480,8 +480,8 @@ describe("interpreter eval — fs-writer APIs are caught", () => {
       `php -r '$x = \`printf hi\`;'`,
       "ruby -e 'x = `printf \"\\`safe\\`\"`'",
       `ruby -e 'x = \`echo $(git status)\`'`,
-    ])("allows fully classified read-only shell body %s", (cmd) => {
-      expect(findDestructiveToken(cmd)).toBeNull();
+    ])("stops on any interpreter shell body, even a read-only one (CORE-5 review) %s", (cmd) => {
+      expect(findDestructiveToken(cmd)).not.toBeNull();
     });
 
     it.each([
@@ -537,8 +537,8 @@ describe("interpreter eval — fs-writer APIs are caught", () => {
     it.each([
       `php -r '$x = \`printf \\$HOME\`;'`,
       `php -r '$x = \`printf \\$literal\`;'`,
-    ])("keeps escaped PHP shell dollars safe when shell syntax is read-only %s", (cmd) => {
-      expect(findDestructiveToken(cmd)).toBeNull();
+    ])("stops on PHP shell bodies even with escaped dollars (CORE-5 review) %s", (cmd) => {
+      expect(findDestructiveToken(cmd)).not.toBeNull();
     });
 
     it.each([
@@ -1590,6 +1590,65 @@ describe("wrapper parity and allowlist-based interpreter eval (CORE-4/5)", () =>
     `perl -e 'open(my $fh, "<", "f"); print <$fh>'`,
     `php -r 'echo file_get_contents("x");'`,
   ])("allowlist-read-only: %s", (c) => expect(isDestructiveCommand(c)).toBe(false));
+
+  // Review round 1: wildcard re-exposure, masked shell execution, unrecognized
+  // eval flags, unchecked imports, and interpreter preload options.
+  it.each([
+    `python3 -c "import os; os.path.os.execv('/bin/sh', ['sh'])"`,
+    `python3 -c "import os; os.path.os.replace('a', 'b')"`,
+    `python3 -c "import os; os.path.os.posix_spawn('/bin/sh', ['sh'], {})"`,
+    `python3 -c "import os; os.path.os.symlink('a', 'b')"`,
+    "ruby -e 'puts `id`'",
+    `ruby -e 'puts "#{\`id\`}"'`,
+    "ruby -e 'puts %x(id)'",
+    "perl -e 'print `id`'",
+    "perl -e 'print qx(id)'",
+    "perl -e 'print qx{id}'",
+    "perl -e 'print \"@{[ `id` ]}\"'",
+    "php -r 'echo `id`;'",
+    `python3 -Ic "import os; os.system('id')"`,
+    `python3 -Sc "import os; os.replace('a', 'b')"`,
+    `perl -E 'system "id"'`,
+    `node -e "console.log(1)" --eval="require('fs').linkSync('a', 'b')"`,
+    `node -p "1" --print "require('child_process').execSync('id')"`,
+    `python3 -c "import evil"`,
+    `python3 -c "import sys; sys.path.insert(0, '.'); import evil"`,
+    `python3 -c "from evil import x"`,
+    `python3 -c "import sys; sys.remote_exec(1, 'x.py')"`,
+    `python3 -c "import platform; max(['id'], key=platform.os.system)"`,
+    `perl -e '$x = "id"; print \`$x\`'`,
+    `python3 -Ic "open('x', 'w').write('y')"`,
+    "perl -d:evil -e 1",
+    "php -d auto_prepend_file=x.php -r 'echo 1;'",
+    "ruby -revil -e 'puts 1'",
+    "bun --preload ./x.ts -e 'console.log(1)'",
+    `node -r ./evil.js -e "console.log(1)"`,
+    `node --require=./evil.js -e "console.log(1)"`,
+    `node --import ./evil.mjs -e "console.log(1)"`,
+    `node --loader ./evil.mjs -e "console.log(1)"`,
+    `node --experimental-loader=./evil.mjs -e "console.log(1)"`,
+    `NODE_OPTIONS='--require ./evil.js' node -e "console.log(1)"`,
+    `env NODE_OPTIONS=-r./evil.js node -e "console.log(1)"`,
+    `perl -Mevil -e 'print 1'`,
+    `perl -mevil -e 'print 1'`,
+    `deno eval "console.log(1)"`,
+    `deno run x.ts`,
+  ])("review-mutating: %s", (c) => expect(isDestructiveCommand(c)).toBe(true));
+
+  it.each([
+    `python3 -c "import os.path; print(os.path.exists('x'), os.path.join('a', 'b'))"`,
+    `python3 -c "import math, re; print(math.sqrt(4), re.findall('a', 'aa'), hex(3))"`,
+    `python3 -c "import sys; print(sys.version, sys.argv, sys.platform); sys.exit(0)"`,
+    `python3 -Ic "print(1)"`,
+    `node -e "console.log(Math.max(1, 2), [1, 2].reduce((a, b) => a + b))"`,
+    `node --eval="console.log(1)"`,
+    `perl -E 'say 1'`,
+    `perl -MJSON::PP -e 'print 1'`,
+    `python3 -c "import datetime, hashlib, json, sys; print(datetime.datetime.now().isoformat(), hashlib.sha256(b'x').hexdigest()); json.dump(1, sys.stdout)"`,
+    `node -e "console.log(new Date().toISOString())"`,
+    "perl -lne 'print length' f",
+    "ruby -ryaml -e 'puts 1'",
+  ])("review-read-only: %s", (c) => expect(isDestructiveCommand(c)).toBe(false));
 
   // Temporary scaffolding until the lexers merge; trivially true afterwards.
   it("core WRAPPERS is a superset of command-inspection DEFAULT_WRAPPERS", () => {

@@ -442,7 +442,7 @@ describe("runPlanTree — traversal & stop reasons", () => {
 
   it.skipIf(
     !["/usr/bin/perl", "/usr/local/bin/perl", "/opt/homebrew/bin/perl", "/usr/bin/ruby", "/usr/local/bin/ruby", "/opt/homebrew/bin/ruby", "/usr/bin/php", "/usr/local/bin/php", "/opt/homebrew/bin/php"].some(existsSync),
-  )("allows installed read-only qx/backtick bodies to reach a leaf", async () => {
+  )("stops installed qx/backtick bodies before running them, even read-only ones (CORE-5 review)", async () => {
     const dir = mkdtempSync(join(tmpdir(), "predexec-shell-body-read-"));
     try {
       const commands = [
@@ -452,8 +452,8 @@ describe("runPlanTree — traversal & stop reasons", () => {
       ];
       for (const command of commands) {
         const result = await runPlanTree({ root: "a", nodes: [{ id: "a", commands: [command] }] }, { cwd: dir });
-        expect(result.stoppedReason).toBe("leaf");
-        expect(result.pathTaken).toEqual(["a"]);
+        expect(result.stoppedReason).toBe("mutationStop");
+        expect(result.pathTaken).toEqual([]);
       }
     } finally {
       rmSync(dir, { recursive: true, force: true });

@@ -577,8 +577,11 @@ function lessArgvWrite(args: readonly string[]): string | null {
     if (arg === "--") break;
     if (arg.startsWith("+") && !/^\+\+?(?:\d*[GgFjk]?|[/?].*)$/.test(arg)) return "less +cmd";
     if (/^-[^-]/.test(arg) && /[oO]/.test(arg)) return "less -o";
+    // -k/--lesskey-*: a lesskey source can set LESSOPEN in its #env section.
+    if (/^-[^-]/.test(arg) && arg.includes("k")) return "less -k";
     const long = /^--([^=]+)/.exec(arg);
     if (long && "log-file".startsWith(long[1]!.toLowerCase())) return "less --log-file";
+    if (long && /^lessk/i.test(long[1]!)) return "less --lesskey";
   }
   return null;
 }
@@ -1579,36 +1582,158 @@ function perlOpenWriteMode(mode: string): boolean {
   return normalized.startsWith(">") || normalized.startsWith("+") || normalized.startsWith("|") || normalized.startsWith("-|");
 }
 
+type EvalPrograms =
+  | { kind: "none" }
+  | { kind: "eval"; programs: string[]; join: boolean }
+  | { kind: "violation"; reason: string };
+
+/** Modules a `perl -M`/`-m` or `ruby -r` preload may name: loading them runs no repo code. */
+const PERL_PRELOAD_MODULES = new Set(["strict", "warnings", "utf8", "JSON::PP", "Data::Dumper", "List::Util"]);
+const RUBY_PRELOAD_LIBRARIES = new Set(["json", "set", "pp", "yaml"]);
+/** Node options that load code before the eval program runs. */
+const NODE_PRELOAD_OPTION_RE = /^(?:-r|--require|--import|--loader|--experimental-loader|--preload|--env-file|--env-file-if-exists)(?:=|$)/;
+
 /**
- * The inline programs of an interpreter invocation, without the script
- * arguments that follow them (`perl -pe 's/a/b/' FILE`): each word after an
- * eval flag, plus Ruby/Perl clusters ending in `e` (`-lane`, `-ne`) and
- * attached `-ePROGRAM`. Null when no eval flag is recognized, so callers fall
- * back to the whole-payload view.
+ * The inline programs of an interpreter invocation, parsed with each
+ * interpreter's own option grammar, without the script arguments that follow
+ * (`perl -pe 's/a/b/' FILE`). Clustered switches (`python3 -Ic`, `perl -lane`,
+ * `ruby -ne`), attached programs (`-ePROGRAM`, `--eval=PROGRAM`) and repeated
+ * eval flags are all collected. Options that load code before the program
+ * (`node -r`, `perl -Mmod`, `ruby -rlib`, `php -d`) and options the grammar
+ * does not know are violations: an extraction miss must never degrade to "no
+ * calls". `none` means the invocation runs a script or nothing inline.
  */
-function interpreterEvalPrograms(segment: string): string | null {
+function interpreterEvalPrograms(segment: string): EvalPrograms {
   const normalized = normalizeEnvInvocation(shellWords(segment));
-  if (!normalized.complete || normalized.argv.length === 0) return null;
+  if (!normalized.complete || normalized.argv.length === 0) return { kind: "violation", reason: "ambiguous invocation" };
   const head = normalized.argv[0]!.replace(/^.*\//, "");
   const argv = normalized.argv;
-  const flag = head === "php" ? /^(?:-r|--run)$/
-    : head === "ruby" || head === "perl" ? /^-[A-Za-z]*e$/
-    : head === "python" || head === "python3" ? /^-c$/
-    : /^(?:-e|-p|-pe|--eval|--print)$/;
   const programs: string[] = [];
+  const violation = (reason: string): EvalPrograms => ({ kind: "violation", reason });
+  const result = (join: boolean): EvalPrograms => programs.length > 0 ? { kind: "eval", programs, join } : { kind: "none" };
+
+  if (head === "deno") {
+    return argv[1] === "eval" || argv[1] === "run" ? violation(`deno ${argv[1]}`) : { kind: "none" };
+  }
+
+  if (head === "python" || head === "python3") {
+    for (let i = 1; i < argv.length; i++) {
+      const word = argv[i]!;
+      if (word === "--" || word === "-" || !word.startsWith("-")) return { kind: "none" };
+      if (word.startsWith("--")) {
+        if (/^--(?:version|help)$/.test(word)) continue;
+        return violation(word);
+      }
+      for (let j = 1; j < word.length; j++) {
+        const letter = word[j]!;
+        if (letter === "c") {
+          const rest = word.slice(j + 1);
+          if (rest) programs.push(rest);
+          else if (i + 1 < argv.length) programs.push(argv[++i]!);
+          else return violation("-c");
+          return result(false);
+        }
+        if (letter === "m") return { kind: "none" };
+        if (letter === "W" || letter === "X") {
+          if (j === word.length - 1) i++;
+          break;
+        }
+        if (!"bBdEhiIOPqsSuvVxR".includes(letter)) return violation(`-${letter}`);
+      }
+    }
+    return { kind: "none" };
+  }
+
+  if (head === "perl" || head === "ruby") {
+    const isPerl = head === "perl";
+    // Per-letter grammar (perlrun / ruby --help): plain switches continue the
+    // cluster, digit-suffixed ones consume only their digits, and the rest
+    // take the remainder of the cluster or, when empty, the next word.
+    const plain = isPerl ? "napsuUtTwWXcvhfgS" : "napslvwdcyUh";
+    const digits: Record<string, RegExp> = isPerl
+      ? { l: /^[0-7]*/, "0": /^(?:x[0-9a-fA-F]*|[0-7]*)/, C: /^(?:\d+|[IOEioSDAL]*)/ }
+      : { "0": /^[0-7]*/, W: /^[0-2:a-z]*/ };
+    const rest = isPerl ? "eEFiIMmx" : "erIFiCEKx";
+    const restOptional = "i";
+    for (let i = 1; i < argv.length; i++) {
+      const word = argv[i]!;
+      if (word === "--" || word === "-" || !word.startsWith("-")) break;
+      if (word.startsWith("--")) {
+        if (/^--(?:version|help|verbose|disable-gems|disable=gems)$/.test(word)) continue;
+        return violation(word);
+      }
+      for (let j = 1; j < word.length; j++) {
+        const letter = word[j]!;
+        if (plain.includes(letter)) continue;
+        const digitRe = digits[letter];
+        if (digitRe) {
+          j += digitRe.exec(word.slice(j + 1))![0].length;
+          continue;
+        }
+        if (!rest.includes(letter)) return violation(`-${letter}`);
+        let value = word.slice(j + 1);
+        if (!value && !restOptional.includes(letter)) {
+          if (i + 1 >= argv.length) return violation(`-${letter}`);
+          value = argv[++i]!;
+        } else if (value && (letter === "e" || letter === "E") && j === 1) {
+          value = attachedEvalProgram(segment, head as "perl" | "ruby") ?? value;
+        }
+        if (letter === "e" || letter === "E") programs.push(value);
+        else if (isPerl && (letter === "M" || letter === "m")) {
+          if (!PERL_PRELOAD_MODULES.has(value.replace(/[=\s].*$/s, ""))) return violation(`-${letter}${value}`);
+        } else if (!isPerl && letter === "r") {
+          if (!RUBY_PRELOAD_LIBRARIES.has(value)) return violation(`-r${value}`);
+        } else if (!isPerl && letter === "x") {
+          return violation("-x");
+        }
+        break;
+      }
+    }
+    return result(true);
+  }
+
+  if (head === "php") {
+    for (let i = 1; i < argv.length; i++) {
+      const word = argv[i]!;
+      if (word === "--" || !word.startsWith("-")) break;
+      const program = /^(?:-[rBRE]|--(?:run|process-begin|process-code|process-end))$/.test(word);
+      if (program) {
+        if (i + 1 >= argv.length) return violation(word);
+        programs.push(argv[++i]!);
+        continue;
+      }
+      if (/^-[nqHhviem]+$/.test(word)) continue;
+      return violation(word);
+    }
+    return result(false);
+  }
+
+  // node and bun: options may follow the program, a later `--eval=` replaces
+  // an earlier one, and an unknown option may take a separate value, so every
+  // eval flag anywhere in argv is collected (a script argument spelled like
+  // one fails closed).
   for (let i = 1; i < argv.length; i++) {
     const word = argv[i]!;
-    if (word === "--" || !word.startsWith("-")) break;
-    if (flag.test(word)) {
-      if (i + 1 >= argv.length) return null;
-      programs.push(argv[++i]!);
+    if (word === "--") break;
+    if (!word.startsWith("-")) continue;
+    if (NODE_PRELOAD_OPTION_RE.test(word)) return violation(word.replace(/=.*$/s, ""));
+    const attached = /^--(?:eval|print)=(.*)$/s.exec(word);
+    if (attached) {
+      programs.push(attached[1]!);
       continue;
     }
-    if ((head === "ruby" || head === "perl") && /^-e./s.test(word)) {
-      programs.push(attachedEvalProgram(segment, head) ?? word.slice(2));
+    if (/^(?:-e|-p|-pe|-ep|--eval|--print)$/.test(word)) {
+      if (i + 1 >= argv.length) return violation(word);
+      programs.push(argv[++i]!);
     }
   }
-  return programs.length > 0 ? programs.join("\n") : null;
+  for (const assignment of programs.length > 0 ? normalized.assignments : []) {
+    const [, name, value] = ENV_ASSIGNMENT_RE.exec(assignment) ?? [];
+    if (name === "NODE_OPTIONS" && /(?:^|\s)(?:-r|--require|--import|--loader|--experimental-loader|--env-file)/.test(value ?? "")) {
+      return violation("NODE_OPTIONS preload");
+    }
+  }
+  return result(false);
 }
 
 function interpreterEvalPayload(segment: string): string {
@@ -2078,16 +2203,58 @@ interface ReaderAllowlist {
   forbidden: RegExp;
 }
 
+/**
+ * Exact `os`/`sys` members a Python reader may touch, called or not. No
+ * wildcard: `os.path.os` and `sys.modules` lead straight back to writers.
+ */
+const PYTHON_OS_SYS_READERS = [
+  ...[
+    "exists", "isfile", "isdir", "islink", "isabs", "join", "basename", "dirname", "abspath", "realpath", "getsize",
+    "getmtime", "getctime", "getatime", "splitext", "split", "normpath", "relpath", "expanduser", "expandvars",
+    "commonpath", "sep",
+  ].map((name) => `os.path.${name}`),
+  "os.path", "os.listdir", "os.getcwd", "os.getenv", "os.environ", "os.environ.get", "os.sep", "os.linesep",
+  "os.name", "os.curdir",
+  "sys.argv", "sys.version", "sys.version_info", "sys.version_info.major", "sys.version_info.minor",
+  "sys.platform", "sys.executable", "sys.maxsize", "sys.byteorder", "sys.path", "sys.stdin", "sys.stdin.read",
+  "sys.stdin.readline", "sys.stdin.readlines", "sys.stdout", "sys.stdout.write", "sys.stderr", "sys.stderr.write",
+  "sys.exit",
+];
+
+/** Stdlib modules a Python reader may import; importing anything else runs its code. */
+const PYTHON_IMPORTABLE = new Set([
+  "json", "sys", "os", "os.path", "re", "math", "datetime", "hashlib", "base64", "platform", "struct", "string",
+  "textwrap", "collections", "itertools", "functools", "pprint", "csv", "tomllib", "time", "statistics", "decimal",
+  "fractions", "pathlib",
+]);
+
+/**
+ * Member names a one-level `X.*` wildcard never admits: attributes that
+ * re-expose another module (`platform.os`, `re.sys`) lead back to writers.
+ */
+const WILDCARD_EXCLUDED_MEMBERS = new Set([
+  "os", "sys", "subprocess", "shutil", "importlib", "builtins", "ctypes", "socket", "io", "codecs", "posix", "nt",
+  "pathlib", "tempfile", "signal", "constructor", "prototype",
+]);
+
 const READER_ALLOWLISTS: Record<InterpolationLanguage, ReaderAllowlist> = {
   python: {
     calls: new Set([
-      "print", "open", "json.load", "json.loads", "json.dumps", "sys.*", "os.path.*", "os.listdir", "os.getcwd",
-      "os.environ.get", "len", "str", "int", "float", "bool", "repr", "sorted", "list", "dict", "tuple", "set",
-      "min", "max", "sum", "abs", "round", "range", "enumerate", "zip", "isinstance",
+      "print", "open", "json.load", "json.loads", "json.dump", "json.dumps", ...PYTHON_OS_SYS_READERS,
+      "len", "str", "int", "float", "bool", "repr", "sorted", "list", "dict", "tuple", "set",
+      "min", "max", "sum", "abs", "round", "range", "enumerate", "zip", "isinstance", "hex", "oct", "bin", "chr",
+      "ord", "any", "all", "map", "filter", "reversed", "type", "hash", "divmod", "pow", "format", "iter", "next",
+      "math.*", "re.*", "hashlib.*", "base64.*", "struct.*", "statistics.*", "textwrap.*", "collections.*",
+      "itertools.*", "functools.*", "string.*", "time.time", "time.monotonic", "datetime.datetime.now",
+      "datetime.datetime.utcnow", "datetime.datetime.fromtimestamp", "datetime.date.today", "csv.reader",
+      "tomllib.load", "tomllib.loads", "pprint.pprint", "decimal.Decimal", "fractions.Fraction",
+      "platform.python_version", "platform.system", "platform.machine", "platform.release", "platform.platform",
+      "platform.node", "platform.python_implementation",
     ]),
     valueMethods: new Set([
       "read", "readline", "readlines", "strip", "lstrip", "rstrip", "split", "splitlines", "get", "keys", "values",
-      "items", "join", "format", "lower", "upper", "startswith", "endswith", "count", "find",
+      "items", "join", "format", "lower", "upper", "startswith", "endswith", "count", "find", "hexdigest", "digest",
+      "decode", "encode", "isoformat", "strftime", "group", "groups",
     ]),
     keywords: new Set([
       "if", "elif", "while", "for", "in", "not", "and", "or", "is", "return", "lambda", "else", "assert", "yield", "del",
@@ -2104,10 +2271,12 @@ const READER_ALLOWLISTS: Record<InterpolationLanguage, ReaderAllowlist> = {
       "console.log", "console.error", "process.stdout.write", "process.stderr.write", "require", "JSON.*",
       "fs.readFileSync", "fs.existsSync", "fs.readdirSync",
       "fs.statSync", "Object.keys", "Object.values", "Object.entries", "String", "Number", "parseInt", "parseFloat",
+      "Math.*", "Date", "Date.now", "Array.isArray", "Array.from", "Number.isInteger",
     ]),
     valueMethods: new Set([
       "toString", "trim", "split", "join", "slice", "map", "filter", "includes", "startsWith", "endsWith",
       "toUpperCase", "toLowerCase", "indexOf", "toFixed", "at", "find", "some", "every", "forEach", "repeat",
+      "reduce", "toISOString", "getTime", "padStart", "padEnd",
     ]),
     keywords: new Set(["if", "while", "for", "switch", "catch", "return", "typeof", "function", "await", "void", "in", "of", "delete"]),
     roots: new Set(["console", "require", "JSON", "fs", "Object", "String", "Number", "parseInt", "parseFloat"]),
@@ -2158,12 +2327,16 @@ const READER_ALLOWLISTS: Record<InterpolationLanguage, ReaderAllowlist> = {
   },
 };
 
+/**
+ * Exact chains, or `X.*`, which admits exactly one further public member of X
+ * that does not re-expose a module (`math.sqrt`, never `platform.os.system`).
+ */
 function allowlistedCall(chain: string, allowlist: ReaderAllowlist): boolean {
   if (allowlist.calls.has(chain)) return true;
-  for (let dot = chain.indexOf("."); dot !== -1; dot = chain.indexOf(".", dot + 1)) {
-    if (allowlist.calls.has(`${chain.slice(0, dot)}.*`)) return true;
-  }
-  return false;
+  const dot = chain.lastIndexOf(".");
+  if (dot === -1 || !allowlist.calls.has(`${chain.slice(0, dot)}.*`)) return false;
+  const member = chain.slice(dot + 1);
+  return !member.startsWith("_") && !WILDCARD_EXCLUDED_MEMBERS.has(member);
 }
 
 /** Node `require` is a reader only for relative JSON files and `fs` itself. */
@@ -2278,8 +2451,10 @@ function maskRegexLiterals(source: string, view: string, language: "ruby" | "per
  */
 const READER_REFERENCE_ROOTS: Partial<Record<InterpolationLanguage, { roots: RegExp; allowed: ReadonlySet<string> }>> = {
   python: {
-    roots: /^(?:os|shutil|subprocess|pathlib|io|socket|ctypes|importlib|signal|tempfile)$/,
-    allowed: new Set(["os.environ", "os.environ.get", "os.sep", "os.linesep", "os.name", "os.curdir", "os.path.*", "os.listdir", "os.getcwd"]),
+    // Importable reader modules are roots too, so an uncalled two-level
+    // reference (`key=platform.os.system`) is held to the allowlist.
+    roots: /^(?:os|sys|shutil|subprocess|pathlib|io|socket|ctypes|importlib|signal|tempfile|json|re|math|datetime|hashlib|base64|platform|struct|string|textwrap|collections|itertools|functools|pprint|csv|tomllib|time|statistics|decimal|fractions)$/,
+    allowed: new Set(PYTHON_OS_SYS_READERS),
   },
   node: {
     roots: /^(?:fs|process|child_process)$/,
@@ -2303,6 +2478,52 @@ function namesIn(text: string): string[] {
   return text.match(/[A-Za-z_$][\w$]*/g) ?? [];
 }
 
+/**
+ * Targets of `=`/`op=`/`:=` assignments: the root identifier and whether a
+ * member or subscript follows it. Driven by each operator with a bounded
+ * backward walk, so long spaced member chains stay linear.
+ */
+function assignmentTargets(view: string): { root: string; member: boolean; operatorEnd: number }[] {
+  const targets: { root: string; member: boolean; operatorEnd: number }[] = [];
+  for (let i = 0; i < view.length; i++) {
+    if (view[i] !== "=") continue;
+    const next = view[i + 1];
+    if (next === "=" || next === ">" || next === "~") { i++; continue; }
+    const previous = view[i - 1] ?? "";
+    if ("=!<>".includes(previous) && previous !== "") continue;
+    let cursor = "+-*/|&:".includes(previous) && previous !== "" ? i - 2 : i - 1;
+    const limit = Math.max(0, i - 256);
+    let member = false;
+    let root: string | null = null;
+    while (cursor >= limit) {
+      cursor = skipBackSpaces(view, cursor);
+      if (cursor < limit) break;
+      if (view[cursor] === "]") {
+        let open = cursor - 1;
+        while (open >= limit && view[open] !== "[" && view[open] !== "]" && view[open] !== "\n") open--;
+        if (open < limit || view[open] !== "[") break;
+        member = true;
+        cursor = open - 1;
+        continue;
+      }
+      let start = cursor;
+      while (start >= limit && /[\w$]/.test(view[start]!)) start--;
+      if (start === cursor) break;
+      const word = view.slice(start + 1, cursor + 1);
+      const before = skipBackSpaces(view, start);
+      if (before >= limit && view[before] === ".") {
+        member = true;
+        cursor = before - 1;
+        continue;
+      }
+      if (/^[A-Za-z_$]/.test(word)) root = word;
+      break;
+    }
+    if (root) targets.push({ root, member, operatorEnd: i + 1 });
+  }
+  return targets;
+}
+
 /** Names bound by assignment/declaration/parameters, used for local receivers and rebinding. */
 function boundNames(
   view: string,
@@ -2316,12 +2537,11 @@ function boundNames(
   const add = (list: string[]) => { for (const name of list) names.add(name); };
   let rebound: string | null = null;
   // Member/subscript assignment rebinds its root: `json.load = os.remove`.
-  const assignment = /(?<![\w.$])([A-Za-z_$][\w$]*)((?:\s*\.\s*[\w$]+|\s*\[[^\]\n]{0,256}\])*)\s*(?:=(?![=>~])|[-+*/|&]=|:=)/g;
   const fsRequire = (at: number) => /^\s*require\s*\(\s*(['"])(?:node:)?fs\1\s*\)/.test(source.slice(at));
-  for (const match of view.matchAll(assignment)) {
-    if (match[2]) { names.add(`${match[1]}.`); continue; }
-    if (language === "node" && match[1] === "fs" && fsRequire(match.index! + match[0].length)) continue;
-    names.add(match[1]!);
+  for (const target of assignmentTargets(view)) {
+    if (target.member) { names.add(`${target.root}.`); continue; }
+    if (language === "node" && target.root === "fs" && fsRequire(target.operatorEnd)) continue;
+    names.add(target.root);
   }
   if (language === "python") {
     for (const match of view.matchAll(/\b(?:as|def|class)\s+([A-Za-z_]\w*)/g)) names.add(match[1]!);
@@ -2382,15 +2602,24 @@ function nextNonSpace(view: string, index: number): number {
 function interpreterReaderViolation(payload: string, language: InterpolationLanguage): string | null {
   const allowlist = READER_ALLOWLISTS[language];
   const syntax = { hashComments: language !== "node", slashComments: language === "node" || language === "php" };
-  let view = executableLanguageView(payload, language);
+  const details: LanguageViewDetails = { shellBodies: [] };
+  let view = executableLanguageView(payload, language, details);
   if (view === null) return `${language} eval payload`;
   if (language === "ruby" || language === "perl") {
     const masked = maskRegexLiterals(payload, view, language);
     if (masked.violation) return masked.violation;
     view = masked.view;
   }
+  // Backtick/qx/%x bodies run a shell whatever they contain; the view has
+  // already masked them, so check them before anything reads as data.
+  if (details.shellBodies.length > 0) return `${language} shell command`;
+  if (language === "ruby" && /%x[^\w\s]/.test(view)) return "%x";
   const forbidden = allowlist.forbidden.exec(view);
   if (forbidden) return forbidden[0];
+  if (language === "python") {
+    const unimportable = pythonImportViolation(view);
+    if (unimportable) return `import ${unimportable.slice(0, 64)}`;
+  }
 
   if (language === "perl") return perlReaderViolation(payload, view, allowlist);
 
@@ -2398,7 +2627,7 @@ function interpreterReaderViolation(payload: string, language: InterpolationLang
     : language === "php" ? /[)\]]\s*\(|\$\w*\s*\(/.exec(view)
     : /[)\]]\s*\(/.exec(view);
   if (computed) return `${language} computed call`;
-  if ((language === "node" || language === "php") && /\bnew\s+[A-Za-z_\\]/.test(view)) return "new";
+  if ((language === "node" || language === "php") && /\bnew\s+(?!Date\b)[A-Za-z_\\]/.test(view)) return "new";
 
   const bound = boundNames(view, payload, language);
   if (bound.rebound) return bound.rebound;
@@ -2541,6 +2770,29 @@ function perlReaderViolation(payload: string, view: string, allowlist: ReaderAll
   return null;
 }
 
+/** The first module a Python import names that is not a known stdlib reader. */
+function pythonImportViolation(view: string): string | null {
+  for (const match of view.matchAll(/\bimport\b/g)) {
+    const index = match.index!;
+    // `from M import …`: M is the dotted word before `import`, after `from`.
+    const moduleEnd = skipBackSpaces(view, index - 1);
+    let moduleStart = moduleEnd;
+    while (moduleStart >= 0 && /[\w.]/.test(view[moduleStart]!)) moduleStart--;
+    const fromEnd = skipBackSpaces(view, moduleStart);
+    if (trailingWord(view, fromEnd) === "from" && moduleEnd > moduleStart) {
+      const module = view.slice(moduleStart + 1, moduleEnd + 1);
+      if (!PYTHON_IMPORTABLE.has(module)) return module;
+      continue;
+    }
+    const statement = view.slice(index + "import".length, index + "import".length + 256).split(/[;\n)]/)[0]!;
+    for (const item of statement.split(",")) {
+      const module = item.trim().replace(/\s+as\s+\w+$/, "");
+      if (!PYTHON_IMPORTABLE.has(module)) return module || "*";
+    }
+  }
+  return null;
+}
+
 /** Whether `index` falls inside a Python `import …` / `from … import …` statement. */
 function pythonImportStatementAt(view: string, index: number): boolean {
   const statementStart = Math.max(view.lastIndexOf(";", index), view.lastIndexOf("\n", index)) + 1;
@@ -2559,7 +2811,7 @@ function moduleReferenceViolation(
   const chain = parts.join(".");
   if (parts.length > 1) {
     const allow: ReaderAllowlist = { ...READER_ALLOWLISTS[language], calls: allowed };
-    return allowlistedCall(chain, allow) ? null : chain;
+    return allowlistedCall(chain, allow) || allowlistedCall(chain, READER_ALLOWLISTS[language]) ? null : chain;
   }
   if (language === "python") {
     // A bare module name is only safe inside its import statement; any alias
@@ -3549,9 +3801,27 @@ function findDestructiveTokenInternal(cmd: string, depth: number): string | null
       if (writerSource === null) return `${head} eval payload`;
       const writer = EVAL_WRITER_RE.exec(writerSource);
       if (writer) return writer[0].trim();
-      if (EVAL_INTERPRETERS.has(head)) {
-        const unlisted = interpreterReaderViolation(interpreterEvalPrograms(segment) ?? writerPayload, language);
-        if (unlisted) return `${head} eval: ${unlisted}`;
+    }
+    // The allowlist runs on programs extracted with the interpreter's own
+    // option grammar, independent of isEvalInvocation's spellings (`perl -E`,
+    // `python3 -Ic`, `node --eval=`), and re-runs the writer screens on them.
+    if (EVAL_INTERPRETERS.has(head)) {
+      const extracted = interpreterEvalPrograms(segment);
+      if (extracted.kind === "violation") return `${head} eval: ${extracted.reason}`;
+      if (extracted.kind === "eval") {
+        const language = interpreterLanguage(head);
+        const programs = extracted.join ? [extracted.programs.join("\n")] : extracted.programs;
+        for (const program of programs) {
+          if (program.length > MAX_LANGUAGE_ARGUMENT_LENGTH) return `${head} eval payload`;
+          const writer = scanLanguagePayload(program, language, { depth: 0, shellBodies: new Set(), shellBodyCount: 0 });
+          if (writer) return writer;
+          const view = executableLanguageView(program, language);
+          if (view === null) return `${head} eval payload`;
+          const fsWriter = EVAL_WRITER_RE.exec(view);
+          if (fsWriter) return fsWriter[0].trim();
+          const unlisted = interpreterReaderViolation(program, language);
+          if (unlisted) return `${head} eval: ${unlisted}`;
+        }
       }
     }
   }

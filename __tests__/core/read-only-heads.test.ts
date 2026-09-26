@@ -45,6 +45,7 @@ const MORE_ESCAPES = [
   "less -So log f", "less -Olog f", "less --LOG-FILE=log f", "less --log=log f",
   // less: +cmd initial commands (`!` runs a shell), also via $LESS
   "less '+!touch x' f", "less '+|touch x' f", "LESS='+!touch x' less f", "LESS=So less f",
+  "less -k keys f", "less --lesskey-file=keys f", "less --lesskey-src=keys f", "less -kkeys f",
   "less \"+/x\n!touch y\" f", "LESSKEY_CONTENT='#env LESSOPEN=|touch' less f",
   // yq: in-place and split-exp
   "yq --inplace .a=1 f.yaml", "yq -Pi .a=1 f.yaml", "yq --split-exp .a f.yaml", "yq -s .a f.yaml",
