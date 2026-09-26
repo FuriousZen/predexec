@@ -76,10 +76,32 @@ export function inspectCommandSubstitutions(command: string): CommandSubstitutio
   return { bodies: inspected.bodies.map((body) => body.text), complete: inspected.complete };
 }
 
-function substitutionBodySpans(command: string): { bodies: SpannedBody[]; complete: boolean } {
+/**
+ * True for the body of `$(( … ))`: its first `(` closes at its last
+ * character. That is arithmetic expansion, not a command substitution of a
+ * subshell (POSIX requires a space for that: `$( (cmd) )`), so it runs no
+ * command itself; only substitutions nested inside it do.
+ */
+function isArithmeticBody(body: string): boolean {
+  return body.startsWith("(") && findParenSubstitutionClose(body, 1) === body.length - 1;
+}
+
+function substitutionBodySpans(command: string, depth = 0): { bodies: SpannedBody[]; complete: boolean } {
   const bodies: SpannedBody[] = [];
   let quote: "'" | '"' | null = null;
   let complete = true;
+  /** Record `$(`'s body, or for arithmetic `$((…))` the substitutions nested in it. */
+  const pushDollarBody = (start: number, close: number): boolean => {
+    const text = command.slice(start, close);
+    if (!isArithmeticBody(text)) {
+      bodies.push({ text, start, end: close });
+      return true;
+    }
+    if (depth >= 32) return false;
+    const nested = substitutionBodySpans(text, depth + 1);
+    for (const body of nested.bodies) bodies.push({ text: body.text, start: start + body.start, end: start + body.end });
+    return nested.complete;
+  };
   for (let i = 0; i < command.length; i++) {
     const ch = command[i]!;
     if (quote === "'") {
@@ -100,11 +122,8 @@ function substitutionBodySpans(command: string): { bodies: SpannedBody[]; comple
         }
       } else if (ch === "$" && command[i + 1] === "(") {
         const close = findParenSubstitutionClose(command, i + 2);
-        if (close === -1) return { bodies, complete: false };
-        else {
-          bodies.push({ text: command.slice(i + 2, close), start: i + 2, end: close });
-          i = close;
-        }
+        if (close === -1 || !pushDollarBody(i + 2, close)) return { bodies, complete: false };
+        i = close;
       }
       continue;
     }
@@ -132,10 +151,12 @@ function substitutionBodySpans(command: string): { bodies: SpannedBody[]; comple
     if ((ch === "$" || ch === "<" || ch === ">") && command[i + 1] === "(") {
       const close = findParenSubstitutionClose(command, i + 2);
       if (close === -1) return { bodies, complete: false };
-      else {
+      if (ch === "$") {
+        if (!pushDollarBody(i + 2, close)) return { bodies, complete: false };
+      } else {
         bodies.push({ text: command.slice(i + 2, close), start: i + 2, end: close });
-        i = close;
       }
+      i = close;
     }
   }
   if (quote !== null) complete = false;
@@ -1814,16 +1835,33 @@ function sourceWordExpands(source: string): boolean {
 }
 
 /**
- * True when a segment's effective command name (after assignments, `env` and
- * wrappers) is not a literal: it holds a parameter expansion, a command
- * substitution or backtick, or a glob/brace expansion. The program such a
- * word runs is decided at run time (`$c`, `$(printf rm)`, `/bin/r?`), so no
- * static check can vouch for it. Arguments are never inspected. A segment
- * whose head cannot be placed at all is false here; callers already treat it
- * as incomplete.
+ * Leading reserved words and group keywords (`if`, `then`, `while`, `do`, `!`,
+ * `{`, ...), each only as a whole word: `{r,}m` is a brace expansion, not a
+ * group, and `(` is left in place for the caller.
+ */
+const RESERVED_PREFIX_RE =
+  /^(?:(?:if|then|elif|else|fi|while|until|do|done|for|select|function|coproc)|[!{}])(?=\s|$)\s*/;
+
+/**
+ * True when a segment's effective command name (after reserved words,
+ * assignments, `env` and wrappers) is not a literal: it holds a parameter
+ * expansion, a command substitution or backtick, or a glob/brace expansion.
+ * The program such a word runs is decided at run time (`$c`, `$(printf rm)`,
+ * `/bin/r?`), so no static check can vouch for it. Arguments are never
+ * inspected. A segment opening with `(` names no command itself: a subshell's
+ * body is inspected as its own clause, and `(( … ))` / `$(( … ))` arithmetic
+ * runs nothing. A segment whose head cannot be placed at all is false here;
+ * callers already treat it as incomplete.
  */
 export function hasDynamicCommandName(segment: string): boolean {
-  const lex = lexShellWords(segment, ARGV);
+  let text = segment.trim();
+  for (let i = 0; i < 8; i++) {
+    const next = text.replace(RESERVED_PREFIX_RE, "");
+    if (next === text) break;
+    text = next;
+  }
+  if (text.startsWith("(")) return false;
+  const lex = lexShellWords(text, ARGV);
   const values = lex.words.map((word) => word.value);
   const normalized = normalizeEnvInvocation(values);
   if (!normalized.complete || normalized.argv.length === 0) return false;
@@ -1832,5 +1870,5 @@ export function hasDynamicCommandName(segment: string): boolean {
   // (a dynamic payload is already incomplete), so it is not dynamic.
   if (offset < 0 || values[offset] !== normalized.argv[0]) return false;
   const head = lex.words[offset]!;
-  return head.dynamic || sourceWordExpands(segment.slice(head.start, head.end));
+  return head.dynamic || sourceWordExpands(text.slice(head.start, head.end));
 }

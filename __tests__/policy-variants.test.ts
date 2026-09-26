@@ -91,12 +91,12 @@ describe.each(checkers)("dynamic command names never reach a run — %s", (_name
 describe("policyShellVariants — dynamic command names", () => {
   // The classifier already stops these as mutating; the policy layer must
   // also refuse on its own, so neither gate relies on the other.
-  it.each(["c=cat; $c .env", "${X:-cat} .env", "$(echo cat) .env", "echo \"$(sh -c '$c .env')\"", "{c,}at .env"])(
+  it.each(["c=cat; $c .env", "${X:-cat} .env", "$(echo cat) .env", "echo \"$(sh -c '$c .env')\"", "{c,}at .env", "( $c .env )", "if true; then $c .env; fi"])(
     "throws for %s", (command) => {
       expect(() => policyShellVariants(command)).toThrow(/command name/);
     });
 
-  it.each(["cat \"$HOME\"/.env", "ls $DIR", "echo $(cat README.md)"])("expansion in arguments is fine: %s", (command) => {
+  it.each(["cat \"$HOME\"/.env", "ls $DIR", "echo $(cat README.md)", "echo $((3*4))", "(( x*2 ))", "( cat f )"])("expansion in arguments is fine: %s", (command) => {
     expect(() => policyShellVariants(command)).not.toThrow();
   });
 });

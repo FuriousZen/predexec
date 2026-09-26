@@ -21,7 +21,7 @@ import { conditionStringBudget, evaluateConditionWithDetail, isInsideRoot } from
 import { READ_ONLY_TOOLS, MUTATING_TOOLS, findDestructiveToken } from "./destructive.ts";
 import { runNode, isToolOp, formatToolOpLabel } from "./runner.ts";
 import { ARGV, extractShellCommandClauses, hasDynamicCommandName, inspectCommandSubstitutionTree, normalizeEnvInvocation, splitCommandSegments, tokenizeShellWords } from "./shell/lexer.ts";
-import { shellEvalPayload, stripShellControlPrefix } from "./shell/interpreters.ts";
+import { shellEvalPayload } from "./shell/interpreters.ts";
 import { validateOperation } from "./validation.ts";
 import {
   DEFAULT_MAX_DEPTH,
@@ -380,7 +380,7 @@ export function policyShellVariants(command: string): string[] {
       for (const piece of splitCommandSegments(body)) {
         for (const clause of new Set([piece, ...extractShellCommandClauses(piece)])) {
           // No host rule can match a program chosen at run time (`$c .env`).
-          if (hasDynamicCommandName(clause) || hasDynamicCommandName(stripShellControlPrefix(clause))) {
+          if (hasDynamicCommandName(clause)) {
             throw new Error("unresolvable command name (an expansion in the command position)");
           }
           const argvForm = decodedArgvForm(clause);

@@ -1953,9 +1953,19 @@ describe("dynamic command names (final review #3)", () => {
     "/bin/r[m] -rf zz",
     "{r,}m -rf zz",
     "\"$HOME\"/bin/tool --flag",
+    "( $c zz )",
+    "(cd sub && $c zz)",
+    "{ $c zz; }",
+    "! $c zz",
   ])("mutating: %s", (c) => {
     expect(findDestructiveToken(c)).toBe("dynamic command name");
   });
+
+  // Arithmetic runs no command itself, but a substitution nested in it does.
+  it.each(["echo $(( $(rm zz) + 1 ))", "echo \"$(( `rm zz` ))\"", "echo $( (rm zz) )", "echo $(( $(( $(touch x) )) ))"])(
+    "mutating through arithmetic: %s", (c) => {
+      expect(isDestructiveCommand(c)).toBe(true);
+    });
 
   // Expansion in ARGUMENT positions stays data; only the command name matters.
   it.each([
@@ -1970,6 +1980,11 @@ describe("dynamic command names (final review #3)", () => {
     "ls *.ts",
     "cat '$literal'",
     "\\$not-expanded",
+    // Arithmetic is not a command name, even with a `*` in it.
+    "echo $((3*4))",
+    "(( x*2 ))",
+    "x=$((y*2)); echo $x",
+    "( cat f )",
   ])("read-only: %s", (c) => {
     expect(findDestructiveToken(c)).toBeNull();
   });

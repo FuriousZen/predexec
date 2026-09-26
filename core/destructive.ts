@@ -417,10 +417,7 @@ function findDestructiveTokenInternal(cmd: string, depth: number): string | null
   // A command name produced by expansion (`$c`, `$(printf rm)`, `/bin/r?`)
   // can be any program; nothing below can vouch for it.
   for (const segment of segments) {
-    // Unstripped too: the prefix stripper also eats a brace expansion's `{`.
-    if (hasDynamicCommandName(segment) || hasDynamicCommandName(stripShellControlPrefix(segment))) {
-      return "dynamic command name";
-    }
+    if (hasDynamicCommandName(segment)) return "dynamic command name";
   }
 
   // An environment variable that makes a later reader run a command
