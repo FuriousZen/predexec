@@ -342,7 +342,11 @@ function raceAbort(verdict: PolicyVerdict | Promise<PolicyVerdict>, signal: Abor
   });
 }
 
-/** Nesting bound for `sh -c "bash -c '...'"` expansion in policyShellVariants. */
+/**
+ * Nesting bound for `sh -c "bash -c '...'"` expansion in policyShellVariants.
+ * A termination bound, never an allow: a payload nested deeper throws, and the
+ * caller turns the throw into a policyStop.
+ */
 const MAX_POLICY_SHELL_DEPTH = 8;
 
 /**
@@ -354,7 +358,8 @@ const MAX_POLICY_SHELL_DEPTH = 8;
  * wrappers dropped, head reduced to its basename (`/usr/bin/env '/bin/cat'
  * .env` → `cat .env`). The command itself is not included, and nothing is
  * returned for a command with neither form. Throws (fail closed) when the
- * substitution tree cannot be fully inspected.
+ * substitution tree cannot be fully inspected or the shell nesting exceeds
+ * MAX_POLICY_SHELL_DEPTH.
  */
 function policyShellVariants(command: string): string[] {
   const variants: string[] = [];
@@ -377,7 +382,10 @@ function policyShellVariants(command: string): string[] {
           const argvForm = decodedArgvForm(clause);
           if (argvForm !== null) add(argvForm);
           const shell = shellEvalPayload(clause);
-          if (shell?.payload == null || depth >= MAX_POLICY_SHELL_DEPTH) continue;
+          if (shell?.payload == null) continue;
+          if (depth >= MAX_POLICY_SHELL_DEPTH) {
+            throw new Error(`shell nesting deeper than ${MAX_POLICY_SHELL_DEPTH} levels cannot be inspected for policy`);
+          }
           for (const inner of splitCommandSegments(shell.payload)) {
             // A clause can surface both as a tree body and as a clause of its
             // parent; expanding it once keeps the walk linear.

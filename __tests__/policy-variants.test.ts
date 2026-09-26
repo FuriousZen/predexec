@@ -60,4 +60,21 @@ describe.each(checkers)("policy variants through the engine — %s", (_name, mak
     const r = await run(nestShells(3), make());
     expect(r.stoppedReason).toBe("policyStop");
   });
+
+  it("nesting at the bound (8 levels) is still expanded, not refused", async () => {
+    const r = await run(nestShells(8).replace("cat .env", "echo ok"), make());
+    expect(r.stoppedReason).toBe("leaf");
+  });
+
+  it("nesting past the bound fails closed (9 levels)", async () => {
+    const r = await run(nestShells(9), make());
+    expect(r.stoppedReason).toBe("policyStop");
+    expect(r.transcript).not.toContain("SECRET=1");
+  });
+
+  it("nesting past the bound fails closed even when the innermost command is allowed", async () => {
+    const r = await run(nestShells(9).replace("cat .env", "echo ok"), make());
+    expect(r.stoppedReason).toBe("policyStop");
+    expect(r.transcript).toMatch(/policy check failed: .*nest/);
+  });
 });
