@@ -11,6 +11,9 @@ node_modules
 
 # build output — the published artifact (tsc -p tsconfig.build.json); tests build it on demand
 dist/
+# scripts/clean-build.mjs's scratch names, mid-swap or after a killed build
+dist.tmp/
+dist.stale-*/
 *.tsbuildinfo
 
 # pnpm writes this locally with unresolved `allowBuilds` placeholders; it is

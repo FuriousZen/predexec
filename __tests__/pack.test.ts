@@ -131,6 +131,35 @@ describe("packed artifact verification", () => {
     expect(list.some((p) => /^adapter-runtime\.ts$/.test(p))).toBe(false);
   });
 
+  /**
+   * `pnpm run build` (scripts/clean-build.mjs) now compiles into a scratch
+   * dir and atomically swaps it in as `dist/`, specifically so a stale file a
+   * PAST source layout emitted (e.g. the pre-Task-5 `dist/command-inspection.js`,
+   * from before that module moved into `core/shell/`) can never survive a
+   * rebuild — a plain in-place `tsc` only ever adds or overwrites, so it never
+   * would have caught this on its own. `dist/` mirrors the source tree
+   * exactly (verified: every current `dist/**\/*.js` maps 1:1 to a same-named
+   * `.ts` one level up), so this asserts that invariant directly on the
+   * packed artifact — the release-hygiene backstop if the build script ever
+   * regresses.
+   */
+  it("every packaged dist/ .js file maps to a real source .ts file (catches stale compiled output)", () => {
+    const distRoot = join(extractDir, "dist");
+    const jsFiles: string[] = [];
+    const walk = (dir: string) => {
+      for (const entry of readdirSync(dir)) {
+        const full = join(dir, entry);
+        if (statSync(full).isDirectory()) walk(full);
+        else if (entry.endsWith(".js")) jsFiles.push(full.slice(distRoot.length + 1));
+      }
+    };
+    walk(distRoot);
+    expect(jsFiles.length).toBeGreaterThan(0);
+
+    const orphaned = jsFiles.filter((rel) => !existsSync(join(root, rel.replace(/\.js$/, ".ts"))));
+    expect(orphaned).toEqual([]);
+  });
+
   it("no packaged runtime JS file imports .ts or jiti", () => {
     const getFiles = (dir: string): string[] => {
       const entries = readdirSync(dir);
