@@ -205,3 +205,18 @@ describe("substitutions used directly as variable names (R12)", () => {
   it.each(R12_MUTATING)("mutating: %s", (c) => expect(isDestructiveCommand(c)).toBe(true));
   it.each(R12_READ_ONLY)("read-only: %s", (c) => expect(isDestructiveCommand(c)).toBe(false));
 });
+
+// Fix round 2: declare-family data operands, wait clusters, mapfile callbacks (R13).
+const ROUND2_MUTATING = [
+  "declare \"$(cat f)\"", "declare $(cat f)", "declare -- \"$(cat f)\"", "declare -a \"$(cat f)\"",
+  "g() { local $(cat f); }; g", "bash -c 'declare \"$(cat f)\"'", "c=$(cat f); declare \"$c\"",
+  "c=$(cat f); wait -np \"$c\"", "c=$(cat f); wait -fp \"$c\"", "wait -np \"$(cat f)\"",
+  "c=$(cat f); mapfile -C \"$c\" -c 1 arr < f", "mapfile -C \"$(cat f)\" -c 1 arr < f",
+  "c=$(cat f); readarray -C \"$c\" < f", "mapfile -C\"$(cat f)\" arr < f",
+];
+const ROUND2_READ_ONLY = ["declare -a arr", "local x=5", "declare -p literal", "mapfile -t arr < f"];
+
+describe("taint fix round 2", () => {
+  it.each(ROUND2_MUTATING)("mutating: %s", (c) => expect(isDestructiveCommand(c)).toBe(true));
+  it.each(ROUND2_READ_ONLY)("read-only: %s", (c) => expect(isDestructiveCommand(c)).toBe(false));
+});

@@ -19,7 +19,10 @@
  * `printf -v "$c"`, `read "$c"` (and `-a`), `getopts o "$c"`,
  * `declare|typeset|local|export|readonly "$c=…"`, bare `export|readonly "$c"`,
  * `declare -p "$c"`, and (sh only) `unset -f "$c"`. These do not: `test -v`/
- * `[ -v`, and bare `declare|local "$c"`. Namerefs (`declare -n r=$c`, which
+ * `[ -v`, and bare `declare|local "$c"` — but data can hold `=`, turning the
+ * latter into the evaluating `"$c=1"` form, so every declare-family operand
+ * built from data is flagged. `mapfile -C CALLBACK` evaluates its callback as
+ * a command and is always flagged. Namerefs (`declare -n r=$c`, which
  * bash 3.2 rejects) and plain `unset "$c"` did not evaluate on 3.2 either, but
  * are flagged fail-closed for bash >= 4.3 semantics (the Linux default), where
  * array subscripts in them are evaluated — unverifiable on this 3.2 host.
@@ -301,6 +304,8 @@ interface Flow {
   substitution: boolean;
   /** A command substitution's output used directly as a variable-name operand. */
   nameSubstitution: boolean;
+  /** `mapfile`/`readarray -C`: a callback evaluated as a command. */
+  callback: boolean;
   /** Functions this command defines, and the commands it calls with data arguments. */
   functions: Set<string>;
   dataCalls: Set<string>;
@@ -328,7 +333,7 @@ function recordAssignment(flow: Flow, segment: string, word: ShellWord, intDecla
   if (!substitutions.complete || substitutions.bodies.length > 0) flow.sources.add(name);
   // `x=(*)`: an array's elements undergo expansion and globbing, so a glob or
   // expansion in one fills the array with data (filenames, split output).
-  if (value.startsWith("(") && /[*?$`]|\[(?![^\]\s]*\]=)/.test(rawValue.slice(1))) flow.sources.add(name);
+  if (value.startsWith("(") && arrayElementsExpand(rawValue)) flow.sources.add(name);
   const values = identifiers(rawValue);
   for (const from of values) addDependency(flow, name, from);
   flow.assignments.push({ name, values });
@@ -337,6 +342,29 @@ function recordAssignment(flow: Flow, segment: string, word: ShellWord, intDecla
     flow.arithmetic.push(...values);
   }
   return true;
+}
+
+/**
+ * True when an `( … )` array value holds a glob (`*`, `?`, a `[` that is not
+ * an `[index]=` prefix), a `$` expansion or a backtick. One forward pass: a
+ * `[` scans ahead to the next `]` or blank and resumes there, so every
+ * character is visited once.
+ */
+function arrayElementsExpand(rawValue: string): boolean {
+  for (let i = 1; i < rawValue.length; i++) {
+    const ch = rawValue[i]!;
+    if (ch === "*" || ch === "?" || ch === "$" || ch === "`") return true;
+    if (ch !== "[") continue;
+    let j = i + 1;
+    for (; j < rawValue.length; j++) {
+      const inner = rawValue[j]!;
+      if (inner === "]" || /\s/.test(inner)) break;
+      if (inner === "*" || inner === "?" || inner === "$" || inner === "`") return true;
+    }
+    if (rawValue[j] !== "]" || rawValue[j + 1] !== "=") return true;
+    i = j + 1;
+  }
+  return false;
 }
 
 function taintIdentifierWords(flow: Flow, words: readonly ShellWord[]): void {
@@ -468,6 +496,9 @@ function recordNameOperands(flow: Flow, segment: string, command: string, args: 
       break;
     case "mapfile":
     case "readarray":
+      // `-C CALLBACK` is evaluated as a command for every quantum of lines:
+      // fail closed on any callback, literal or not (R13).
+      if (args.some((word) => /^-[A-Za-z]*C/.test(word.value))) flow.callback = true;
       // bash 4+: the array name operand is parsed as a name. Flagged fail-closed.
       for (let i = 0; i < args.length; i++) {
         const value = args[i]!.value;
@@ -479,7 +510,7 @@ function recordNameOperands(flow: Flow, segment: string, command: string, args: 
     case "wait":
       // bash 5.1+: `wait -p NAME` assigns NAME. Flagged fail-closed.
       for (let i = 0; i < args.length; i++) {
-        if (args[i]!.value === "-p") name(args[i + 1]);
+        if (/^-[fn]*p$/.test(args[i]!.value)) name(args[i + 1]); // `-p`, `-np`, `-fp`
         else if (/^-[fn]*p./.test(args[i]!.value)) name(args[i]);
       }
       break;
@@ -496,18 +527,17 @@ function recordNameOperands(flow: Flow, segment: string, command: string, args: 
     case "local":
     case "export":
     case "readonly": {
-      // A bare name is only parsed as one by export/readonly and `-p`, and a
-      // nameref (`-n`) also resolves its value as a name. Namerefs are flagged
+      // A bare operand counts too, for every head: data can hold `=`, which
+      // turns `declare "$c"` into the `declare "$c=1"` assignment form. A
+      // nameref (`-n`) also resolves its value as a name; namerefs are flagged
       // for bash >= 4.3 semantics (bash 3.2 has no `-n`).
       const nameref = options.some((option) => /^-[A-Za-z]*n/.test(option));
-      const bareIsName = nameref || command === "export" || command === "readonly" ||
-        options.some((option) => /^-[A-Za-z]*p/.test(option));
       for (const word of args) {
         if (/^[-+]/.test(word.value)) continue;
         const raw = rawWord(segment, word);
         const equals = raw.indexOf("=");
         if (equals === -1) {
-          if (bareIsName) nameText(raw);
+          nameText(raw);
           continue;
         }
         nameText(raw.slice(0, equals));
@@ -554,6 +584,7 @@ export function findTaintedEvaluation(command: string): string | null {
     nameReferences: [],
     substitution: false,
     nameSubstitution: false,
+    callback: false,
     functions: new Set(),
     dataCalls: new Set(),
     assignments: [],
@@ -564,6 +595,7 @@ export function findTaintedEvaluation(command: string): string | null {
   for (const body of tree.commands) {
     for (const segment of splitCommandSegments(body)) scanSegment(flow, segment);
   }
+  if (flow.callback) return "mapfile callback evaluates a command";
   if (ranges.substitution || flow.substitution) return "arithmetic over command substitution output";
   if (ranges.nameSubstitution || flow.nameSubstitution) return "command substitution output used as a variable name";
   for (const { name, values } of flow.assignments) {

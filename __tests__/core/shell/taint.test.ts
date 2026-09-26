@@ -126,7 +126,7 @@ const TAINTED_NAMES: Array<[string, string]> = [
 // or no data-derived name is involved.
 const CLEAN_NAMES = [
   "c=$(cat f); echo \"$c\"", "echo ${!prefix*}", "echo ${!prefix@}", "declare -n r=literal",
-  "c=$(cat f); echo ${!c[@]}", "c=$(cat f); declare \"$c\"", "c=$(cat f); f(){ local \"$c\"; }; f",
+  "c=$(cat f); echo ${!c[@]}",
   "c=$(cat f); test -v \"$c\"", "c=$(cat f); read -p \"$c\" x",
   "c=lit; echo ${!c}", "c=lit; printf -v \"$c\" x",
 ];
@@ -242,5 +242,50 @@ describe("substitutions used directly as variable names (R12)", () => {
   });
   it.each(SUBSTITUTED_VALUES)("clean: %s", (command) => {
     expect(findTaintedEvaluation(command)).toBeNull();
+  });
+});
+
+// Fix round 2. Data can hold `=`, so any declare-family operand built from
+// data is the already-flagged `declare "$c=1"` shape.
+const ROUND2_NAMES: Array<[string, string]> = [
+  ["c=$(cat f); declare \"$c\"", "data-derived variable c used as a variable name"],
+  ["c=$(cat f); f(){ local \"$c\"; }; f", "data-derived variable c used as a variable name"],
+  ["c=$(cat f); declare -a \"$c\"", "data-derived variable c used as a variable name"],
+  ["c=$(cat f); typeset $c", "data-derived variable c used as a variable name"],
+  ["declare \"$(cat f)\"", "command substitution output used as a variable name"],
+  ["declare $(cat f)", "command substitution output used as a variable name"],
+  ["declare -- \"$(cat f)\"", "command substitution output used as a variable name"],
+  ["declare -a \"$(cat f)\"", "command substitution output used as a variable name"],
+  ["g() { local $(cat f); }; g", "command substitution output used as a variable name"],
+  // wait option clusters
+  ["c=$(cat f); wait -np \"$c\"", "data-derived variable c used as a variable name"],
+  ["c=$(cat f); wait -fp \"$c\"", "data-derived variable c used as a variable name"],
+  ["wait -np \"$(cat f)\"", "command substitution output used as a variable name"],
+  // R13: a mapfile/readarray callback is evaluated as a command
+  ["c=$(cat f); mapfile -C \"$c\" -c 1 arr < f", "mapfile callback evaluates a command"],
+  ["mapfile -C \"$(cat f)\" -c 1 arr < f", "mapfile callback evaluates a command"],
+  ["c=$(cat f); readarray -C \"$c\" < f", "mapfile callback evaluates a command"],
+  ["mapfile -C\"$(cat f)\" arr < f", "mapfile callback evaluates a command"],
+  ["mapfile -tC echo arr < f", "mapfile callback evaluates a command"],
+  ["mapfile -C echo -c 1 arr < f", "mapfile callback evaluates a command"],
+];
+const ROUND2_CLEAN = ["declare -a arr", "local x=5", "declare -p literal", "mapfile -t -c 1 arr < f", "wait -n"];
+
+describe("fix round 2: declare-family operands, wait clusters, mapfile callbacks", () => {
+  it.each(ROUND2_NAMES)("tainted: %s", (command, reason) => {
+    expect(findTaintedEvaluation(command)).toBe(reason);
+  });
+  it.each(ROUND2_CLEAN)("clean: %s", (command) => {
+    expect(findTaintedEvaluation(command)).toBeNull();
+  });
+  it("scans a glob-array assignment in linear time", () => {
+    // Each `[` used to rescan the rest of the value; a linear scan finishes
+    // 32k of them far inside this generous guard.
+    const many = `x=(${"[".repeat(32_000)}); echo $((x))`;
+    const started = performance.now();
+    expect(findTaintedEvaluation(many)).toBe("arithmetic over data-derived variable x");
+    expect(performance.now() - started).toBeLessThan(10_000);
+    expect(findTaintedEvaluation("x=([0]=a [1]=b); echo $((x))")).toBeNull();
+    expect(findTaintedEvaluation("x=(a[0-9]); echo $((x))")).toBe("arithmetic over data-derived variable x");
   });
 });
