@@ -17,7 +17,7 @@
  */
 
 import { isAbsolute, relative, resolve, sep } from "node:path";
-import { conditionStringBudget, evaluateConditionWithDetail } from "./conditions.ts";
+import { conditionStringBudget, evaluateConditionWithDetail, isInsideRoot } from "./conditions.ts";
 import { READ_ONLY_TOOLS, MUTATING_TOOLS, findDestructiveToken } from "./destructive.ts";
 import { runNode, isToolOp, formatToolOpLabel } from "./runner.ts";
 import { validateOperation } from "./validation.ts";
@@ -133,7 +133,7 @@ export async function runPlanTree(plan: PlanTree, opts: RunOptions): Promise<Cor
     const misses: string[] = [];
     for (const edge of edges) {
       edgesEvaluated++;
-      const { result: matched, detail } = evaluateConditionWithDetail(output, edge.when, effectiveCwd);
+      const { result: matched, detail } = evaluateConditionWithDetail(output, edge.when, effectiveCwd, opts.cwd);
       if (matched) {
         edgesMatched++;
         next = byId.get(edge.to)!;
@@ -160,8 +160,7 @@ export function resolvePlanCwd(sessionRoot: string, planCwd?: string): { cwd: st
     return { error: "cwd must be a relative directory inside the session root" };
   }
   const cwd = resolve(sessionRoot, planCwd);
-  const rel = relative(sessionRoot, cwd);
-  if (rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
+  if (!isInsideRoot(sessionRoot, cwd)) {
     return { error: "cwd must be a relative directory inside the session root" };
   }
   return { cwd };

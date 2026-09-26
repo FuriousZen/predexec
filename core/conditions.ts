@@ -13,8 +13,8 @@
  * per added character. isSafeRegex screens those out — see below.
  */
 
-import { existsSync } from "node:fs";
-import { isAbsolute, resolve } from "node:path";
+import { existsSync, realpathSync } from "node:fs";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import {
   MAX_CONDITION_LENGTH,
   MAX_CONDITION_TOTAL_LENGTH,
@@ -211,6 +211,8 @@ interface RegexAtom {
   first: RegexCharSet;
   optional: boolean;
   quantifiedOpenEnded: boolean;
+  /** Characters the open-ended part can keep consuming ("unknown" when not tracked). */
+  openSet: RegexCharSet;
 }
 
 interface RegexSequence {
@@ -218,6 +220,8 @@ interface RegexSequence {
   nullable: boolean;
   first: RegexCharSet;
   endsOpenEnded: boolean;
+  /** openSet of the atom that makes the sequence end open-ended. */
+  tail: RegexCharSet;
 }
 
 const ASCII_DIGITS = new Set("0123456789");
@@ -307,16 +311,32 @@ function classSet(body: string): RegexCharSet {
   return chars;
 }
 
-function readQuantifier(source: string, start: number): { next: number; optional: boolean; openEnded: boolean } {
+interface RegexQuantifier {
+  next: number;
+  optional: boolean;
+  /** Variable-length repetition: `+`, `*`, `{n,}`, or `{n,m}` with m > n and m >= 2. */
+  openEnded: boolean;
+  /** Can match its atom two or more times: openEnded, or an exact `{n}` with n >= 2. */
+  repeats: boolean;
+}
+
+function readQuantifier(source: string, start: number): RegexQuantifier {
+  const none = { next: start, optional: false, openEnded: false, repeats: false };
   const ch = source[start];
-  if (ch === "+" || ch === "*") return { next: start + 1, optional: ch === "*", openEnded: true };
-  if (ch === "?") return { next: start + 1, optional: true, openEnded: false };
-  if (ch !== "{") return { next: start, optional: false, openEnded: false };
-  const end = source.indexOf("}", start + 1);
-  if (end < 0) return { next: start, optional: false, openEnded: false };
-  const quantifier = source.slice(start + 1, end);
-  const min = Number.parseInt(quantifier.split(",", 1)[0] ?? "", 10);
-  return { next: end + 1, optional: min === 0, openEnded: quantifier.endsWith(",") };
+  let q: RegexQuantifier;
+  if (ch === "+" || ch === "*") q = { next: start + 1, optional: ch === "*", openEnded: true, repeats: true };
+  else if (ch === "?") q = { next: start + 1, optional: true, openEnded: false, repeats: false };
+  else if (ch === "{") {
+    const match = /^\{(\d+)(,(\d*))?\}/.exec(source.slice(start));
+    if (!match) return none;
+    const min = Number.parseInt(match[1]!, 10);
+    const max = match[2] === undefined ? min : match[3] === "" ? Infinity : Number.parseInt(match[3]!, 10);
+    const openEnded = max > min && max >= 2;
+    q = { next: start + match[0].length, optional: min === 0, openEnded, repeats: openEnded || max >= 2 };
+  } else return none;
+  // Lazy modifier (`+?`, `{2,}?`) does not change what can match.
+  if (source[q.next] === "?") q.next += 1;
+  return q;
 }
 
 function parseSequence(source: string): RegexSequence {
@@ -334,6 +354,8 @@ function parseSequence(source: string): RegexSequence {
     let atomFirst: RegexCharSet;
     let nestedNullable = false;
     let nestedEndsOpenEnded = false;
+    let nestedTail: RegexCharSet = "unknown";
+    let isGroup = false;
     if (ch === "\\") {
       atomFirst = escapeSet(source[i + 1] ?? "");
       i += 2;
@@ -357,6 +379,8 @@ function parseSequence(source: string): RegexSequence {
         atomFirst = nested.first;
         nestedNullable = nested.nullable;
         nestedEndsOpenEnded = nested.endsOpenEnded;
+        nestedTail = nested.tail;
+        isGroup = true;
         i = end + 1;
       }
     } else {
@@ -366,14 +390,24 @@ function parseSequence(source: string): RegexSequence {
     const quantifier = readQuantifier(source, i);
     i = quantifier.next;
     const optional = quantifier.optional || nestedNullable;
-    atoms.push({ first: atomFirst, optional, quantifiedOpenEnded: quantifier.openEnded || nestedEndsOpenEnded });
+    // A quantified group can keep consuming any character in its body, which is
+    // not tracked, so its open set is "unknown" (overlaps everything).
+    const openSet: RegexCharSet = !quantifier.openEnded ? nestedTail : isGroup ? "unknown" : atomFirst;
+    atoms.push({ first: atomFirst, optional, quantifiedOpenEnded: quantifier.openEnded || nestedEndsOpenEnded, openSet });
     if (firstCanContinue) {
       first = unionCharSets(first, atomFirst);
       firstCanContinue = optional;
     }
     if (!optional) nullable = false;
   }
-  return { atoms, nullable, first, endsOpenEnded: atoms.at(-1)?.quantifiedOpenEnded ?? false };
+  const last = atoms.at(-1);
+  return {
+    atoms,
+    nullable,
+    first,
+    endsOpenEnded: last?.quantifiedOpenEnded ?? false,
+    tail: last?.quantifiedOpenEnded ? last.openSet : new Set(),
+  };
 }
 
 function parseAlternativesSequence(body: string): RegexSequence {
@@ -381,13 +415,15 @@ function parseAlternativesSequence(body: string): RegexSequence {
   let first: RegexCharSet = new Set();
   let nullable = false;
   let endsOpenEnded = false;
+  let tail: RegexCharSet = new Set();
   for (const alternative of alternatives) {
     const shape = parseSequence(alternative);
     first = unionCharSets(first, shape.first);
     nullable ||= shape.nullable;
     endsOpenEnded ||= shape.endsOpenEnded;
+    tail = unionCharSets(tail, shape.tail);
   }
-  return { atoms: [], nullable, first, endsOpenEnded };
+  return { atoms: [], nullable, first, endsOpenEnded, tail };
 }
 
 function ambiguousAlternation(body: string): boolean {
@@ -413,6 +449,42 @@ function ambiguousAlternation(body: string): boolean {
   return false;
 }
 
+/**
+ * Can one input be split across the repetitions of a repeated group body in
+ * more than one way? That holds when an open-ended atom (`x+`, `x*`, `x{n,}`,
+ * or a nested group whose body ends open-ended) is followed — through optional
+ * atoms and fixed atoms over overlapping characters — by either another
+ * optional/open-ended atom over overlapping characters (`x+x+`, `x+x?`), or by
+ * the end of the body with the next repetition able to start on a character
+ * the open-ended atom could also have consumed (`(a+)+`, `(\w+\s?)+`).
+ *
+ * A disjoint fixed atom separates cleanly: `(?:\d+\.)+` and `(\.\d+){2}` have
+ * exactly one split, so they stay accepted.
+ */
+function ambiguousRepetition(body: string): boolean {
+  const shapes = splitAlternatives(body).map((alternative) => parseSequence(alternative));
+  let bodyFirst: RegexCharSet = new Set();
+  for (const shape of shapes) bodyFirst = unionCharSets(bodyFirst, shape.first);
+  for (const { atoms } of shapes) {
+    for (let i = 0; i < atoms.length; i++) {
+      if (!atoms[i]!.quantifiedOpenEnded) continue;
+      const open = atoms[i]!.openSet;
+      let separated = false;
+      for (let j = i + 1; j < atoms.length; j++) {
+        const next = atoms[j]!;
+        if (charSetsOverlap(open, next.quantifiedOpenEnded ? unionCharSets(next.first, next.openSet) : next.first)) {
+          if (next.optional || next.quantifiedOpenEnded) return true;
+        } else if (!next.optional) {
+          separated = true;
+          break;
+        }
+      }
+      if (!separated && charSetsOverlap(open, bodyFirst)) return true;
+    }
+  }
+  return false;
+}
+
 export function isSafeRegex(pattern: string): boolean {
   if (pattern.length > MAX_CONDITION_LENGTH) return false;
   let backslashParity = 0;
@@ -426,10 +498,9 @@ export function isSafeRegex(pattern: string): boolean {
     if (pattern[i] !== "(" || escaped) continue;
     const end = matchingParen(pattern, i);
     if (end < 0) continue;
-    const quantifier = readQuantifier(pattern, end + 1);
-    if (quantifier.next === end + 1 || !quantifier.openEnded && pattern[end + 1] !== "+" && pattern[end + 1] !== "*") continue;
+    if (!readQuantifier(pattern, end + 1).repeats) continue;
     const body = pattern.slice(i + 1, end).replace(/^\?(?::|[=!]|<[=!]?[^>]*>)/, "");
-    if (/(?:[+*]|\{\d+,\})\s*$/.test(body) || ambiguousAlternation(body)) return false;
+    if (ambiguousRepetition(body) || ambiguousAlternation(body)) return false;
   }
   return true;
 }
@@ -534,6 +605,37 @@ function quoteJsonString(value: string): string {
 }
 
 /**
+ * True when `target` is `root` or lies beneath it. Both paths must already be
+ * absolute and normalized; this is the one containment rule the engine uses
+ * for plan `cwd` and for condition paths.
+ */
+export function isInsideRoot(root: string, target: string): boolean {
+  const rel = relative(root, target);
+  return !(rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel));
+}
+
+/**
+ * Canonical path for containment checks: the realpath of the deepest existing
+ * ancestor (so a symlink inside the root that points outside it is caught, and
+ * a root reached through a symlink such as macOS /tmp still compares equal),
+ * with any not-yet-existing remainder appended lexically.
+ */
+function canonicalPath(path: string): string {
+  const missing: string[] = [];
+  let current = path;
+  for (;;) {
+    try {
+      return join(realpathSync(current), ...missing);
+    } catch {
+      const parent = dirname(current);
+      if (parent === current) return path;
+      missing.unshift(basename(current));
+      current = parent;
+    }
+  }
+}
+
+/**
  * Evaluate + explain in one pass. The `detail` string is what the engine echoes
  * into the transcript when NO edge matches, so the model can fix its condition
  * instead of guessing — a silent false is how authoring errors turn into
@@ -543,6 +645,8 @@ export function evaluateConditionWithDetail(
   output: NodeOutput,
   cond: Condition,
   cwd: string,
+  /** Paths are confined here; defaults to `cwd`. The engine passes the session root. */
+  sessionRoot: string = cwd,
 ): ConditionEvaluation {
   try {
     const conditionBudget = conditionStringBudget(cond, undefined);
@@ -557,12 +661,18 @@ export function evaluateConditionWithDetail(
       }
 
       case "fileExists": {
-        const target = isAbsolute(cond.path) ? cond.path : resolve(cwd, cond.path);
+        const label = `file ${cond.negate ? "missing" : "exists"} ${cond.path}`;
+        const target = resolve(cwd, cond.path);
+        // Refused either way, negate included: a plan must not probe the
+        // filesystem outside the session root through a condition.
+        if (!isInsideRoot(canonicalPath(resolve(sessionRoot)), canonicalPath(target))) {
+          return { result: false, detail: `${label} → false (${target} is outside session root)` };
+        }
         const exists = existsSync(target);
         const result = cond.negate ? !exists : exists;
         return {
           result,
-          detail: `file ${cond.negate ? "missing" : "exists"} ${cond.path} → ${result} (${target} ${exists ? "exists" : "is missing"})`,
+          detail: `${label} → ${result} (${target} ${exists ? "exists" : "is missing"})`,
         };
       }
 

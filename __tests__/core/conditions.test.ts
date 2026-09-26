@@ -1,4 +1,4 @@
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -43,8 +43,38 @@ describe("evaluateCondition — fileExists", () => {
     expect(evaluateCondition(out({}), { kind: "fileExists", path: "absent.txt", negate: true }, dir)).toBe(true);
   });
 
-  it("supports absolute paths", () => {
-    expect(evaluateCondition(out({}), { kind: "fileExists", path: join(dir, "present.txt") }, "/nowhere")).toBe(true);
+  it("supports absolute paths inside the session root", () => {
+    expect(evaluateCondition(out({}), { kind: "fileExists", path: join(dir, "present.txt") }, dir)).toBe(true);
+  });
+
+  it("fileExists refuses paths outside the session root", () => {
+    const cwd = dir;
+    for (const path of ["../../etc/hosts", "/etc/hosts"]) {
+      const r = evaluateConditionWithDetail(out({}), { kind: "fileExists", path }, cwd);
+      expect(r.result, path).toBe(false);
+      expect(r.detail, path).toContain("outside session root");
+      // negate must not turn a refusal into a match
+      const negated = evaluateConditionWithDetail(out({}), { kind: "fileExists", path, negate: true }, cwd);
+      expect(negated.result, path).toBe(false);
+      expect(negated.detail, path).toContain("outside session root");
+    }
+  });
+
+  it("resolves relative paths against cwd but confines them to the session root", () => {
+    const sub = join(dir, "sub");
+    mkdirSync(sub, { recursive: true });
+    expect(evaluateConditionWithDetail(out({}), { kind: "fileExists", path: "../present.txt" }, sub, dir).result).toBe(true);
+    const escaped = evaluateConditionWithDetail(out({}), { kind: "fileExists", path: "../present.txt" }, sub, sub);
+    expect(escaped.result).toBe(false);
+    expect(escaped.detail).toContain("outside session root");
+  });
+
+  it("follows symlinks when checking containment", () => {
+    const root = mkdtempSync(join(tmpdir(), "predexec-cond-link-"));
+    symlinkSync("/etc", join(root, "etc-link"));
+    const r = evaluateConditionWithDetail(out({}), { kind: "fileExists", path: "etc-link/hosts" }, root);
+    expect(r.result).toBe(false);
+    expect(r.detail).toContain("outside session root");
   });
 });
 
@@ -160,6 +190,30 @@ describe("evaluateCondition — match (low confidence)", () => {
       expect(result.detail).toContain("regex rejected");
     },
   );
+
+  const CATASTROPHIC = ["((a+))+$", "(a+b?)+$", "(\\w+\\s?)+$", "(a+){12}$", "((?:a|b)+c?)*$", "(x+x+)+y"];
+  const SAFE = ["(?:\\d+\\.)+\\d+", "^v\\d+(?:\\.\\d+){2}$", "(ab)+", "(a|b){3}", "\\w+", "(foo\\s)+bar"];
+  it.each(CATASTROPHIC)("rejects %s", (p) => expect(isSafeRegex(p)).toBe(false));
+  it.each(SAFE)("accepts %s", (p) => expect(isSafeRegex(p)).toBe(true));
+
+  it("every accepted pattern runs in bounded time on adversarial input", () => {
+    const gen = ["a", "b?", "\\w", "\\s?", "a+", "(a+)", "(?:a|b)", "\\d+"];
+    const input = "a".repeat(28) + "!";
+    for (const x of gen) for (const y of gen) for (const q of ["+", "*", "{2,}", "{5}"]) {
+      const p = `(${x}${y})${q}$`;
+      if (!isSafeRegex(p)) continue;
+      const re = new RegExp(p);
+      // Minimum of 3 runs: an exponential pattern is slow every time, while a
+      // loaded CI box only makes an individual run slow.
+      let best = Infinity;
+      for (let run = 0; run < 3; run++) {
+        const t0 = performance.now();
+        re.test(input);
+        best = Math.min(best, performance.now() - t0);
+      }
+      expect(best, p).toBeLessThan(50);
+    }
+  });
 
   it("uses preceding-backslash parity when deciding whether a group is escaped", () => {
     expect(isSafeRegex(String.raw`\(`)).toBe(true);

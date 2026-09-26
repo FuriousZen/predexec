@@ -16,6 +16,28 @@ const mockToolExecutor = async (op: ToolOp) => {
   return { stdout: "", stderr: `unknown: ${op.tool}`, exitCode: 1 };
 };
 
+describe("runPlanTree — fileExists confinement", () => {
+  const root = mkdtempSync(join(tmpdir(), "predexec-engine-root-"));
+  mkdirSync(join(root, "sub"));
+  writeFileSync(join(root, "marker.txt"), "x");
+  const planFor = (path: string): PlanTree => ({
+    root: "a",
+    cwd: "sub",
+    nodes: [
+      { id: "a", commands: ["true"], edges: [{ when: { kind: "fileExists", path }, to: "b" }] },
+      { id: "b", commands: ["true"] },
+    ],
+  });
+
+  it("resolves against the plan cwd but confines to the session root", async () => {
+    const inside = await runPlanTree(planFor("../marker.txt"), { cwd: root });
+    expect(inside.pathTaken).toEqual(["a", "b"]);
+    const outside = await runPlanTree(planFor("../../marker.txt"), { cwd: root });
+    expect(outside.stoppedReason).toBe("noEdgeMatch");
+    expect(outside.transcript).toContain("outside session root");
+  });
+});
+
 describe("runPlanTree — traversal & stop reasons", () => {
   it("depth-0 leaf: runs one command, no fallback, terminal on success", async () => {
     const plan: PlanTree = { root: "a", nodes: [{ id: "a", commands: ["echo hi"] }] };
