@@ -816,6 +816,36 @@ describe("mcp tool-ops — bounded fallback scans", () => {
     },
   );
 
+  it.skipIf(!hasRg)("rejects an unsafe pattern identically whether or not ripgrep is installed", async () => {
+    // rg's Rust engine is linear-time and would happily run an "unsafe" pattern
+    // rg itself never hangs on — but the model author sees the same tool op on
+    // every machine, so both paths must reject it the same way (R8).
+    const pattern = "(a+)+$";
+    write("unsafe-parity.txt", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n");
+    const withRg = await run({ tool: "grep", pattern, path: "unsafe-parity.txt" });
+    const withoutRg = await run({ tool: "grep", pattern, path: "unsafe-parity.txt" }, NODE_ONLY);
+    expect(withRg.exitCode).toBe(2);
+    expect(withRg.stderr).toContain("unsafe pattern");
+    expect(withoutRg).toEqual(withRg);
+  });
+
+  it("bounds a single catastrophic regex evaluation that isSafeRegex's screen does not catch", async () => {
+    // isSafeRegex only screens grouped/alternated repetition; an ungrouped run
+    // of quantified atoms like a*a*a*a* is a known polynomial-time ReDoS shape
+    // that still passes it (documented in core/conditions.ts). Without a
+    // per-execution deadline this single .test() call blocks the walk for
+    // seconds (measured on this pattern/length: ~3.5s uninterrupted).
+    const pattern = "a*a*a*a*b";
+    expect(isSafeRegex(pattern)).toBe(true);
+    write("slow-regex.txt", `${"a".repeat(180)}\n`);
+    const start = Date.now();
+    const r = await run({ tool: "grep", pattern, path: "slow-regex.txt" }, NODE_ONLY);
+    expect(Date.now() - start).toBeLessThan(2000);
+    expect(r.exitCode).toBe(2);
+    expect(r.stdout).toBe("");
+    expect(r.stderr).toContain("time budget");
+  });
+
   it("refuses an unterminated line over the fallback scan bound", async () => {
     write("oversized-line.txt", `${"x".repeat(64 * 1024 + 1)}\n`);
     const read = await run({ tool: "read", path: "oversized-line.txt" }, NODE_ONLY);

@@ -34,7 +34,16 @@ import { accessSync, constants, realpathSync } from "node:fs";
 import { open, opendir, realpath, stat } from "node:fs/promises";
 import { delimiter, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { StringDecoder } from "node:string_decoder";
-import { escapeRegExp, isSafeRegex, MAX_GREP_PATTERN_LENGTH, validateOperation, type ToolExecutor, type ToolOp } from "../core/index.ts";
+import {
+  escapeRegExp,
+  execWithDeadline,
+  isSafeRegex,
+  MAX_GREP_PATTERN_LENGTH,
+  REGEX_EVAL_TIMEOUT_MS,
+  validateOperation,
+  type ToolExecutor,
+  type ToolOp,
+} from "../core/index.ts";
 
 /** The shell-like shape the core engine branches on (see core/runner.ts). */
 interface OpResult {
@@ -708,6 +717,15 @@ async function grepOp(
   const literal = op.literal === true;
   const glob = op.glob === undefined ? undefined : String(op.glob);
 
+  // Screened HERE, before the rg/fallback branch, so an "unsafe" pattern is
+  // rejected the same way (same exit code, same message) regardless of
+  // whether ripgrep is installed (R8). rg's Rust engine is linear-time and
+  // would never hang on this, but the model author sees one tool op and must
+  // not get different behavior depending on the host's installed tooling.
+  if (!literal && !isSafeRegex(pattern)) {
+    return fail("grep", "unsafe pattern: nested quantifier may not terminate");
+  }
+
   // Revalidate immediately before handing the target to either the accelerator
   // or the fallback. This closes the ordinary alias-swap window while the
   // local options above are being prepared (the remaining pathname race is
@@ -849,10 +867,11 @@ async function grepViaNode(
   { matches: Match[]; capped: boolean; capReason?: WalkCapReason; err?: undefined } |
   { matches?: undefined; capped?: undefined; capReason?: undefined; err: OpResult }
 > {
+  // isSafeRegex was already applied by the caller (grepOp), before the rg/
+  // fallback branch, so both paths reject the same "unsafe" patterns the same
+  // way. isSafeRegex is a screen, not a proof (see core/conditions.ts), so
+  // every execution below still runs under REGEX_EVAL_TIMEOUT_MS.
   let re: RegExp;
-  if (!flags.literal && !isSafeRegex(pattern)) {
-    return { err: fail("grep", "unsafe pattern: nested quantifier may not terminate") };
-  }
   try {
     const source = flags.literal ? escapeRegExp(pattern) : pattern;
     re = new RegExp(source, flags.ignoreCase ? "i" : "");
@@ -876,13 +895,31 @@ async function grepViaNode(
     const rel = displayRel(base, abs, lexicalAbs, file);
     if (globRe && !matchesGlob(globRe, rel, flags.glob!)) continue;
     const pending: Match[] = [];
+    let timedOutAt: number | undefined;
     try {
       const scan = await scanTextLines(file, (text, line) => {
-        if (re!.test(text)) {
+        const run = execWithDeadline(re, text);
+        if (run.timedOut) {
+          timedOutAt = line;
+          return false;
+        }
+        if (run.match !== null) {
           pending.push({ path: rel, canonicalPath: file, line, text });
           if (matches.length + pending.length > limit) return false;
         }
       }, signal);
+      // A timeout establishes nothing about the rest of the file (or tree) —
+      // returning the matches found so far would be a silent partial result
+      // presented as complete. Abort the whole op instead, the same way a
+      // rejected pattern does.
+      if (timedOutAt !== undefined) {
+        return {
+          err: fail(
+            "grep",
+            `${rel}:${timedOutAt}: regex exceeded its ${REGEX_EVAL_TIMEOUT_MS}ms time budget — narrow the pattern or scope it with \`path\``,
+          ),
+        };
+      }
       if (scan.binary) continue;
       if (scan.oversized) {
         return { err: fail("grep", `${rel}: line exceeds the ${MAX_TEXT_LINE_BYTES} byte fallback scan limit`) };

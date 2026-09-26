@@ -16,7 +16,7 @@ export { runPlanTree } from "./engine.ts";
 export { OUTPUT_CAP } from "./runner.ts";
 export { isDestructiveCommand } from "./destructive.ts";
 export { coercePlan } from "./coerce.ts";
-export { escapeRegExp, isSafeRegex } from "./conditions.ts";
+export { escapeRegExp, execWithDeadline, isSafeRegex, REGEX_EVAL_TIMEOUT_MS } from "./conditions.ts";
 export { validateOperation } from "./validation.ts";
 export {
   inspectCommandSubstitutionTree,

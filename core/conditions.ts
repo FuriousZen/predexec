@@ -673,8 +673,14 @@ export const REGEX_EVAL_TIMEOUT_MS = 250;
 
 let regexSandbox: { context: Context; exec: Script } | undefined;
 
-/** `regex.exec(input)` under REGEX_EVAL_TIMEOUT_MS; `timedOut` instead of hanging. */
-function execWithDeadline(regex: RegExp, input: string): { timedOut: false; match: RegExpExecArray | null } | { timedOut: true } {
+/**
+ * `regex.exec(input)` under REGEX_EVAL_TIMEOUT_MS; `timedOut` instead of hanging.
+ * Exported (via core/index.ts) so other in-process regex evaluators — notably
+ * the MCP grep tool op, which runs model-authored patterns against file
+ * contents outside the condition DSL entirely — can reuse the same
+ * termination guarantee instead of re-deriving it.
+ */
+export function execWithDeadline(regex: RegExp, input: string): { timedOut: false; match: RegExpExecArray | null } | { timedOut: true } {
   regexSandbox ??= { context: createContext({}), exec: new Script("regex.exec(input)") };
   const { context, exec } = regexSandbox;
   context.regex = regex;
