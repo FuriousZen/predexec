@@ -696,22 +696,22 @@ describe.each(variants)("opencode createToolExecutor ($name) — missing-path pr
     },
   };
 
-  it("read of a missing file => exit 1 with the resolved location", async () => {
+  it("read of a missing file => exit 2 with the resolved location", async () => {
     const r = await run(sdkNeverCalled, { tool: "read", path: "nope/absent.ts" });
-    expect(r.exitCode).toBe(1);
+    expect(r.exitCode).toBe(2);
     expect(r.stderr).toBe(`path not found: nope/absent.ts (resolved against ${repo})`);
   });
 
-  it("ls of a missing dir => exit 1 with the resolved location", async () => {
+  it("ls of a missing dir => exit 2 with the resolved location", async () => {
     const r = await run(sdkNeverCalled, { tool: "ls", path: "core/" });
-    expect(r.exitCode).toBe(1);
+    expect(r.exitCode).toBe(2);
     expect(r.stderr).toContain("path not found: core/");
     expect(r.stderr).toContain(repo);
   });
 
   it("absolute paths are checked as-is", async () => {
     const r = await run(sdkNeverCalled, { tool: "read", path: "/definitely/not/here.ts" });
-    expect(r.exitCode).toBe(1);
+    expect(r.exitCode).toBe(2);
     expect(r.stderr).toContain("path not found: /definitely/not/here.ts");
   });
 
@@ -1108,9 +1108,10 @@ describe.each(variants)("opencode plugin ($name) — v2 setup registrations", ({
     expect(tool.input.type).toBe("object");
     expect(tool.input.properties.plan.description).toContain(PLAN_SHAPE_DESCRIPTION);
     expect(tool.input.properties.plan.description).toContain('"exit == 0"');
-    // R42: the shared node:fs executor's exit codes differ from the v1 SDK path's.
-    expect(tool.input.properties.plan.description).toMatch(/read\/ls 1 = failed/);
-    expect(tool.input.properties.plan.description).toMatch(/opencode 1\.x every op that never ran exits 2/);
+    // R42 revisited: the shared node:fs executor now uses the v1 path's exit
+    // codes, so the description states one rule for every op.
+    expect(tool.input.properties.plan.description).toMatch(/2 = never ran, for every op \(read\/ls included\)/);
+    expect(tool.input.properties.plan.description).not.toMatch(/read\/ls 1 = failed/);
     // No zod on the v2 path: a zod instance would be introspected cross-instance
     // by the host's pinned zod 4.1.8 (core/src/tool/runtime.ts:165-169).
     expect(tool.input._zod).toBeUndefined();

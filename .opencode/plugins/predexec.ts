@@ -255,16 +255,16 @@ export function createToolExecutor(client: OpencodeClient, cwd: string): ToolExe
     // file returns empty content with NO error, and file.list throws an opaque
     // 500 ("Unexpected server error") — so read/ls pre-check existence and
     // report the resolved location the model needs to correct its plan.
+    // "Never ran" (a missing path, invalid arg, unknown tool, an SDK
+    // error/throw, a rejected find limit, a binary read) is exit 2; a search
+    // that ran and found nothing stays exit 1 — the same split mcp/tool-ops.ts
+    // uses, on every op, so a failure can never be read as "ran, found
+    // nothing" on any of them.
+    const NEVER_RAN = 2;
     const missing = (p: string) =>
       existsSync(isAbsolute(p) ? p : resolve(directory, p))
         ? null
-        : { stdout: "", stderr: `path not found: ${p} (resolved against ${directory})`, exitCode: 1 };
-    // "Never ran" (invalid arg, unknown tool, an SDK error/throw, a rejected
-    // find limit, a binary read) is exit 2; a search that ran and found
-    // nothing stays exit 1 — the same split mcp/tool-ops.ts uses for grep/find,
-    // generalized here to every op so a validation failure can never be read
-    // as "ran, found nothing" on any of them.
-    const NEVER_RAN = 2;
+        : { stdout: "", stderr: `path not found: ${p} (resolved against ${directory})`, exitCode: NEVER_RAN };
     const fail = (label: string, e: unknown) => ({ stdout: "", stderr: `${label}: ${errText(e)}`, exitCode: NEVER_RAN });
     const requiredArgMissing =
       (op.tool === "read" && op.path === undefined) ||
@@ -290,7 +290,7 @@ export function createToolExecutor(client: OpencodeClient, cwd: string): ToolExe
       if (p === undefined) return { prefix: "" };
       const path = String(p);
       const gone = missing(path);
-      if (gone) return { err: { ...gone, exitCode: NEVER_RAN } };
+      if (gone) return { err: gone };
       const abs = isAbsolute(path) ? path : resolve(directory, path);
       // A path that exists but resolves outside the session root (an
       // absolute path elsewhere, or `..` walking past the root) must refuse

@@ -36,7 +36,7 @@
  *  - native tool ops: the v2 plugin context exposes no file/find API, so
  *    read/grep/find/ls run through ../../mcp/tool-ops.ts (node:fs, rg/fd as
  *    accelerators) — the same executor as Claude Code / Codex, with its exit
- *    conventions (grep/find: 1 = no results, 2 = never ran; read/ls: 1 = fail).
+ *    conventions (1 = ran, found nothing; 2 = never ran, for every op).
  */
 
 import { readFileSync } from "node:fs";
@@ -58,8 +58,7 @@ const PLAN_ARG_DESCRIPTION =
   WHEN_SYNTAX_LINE +
   "Note: tool ops read the filesystem directly (opencode v2 gives plugins no file API), paths may not escape the session root, " +
   "grep/find fall back to a pure-Node walk that ignores .gitignore when ripgrep/fd are absent, " +
-  "and exit codes are: grep/find 1 = searched, found nothing, 2 = never ran; read/ls 1 = failed " +
-  "(on opencode 1.x every op that never ran exits 2 — gate on `exit == 0`, not on a specific failure code).";
+  "and exit codes are: 1 = ran, found nothing (a grep/find with no matches); 2 = never ran, for every op (read/ls included).";
 
 /**
  * Local structural stand-ins for the slice of `@opencode/plugin` (v2 Promise

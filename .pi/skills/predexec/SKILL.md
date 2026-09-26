@@ -12,5 +12,5 @@ description: Use predexec for all read-only shell operations. Use bash only for 
 - Relative paths resolve against the session directory (the transcript's '# cwd:' header). Do not build depth on unverified paths: verify layout in the first node (ls) and gate children with 'file exists' edges.
 - predexec hard-stops (`mutationStop`) before any write/install/delete/exec — including interpreter one-liners that write, shell scripts (`bash x.sh`), and `sh -c` with writes. Run those, and interactive commands, with bash.
 - mutationStop/noEdgeMatch is recoverable — read the transcript and resume with bash. Never retry the same plan blindly.
-- A tool op exiting 2 means the search never ran (bad path or scope); exit 1 means it ran and found nothing.
+- A tool op exiting 2 never ran (missing, unreadable or out-of-scope path, bad argument) — read/ls included; exit 1 means it ran and found nothing (a grep/find with no matches).
 - Truncated output is always flagged (`…[truncated`) — never branch on it as if it were complete.

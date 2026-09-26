@@ -188,27 +188,27 @@ describe("mcp tool-ops — read", () => {
 
   it("rejects an offset past EOF instead of returning empty stdout", async () => {
     const r = await run({ tool: "read", path: "a.txt", offset: 99 });
-    expect(r.exitCode).toBe(1);
+    expect(r.exitCode).toBe(2);
     expect(r.stderr).toContain("offset 99 is past the end of a.txt (4 lines)");
     expect(r.stdout).toBe("");
   });
 
   it("reports a missing path with the base it resolved against", async () => {
     const r = await run({ tool: "read", path: "nope.txt" });
-    expect(r.exitCode).toBe(1);
+    expect(r.exitCode).toBe(2);
     expect(r.stderr).toContain("read: path not found: nope.txt");
     expect(r.stderr).toContain(root);
   });
 
   it("refuses a directory and points at ls", async () => {
     const r = await run({ tool: "read", path: "sub" });
-    expect(r.exitCode).toBe(1);
+    expect(r.exitCode).toBe(2);
     expect(r.stderr).toContain('is a directory — use {tool:"ls"}');
   });
 
   it("refuses a binary file rather than dumping bytes into the transcript", async () => {
     const r = await run({ tool: "read", path: "bin.dat" });
-    expect(r.exitCode).toBe(1);
+    expect(r.exitCode).toBe(2);
     expect(r.stderr).toContain("looks like a binary file");
   });
 
@@ -222,14 +222,14 @@ describe("mcp tool-ops — read", () => {
 describe("mcp tool-ops — path containment", () => {
   it("rejects a relative path that climbs out of the root", async () => {
     const r = await run({ tool: "read", path: "../secret.txt" });
-    expect(r.exitCode).toBe(1);
+    expect(r.exitCode).toBe(2);
     expect(r.stderr).toContain("outside the predexec root");
     expect(r.stdout).toBe("");
   });
 
   it("rejects an absolute path outside the root", async () => {
     const r = await run({ tool: "read", path: join(outside, "secret.txt") });
-    expect(r.exitCode).toBe(1);
+    expect(r.exitCode).toBe(2);
     expect(r.stderr).toContain("refusing to read outside the session root");
   });
 
@@ -242,7 +242,7 @@ describe("mcp tool-ops — path containment", () => {
   it("does not let a sibling directory with the root as a prefix pass", async () => {
     // `${root}-evil` starts with `${root}` — a naive prefix check would allow it.
     const r = await run({ tool: "read", path: `${root}-evil/a.txt` });
-    expect(r.exitCode).toBe(1);
+    expect(r.exitCode).toBe(2);
     expect(r.stderr).toContain("outside the predexec root");
   });
 
@@ -250,15 +250,15 @@ describe("mcp tool-ops — path containment", () => {
     // The engine folds plan.cwd into RunOptions.cwd, so a plan pointing its cwd
     // out of the session arrives here as an escaping base.
     const r = await run({ tool: "ls" }, {}, outside);
-    expect(r.exitCode).toBe(1);
+    expect(r.exitCode).toBe(2);
     expect(r.stderr).toContain("a plan's cwd may not escape the session root");
   });
 
   it("rejects escaping paths for every op, not just read", async () => {
-    // grep/find report 2, not 1: an escaping path never searched anything, and
-    // exit 1 is reserved for "searched, found nothing".
+    // Every op reports 2, not 1: an escaping path never ran anything, and
+    // exit 1 is reserved for "ran, found nothing".
     for (const [op, exit] of [
-      [{ tool: "ls", path: ".." }, 1],
+      [{ tool: "ls", path: ".." }, 2],
       [{ tool: "grep", pattern: "alpha", path: ".." }, 2],
       [{ tool: "find", pattern: "*.ts", path: ".." }, 2],
     ] as [ToolOp, number][]) {
@@ -282,10 +282,10 @@ describe("mcp tool-ops — path containment", () => {
   it.skipIf(!symlinksAvailable)(
     "refuses a node_modules symlink that resolves outside the root (CC-1: exemption removed)",
     async () => {
-      // read keeps the plain 0/1 contract; grep/find reserve 2 for "never
-      // searched" (see the SEARCH_ERROR_EXIT comment in mcp/tool-ops.ts).
+      // Every op reports 2 for "never ran" (see NEVER_RAN_EXIT in
+      // mcp/tool-ops.ts); 1 is reserved for "ran, found nothing".
       for (const [op, exitCode] of [
-        [{ tool: "read", path: "node_modules/pkg/package.json" }, 1],
+        [{ tool: "read", path: "node_modules/pkg/package.json" }, 2],
         [{ tool: "grep", pattern: "outside-package", path: "node_modules/pkg" }, 2],
         [{ tool: "find", pattern: "*.json", path: "node_modules/pkg" }, 2],
       ] as [ToolOp, number][]) {
@@ -315,8 +315,8 @@ describe("mcp tool-ops — path containment", () => {
       const executor = createToolExecutor({ cwd: evilNodeModulesRoot });
       const runEvil = (op: ToolOp) => executor(op, { cwd: evilNodeModulesRoot });
       for (const [op, exitCode] of [
-        [{ tool: "read", path: "node_modules/secret.txt" }, 1],
-        [{ tool: "ls", path: "node_modules" }, 1],
+        [{ tool: "read", path: "node_modules/secret.txt" }, 2],
+        [{ tool: "ls", path: "node_modules" }, 2],
         [{ tool: "grep", pattern: "secret", path: "node_modules" }, 2],
         [{ tool: "find", pattern: "*.txt", path: "node_modules" }, 2],
       ] as [ToolOp, number][]) {
@@ -332,7 +332,7 @@ describe("mcp tool-ops — path containment", () => {
       { tool: "read", path: "node_modules/px-parent-sibling-secret.txt" },
       { cwd: parentNodeModulesRoot },
     );
-    expect(r.exitCode).toBe(1);
+    expect(r.exitCode).toBe(2);
     expect(r.stderr).toContain("outside");
     expect(r.stdout).toBe("");
   });
@@ -455,7 +455,7 @@ describe("mcp tool-ops — ls", () => {
 
     const result = await executor({ tool: "ls" }, { cwd: root, signal: controller.signal });
 
-    expect(result.exitCode).toBe(1);
+    expect(result.exitCode).toBe(2);
     expect(result.stderr).toContain("aborted");
     expect(nextCalls).toBe(1);
     expect(returnCalls).toBe(1);
@@ -490,13 +490,13 @@ describe("mcp tool-ops — ls", () => {
 
   it("reports a missing directory", async () => {
     const r = await run({ tool: "ls", path: "nope" });
-    expect(r.exitCode).toBe(1);
+    expect(r.exitCode).toBe(2);
     expect(r.stderr).toContain("ls: path not found: nope");
   });
 
   it("refuses a file and points at read", async () => {
     const r = await run({ tool: "ls", path: "a.txt" });
-    expect(r.exitCode).toBe(1);
+    expect(r.exitCode).toBe(2);
     expect(r.stderr).toContain('is not a directory — use {tool:"read"}');
   });
 });
@@ -704,7 +704,7 @@ describe("mcp tool-ops — accelerated/fallback parity", () => {
 describe("mcp tool-ops — executor contract", () => {
   it("rejects an unknown tool the way the sibling adapters do", async () => {
     const r = await run({ tool: "deploy" });
-    expect(r.exitCode).toBe(1);
+    expect(r.exitCode).toBe(2);
     expect(r.stderr).toContain("unknown tool: deploy");
   });
 
@@ -1002,14 +1002,14 @@ describe("mcp tool-ops — bounded fallback scans", () => {
     }
   });
 
-  it("classifies aborted fallback read and grep as search-not-run where applicable", async () => {
+  it("classifies aborted fallback read and grep as never-ran", async () => {
     write("abort.txt", "ready\n");
     const executor = createToolExecutor({ cwd: root, ...NODE_ONLY });
     const controller = new AbortController();
     controller.abort();
     const read = await executor({ tool: "read", path: "abort.txt" }, { cwd: root, signal: controller.signal });
     const grep = await executor({ tool: "grep", pattern: "ready", path: "abort.txt" }, { cwd: root, signal: controller.signal });
-    expect(read.exitCode).toBe(1);
+    expect(read.exitCode).toBe(2);
     expect(read.stderr).toContain("aborted");
     expect(grep.exitCode).toBe(2);
     expect(grep.stderr).toContain("aborted");
@@ -1131,7 +1131,7 @@ describe("mcp tool-ops — bounded fallback scans", () => {
   it("refuses an unterminated line over the fallback scan bound", async () => {
     write("oversized-line.txt", `${"x".repeat(64 * 1024 + 1)}\n`);
     const read = await run({ tool: "read", path: "oversized-line.txt" }, NODE_ONLY);
-    expect(read.exitCode).toBe(1);
+    expect(read.exitCode).toBe(2);
     expect(read.stdout).toBe("");
     expect(read.stderr).toContain("line exceeds");
 

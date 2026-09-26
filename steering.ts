@@ -216,7 +216,8 @@ export function renderSkill(h: SkillHarness): string {
     RECOVERY_LINE.trim() +
       (policy ? " `policyStop` recovers the same way." : "") +
       (shell.toLowerCase() === "bash" ? "" : ` ("bash" here means ${shell}.)`),
-    "A tool op exiting 2 means the search never ran (bad path or scope); exit 1 means it ran and found nothing.",
+    "A tool op exiting 2 never ran (missing, unreadable or out-of-scope path, bad argument) — read/ls included; " +
+      "exit 1 means it ran and found nothing (a grep/find with no matches).",
     "Truncated output is always flagged (`…[truncated`) — never branch on it as if it were complete.",
     ...(OWN_TOOL_OPS.has(h)
       ? [

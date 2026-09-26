@@ -9,14 +9,13 @@
  * the output is shaped. `read` never shells out at all; routing file reads back
  * through a shell would re-enter the command path that policy exists to gate.
  *
- * grep/find exit codes follow grep(1)/rg: 0 = results, 1 = no results (a fact,
- * not a failure), 2 = the search never happened (bad pattern, missing path, dead
- * binary, abort). read/ls keep the siblings' plain 0/1 — they have no no-results
- * state to confuse. The 2 is a deliberate divergence from the pi and opencode
- * adapters, which report 1 for everything: those run inside a host that mediates
- * failures, while here a typo'd path would otherwise branch down an `exit == 1`
- * "nothing matched" edge on a search that never ran. It errs toward a miss (~0
- * requests) over a false-hit (real requests to unwind).
+ * Exit codes follow grep(1)/rg: 0 = results, 1 = no results (a fact, not a
+ * failure; only grep/find have that state), 2 = the op never happened (bad
+ * pattern, missing or escaping path, unreadable file, dead binary, abort) — for
+ * every op, read/ls included, matching the pi and opencode adapters. A typo'd
+ * path must never branch down an `exit == 1` "nothing matched" edge on an op
+ * that never ran. It errs toward a miss (~0 requests) over a false-hit (real
+ * requests to unwind).
  *
  * Known parity gaps vs pi's native tools — documented, not hidden:
  *  - the pure-Node fallback does not honor .gitignore (rg/fd do), so it can
@@ -138,18 +137,19 @@ export interface ToolExecutorOptions {
 }
 
 /**
- * Exit status for "we could not look", chosen per tool.
+ * Exit status for "the op never ran", the same for every tool and on every
+ * host (pi and opencode use 2 as well).
  *
- * grep/find reserve 1 for "searched, found nothing", so every failure that
- * PREVENTED a search — a typo'd path, a dead accelerator, a broken pattern, an
- * abort — must land somewhere else, or it branches down the no-matches edge
- * claiming a fact it never established. read/ls have no no-results state, so 1
- * stays their single failure code.
+ * 1 is reserved for "ran, found nothing" (a grep/find with no matches), so
+ * every failure that PREVENTED the op — a typo'd or escaping path, an
+ * unreadable or binary file, a dead accelerator, a broken pattern, an abort —
+ * must land somewhere else, or it branches down the no-results edge claiming
+ * a fact it never established. read/ls have no no-results state, so they
+ * never exit 1 at all.
  */
-const SEARCH_ERROR_EXIT = 2;
-const errorExit = (tool: string): number => (tool === "grep" || tool === "find" ? SEARCH_ERROR_EXIT : 1);
+const NEVER_RAN_EXIT = 2;
 
-const fail = (label: string, msg: string, exitCode = errorExit(label)): OpResult => ({
+const fail = (label: string, msg: string, exitCode = NEVER_RAN_EXIT): OpResult => ({
   stdout: "",
   stderr: `${label}: ${msg}`,
   exitCode,
@@ -1395,7 +1395,7 @@ export function createToolExecutor(opts: ToolExecutorOptions): ToolExecutor {
         case "ls":
           return await lsOp(op, root, base, runOpts.signal, opts.lsOpendir ? { opendir: opts.lsOpendir } : undefined);
         default:
-          return { stdout: "", stderr: `unknown tool: ${op.tool}`, exitCode: 1 };
+          return { stdout: "", stderr: `unknown tool: ${op.tool}`, exitCode: NEVER_RAN_EXIT };
       }
     } catch (err) {
       return fail(label, errText(err));

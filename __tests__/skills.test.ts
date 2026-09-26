@@ -77,6 +77,13 @@ describe("skills — single source (steering.ts → SKILL.md)", () => {
     expect(body).toMatch(/truncat/i);
   });
 
+  it.each(SKILL_HARNESSES)("%s: exit 2 = never ran covers every tool op, not just searches", (h) => {
+    const body = renderSkill(h);
+    expect(body).toMatch(/tool op exiting 2 never ran[^.]*(missing|unreadable)/);
+    expect(body).not.toContain("the search never ran");
+    expect(body).toMatch(/exit 1 means it ran and found nothing/);
+  });
+
   it("pi omits policyStop; every other harness has a policy paragraph", () => {
     expect(renderSkill("pi")).not.toContain("policyStop");
     for (const h of SKILL_HARNESSES.filter((x) => x !== "pi")) expect(renderSkill(h)).toContain("policyStop");
