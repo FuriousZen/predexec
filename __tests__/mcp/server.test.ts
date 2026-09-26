@@ -219,6 +219,20 @@ describe("mcp server — Claude Code permission policy", () => {
     expect(text).not.toContain("nested secret");
   });
 
+  it("a Read deny rule also stops a shell read of the file (CC-3)", async () => {
+    const dir = project();
+    writeFileSync(join(dir, ".env"), "shell secret\n");
+    mkdirSync(join(dir, ".claude"));
+    writeFileSync(join(dir, ".claude", "settings.json"), '{"permissions":{"deny":["Read(.env)"]}}');
+    const { request } = await connected({ cwd: dir, policy: policyOptions });
+    const text = textOf(await callPredexec(request, {
+      root: "a",
+      nodes: [{ id: "a", commands: ["cat < .env"] }],
+    }));
+    expect(text).toContain("POLICY HARD-STOP (not run)");
+    expect(text).not.toContain("shell secret");
+  });
+
   it("uses native recovery guidance instead of advising a host bash tool", async () => {
     const dir = project();
     mkdirSync(join(dir, ".claude"));

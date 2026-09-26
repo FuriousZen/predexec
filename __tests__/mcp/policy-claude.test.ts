@@ -1,9 +1,12 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   claudeSettingsPaths,
+  compileClaudePathRule,
+  createClaudeHostPolicyChecker,
+  detectManagedPolicySources,
   createClaudePolicyChecker,
   createClaudeOperationPolicyChecker,
   parseClaudeBashRules,
@@ -458,18 +461,19 @@ describe("readClaudeBashRules — settings discovery", () => {
     mkdirSync(join(repo, ".git"), { recursive: true });
     mkdirSync(home, { recursive: true });
     mkdirSync(managed, { recursive: true });
-    const opts = { env: { CLAUDE_CONFIG_DIR: home } as NodeJS.ProcessEnv, managedDir: managed };
+    const opts = { env: { CLAUDE_CONFIG_DIR: home } as NodeJS.ProcessEnv, managedDir: managed, home: join(tmp, "home") };
     return { repo, home, managed, opts };
   };
 
   const write = (path: string, deny: string[]) =>
     writeFileSync(path, JSON.stringify({ permissions: { deny: deny.map((d) => `Bash(${d})`) } }));
 
-  it("lists managed → local → project → user, in that order", () => {
+  it("lists remote → managed → local → project → user, in that order", () => {
     const { repo, home, managed, opts } = setup();
     mkdirSync(join(managed, "managed-settings.d"), { recursive: true });
     writeFileSync(join(managed, "managed-settings.d", "10-org.json"), "{}");
     expect(claudeSettingsPaths(repo, opts)).toEqual([
+      join(home, "remote-settings.json"),
       join(managed, "managed-settings.json"),
       join(managed, "managed-settings.d", "10-org.json"),
       join(repo, ".claude", "settings.local.json"),
@@ -585,6 +589,259 @@ describe("engine — policyStop through the Claude checker", () => {
       expect(r.transcript).toContain("'README.md'");
     } finally {
       rmSync(sessionRoot, { recursive: true, force: true });
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// CC-2/3/4: gitignore-semantics Read rules, shell readers, managed sources.
+// Authority: https://code.claude.com/docs/en/permissions ("Read and Edit").
+// ---------------------------------------------------------------------------
+
+describe("compileClaudePathRule — anchors and gitignore depth", () => {
+  const P = "/px-proj/app";
+  const S = "/px-settings/.claude";
+  const H = "/px-home/alice";
+  const anchor = { projectDir: P, settingsDir: S, home: H };
+  const cases: [rule: string, path: string, expected: boolean][] = [
+    // Bare names match at any depth under the project, never outside it.
+    [".env", `${P}/.env`, true],
+    [".env", `${P}/config/.env`, true],
+    [".env", `/elsewhere/.env`, false],
+    // A single-segment `dir/**` deny matches that directory at any depth.
+    ["secrets/**", `${P}/lib/secrets/x`, true],
+    ["secrets/**", `${P}/secrets/a/b`, true],
+    // Every other shape matches only at its anchored location.
+    ["src/components/**", `${P}/vendor/src/components/a`, false],
+    ["src/components/**", `${P}/src/components/a`, true],
+    // `//` is filesystem-absolute.
+    ["//etc/**", "/etc/hosts", true],
+    ["//**/.env", "/any/where/.env", true],
+    // `~/` is home-relative.
+    ["~/.ssh/**", `${H}/.ssh/id_rsa`, true],
+    ["~/.ssh/**", `${P}/.ssh/id_rsa`, false],
+    // `/` anchors at the settings source, NOT the filesystem root.
+    ["/x/**", `${S}/x/y`, true],
+    ["/x/**", `${P}/x/y`, false],
+    ["/x/**", "/x/y", false],
+    // `./` anchors at the project directory.
+    ["./.env", `${P}/.env`, true],
+    ["./.env", `${P}/sub/.env`, false],
+  ];
+  it.each(cases)("Read(%s) vs %s → %s", (rule, path, expected) => {
+    expect(compileClaudePathRule(rule, anchor)(path)).toBe(expected);
+  });
+
+  it("a deny written through a symlinked directory also applies at its real location", () => {
+    // realpath the temp root so only `link` is a symlink (macOS /var → /private/var).
+    const tmp = realpathSync(mkdtempSync(join(tmpdir(), "px-claude-real-")));
+    try {
+      mkdirSync(join(tmp, "real"));
+      symlinkSync(join(tmp, "real"), join(tmp, "link"));
+      const match = compileClaudePathRule(`/${join(tmp, "link")}/**`, anchor);
+      expect(match(join(tmp, "real", "secret"))).toBe(true);
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("Claude Read rules — tool ops and shell readers", () => {
+  let tmp: string;
+  afterEach(() => tmp && rmSync(tmp, { recursive: true, force: true }));
+
+  const setup = (permissions: Record<string, string[]>) => {
+    tmp = mkdtempSync(join(tmpdir(), "px-claude-read-"));
+    const repo = join(tmp, "repo");
+    const home = join(tmp, "home");
+    const configDir = join(home, ".claude");
+    const managed = join(tmp, "managed");
+    for (const dir of [join(repo, ".claude"), join(repo, ".git"), join(repo, "secrets"), join(repo, "lib", "secrets"), join(repo, "src"), configDir, managed]) {
+      mkdirSync(dir, { recursive: true });
+    }
+    writeFileSync(join(repo, ".env"), "TOKEN=1\n");
+    writeFileSync(join(repo, "README.md"), "hello\n");
+    writeFileSync(join(repo, "secrets", "k.pem"), "k\n");
+    writeFileSync(join(repo, "lib", "secrets", "x"), "x\n");
+    writeFileSync(join(repo, ".claude", "settings.json"), JSON.stringify({ permissions }));
+    const opts = {
+      env: { CLAUDE_CONFIG_DIR: configDir } as NodeJS.ProcessEnv,
+      managedDir: managed,
+      home,
+      managedPolicySources: () => [],
+    };
+    const check = createClaudeHostPolicyChecker(repo, opts);
+    const ctx = { cwd: repo, sessionRoot: repo };
+    return { repo, home, configDir, opts, check, ctx };
+  };
+
+  const run = (repo: string, check: ReturnType<typeof createClaudeHostPolicyChecker>, commands: PlanTree["nodes"][number]["commands"]) =>
+    runPlanTree({ root: "a", nodes: [{ id: "a", commands }] }, { cwd: repo, checkOperationPolicy: check });
+
+  it("Read(.env) denies a nested config/.env (bare names match at any depth)", () => {
+    const { check, ctx, repo } = setup({ deny: ["Read(.env)"] });
+    mkdirSync(join(repo, "config"));
+    writeFileSync(join(repo, "config", ".env"), "");
+    expect(check({ tool: "read", path: "config/.env" }, ctx)).toBe(".env");
+    expect(check({ tool: "read", path: "README.md" }, ctx)).toBeNull();
+  });
+
+  it("Read(secrets/**) denies lib/secrets/x", () => {
+    const { check, ctx } = setup({ deny: ["Read(secrets/**)"] });
+    expect(check({ tool: "read", path: "lib/secrets/x" }, ctx)).toBe("secrets/**");
+  });
+
+  it("Read(//abs/**) and Read(~/...) deny absolute and home paths", () => {
+    const { check, ctx, home } = setup({ deny: [`Read(/${join(tmpdir(), "px-nowhere")}/**)`, "Read(~/.ssh/**)"] });
+    expect(check({ tool: "read", path: join(tmpdir(), "px-nowhere", "f") }, ctx)).not.toBeNull();
+    expect(check({ tool: "read", path: join(home, ".ssh", "id_rsa") }, ctx)).toBe("~/.ssh/**");
+  });
+
+  it("normalizes the operation path: Read(./.env) denies a/../.env", () => {
+    const { check, ctx } = setup({ deny: ["Read(./.env)"] });
+    expect(check({ tool: "read", path: "a/../.env" }, ctx)).toBe("./.env");
+  });
+
+  it("checks a symlink's target: link -> .env is denied", () => {
+    const { check, ctx, repo } = setup({ deny: ["Read(./.env)"] });
+    symlinkSync(join(repo, ".env"), join(repo, "link"));
+    expect(check({ tool: "read", path: "link" }, ctx)).toBe("./.env");
+  });
+
+  it("applies Read rules to the directory grep/find/ls search", () => {
+    const { check, ctx } = setup({ deny: ["Read(secrets/**)"] });
+    expect(check({ tool: "grep", path: "secrets", pattern: "k" }, ctx)).toBe("secrets/**");
+    expect(check({ tool: "find", path: "secrets", pattern: "*.pem" }, ctx)).toBe("secrets/**");
+    expect(check({ tool: "ls", path: "secrets" }, ctx)).toBe("secrets/**");
+    expect(check({ tool: "grep", path: "src", pattern: "k" }, ctx)).toBeNull();
+  });
+
+  it("a file-name rule does not make a whole-tree search a read of that file", () => {
+    const { check, ctx } = setup({ deny: ["Read(.env)"] });
+    expect(check({ tool: "grep", path: ".", pattern: "x" }, ctx)).toBeNull();
+    expect(check({ tool: "find", path: ".", pattern: "*.md" }, ctx)).toBeNull();
+  });
+
+  it("honors ordered `!` carve-outs within one settings file only", () => {
+    const { check, ctx } = setup({ deny: ["Read(*.pem)", "Read(!k.pem)", "Read(*.key)"] });
+    expect(check({ tool: "read", path: "secrets/k.pem" }, ctx)).toBeNull();
+    expect(check({ tool: "read", path: "secrets/other.pem" }, ctx)).toBe("*.pem");
+    expect(check({ tool: "read", path: "a.key" }, ctx)).toBe("*.key");
+  });
+
+  it("a carve-out in one file does not cancel a deny from another file", () => {
+    const { repo, configDir, opts, ctx } = setup({ deny: ["Read(!k.pem)"] });
+    writeFileSync(join(configDir, "settings.json"), JSON.stringify({ permissions: { deny: ["Read(//**/*.pem)"] } }));
+    const check = createClaudeHostPolicyChecker(repo, opts);
+    expect(check({ tool: "read", path: "secrets/k.pem" }, ctx)).toBe("//**/*.pem");
+  });
+
+  it.each([
+    ["cat .env"],
+    ["head .env"],
+    ["cat < .env"],
+    ["tail -n1 ./.env"],
+    ["grep TOKEN .env"],
+    ["sed -n 1p .env"],
+    ["cat .en*"],
+    ["wc -l README.md && cat .env"],
+    ["timeout 5 cat .env"],
+    ["while read l; do echo $l; done < .env"],
+  ])("Read(./.env) deny hard-stops the shell read `%s`", async (command) => {
+    const { repo, check } = setup({ deny: ["Read(./.env)"] });
+    const r = await run(repo, check, [command]);
+    expect(r.stoppedReason).toBe("policyStop");
+    expect(r.pathTaken).toEqual([]);
+  });
+
+  it.each([
+    ["cat README.md"],
+    ["grep .env README.md"],
+    ["echo hi 2>&1"],
+    ["awk '{print $1}' README.md"],
+  ])("a Read(./.env) deny still runs the unrelated shell read `%s`", async (command) => {
+    const { repo, check } = setup({ deny: ["Read(./.env)"] });
+    const r = await run(repo, check, [command]);
+    expect(r.stoppedReason).toBe("leaf");
+  });
+
+  it("stops a reader operand it cannot resolve (shell expansion)", async () => {
+    const { repo, check } = setup({ deny: ["Read(./.env)"] });
+    const r = await run(repo, check, ["F=.env; cat $F"]);
+    expect(r.stoppedReason).toBe("policyStop");
+  });
+
+  it("no Read rules => shell readers are not inspected", async () => {
+    const { repo, check } = setup({});
+    expect((await run(repo, check, ["cat $HOME/x || true"])).stoppedReason).not.toBe("policyStop");
+  });
+
+  it("honors a rule placed only in the remote-settings cache", async () => {
+    const { repo, configDir, opts, ctx } = setup({});
+    writeFileSync(
+      join(configDir, "remote-settings.json"),
+      JSON.stringify({ permissions: { deny: ["Read(./.env)", "Bash(curl *)"] } }),
+    );
+    const check = createClaudeHostPolicyChecker(repo, opts);
+    expect(check({ tool: "read", path: ".env" }, ctx)).toBe("./.env");
+    expect(check("curl https://x", ctx)).toBe("curl *");
+    expect(check("cat .env", ctx)).toBe("./.env");
+  });
+});
+
+describe("Claude settings sources — CLAUDE_CONFIG_DIR and managed policy", () => {
+  it("CLAUDE_CONFIG_DIR relocates the user settings and remote cache", () => {
+    const paths = claudeSettingsPaths("/px-proj", {
+      env: { CLAUDE_CONFIG_DIR: "/px-cfg" } as NodeJS.ProcessEnv,
+      managedDir: "/px-managed",
+      home: "/px-home",
+    });
+    expect(paths).toContain(join("/px-cfg", "settings.json"));
+    expect(paths).toContain(join("/px-cfg", "remote-settings.json"));
+    expect(paths).not.toContain(join("/px-home", ".claude", "settings.json"));
+    const unset = claudeSettingsPaths("/px-proj", { env: {}, managedDir: "/px-managed", home: "/px-home" });
+    expect(unset).toContain(join("/px-home", ".claude", "settings.json"));
+    expect(unset).toContain(join("/px-home", ".claude", "remote-settings.json"));
+  });
+
+  it("detects a macOS MDM plist by presence, device-wide or per-user", () => {
+    const tmp = mkdtempSync(join(tmpdir(), "px-claude-mdm-"));
+    try {
+      expect(detectManagedPolicySources({ platform: "darwin", managedPreferencesDir: tmp, user: "alice" })).toEqual([]);
+      mkdirSync(join(tmp, "alice"));
+      writeFileSync(join(tmp, "alice", "com.anthropic.claudecode.plist"), "bplist00");
+      expect(detectManagedPolicySources({ platform: "darwin", managedPreferencesDir: tmp, user: "alice" })).toEqual([
+        join(tmp, "alice", "com.anthropic.claudecode.plist"),
+      ]);
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("detects a Windows registry policy by presence and skips other platforms", () => {
+    const seen: string[] = [];
+    const found = detectManagedPolicySources({
+      platform: "win32",
+      registryHasValue: (key) => {
+        seen.push(key);
+        return key.startsWith("HKCU");
+      },
+    });
+    expect(seen).toEqual(["HKLM\\SOFTWARE\\Policies\\ClaudeCode", "HKCU\\SOFTWARE\\Policies\\ClaudeCode"]);
+    expect(found).toEqual(["HKCU\\SOFTWARE\\Policies\\ClaudeCode"]);
+    expect(detectManagedPolicySources({ platform: "linux" })).toEqual([]);
+  });
+
+  it("fails closed on every operation when an unreadable managed policy is present", () => {
+    const check = createClaudeHostPolicyChecker("/px-proj", {
+      env: {},
+      managedDir: "/px-managed-none",
+      home: "/px-home-none",
+      managedPolicySources: () => ["/Library/Managed Preferences/com.anthropic.claudecode.plist"],
+    });
+    const ctx = { cwd: "/px-proj", sessionRoot: "/px-proj" };
+    for (const op of ["echo hi", { tool: "read", path: "README.md" }, { tool: "bash", command: "ls" }] as const) {
+      expect(check(op, ctx)).toMatch(/managed MDM policy .* cannot be read by predexec/);
     }
   });
 });

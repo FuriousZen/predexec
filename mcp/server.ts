@@ -61,13 +61,7 @@ import {
 } from "../steering.ts";
 import { PLAN_SHAPE_DESCRIPTION } from "../plan-language.ts";
 // PLAN_SHAPE_DESCRIPTION includes JSON_PATH_SINGLE_OP_LINE for the MCP schema.
-import {
-  createClaudeOperationPolicyChecker,
-  createClaudePolicyChecker,
-  readClaudeBashRules,
-  readClaudeOperationRules,
-  type ClaudePolicyOptions,
-} from "./policy-claude.ts";
+import { createClaudeHostPolicyChecker, type ClaudePolicyOptions } from "./policy-claude.ts";
 import { createCodexPolicyChecker, readCodexRules, type CodexPolicyOptions } from "./policy-codex.ts";
 import { createToolExecutor } from "./tool-ops.ts";
 
@@ -201,15 +195,7 @@ async function runPredexecTool(
           return (operation: import("../core/types.ts").Operation) =>
             checkShell(operation);
         })()
-      : (() => {
-          const policyOpts = (opts.policy as ClaudePolicyOptions) ?? {};
-          const bash = readClaudeBashRules(opts.cwd, policyOpts);
-          const native = readClaudeOperationRules(opts.cwd, policyOpts);
-          const checkBash = createClaudePolicyChecker(bash.rules, bash.unreadable);
-          const checkNative = createClaudeOperationPolicyChecker(native.rules, native.unreadable);
-          return (operation: import("../core/types.ts").Operation) =>
-            typeof operation === "string" || operation.tool === "bash" ? checkBash(operation) : checkNative(operation);
-        })();
+      : createClaudeHostPolicyChecker(opts.cwd, (opts.policy as ClaudePolicyOptions) ?? {});
 
   const result = await executeAdapterPlan(rawPlan, opts.host, {
     cwd: opts.cwd,
