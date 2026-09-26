@@ -14,6 +14,9 @@ const ESCAPES = [
   "rg --pre ./x.sh hello f", "rg --pre=./x.sh hello f", "tree -o out.txt", "find . -fprint out",
   "find . -fls out", "find . -fprintf out %p", "find . -okdir rm {} ;", "find . -delete",
   "less -o log f", "less --log-file=log f", "yq -i .a=1 f.yaml",
+  // less reads options and input preprocessors from its environment too.
+  "LESSOPEN='|cmd' less f", `LESSOPEN="||cmd %s" less f`, "LESS=-olog less f", "LESS='-O log' less f",
+  "env LESSOPEN='|cmd' less f", "env LESS=-olog less f", "LESSCLOSE='cmd %s %s' less f",
 ];
 
 // Further write/exec spellings of the same heads, beyond the audit's list.
@@ -40,6 +43,9 @@ const MORE_ESCAPES = [
   "find . -ok rm {} +", "find . -name x -fprint0 out",
   // less: clustered -o, log-file abbreviations
   "less -So log f", "less -Olog f", "less --LOG-FILE=log f", "less --log=log f",
+  // less: +cmd initial commands (`!` runs a shell), also via $LESS
+  "less '+!touch x' f", "less '+|touch x' f", "LESS='+!touch x' less f", "LESS=So less f",
+  "less \"+/x\n!touch y\" f", "LESSKEY_CONTENT='#env LESSOPEN=|touch' less f",
   // yq: in-place and split-exp
   "yq --inplace .a=1 f.yaml", "yq -Pi .a=1 f.yaml", "yq --split-exp .a f.yaml", "yq -s .a f.yaml",
   // review round 1: dynamic find -exec payloads, gawk indirect calls, find
@@ -68,7 +74,8 @@ const MORE_SAFE = [
   "rg --pre-glob '*.gz' foo", "tree -a -I node_modules", "tree -d",
   "find . -exec grep pat {} \\;", "find . -name '*.ts' -exec wc -l {} +", "find . -type f -print", "find . -exec grep x {} \\; | head", "find . -exec grep x {} \\; && echo done",
   "gawk '@namespace \"x\"; BEGIN{print 1}'",
-  "less -S f", "less -N --line-numbers f", "yq -o=json .a f.yaml", "yq -P .a f.yaml", "jq -n 'input' --rawfile x /dev/stdin",
+  "less -S f", "less -N --line-numbers f", "less +G f", "less +F f", "less '+/pattern' f", "less +100 f",
+  "LESS=FRX less f", "LESS=-R less f", "yq -o=json .a f.yaml", "yq -P .a f.yaml", "jq -n 'input' --rawfile x /dev/stdin",
 ];
 
 describe("read-only heads that write or exec (CORE-1)", () => {

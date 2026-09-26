@@ -19,7 +19,8 @@ export interface WrapperInspectionOptions {
   durationPattern?: RegExp;
 }
 
-const DEFAULT_WRAPPERS = new Set(["timeout", "time", "nice", "nohup", "stdbuf", "noglob"]);
+/** Exported only for the temporary parity test against core `WRAPPERS`. */
+export const DEFAULT_WRAPPERS = new Set(["timeout", "time", "nice", "nohup", "stdbuf", "noglob"]);
 const DEFAULT_OPTION_TAKING_WRAPPERS = new Set(["timeout", "nice", "stdbuf"]);
 const DEFAULT_BARE_ONLY_WRAPPERS = new Set(["command", "builtin", "xargs"]);
 const DEFAULT_DURATION_PATTERN = /^\d+(?:\.\d+)?[smhd]?$/;

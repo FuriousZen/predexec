@@ -6,7 +6,9 @@ import {
   isDestructiveCommand,
   LANGUAGE_CALL_CANDIDATE_BUDGET,
   splitCommandSegments,
+  WRAPPERS,
 } from "../../core/destructive.ts";
+import { DEFAULT_WRAPPERS } from "../../command-inspection.ts";
 
 describe("isDestructiveCommand — heuristic coverage (2026-07 audit)", () => {
   // Writers the audit found the blocklist missing. Every one must be caught.
@@ -1516,4 +1518,81 @@ describe("isDestructiveCommand — bypasses found in the 2026-08 audit", () => {
   for (const cmd of stillReads) {
     it(`still reads: ${cmd}`, () => expect(isDestructiveCommand(cmd)).toBe(false));
   }
+});
+
+// CORE-4/CORE-5: wrapper parity with command-inspection, and interpreter eval
+// payloads classified by a reader allowlist instead of a writer blocklist.
+describe("wrapper parity and allowlist-based interpreter eval (CORE-4/5)", () => {
+  it.each([
+    `timeout 5 node -e "require('fs').writeFileSync('x','y')"`,
+    `stdbuf -o0 python3 -c "open('x','w').write('y')"`,
+    `noglob python3 -c "open('x','w').write('y')"`,
+    `python3 -c "import os; os.replace('a','b')"`,
+    `python3 -c "__import__('os').system('touch x')"`,
+    `ruby -e 'IO.write("x","y")'`,
+    `perl -e 'unlink "x"'`,
+    `node -e "require('child_process').execSync('touch x')"`,
+  ])("mutating: %s", (c) => expect(isDestructiveCommand(c)).toBe(true));
+
+  it.each([
+    `python3 -c "import json,sys; print(json.load(open('p.json'))['version'])"`,
+    `node -e "console.log(require('./package.json').version)"`,
+    `python3 --version`,
+  ])("read-only: %s", (c) => expect(isDestructiveCommand(c)).toBe(false));
+
+  // Wrapper option/duration skipping resolves the real head either way.
+  it.each([
+    "timeout -s KILL 5 rm -f x", "timeout --kill-after=1 5s touch x", "stdbuf -o L -eL rm x", "noglob rm *.log",
+    "timeout notaduration rm x",
+  ])("wrapper-mutating: %s", (c) => expect(isDestructiveCommand(c)).toBe(true));
+  it.each(["timeout 5 cat f", "timeout -k 1 2.5 grep x f", "stdbuf -oL grep x f", "noglob ls *.ts"])(
+    "wrapper-read-only: %s",
+    (c) => expect(isDestructiveCommand(c)).toBe(false),
+  );
+
+  // Calls off the allowlist, uncalled references to writers, rebinding an
+  // allowlisted name, and payload shapes the old blocklist missed.
+  it.each([
+    `python3 -c "import os; print(max(['touch x'], key=os.system))"`,
+    `python3 -c "from os import system; max(['touch x'], key=system)"`,
+    `python3 -c "import subprocess as sp; sp.call('x')"`,
+    `python3 -c "print = os.remove; print('x')"`,
+    `python3 -c "(os).system('x')"`,
+    `python3 -c "exec('import os')"`,
+    `node -e "['x'].map(require('fs').linkSync)"`,
+    `node -e "const f = require('fs'); f.chownSync('x', 1, 1)"`,
+    `node -e "process.kill(1)"`,
+    `node -e "fs['writeFileSync']('x', 'y')"`,
+    `node -e "['./x.js'].map(require)"`,
+    `node -e "[].constructor.constructor('return 1')"`,
+    `python3 -c "import sys; max(['x'], key=sys.modules.get('os').system)"`,
+    `php -r 'include "x.php";'`,
+    `ruby -e 'system "touch x"'`,
+    `ruby -e 'Kernel.spawn "touch x"'`,
+    `perl -pe 's/a/system("id")/e' f`,
+    `perl -e 'open(F, "cmd|"); print <F>'`,
+    `perl -e 'print 1;' -e 'system 2'`,
+    `php -r '$f = "system"; $f("id");'`,
+  ])("allowlist-mutating: %s", (c) => expect(isDestructiveCommand(c)).toBe(true));
+
+  it.each([
+    `python3 -c "with open('f') as fh: print(fh.read())"`,
+    `python3 -c "import sys, json; d = json.load(sys.stdin); print(d['a'])"`,
+    `python3 -c "import os; print(os.environ['HOME'], os.path.join('a', 'b'), os.listdir('.'))"`,
+    `node -e "console.log(require('fs').readFileSync('package.json', 'utf8'))"`,
+    `node -e "const fs = require('fs'); console.log(fs.readdirSync('.'))"`,
+    `node -p "process.versions.node"`,
+    `node -e 'process.stdout.write("x".repeat(3))'`,
+    `ruby -e 'require "json"; puts JSON.parse(File.read("p.json"))["version"]'`,
+    `ruby -ne 'print if /foo/' f`,
+    `perl -pe 's/a/b/g' f`,
+    `perl -F: -lane 'print $F[0]' /etc/passwd`,
+    `perl -e 'open(my $fh, "<", "f"); print <$fh>'`,
+    `php -r 'echo file_get_contents("x");'`,
+  ])("allowlist-read-only: %s", (c) => expect(isDestructiveCommand(c)).toBe(false));
+
+  // Temporary scaffolding until the lexers merge; trivially true afterwards.
+  it("core WRAPPERS is a superset of command-inspection DEFAULT_WRAPPERS", () => {
+    for (const wrapper of DEFAULT_WRAPPERS) expect(WRAPPERS.has(wrapper), wrapper).toBe(true);
+  });
 });
