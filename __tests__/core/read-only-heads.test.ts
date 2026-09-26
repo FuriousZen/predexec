@@ -191,3 +191,17 @@ describe("taint fix round 1", () => {
   it.each(ROUND1_MUTATING)("mutating: %s", (c) => expect(isDestructiveCommand(c)).toBe(true));
   it.each(ROUND1_READ_ONLY)("read-only: %s", (c) => expect(isDestructiveCommand(c)).toBe(false));
 });
+
+// R12: a substitution's output used directly as a variable name.
+const R12_MUTATING = [
+  "printf -v \"$(cat f)\" x", "read \"$(cat f)\" <<< x", "read -a \"$(cat f)\" <<< x", "declare \"$(cat f)=1\"",
+  "export \"$(cat f)=1\"", "readonly \"$(cat f)=1\"", "g() { local \"$(cat f)=1\"; }; g", "typeset \"$(cat f)=1\"",
+  "unset \"$(cat f)\"", "getopts a \"$(cat f)\"", "mapfile -t \"$(cat f)\" < f", "declare -n r=\"$(cat f)\"",
+  "[[ -v $(cat f) ]]", "printf -v \"`cat f`\" x", "printf -v \"$(<f)\" x",
+];
+const R12_READ_ONLY = ["printf -v out '%s' \"$(cat f)\"", "read -r line < f"];
+
+describe("substitutions used directly as variable names (R12)", () => {
+  it.each(R12_MUTATING)("mutating: %s", (c) => expect(isDestructiveCommand(c)).toBe(true));
+  it.each(R12_READ_ONLY)("read-only: %s", (c) => expect(isDestructiveCommand(c)).toBe(false));
+});

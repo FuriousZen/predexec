@@ -33,7 +33,8 @@
  * no variable in between, and so is any data assigned to an integer-declared
  * name (`declare -i n=$(cat f)`), because that assignment evaluates. Name
  * operands of `mapfile`/`readarray`, `wait -p` and `[[ -R` (bash 4+) are
- * flagged fail-closed, like namerefs.
+ * flagged fail-closed, like namerefs. A substitution's output used directly
+ * in any name-operand position (`printf -v "$(cat f)"`) is flagged too.
  *
  * The analysis is deliberately flow-insensitive and over-approximating: order
  * is ignored, quoting is ignored for context detection, and any identifier in
@@ -132,6 +133,8 @@ interface ArithmeticRanges {
   nameReferences: string[];
   /** True when a command substitution's output lands in an arithmetic context. */
   substitution: boolean;
+  /** True when a command substitution's output is used as a variable name. */
+  nameSubstitution: boolean;
   /** `${NAME:=value}` / `${NAME=value}`: NAME is assigned value. */
   defaults: Array<{ name: string; value: string }>;
   complete: boolean;
@@ -148,6 +151,7 @@ function arithmeticRangeIdentifiers(text: string): ArithmeticRanges {
   let complete = true;
   const nameReferences: string[] = [];
   const defaults: Array<{ name: string; value: string }> = [];
+  const names = { substitution: false };
   const mark = (start: number, end: number) => {
     if (start >= end) return;
     cover[start]!++;
@@ -209,7 +213,7 @@ function arithmeticRangeIdentifiers(text: string): ArithmeticRanges {
       const bodyEnd = close === -1 || close < i ? text.length : close - 1;
       if (bodyEnd === text.length) complete = false;
       testEnd = bodyEnd;
-      markTestOperands(text, i + 2, bodyEnd, match, mark, nameReferences);
+      markTestOperands(text, i + 2, bodyEnd, match, mark, nameReferences, names);
     }
   }
   const covered: string[] = [];
@@ -227,7 +231,14 @@ function arithmeticRangeIdentifiers(text: string): ArithmeticRanges {
       runStart = -1;
     }
   }
-  return { identifiers: covered.flatMap(identifiers), nameReferences, substitution, defaults, complete };
+  return {
+    identifiers: covered.flatMap(identifiers),
+    nameReferences,
+    substitution,
+    nameSubstitution: names.substitution,
+    defaults,
+    complete,
+  };
 }
 
 /**
@@ -241,6 +252,7 @@ function markTestOperands(
   match: Int32Array,
   mark: (start: number, end: number) => void,
   nameReferences: string[],
+  names: { substitution: boolean },
 ): void {
   const words: Array<[number, number]> = [];
   let wordStart = -1;
@@ -264,7 +276,9 @@ function markTestOperands(
     const word = text.slice(s, e);
     // `-v NAME` and `-R NAME` (nameref test, bash 4.3+) parse NAME.
     if ((word === "-v" || word === "-R") && w + 1 < words.length) {
-      nameReferences.push(...variableReferences(text.slice(words[w + 1]![0], words[w + 1]![1])));
+      const operand = text.slice(words[w + 1]![0], words[w + 1]![1]);
+      nameReferences.push(...variableReferences(operand));
+      if (SUBSTITUTION_START_RE.test(operand)) names.substitution = true;
     }
     if (!ARITHMETIC_TEST_OPERATORS.has(word)) continue;
     if (w > 0) mark(words[w - 1]![0], words[w - 1]![1]);
@@ -285,6 +299,8 @@ interface Flow {
   nameReferences: string[];
   /** A command substitution's output used directly as a `let` expression. */
   substitution: boolean;
+  /** A command substitution's output used directly as a variable-name operand. */
+  nameSubstitution: boolean;
   /** Functions this command defines, and the commands it calls with data arguments. */
   functions: Set<string>;
   dataCalls: Set<string>;
@@ -426,8 +442,12 @@ const rawWord = (segment: string, word: ShellWord) => segment.slice(word.start, 
 
 /** Record the variables whose values `command` would use as variable names. */
 function recordNameOperands(flow: Flow, segment: string, command: string, args: readonly ShellWord[]): void {
+  const nameText = (text: string) => {
+    flow.nameReferences.push(...variableReferences(text));
+    if (SUBSTITUTION_START_RE.test(text)) flow.nameSubstitution = true;
+  };
   const name = (word: ShellWord | undefined) => {
-    if (word) flow.nameReferences.push(...variableReferences(rawWord(segment, word)));
+    if (word) nameText(rawWord(segment, word));
   };
   const options = args.filter((word) => /^[-+]/.test(word.value)).map((word) => word.value);
   switch (command) {
@@ -487,11 +507,11 @@ function recordNameOperands(flow: Flow, segment: string, command: string, args: 
         const raw = rawWord(segment, word);
         const equals = raw.indexOf("=");
         if (equals === -1) {
-          if (bareIsName) flow.nameReferences.push(...variableReferences(raw));
+          if (bareIsName) nameText(raw);
           continue;
         }
-        flow.nameReferences.push(...variableReferences(raw.slice(0, equals)));
-        if (nameref) flow.nameReferences.push(...variableReferences(raw.slice(equals + 1)));
+        nameText(raw.slice(0, equals));
+        if (nameref) nameText(raw.slice(equals + 1));
       }
       break;
     }
@@ -533,6 +553,7 @@ export function findTaintedEvaluation(command: string): string | null {
     integerNames: new Set(),
     nameReferences: [],
     substitution: false,
+    nameSubstitution: false,
     functions: new Set(),
     dataCalls: new Set(),
     assignments: [],
@@ -544,6 +565,7 @@ export function findTaintedEvaluation(command: string): string | null {
     for (const segment of splitCommandSegments(body)) scanSegment(flow, segment);
   }
   if (ranges.substitution || flow.substitution) return "arithmetic over command substitution output";
+  if (ranges.nameSubstitution || flow.nameSubstitution) return "command substitution output used as a variable name";
   for (const { name, values } of flow.assignments) {
     if (flow.integerNames.has(name)) flow.arithmetic.push(...values);
   }

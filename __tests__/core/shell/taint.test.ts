@@ -224,3 +224,23 @@ describe("fix round 1: direct, integer, default, positional and glob sources", (
     expect(findTaintedEvaluation(command)).toBeNull();
   });
 });
+
+// R12: a substitution's output used directly as a variable NAME operand.
+const SUBSTITUTED_NAMES = [
+  "printf -v \"$(cat f)\" x", "printf -v \"`cat f`\" x", "printf -v \"$(<f)\" x",
+  "read \"$(cat f)\" <<< x", "read -a \"$(cat f)\" <<< x",
+  "declare \"$(cat f)=1\"", "export \"$(cat f)=1\"", "readonly \"$(cat f)=1\"",
+  "g() { local \"$(cat f)=1\"; }; g", "typeset \"$(cat f)=1\"",
+  "unset \"$(cat f)\"", "getopts a \"$(cat f)\"", "mapfile -t \"$(cat f)\" < f",
+  "declare -n r=\"$(cat f)\"", "[[ -v $(cat f) ]]", "[[ -v `cat f` ]]",
+];
+const SUBSTITUTED_VALUES = ["printf -v out '%s' \"$(cat f)\"", "read -r line < f", "declare \"x=$(cat f)\""];
+
+describe("substitutions used directly as variable names (R12)", () => {
+  it.each(SUBSTITUTED_NAMES)("tainted: %s", (command) => {
+    expect(findTaintedEvaluation(command)).toBe("command substitution output used as a variable name");
+  });
+  it.each(SUBSTITUTED_VALUES)("clean: %s", (command) => {
+    expect(findTaintedEvaluation(command)).toBeNull();
+  });
+});
