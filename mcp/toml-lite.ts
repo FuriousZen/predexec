@@ -1,231 +1,424 @@
 /**
- * predexec toml-lite — a deliberately SMALL, fail-closed TOML subset reader.
- * No TOML dependency is allowed, so `~/.codex/config.toml` (Task 4, Task 6) is
- * read by this hand-rolled parser instead: parse the subset confidently, or
- * return `{ ok: false, error }` naming the offending line — never a silent
- * wrong parse.
+ * predexec toml-lite — a hand-rolled TOML reader for `~/.codex/config.toml`.
+ * No TOML dependency is allowed, so the file Codex itself writes is read by
+ * this parser instead.
  *
- * Supported: `[table]` / `[table.sub."quoted key"]` headers (quote-aware dot
- * splitting); bare/quoted `key = value`; basic strings (`\"`/`\\`/`\n`/`\t`
- * escapes), literal strings (raw), booleans, integers, floats, and flat
- * arrays of those (may span lines). `#` comments are string-aware. Reopening
- * a table via a second identical/prefix-sharing header merges (matches
- * TOML); a duplicate key within a table is a hard failure.
+ * Coverage (Task 13, CX-1): the full TOML value grammar — basic / literal /
+ * multi-line strings (`"""`, `'''`, every TOML escape incl. `\u`/`\U`),
+ * integers (`1_000`, `0x`/`0o`/`0b`), floats (`1e5`, `inf`, `nan`), booleans,
+ * datetimes (kept as their source text), nested arrays, inline tables,
+ * `[table]` and `[[array.of.tables]]` headers, and dotted keys. Codex's own
+ * UI writes `[[skills.config]]` (codex-rs/core/src/config/edit.rs:529) and
+ * inline tables, so rejecting them locked every user out.
  *
- * NOT supported (fails loudly, naming the line): inline tables `{...}`,
- * array-of-tables `[[x]]`, datetimes, nested arrays, dotted keys on the LEFT
- * of `=`, string concatenation, multi-line strings — every field the Codex
- * adapters read is representable without them, so e.g.
- * `approval_policy = { granular = {...} }` fails the read and the caller
- * falls closed. Pure function, no imports.
+ * Error policy — the reader only needs `projects` (trust) and
+ * `project_root_markers` (project-root discovery), so:
+ * - a parse error in a statement that touches either key (a header whose
+ *   text names them, a key/value inside such a table, or a root key/value
+ *   naming them) fails the whole read: `{ ok: false, error }`.
+ * - a parse error anywhere else drops only that statement and is recorded as
+ *   `warnings` (`line N: message`); after a bad header, the keys that follow
+ *   are parsed but discarded rather than misfiled into the previous table.
+ *   Recovery restarts on the line after the failing statement's first line,
+ *   so a broken multi-line construct cannot swallow a later `[projects]`
+ *   section unseen.
+ * - a table header defined twice (`[a]` ... `[a]`) always fails: TOML forbids
+ *   it and the old reader silently merged it (CX-7).
+ * Pure function, no imports.
  */
 
-export type TomlValue = string | number | boolean | TomlValue[];
-export type TomlTable = { [key: string]: TomlTable | TomlValue };
-export type TomlParseResult = { ok: true; value: Record<string, unknown> } | { ok: false; error: string };
+export type TomlValue = string | number | boolean | TomlValue[] | TomlTable;
+export interface TomlTable {
+  [key: string]: TomlValue;
+}
+export type TomlParseResult =
+  | { ok: true; value: Record<string, unknown>; warnings?: string[] }
+  | { ok: false; error: string };
 
-/** Threads the offending line number out of the recursive descent so the
- * top-level catch can format `line N: <message>` without passing it through
- * every helper. */
-class TomlLineError extends Error {
+/** Root keys whose statements may not be dropped: a lost trust entry or marker list is a fail-open. */
+const CRITICAL_TEXT_RE = /projects|project_root_markers/;
+const CRITICAL_ROOT_KEYS = new Set(["projects", "project_root_markers"]);
+
+class TomlError extends Error {
   constructor(
-    public readonly lineNo: number,
+    public readonly pos: number,
     message: string,
+    /** A hard error fails the read even outside `projects` (duplicate table headers). */
+    public readonly hard = false,
   ) {
     super(message);
   }
 }
 
-const ESCAPES: Record<string, string> = { '"': '"', "\\": "\\", n: "\n", t: "\t" };
+const SIMPLE_ESCAPES: Record<string, string> = {
+  b: "\b",
+  t: "\t",
+  n: "\n",
+  f: "\f",
+  r: "\r",
+  e: "\x1b",
+  '"': '"',
+  "\\": "\\",
+};
 
-/** Index of the first `target` char outside a string, or -1 — shared by
- * comment-stripping (target `#`) and key/value splitting (target `=`). */
-function firstUnquotedIndex(line: string, target: string): number {
-  let q: '"' | "'" | null = null;
-  for (let i = 0; i < line.length; i++) {
-    const c = line[i]!;
-    if (q) {
-      if (q === '"' && c === "\\") i++;
-      else if (c === q) q = null;
-    } else if (c === '"' || c === "'") q = c;
-    else if (c === target) return i;
+const BARE_KEY_RE = /[A-Za-z0-9_-]/;
+const DEC_INT_RE = /^[+-]?(?:0|[1-9](?:_?\d)*)$/;
+const HEX_RE = /^0x[0-9A-Fa-f](?:_?[0-9A-Fa-f])*$/;
+const OCT_RE = /^0o[0-7](?:_?[0-7])*$/;
+const BIN_RE = /^0b[01](?:_?[01])*$/;
+const FLOAT_RE = /^[+-]?(?:0|[1-9](?:_?\d)*)(?:\.\d(?:_?\d)*)?(?:[eE][+-]?\d(?:_?\d)*)?$/;
+const SPECIAL_FLOAT_RE = /^[+-]?(?:inf|nan)$/;
+const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+const DATETIME_RE = /^\d{4}-\d{2}-\d{2}(?:[Tt ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:[Zz]|[+-]\d{2}:\d{2})?)?$/;
+const TIME_RE = /^\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?$/;
+
+class Parser {
+  i = 0;
+  readonly root: TomlTable = {};
+  /** Tables defined by a `[header]` — a second identical header is an error. */
+  private readonly headerDefined = new WeakSet<TomlTable>();
+  /** Tables created by dotted keys — a header may not reopen them. */
+  private readonly dottedDefined = new WeakSet<TomlTable>();
+  /** Inline tables are closed: nothing may extend them. */
+  private readonly frozen = new WeakSet<TomlTable>();
+  /** Arrays created by `[[header]]` (a static array cannot be appended to). */
+  private readonly tableArrays = new WeakSet<TomlValue[]>();
+
+  constructor(private readonly s: string) {}
+
+  lineOf(pos: number): number {
+    let line = 1;
+    for (let k = 0; k < pos && k < this.s.length; k++) if (this.s[k] === "\n") line++;
+    return line;
   }
-  return -1;
-}
 
-/** Strip a `#` comment, string-aware (a `#` inside a quoted value survives). */
-function stripComment(line: string): string {
-  const idx = firstUnquotedIndex(line, "#");
-  return idx === -1 ? line : line.slice(0, idx);
-}
-
-function parseBasicString(s: string, pos: number): { value: string; pos: number } {
-  let i = pos + 1,
-    out = "";
-  for (; i < s.length; i++) {
-    const c = s[i]!;
-    if (c === "\n") break;
-    if (c === '"') return { value: out, pos: i + 1 };
-    if (c === "\\") {
-      const esc = ESCAPES[s[i + 1] ?? ""];
-      if (esc === undefined) throw new Error(`unsupported escape sequence "\\${s[i + 1] ?? ""}"`);
-      (out += esc), i++;
-    } else out += c;
+  lineEnd(pos: number): number {
+    const nl = this.s.indexOf("\n", pos);
+    return nl === -1 ? this.s.length : nl;
   }
-  throw new Error("unterminated string");
-}
 
-function parseLiteralString(s: string, pos: number): { value: string; pos: number } {
-  const end = s.indexOf("'", pos + 1);
-  if (end === -1 || s.slice(pos, end).includes("\n")) throw new Error("unterminated string");
-  return { value: s.slice(pos + 1, end), pos: end + 1 };
-}
-
-/** A single bare or quoted key token, fully consuming `text`. */
-function parseKeyToken(text: string): string {
-  if (text[0] === '"' || text[0] === "'") {
-    const r = text[0] === '"' ? parseBasicString(text, 0) : parseLiteralString(text, 0);
-    if (r.pos !== text.length) throw new Error(`invalid key "${text}"`);
-    return r.value;
+  skipWs(): void {
+    while (this.s[this.i] === " " || this.s[this.i] === "\t") this.i++;
   }
-  if (/^[A-Za-z0-9_-]+$/.test(text)) return text;
-  throw new Error(`invalid key "${text}"`);
-}
 
-/** Split a table header's inner text on unquoted `.`, into validated key tokens. */
-function splitDottedKey(s: string): string[] {
-  const parts: string[] = [];
-  let cur = "",
-    q: '"' | "'" | null = null;
-  for (let i = 0; i < s.length; i++) {
-    const c = s[i]!;
-    if (q) {
-      cur += c;
-      if (q === '"' && c === "\\") (cur += s[i + 1] ?? ""), i++;
-      else if (c === q) q = null;
-    } else if (c === '"' || c === "'") (q = c), (cur += c);
-    else if (c === ".") (parts.push(cur.trim()), (cur = ""));
-    else cur += c;
+  /** Whitespace, newlines and comments — between statements and inside arrays / inline tables. */
+  skipWsNewlinesComments(): void {
+    for (;;) {
+      const c = this.s[this.i];
+      if (c === " " || c === "\t" || c === "\n" || c === "\r") this.i++;
+      else if (c === "#") this.i = this.lineEnd(this.i);
+      else return;
+    }
   }
-  parts.push(cur.trim());
-  return parts.map(parseKeyToken);
-}
 
-/** Bracket-depth balance, string-aware — decides whether an array value needs
- * more lines. Structural validity is enforced by parseArray below. */
-function arrayIsClosed(text: string): boolean {
-  let depth = 0,
-    q: '"' | "'" | null = null;
-  for (let i = 0; i < text.length; i++) {
-    const c = text[i]!;
-    if (q) {
-      if (q === '"' && c === "\\") i++;
-      else if (c === q) q = null;
-    } else if (c === '"' || c === "'") q = c;
-    else if (c === "[") depth++;
-    else if (c === "]") depth--;
+  /** After a statement: optional whitespace and comment, then a newline or EOF. */
+  expectStatementEnd(): void {
+    this.skipWs();
+    if (this.s[this.i] === "#") this.i = this.lineEnd(this.i);
+    if (this.s[this.i] === "\r" && this.s[this.i + 1] === "\n") this.i++;
+    if (this.i < this.s.length && this.s[this.i] !== "\n") throw new TomlError(this.i, "unexpected trailing content after value");
   }
-  return depth <= 0;
-}
 
-function parseBareValue(s: string, pos: number): { value: TomlValue; pos: number } {
-  let i = pos;
-  while (i < s.length && !/[\s,\]]/.test(s[i]!)) i++;
-  const t = s.slice(pos, i);
-  if (t === "true" || t === "false") return { value: t === "true", pos: i };
-  if (/^[+-]?\d+$/.test(t)) return { value: parseInt(t, 10), pos: i };
-  if (/^[+-]?\d+\.\d+([eE][+-]?\d+)?$/.test(t)) return { value: parseFloat(t), pos: i };
-  throw new Error(`unsupported value "${t}"`);
-}
-
-function parseValue(s: string, pos: number, insideArray: boolean): { value: TomlValue; pos: number } {
-  while (pos < s.length && /\s/.test(s[pos]!)) pos++;
-  if (pos >= s.length) throw new Error("missing value");
-  const c = s[pos]!;
-  if (c === '"') return parseBasicString(s, pos);
-  if (c === "'") return parseLiteralString(s, pos);
-  if (c === "{") throw new Error("inline tables are not supported");
-  if (c === "[") {
-    if (insideArray) throw new Error("nested arrays are not supported");
-    return parseArray(s, pos);
+  parseKey(): string[] {
+    const keys: string[] = [];
+    for (;;) {
+      this.skipWs();
+      const c = this.s[this.i];
+      if (c === '"') keys.push(this.parseBasicString());
+      else if (c === "'") keys.push(this.parseLiteralString());
+      else {
+        const start = this.i;
+        while (this.i < this.s.length && BARE_KEY_RE.test(this.s[this.i]!)) this.i++;
+        if (this.i === start) throw new TomlError(this.i, "invalid key");
+        keys.push(this.s.slice(start, this.i));
+      }
+      this.skipWs();
+      if (this.s[this.i] !== ".") return keys;
+      this.i++;
+    }
   }
-  return parseBareValue(s, pos);
-}
 
-function parseArray(s: string, pos: number): { value: TomlValue[]; pos: number } {
-  let i = pos + 1;
-  const arr: TomlValue[] = [];
-  for (;;) {
-    while (i < s.length && /\s/.test(s[i]!)) i++;
-    if (i >= s.length) throw new Error("unterminated array");
-    if (s[i] === "]") return { value: arr, pos: i + 1 };
-    const r = parseValue(s, i, true);
-    arr.push(r.value);
-    i = r.pos;
-    while (i < s.length && /\s/.test(s[i]!)) i++;
-    if (s[i] === ",") i++;
-    else if (s[i] === "]") return { value: arr, pos: i + 1 };
-    else throw new Error('expected "," or "]" in array');
+  parseEscape(): string {
+    const pos = this.i;
+    const c = this.s[this.i + 1] ?? "";
+    const simple = SIMPLE_ESCAPES[c];
+    if (simple !== undefined) {
+      this.i += 2;
+      return simple;
+    }
+    const width = c === "u" ? 4 : c === "U" ? 8 : c === "x" ? 2 : 0;
+    const hex = this.s.slice(this.i + 2, this.i + 2 + width);
+    if (width === 0 || !new RegExp(`^[0-9A-Fa-f]{${width}}$`).test(hex))
+      throw new TomlError(pos, `invalid escape sequence "\\${c}"`);
+    const code = parseInt(hex, 16);
+    if (code > 0x10ffff || (code >= 0xd800 && code <= 0xdfff)) throw new TomlError(pos, "escape is not a Unicode scalar value");
+    this.i += 2 + width;
+    return String.fromCodePoint(code);
   }
-}
 
-/** Parse one full value; rejects trailing content (catches string concatenation). */
-function parseFullValue(text: string): TomlValue {
-  const r = parseValue(text, 0, false);
-  if (text.slice(r.pos).trim() !== "") throw new Error("unexpected trailing content after value");
-  return r.value;
+  parseBasicString(): string {
+    const start = this.i;
+    this.i++;
+    let out = "";
+    while (this.i < this.s.length) {
+      const c = this.s[this.i]!;
+      if (c === "\n") break;
+      if (c === '"') {
+        this.i++;
+        return out;
+      }
+      if (c === "\\") out += this.parseEscape();
+      else (out += c), this.i++;
+    }
+    throw new TomlError(this.i < this.s.length ? this.i : start, "unterminated string");
+  }
+
+  parseLiteralString(): string {
+    const start = this.i;
+    const end = this.s.indexOf("'", this.i + 1);
+    const nl = this.s.indexOf("\n", this.i + 1);
+    if (end === -1 || (nl !== -1 && nl < end)) throw new TomlError(nl === -1 ? start : nl, "unterminated string");
+    this.i = end + 1;
+    return this.s.slice(start + 1, end);
+  }
+
+  /** `"""` / `'''` strings: first newline trimmed; up to two quotes may sit before the closing delimiter. */
+  parseMultilineString(quote: '"' | "'"): string {
+    const start = this.i;
+    const delim = quote.repeat(3);
+    this.i += 3;
+    if (this.s[this.i] === "\n") this.i++;
+    else if (this.s[this.i] === "\r" && this.s[this.i + 1] === "\n") this.i += 2;
+    let out = "";
+    while (this.i < this.s.length) {
+      if (this.s.startsWith(delim, this.i)) {
+        let run = 3;
+        while (this.s[this.i + run] === quote) run++;
+        if (run > 5) throw new TomlError(this.i, "too many quotes closing a multi-line string");
+        out += quote.repeat(run - 3);
+        this.i += run;
+        return out;
+      }
+      const c = this.s[this.i]!;
+      if (quote === '"' && c === "\\") {
+        // Line-ending backslash: trim the newline and all whitespace after it.
+        let j = this.i + 1;
+        while (this.s[j] === " " || this.s[j] === "\t") j++;
+        if (this.s[j] === "\n" || (this.s[j] === "\r" && this.s[j + 1] === "\n")) {
+          while (j < this.s.length && /[ \t\r\n]/.test(this.s[j]!)) j++;
+          this.i = j;
+          continue;
+        }
+        out += this.parseEscape();
+        continue;
+      }
+      out += c;
+      this.i++;
+    }
+    throw new TomlError(start, "unterminated multi-line string");
+  }
+
+  parseBare(): TomlValue {
+    const start = this.i;
+    while (this.i < this.s.length && !/[\s,\]}#]/.test(this.s[this.i]!)) this.i++;
+    let t = this.s.slice(start, this.i);
+    // `1979-05-27 07:32:00` — a space-separated datetime.
+    if (DATE_RE.test(t) && this.s[this.i] === " " && /^\d{2}:/.test(this.s.slice(this.i + 1, this.i + 4))) {
+      this.i++;
+      while (this.i < this.s.length && !/[\s,\]}#]/.test(this.s[this.i]!)) this.i++;
+      t = this.s.slice(start, this.i);
+    }
+    if (t === "true") return true;
+    if (t === "false") return false;
+    const digits = t.replace(/_/g, "");
+    if (DEC_INT_RE.test(t)) return parseInt(digits, 10);
+    if (HEX_RE.test(t)) return parseInt(digits.slice(2), 16);
+    if (OCT_RE.test(t)) return parseInt(digits.slice(2), 8);
+    if (BIN_RE.test(t)) return parseInt(digits.slice(2), 2);
+    if (SPECIAL_FLOAT_RE.test(t)) return t.endsWith("nan") ? NaN : t.startsWith("-") ? -Infinity : Infinity;
+    if (FLOAT_RE.test(t)) return parseFloat(digits);
+    if (DATETIME_RE.test(t) || TIME_RE.test(t)) return t;
+    throw new TomlError(start, `unsupported value "${t}"`);
+  }
+
+  parseValue(): TomlValue {
+    this.skipWs();
+    const c = this.s[this.i];
+    if (c === undefined || c === "\n" || c === "\r" || c === "#") throw new TomlError(this.i, "missing value");
+    if (this.s.startsWith('"""', this.i)) return this.parseMultilineString('"');
+    if (this.s.startsWith("'''", this.i)) return this.parseMultilineString("'");
+    if (c === '"') return this.parseBasicString();
+    if (c === "'") return this.parseLiteralString();
+    if (c === "[") return this.parseArray();
+    if (c === "{") return this.parseInlineTable();
+    return this.parseBare();
+  }
+
+  parseArray(): TomlValue[] {
+    const start = this.i;
+    this.i++;
+    const arr: TomlValue[] = [];
+    for (;;) {
+      this.skipWsNewlinesComments();
+      if (this.i >= this.s.length) throw new TomlError(start, "unterminated array");
+      if (this.s[this.i] === "]") {
+        this.i++;
+        return arr;
+      }
+      arr.push(this.parseValue());
+      this.skipWsNewlinesComments();
+      if (this.s[this.i] === ",") this.i++;
+      else if (this.s[this.i] === "]") {
+        this.i++;
+        return arr;
+      } else if (this.i >= this.s.length) throw new TomlError(start, "unterminated array");
+      else throw new TomlError(this.i, 'expected "," or "]" in array');
+    }
+  }
+
+  parseInlineTable(): TomlTable {
+    const start = this.i;
+    this.i++;
+    const table: TomlTable = {};
+    for (;;) {
+      this.skipWsNewlinesComments();
+      if (this.i >= this.s.length) throw new TomlError(start, "unterminated inline table");
+      if (this.s[this.i] === "}") {
+        this.i++;
+        break;
+      }
+      const keyPos = this.i;
+      const keys = this.parseKey();
+      if (this.s[this.i] !== "=") throw new TomlError(this.i, 'expected "=" after key');
+      this.i++;
+      this.assign(table, keys, this.parseValue(), keyPos);
+      this.skipWsNewlinesComments();
+      if (this.s[this.i] === ",") this.i++;
+      else if (this.s[this.i] !== "}") throw new TomlError(this.i, 'expected "," or "}" in inline table');
+    }
+    this.frozen.add(table);
+    return table;
+  }
+
+  isTable(v: TomlValue | undefined): v is TomlTable {
+    return typeof v === "object" && v !== null && !Array.isArray(v);
+  }
+
+  /** `a.b.c = v` into `table`: intermediate tables are created as dotted-defined. */
+  assign(table: TomlTable, keys: string[], value: TomlValue, pos: number): void {
+    let node = table;
+    for (const k of keys.slice(0, -1)) {
+      const existing = node[k];
+      if (existing === undefined) {
+        const created: TomlTable = {};
+        this.dottedDefined.add(created);
+        node[k] = created;
+        node = created;
+      } else if (this.isTable(existing) && !this.frozen.has(existing) && !this.headerDefined.has(existing)) node = existing;
+      else throw new TomlError(pos, `cannot extend "${k}" with a dotted key`);
+    }
+    const last = keys[keys.length - 1]!;
+    if (Object.prototype.hasOwnProperty.call(node, last)) throw new TomlError(pos, `duplicate key "${last}"`);
+    node[last] = value;
+  }
+
+  /** `[a.b]` / `[[a.b]]` — returns the table later key/values go into. */
+  openHeader(keys: string[], isArray: boolean, pos: number): TomlTable {
+    let node = this.root;
+    for (const k of keys.slice(0, -1)) {
+      const existing = node[k];
+      if (existing === undefined) {
+        const created: TomlTable = {};
+        node[k] = created;
+        node = created;
+      } else if (Array.isArray(existing) && this.tableArrays.has(existing)) node = existing[existing.length - 1] as TomlTable;
+      else if (this.isTable(existing) && !this.frozen.has(existing)) node = existing;
+      else throw new TomlError(pos, `cannot redefine "${k}" as a table`);
+    }
+    const last = keys[keys.length - 1]!;
+    const existing = node[last];
+    const header = `[${isArray ? "[" : ""}${keys.join(".")}${isArray ? "]" : ""}]`;
+    if (isArray) {
+      const table: TomlTable = {};
+      this.headerDefined.add(table);
+      if (existing === undefined) {
+        const arr: TomlValue[] = [table];
+        this.tableArrays.add(arr);
+        node[last] = arr;
+      } else if (Array.isArray(existing) && this.tableArrays.has(existing)) existing.push(table);
+      else throw new TomlError(pos, `cannot redefine "${last}" as an array of tables`);
+      return table;
+    }
+    if (existing === undefined) {
+      const table: TomlTable = {};
+      this.headerDefined.add(table);
+      node[last] = table;
+      return table;
+    }
+    if (this.isTable(existing)) {
+      if (this.headerDefined.has(existing)) throw new TomlError(pos, `table ${header} defined more than once`, true);
+      if (this.frozen.has(existing) || this.dottedDefined.has(existing))
+        throw new TomlError(pos, `cannot reopen "${last}" with a table header`);
+      this.headerDefined.add(existing);
+      return existing;
+    }
+    throw new TomlError(pos, `cannot redefine "${last}" as a table`);
+  }
 }
 
 export function parseTomlLite(text: string): TomlParseResult {
-  try {
-    const lines = text.split(/\r\n|\n/).map(stripComment);
-    const root: TomlTable = {};
-    let current: TomlTable = root;
-    let i = 0;
-    while (i < lines.length) {
-      const lineNo = i + 1;
-      const line = lines[i]!.trim();
-      i++;
-      if (line === "") continue;
+  const p = new Parser(text);
+  const warnings: string[] = [];
+  let current: TomlTable = p.root;
+  /** Root key of the current table, or null for the root table / a discarded table. */
+  let currentRootKey: string | null = null;
+  let discarding = false;
 
-      try {
-        if (line[0] === "[") {
-          if (line[1] === "[") throw new Error('array-of-tables ("[[...]]") are not supported');
-          if (!line.endsWith("]")) throw new Error("malformed table header");
-          let node = root;
-          for (const seg of splitDottedKey(line.slice(1, -1))) {
-            const existing = node[seg];
-            if (existing === undefined) node[seg] = {};
-            else if (typeof existing !== "object" || Array.isArray(existing))
-              throw new Error(`cannot redefine "${seg}" as a table`);
-            node = node[seg] as TomlTable;
-          }
-          current = node;
-          continue;
-        }
-
-        const eq = firstUnquotedIndex(line, "=");
-        if (eq === -1) throw new Error("expected key = value");
-        const keyText = line.slice(0, eq).trim();
-        if (keyText[0] !== '"' && keyText[0] !== "'" && keyText.includes("."))
-          throw new Error("dotted keys are not supported (use a [table.sub] header instead)");
-        const key = parseKeyToken(keyText);
-
-        let valueText = line.slice(eq + 1).trim();
-        while (valueText[0] === "[" && !arrayIsClosed(valueText)) {
-          if (i >= lines.length) throw new Error("unterminated array");
-          (valueText += "\n" + lines[i]), i++;
-        }
-        const value = parseFullValue(valueText);
-        if (Object.prototype.hasOwnProperty.call(current, key)) throw new Error(`duplicate key "${key}"`);
-        current[key] = value;
-      } catch (e) {
-        throw new TomlLineError(lineNo, (e as Error).message);
+  for (;;) {
+    p.skipWsNewlinesComments();
+    if (p.i >= text.length) break;
+    const stmtStart = p.i;
+    const isHeader = text[stmtStart] === "[";
+    try {
+      if (isHeader) {
+        const isArray = text[stmtStart + 1] === "[";
+        p.i += isArray ? 2 : 1;
+        const keys = p.parseKey();
+        if (text[p.i] !== "]" || (isArray && text[p.i + 1] !== "]")) throw new TomlError(p.i, "malformed table header");
+        p.i += isArray ? 2 : 1;
+        p.expectStatementEnd();
+        current = p.openHeader(keys, isArray, stmtStart);
+        currentRootKey = keys[0]!;
+        discarding = false;
+      } else {
+        const keys = p.parseKey();
+        if (text[p.i] !== "=") throw new TomlError(p.i, 'expected "=" after key');
+        p.i++;
+        const value = p.parseValue();
+        p.expectStatementEnd();
+        p.assign(current, keys, value, stmtStart);
       }
+    } catch (e) {
+      if (!(e instanceof TomlError)) throw e;
+      const message = `line ${p.lineOf(e.pos)}: ${e.message}`;
+      const firstLine = text.slice(stmtStart, p.lineEnd(stmtStart));
+      const critical =
+        e.hard ||
+        (isHeader
+          ? CRITICAL_TEXT_RE.test(firstLine)
+          : currentRootKey !== null
+            ? CRITICAL_ROOT_KEYS.has(currentRootKey)
+            : !discarding && CRITICAL_TEXT_RE.test(firstLine.split("=")[0]!));
+      if (critical) return { ok: false, error: message };
+      warnings.push(message);
+      if (isHeader) {
+        // Keys under a header we could not open must not land in the previous table.
+        current = {};
+        currentRootKey = null;
+        discarding = true;
+      }
+      p.i = p.lineEnd(stmtStart);
     }
-    return { ok: true, value: root };
-  } catch (e) {
-    if (e instanceof TomlLineError) return { ok: false, error: `line ${e.lineNo}: ${e.message}` };
-    throw e;
   }
+  return warnings.length > 0 ? { ok: true, value: p.root, warnings } : { ok: true, value: p.root };
 }

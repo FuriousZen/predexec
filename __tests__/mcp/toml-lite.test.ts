@@ -40,11 +40,10 @@ describe("parseTomlLite — headers", () => {
     expect(result).toEqual({ ok: true, value: { a: { "b.c": { d: { x: 1 } } } } });
   });
 
-  it("merges a table reopened by an identical header, adding new keys", () => {
-    expect(parseTomlLite(fixture("reopened-identical-header-merges"))).toEqual({
-      ok: true,
-      value: { mcp_servers: { predexec: { command: "npx", args: ["-y"] } } },
-    });
+  it("fails closed on a table reopened by an identical header (TOML forbids it; CX-7)", () => {
+    const result = parseTomlLite(fixture("reopened-identical-header"));
+    expect(result.ok).toBe(false);
+    expect(result.ok === false && result.error).toMatch(/^line 4:.*defined more than once/);
   });
 
   it("merges tables that share a parent prefix", () => {
@@ -110,53 +109,117 @@ describe("parseTomlLite — value types", () => {
   });
 });
 
-describe("parseTomlLite — explicit failures (fail-closed, loud)", () => {
-  it("rejects inline tables, naming the line", () => {
-    const result = parseTomlLite(fixture("fail-inline-table"));
-    expect(result.ok).toBe(false);
-    expect(result.ok === false && result.error).toMatch(/^line 2:/);
+describe("parseTomlLite — full TOML constructs Codex writes (CX-1)", () => {
+  it("parses inline tables", () => {
+    expect(parseTomlLite(fixture("inline-tables"))).toEqual({
+      ok: true,
+      value: { a: 1, approval_policy: { granular: {} } },
+    });
   });
 
-  it("rejects array-of-tables, naming the line", () => {
-    const result = parseTomlLite(fixture("fail-array-of-tables"));
-    expect(result.ok).toBe(false);
-    expect(result.ok === false && result.error).toMatch(/^line 2:/);
+  it("parses arrays of tables", () => {
+    expect(parseTomlLite(fixture("array-of-tables-projects"))).toEqual({
+      ok: true,
+      value: { a: 1, projects: [{ trust_level: "trusted" }] },
+    });
   });
 
-  it("rejects dotted keys on the left of =, naming the line", () => {
-    const result = parseTomlLite(fixture("fail-dotted-lhs-key"));
-    expect(result.ok).toBe(false);
-    expect(result.ok === false && result.error).toMatch(/^line 2:/);
+  it("parses dotted keys on the left of =", () => {
+    expect(parseTomlLite(fixture("dotted-lhs-key"))).toEqual({
+      ok: true,
+      value: { a: 1, projects: { trust: "trusted" } },
+    });
   });
 
-  it("rejects a duplicate key within a table, naming the line of the second occurrence", () => {
-    const result = parseTomlLite(fixture("fail-duplicate-key"));
-    expect(result.ok).toBe(false);
-    expect(result.ok === false && result.error).toMatch(/^line 4:/);
+  it("parses nested arrays", () => {
+    expect(parseTomlLite(fixture("nested-arrays"))).toEqual({ ok: true, value: { a: [[1, 2], [3, 4]] } });
   });
 
-  it("rejects an unterminated string, naming the line", () => {
-    const result = parseTomlLite(fixture("fail-unterminated-string"));
-    expect(result.ok).toBe(false);
-    expect(result.ok === false && result.error).toMatch(/^line 2:/);
+  it("parses a host-written config: [[skills.config]], inline tables, multi-line strings, dotted keys, unicode, 1_000, 1e5", () => {
+    expect(parseTomlLite(fixture("codex-host-written"))).toEqual({
+      ok: true,
+      value: {
+        model: "gpt-5",
+        tui: { theme: "dark" },
+        note: "café é",
+        big: 1000,
+        sci: 100000,
+        hex: 255,
+        blurb: 'multi\nline"',
+        raw: "C:\\path",
+        shell_environment_policy: { inherit: "core", set: { A: "1" } },
+        skills: { config: [{ path: "/s/one", enabled: false }, { path: "/s/two" }] },
+        projects: { "/p": { trust_level: "trusted" } },
+      },
+    });
   });
 
-  it("rejects nested arrays, naming the line", () => {
-    const result = parseTomlLite(fixture("fail-nested-array"));
+  it("allows an explicit [a] header after an implicit [a.b] one", () => {
+    expect(parseTomlLite(fixture("implicit-then-explicit-table"))).toEqual({
+      ok: true,
+      value: { a: { b: { x: 1 }, y: 2 } },
+    });
+  });
+});
+
+describe("parseTomlLite — fail closed on anything touching projects / project_root_markers", () => {
+  it.each([
+    ["malformed-projects-section", /^line 5:/],
+    ["malformed-projects-header", /^line 2:/],
+    ["malformed-dotted-projects-key", /^line 2:/],
+    ["malformed-project-root-markers", /^line \d+:/],
+  ])("%s", (name, line) => {
+    const result = parseTomlLite(fixture(name));
     expect(result.ok).toBe(false);
-    expect(result.ok === false && result.error).toMatch(/^line 1:/);
+    expect(result.ok === false && result.error).toMatch(line);
   });
 
-  it("rejects string concatenation, naming the line", () => {
-    const result = parseTomlLite(fixture("fail-string-concatenation"));
+  it("fails closed on a duplicate [a] table header, naming the second one's line (CX-7)", () => {
+    const result = parseTomlLite(fixture("duplicate-table-header"));
     expect(result.ok).toBe(false);
-    expect(result.ok === false && result.error).toMatch(/^line 1:/);
+    expect(result.ok === false && result.error).toMatch(/^line 3:/);
+  });
+});
+
+describe("parseTomlLite — a parse error outside projects is tolerated as a warning", () => {
+  it("a duplicate key in an unrelated table keeps the first value and warns", () => {
+    expect(parseTomlLite(fixture("tolerated-duplicate-key"))).toEqual({
+      ok: true,
+      value: { a: { x: 1, y: 2 } },
+      warnings: [expect.stringMatching(/^line 4: duplicate key "x"/)],
+    });
   });
 
-  it("rejects a table header trying to redefine a scalar key as a table", () => {
-    const result = parseTomlLite(fixture("fail-redefine-scalar-as-table"));
-    expect(result.ok).toBe(false);
-    expect(result.ok === false && result.error).toMatch(/^line 2:/);
+  it("an unterminated string drops only that statement", () => {
+    expect(parseTomlLite(fixture("tolerated-unterminated-string"))).toEqual({
+      ok: true,
+      value: { a: 1 },
+      warnings: [expect.stringMatching(/^line 2:/)],
+    });
+  });
+
+  it("string concatenation drops only that statement", () => {
+    expect(parseTomlLite(fixture("tolerated-string-concatenation"))).toEqual({
+      ok: true,
+      value: {},
+      warnings: [expect.stringMatching(/^line 1:/)],
+    });
+  });
+
+  it("a header redefining a scalar discards that table's keys instead of misfiling them", () => {
+    expect(parseTomlLite(fixture("tolerated-redefine-scalar-as-table"))).toEqual({
+      ok: true,
+      value: { a: 1 },
+      warnings: [expect.stringMatching(/^line 2:/)],
+    });
+  });
+
+  it("an error before the projects section still reads the trust entry after it", () => {
+    expect(parseTomlLite(fixture("tolerated-error-before-projects"))).toEqual({
+      ok: true,
+      value: { tui: {}, projects: { "/p": { trust_level: "trusted" } } },
+      warnings: [expect.stringMatching(/^line 2:/)],
+    });
   });
 });
 

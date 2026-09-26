@@ -15,11 +15,14 @@
  * and the real filesystem/network here too — Codex just has *nothing else*.
  *
  * Scope for v1 (CODEX-RESEARCH.md §4): execpolicy prefix rules
- * (`prefix_rule(pattern=[...], decision=...)` in `~/.codex/rules/*.rules` and,
- * for trusted projects only, `<repo>/.codex/rules/*.rules`) plus the
- * project-trust gate read from `config.toml`. NOT read here: `approval_policy`,
- * `sandbox_mode`, `[permissions]` — those govern Codex's own shell tool, not an
- * MCP subprocess, so they say nothing this checker needs to enforce.
+ * (`prefix_rule(pattern=[...], decision=...)`) from every layer Codex loads —
+ * `/etc/codex/rules`, `$CODEX_HOME/rules`, and, for trusted directories, the
+ * `.codex/rules` of each directory from the project root down to cwd (see
+ * `readCodexRules`) — plus the project-trust gate. From `config.toml` only
+ * `projects.*.trust_level` and `project_root_markers` are read. NOT read
+ * here: `approval_policy`, `sandbox_mode`, `[permissions]` — those govern
+ * Codex's own shell tool, not an MCP subprocess, so they say nothing this
+ * checker needs to enforce.
  *
  * Precedence is most-restrictive-wins — `forbidden > prompt > allow`
  * (§4, and the live docs page, learn.chatgpt.com/docs/agent-configuration/
@@ -37,16 +40,16 @@
  *
  * The Starlark extractor does NOT evaluate Starlark. It is line/paren-balance
  * scanning for `prefix_rule(...)` calls, ignoring comments/blank
- * lines/`load(...)`/plain variable assignments, and it fails a whole `.rules`
- * file closed the moment it meets anything it cannot confidently classify —
- * same "unreadable, not silently wrong" contract `toml-lite.ts` uses for
- * `config.toml`. `pattern` elements that aren't plain quoted string literals
- * (a bare identifier like `ARGS`, or a literal containing a glob wildcard like
- * `"*"`) truncate the matchable prefix there: matching stops being able to
- * confirm anything past that point, so treating it as "matches anything from
- * here on" is the conservative reading — the alternative (matching the glob
- * text literally) would silently narrow a broad rule into one that almost
- * never fires, which is the unsafe direction.
+ * lines/`load(...)`/plain variable assignments and the non-command builtins
+ * Codex itself writes (`network_rule(...)`, `host_executable(...)`), and it
+ * fails a whole `.rules` file closed the moment it meets anything it cannot
+ * confidently classify — same "unreadable, not silently wrong" contract
+ * `toml-lite.ts` uses for `config.toml`. Pattern elements follow Codex
+ * exactly: string literals (escapes decoded) are exact tokens, so `"*"` is a
+ * literal `*`; a list of strings is a set of alternatives in any position. A
+ * bare identifier (a variable like `ARGS`, which is not evaluated) truncates
+ * the matchable prefix there — "matches anything from here on" is the
+ * conservative reading of a value this extractor cannot see.
  *
  * Fail-closed, mirroring policy.ts's "config exists but will not parse"
  * precedent exactly: a `.rules` file OR a `config.toml` that EXISTS and fails
@@ -91,9 +94,9 @@
  * to "nothing configured here."
  */
 
-import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import {
   inspectCommandSubstitutionTree,
   splitCommandSegments,
@@ -107,13 +110,16 @@ import { parseTomlLite } from "./toml-lite.ts";
 
 export type CodexDecision = "allow" | "prompt" | "forbidden";
 
+/** One pattern position: an exact token, or a list of alternative exact tokens. */
+export type CodexPatternToken = string | string[];
+
 export interface CodexRule {
   /**
-   * The rule's literal prefix tokens, in order. A non-literal source element
-   * (bare identifier, or a quoted string containing a glob wildcard) truncates
-   * this array early — see the file header. `[]` matches every command.
+   * The rule's prefix, in order; each position is an exact token or a list of
+   * alternatives. A bare-identifier source element truncates this array
+   * early — see the file header. `[]` matches every command.
    */
-  pattern: string[];
+  pattern: CodexPatternToken[];
   decision: CodexDecision;
 }
 
@@ -122,6 +128,8 @@ export interface CodexPolicyOptions {
   codexHome?: string;
   /** Env to read `CODEX_HOME` (and, as a homedir seam, `HOME`) from. Defaults to `process.env`. */
   env?: NodeJS.ProcessEnv;
+  /** The system config layer's folder; its `rules/` is read first. Defaults to `/etc/codex`. Tests use this. */
+  systemDir?: string;
 }
 
 const DECISIONS: ReadonlySet<CodexDecision> = new Set(["allow", "prompt", "forbidden"]);
@@ -332,27 +340,83 @@ function splitTopLevel(text: string, sep: string): string[] {
   return parts;
 }
 
-/** A whole-string double- or single-quoted literal, unescaped — or `null` if
- * `text` (trimmed) isn't one, meaning it is NOT a plain string literal. */
-function asStringLiteral(text: string): string | null {
-  const t = text.trim();
-  if (t.length < 2) return null;
+const STARLARK_SIMPLE_ESCAPES: Record<string, string> = {
+  a: "\x07",
+  b: "\b",
+  f: "\f",
+  n: "\n",
+  r: "\r",
+  t: "\t",
+  v: "\v",
+  "\\": "\\",
+  "'": "'",
+  '"': '"',
+};
+
+/**
+ * A whole-string Starlark string literal (`"..."`, `'...'`, triple-quoted, or
+ * `r`-prefixed raw), with escapes decoded — or `null` if `text` (trimmed) is
+ * not exactly one literal. `"a\\b"` in a rules file is the three-character
+ * string `a\b`; comparing the undecoded source text let such a rule never
+ * match (CX-6). An escape Starlark would reject makes the literal `null`, so
+ * the file fails closed rather than guessing.
+ */
+function parseStarlarkString(text: string): string | null {
+  let t = text.trim();
+  let raw = false;
+  if (t[0] === "r" || t[0] === "R") (raw = true), (t = t.slice(1));
   const q = t[0];
-  if ((q !== '"' && q !== "'") || t[t.length - 1] !== q) return null;
-  const inner = t.slice(1, -1);
-  if (inner.includes(q) || inner.includes("\n")) return null; // escapes/embedded quotes: not "plain"
-  return inner;
+  if (q !== '"' && q !== "'") return null;
+  const delim = t.startsWith(q.repeat(3)) ? q.repeat(3) : q;
+  if (t.length < delim.length * 2 || !t.endsWith(delim)) return null;
+  const body = t.slice(delim.length, t.length - delim.length);
+  let out = "";
+  for (let i = 0; i < body.length; i++) {
+    const c = body[i]!;
+    if (c === q && delim.length === 1) return null; // an unescaped closing quote mid-string: not one literal
+    if (c === "\n" && delim.length === 1) return null;
+    if (c !== "\\") {
+      out += c;
+      continue;
+    }
+    const next = body[i + 1];
+    if (next === undefined) return null;
+    if (raw) {
+      out += c + next; // raw strings keep the backslash; it still protects a following quote
+      i++;
+      continue;
+    }
+    const simple = STARLARK_SIMPLE_ESCAPES[next];
+    if (simple !== undefined) {
+      out += simple;
+      i++;
+    } else if (next === "\n") i++;
+    else if (/[0-7]/.test(next)) {
+      const oct = /^[0-7]{1,3}/.exec(body.slice(i + 1))![0];
+      out += String.fromCodePoint(parseInt(oct, 8));
+      i += oct.length;
+    } else {
+      const width = next === "x" ? 2 : next === "u" ? 4 : next === "U" ? 8 : 0;
+      const hex = body.slice(i + 2, i + 2 + width);
+      if (width === 0 || !new RegExp(`^[0-9A-Fa-f]{${width}}$`).test(hex)) return null;
+      const code = parseInt(hex, 16);
+      if (code > 0x10ffff || (code >= 0xd800 && code <= 0xdfff)) return null;
+      out += String.fromCodePoint(code);
+      i += 1 + width;
+    }
+  }
+  return out;
 }
 
-/** True when `text` (trimmed) is a `[...]` array literal of plain string
- * literals only — the one shape this extractor treats as an ignorable
- * variable assignment's RHS. */
+/** True when `text` (trimmed) is a `[...]` array literal of string literals
+ * only — the one shape this extractor treats as an ignorable variable
+ * assignment's RHS. */
 function isStringListLiteral(text: string): boolean {
   const t = text.trim();
   if (!t.startsWith("[") || !t.endsWith("]")) return false;
   const inner = t.slice(1, -1).trim();
   if (inner === "") return true;
-  return splitTopLevel(inner, ",").every((el) => asStringLiteral(el) !== null);
+  return splitTopLevel(inner, ",").every((el) => el.trim() === "" || parseStarlarkString(el) !== null);
 }
 
 const ASSIGNMENT_RE = /^[A-Za-z_][A-Za-z0-9_]*\s*=\s*(.+)$/s;
@@ -369,6 +433,12 @@ function parseRulesFile(text: string): CodexRule[] | null {
   const rules: CodexRule[] = [];
   for (const stmt of statements) {
     if (isExactBalancedCall(stmt, "load(")) continue; // ignorable
+    // Codex's own UI appends `network_rule(...)` to default.rules
+    // (codex-rs/execpolicy/src/amend.rs:85-123), and `host_executable(...)`
+    // is a documented builtin (execpolicy/src/parser.rs:410,437). Neither
+    // says anything about which shell commands may run, so each is skipped
+    // as one balanced call; any OTHER unknown call still fails the file.
+    if (isExactBalancedCall(stmt, "network_rule(") || isExactBalancedCall(stmt, "host_executable(")) continue;
 
     if (stmt.startsWith("prefix_rule(")) {
       // Must be EXACTLY one complete call — trailing content of any kind
@@ -384,13 +454,43 @@ function parseRulesFile(text: string): CodexRule[] | null {
     const assignment = ASSIGNMENT_RE.exec(stmt);
     if (assignment) {
       const rhs = assignment[1]!.trim();
-      if (asStringLiteral(rhs) !== null || isStringListLiteral(rhs)) continue; // ignorable
+      if (parseStarlarkString(rhs) !== null || isStringListLiteral(rhs)) continue; // ignorable
       return null; // assignment of something other than a string/list literal
     }
 
     return null; // unrecognized statement shape
   }
   return rules;
+}
+
+const TRUNCATE = Symbol("truncate");
+const IDENTIFIER_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+/**
+ * One `pattern` element, as Codex reads it (execpolicy/src/parser.rs
+ * `parse_pattern_token`): a string literal matches that exact token — `"*"`
+ * is a literal `*`, not a glob (execpolicy/src/rule.rs `PatternToken::matches`);
+ * a list of string literals is a set of alternatives, in ANY position
+ * including the first. A bare identifier (a Starlark variable this extractor
+ * does not evaluate) returns `TRUNCATE`: the rule then matches anything from
+ * that position on — the over-blocking direction. Anything else (an empty
+ * alternatives list, a non-string) is `null`: Codex rejects the file, so it
+ * fails closed here too.
+ */
+function parsePatternToken(el: string): CodexPatternToken | typeof TRUNCATE | null {
+  if (IDENTIFIER_RE.test(el)) return TRUNCATE;
+  if (el.startsWith("[") && el.endsWith("]")) {
+    const alts: string[] = [];
+    for (const alt of splitTopLevel(el.slice(1, -1), ",")) {
+      if (alt.trim() === "") continue;
+      const literal = parseStarlarkString(alt);
+      if (literal === null) return null;
+      alts.push(literal);
+    }
+    if (alts.length === 0) return null;
+    return alts.length === 1 ? alts[0]! : alts;
+  }
+  return parseStarlarkString(el);
 }
 
 /** Parse one balanced `prefix_rule(...)` statement's kwargs into a `CodexRule`,
@@ -416,20 +516,21 @@ function parsePrefixRuleCall(stmt: string): CodexRule | null {
   if (patternText === null) return null; // a prefix_rule with no pattern can't be matched at all
 
   if (!patternText.startsWith("[") || !patternText.endsWith("]")) return null;
-  const elementsText = patternText.slice(1, -1).trim();
-  const pattern: string[] = [];
-  if (elementsText !== "") {
-    for (const el of splitTopLevel(elementsText, ",")) {
-      const literal = asStringLiteral(el);
-      if (literal === null) break; // bare identifier (e.g. ARGS): wildcard from here on
-      if (literal.includes("*") || literal.includes("?")) break; // glob text: same treatment
-      pattern.push(literal);
-    }
+  const elements = splitTopLevel(patternText.slice(1, -1), ",")
+    .map((el) => el.trim())
+    .filter((el, i, all) => el !== "" || i < all.length - 1);
+  if (elements.length === 0) return null; // Codex: "pattern cannot be empty" (parser.rs parse_pattern)
+  const pattern: CodexPatternToken[] = [];
+  for (const el of elements) {
+    const token = parsePatternToken(el);
+    if (token === null) return null;
+    if (token === TRUNCATE) break; // bare identifier (e.g. ARGS): wildcard from here on
+    pattern.push(token);
   }
 
   let decision: CodexDecision = "allow"; // verified default, see file header
   if (decisionText !== null) {
-    const literal = asStringLiteral(decisionText);
+    const literal = parseStarlarkString(decisionText);
     if (literal === null || !DECISIONS.has(literal as CodexDecision)) return null;
     decision = literal as CodexDecision;
   }
@@ -467,71 +568,235 @@ function collectRulesDir(dir: string, rules: CodexRule[], unreadable: string[]):
   }
 }
 
+/** Codex canonicalizes paths before trust lookups; a path that cannot be resolved keeps its lexical form. */
+function canonicalPath(path: string): string {
+  try {
+    return realpathSync(path);
+  } catch {
+    return resolve(path);
+  }
+}
+
+function isDirectory(path: string): boolean {
+  try {
+    return statSync(path).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
 /**
- * Read execpolicy rules across `<codexHome>/rules/*.rules` (always) and, only
- * for a project `config.toml` marks trusted, `<projectDir>/.codex/rules/*.rules`
- * (§4: "untrusted projects skip all `.codex/` layers").
+ * `dir` and its ancestors, nearest first. The walk stops at the filesystem
+ * root or at `$HOME`'s parent, whichever comes first (ruling for Task 13): a
+ * marker above the user's home directory (say `/Users/.git`) must not turn
+ * every session into one giant "project".
+ */
+function ancestors(dir: string, homeParent: string): string[] {
+  const out: string[] = [];
+  for (let cur = dir; ; cur = dirname(cur)) {
+    out.push(cur);
+    if (cur === homeParent || dirname(cur) === cur) return out;
+  }
+}
+
+/** A `.git` DIRECTORY only counts with a `HEAD` in it (config/src/loader/mod.rs discover_project_root). */
+function hasMarker(dir: string, marker: string): boolean {
+  const path = join(dir, marker);
+  if (!existsSync(path)) return false;
+  return marker !== ".git" || !isDirectory(path) || existsSync(join(path, "HEAD"));
+}
+
+/**
+ * The main worktree root for a linked worktree: `<checkout>/.git` is a file
+ * `gitdir: <main>/.git/worktrees/<name>`, whose `commondir` names the main
+ * `.git`. For an ordinary checkout it is the checkout itself. Codex also
+ * checks the worktree's back-pointer before trusting it
+ * (core/src/worktree_trust_tests.rs); predexec skips that ownership check on
+ * purpose — here, inheriting trust only LOADS MORE restrictions, so a forged
+ * pointer can over-block, never under-block.
+ */
+function mainWorktreeRoot(cwd: string, homeParent: string): string | null {
+  for (const dir of ancestors(cwd, homeParent)) {
+    const dotGit = join(dir, ".git");
+    if (!hasMarker(dir, ".git")) continue;
+    if (isDirectory(dotGit)) return dir;
+    try {
+      const gitdirLine = /^gitdir:\s*(.+?)\s*$/m.exec(readFileSync(dotGit, "utf8"));
+      if (!gitdirLine) return dir;
+      const gitdir = resolve(dir, gitdirLine[1]!);
+      const commondirFile = join(gitdir, "commondir");
+      if (!existsSync(commondirFile)) return dir;
+      const common = canonicalPath(resolve(gitdir, readFileSync(commondirFile, "utf8").trim()));
+      return basename(common) === ".git" ? dirname(common) : dir;
+    } catch {
+      return dir;
+    }
+  }
+  return null;
+}
+
+type TrustLevel = "trusted" | "untrusted";
+
+interface TrustConfig {
+  /** `[projects."<key>"] trust_level`, entries without a trust_level dropped (mod.rs:1285-1288). */
+  projects: Array<{ key: string; spellings: Set<string>; level: TrustLevel }>;
+  markers: string[];
+}
+
+/**
+ * Read ONLY what trust and project-root resolution need from config.toml:
+ * `projects.*.trust_level` and `project_root_markers`. Shapes Codex itself
+ * would reject (config/src/loader/mod.rs:1025 deserializes `projects` as a
+ * map of `{ trust_level }`; project_root_markers.rs requires an array of
+ * strings) return `null` so the caller fails closed. Tolerated TOML errors
+ * outside those keys come back as debug-only `warnings`.
+ */
+function readTrustConfig(configPath: string, warnings: string[]): TrustConfig | null {
+  const empty: TrustConfig = { projects: [], markers: [".git"] };
+  if (!existsSync(configPath)) return empty;
+  let parsed: ReturnType<typeof parseTomlLite>;
+  try {
+    parsed = parseTomlLite(readFileSync(configPath, "utf8"));
+  } catch {
+    return null;
+  }
+  if (!parsed.ok) return null;
+  for (const w of parsed.warnings ?? []) warnings.push(`${configPath}: ${w}`);
+  const isTable = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
+
+  const config = { ...empty, projects: [] as TrustConfig["projects"] };
+  const projects = parsed.value.projects;
+  if (projects !== undefined) {
+    if (!isTable(projects)) return null;
+    for (const [key, entry] of Object.entries(projects)) {
+      if (!isTable(entry)) return null;
+      const level = entry.trust_level;
+      if (level === undefined) continue;
+      if (level !== "trusted" && level !== "untrusted") return null;
+      config.projects.push({ key, spellings: new Set([resolve(key), canonicalPath(key)]), level });
+    }
+  }
+  const markers = parsed.value.project_root_markers;
+  if (markers !== undefined) {
+    if (!Array.isArray(markers) || !markers.every((m) => typeof m === "string")) return null;
+    config.markers = markers as string[];
+  }
+  return config;
+}
+
+/**
+ * Trust for one lookup key (mod.rs:1400 project_trust_for_lookup_key): the
+ * exact config key first, then any key that resolves to the same canonical
+ * path. Where several spellings disagree, `trusted` wins — for predexec a
+ * trusted layer only adds restrictions, so that is the over-blocking side.
+ */
+function trustFor(config: TrustConfig, key: string): TrustLevel | null {
+  const exact = config.projects.filter((p) => p.key === key);
+  const matches = exact.length > 0 ? exact : config.projects.filter((p) => p.spellings.has(key));
+  if (matches.length === 0) return null;
+  return matches.some((p) => p.level === "trusted") ? "trusted" : "untrusted";
+}
+
+/**
+ * Read execpolicy rules the way Codex layers them (core/src/exec_policy.rs:
+ * 663-681 walks config layers low to high and loads `<layer folder>/rules`):
+ *   1. system: `<systemDir>/rules` (default `/etc/codex/rules`)
+ *   2. user: `$CODEX_HOME/rules` (env, else `~/.codex`)
+ *   3. project: for each directory from the project root down to cwd, its
+ *      `.codex/rules` — only when that directory is trusted.
  *
- * `unreadable` reports files that EXIST but failed to parse (a `.rules` file
- * the extractor couldn't confidently classify, or a `config.toml` that exists
- * and doesn't parse as TOML) — the caller fails closed on those. A missing
- * `~/.codex` entirely means nothing to read, so `rules`/`unreadable` are both
- * empty: unconfigured, not locked down.
+ * Project root (config/src/loader/mod.rs:1490 discover_project_root): the
+ * nearest ancestor of the CANONICAL cwd holding one of `project_root_markers`
+ * (default `[".git"]`), else cwd itself. Trust per directory
+ * (mod.rs:1041-1080 decision_for_dir): the directory's own entry (canonical
+ * spelling, then the original spelling for cwd; mod.rs:1378), else the
+ * project root's, else the main worktree root's (mod.rs:1249-1340). A
+ * `.codex` that is `$CODEX_HOME` itself is the user layer, not a project one.
+ *
+ * `unreadable` lists files that EXIST but could not be read — the caller
+ * fails closed on those. `warnings` is debug-only (tolerated config.toml
+ * errors outside `projects`): never a stop, never shown as one.
  */
 export function readCodexRules(
-  projectDir: string,
+  cwd: string,
   opts: CodexPolicyOptions = {},
-): { rules: CodexRule[]; unreadable: string[] } {
-  const codexHome = resolveCodexHome(opts);
-  if (!existsSync(codexHome)) return { rules: [], unreadable: [] };
-
-  // Normalized once, used for both the trust-lookup key and the project rules
-  // path: a trailing slash (or a `.`/`..` segment) must not silently make an
-  // otherwise-trusted project compare as untrusted — that would skip real
-  // restrictions the project owner wrote, which is the fail-open direction
-  // (P-minor, adversarial review). Deliberately NOT a symlink-resolving
-  // `realpathSync`: that requires the path to exist and would turn a
-  // resolution problem into a thrown exception for what's supposed to be the
-  // server's own cwd; `resolve()` handles the concretely-reported case
-  // (trailing slash) without that new failure mode.
-  const normalizedProjectDir = resolve(projectDir);
-
+): { rules: CodexRule[]; unreadable: string[]; warnings: string[] } {
   const rules: CodexRule[] = [];
   const unreadable: string[] = [];
+  const warnings: string[] = [];
 
+  collectRulesDir(join(opts.systemDir ?? "/etc/codex", "rules"), rules, unreadable);
+  const codexHome = resolveCodexHome(opts);
   collectRulesDir(join(codexHome, "rules"), rules, unreadable);
 
   const configPath = join(codexHome, "config.toml");
-  let trusted = false;
-  if (existsSync(configPath)) {
-    try {
-      const parsed = parseTomlLite(readFileSync(configPath, "utf8"));
-      if (!parsed.ok) {
-        unreadable.push(configPath);
-      } else {
-        const projects = (parsed.value as Record<string, unknown>).projects;
-        const entry =
-          projects && typeof projects === "object" && !Array.isArray(projects)
-            ? (projects as Record<string, unknown>)[normalizedProjectDir]
-            : undefined;
-        trusted =
-          !!entry &&
-          typeof entry === "object" &&
-          !Array.isArray(entry) &&
-          (entry as Record<string, unknown>).trust_level === "trusted";
-      }
-    } catch {
-      unreadable.push(configPath);
-    }
+  const config = readTrustConfig(configPath, warnings);
+  if (config === null) {
+    unreadable.push(configPath);
+    return { rules, unreadable, warnings };
   }
 
-  if (trusted) collectRulesDir(join(normalizedProjectDir, ".codex", "rules"), rules, unreadable);
+  const env = opts.env ?? process.env;
+  const homeParent = dirname(canonicalPath(env.HOME || homedir()));
+  const originalCwd = resolve(cwd);
+  const canonicalCwd = canonicalPath(cwd);
+  const cwdAncestors = ancestors(canonicalCwd, homeParent);
+  const projectRoot =
+    config.markers.length === 0
+      ? canonicalCwd
+      : (cwdAncestors.find((dir) => config.markers.some((m) => hasMarker(dir, m))) ?? canonicalCwd);
+  const repoRoot = mainWorktreeRoot(canonicalCwd, homeParent);
+  const codexHomeCanonical = canonicalPath(codexHome);
 
-  return { rules, unreadable };
+  const layerDirs = cwdAncestors.slice(0, cwdAncestors.indexOf(projectRoot) + 1).reverse();
+  for (const dir of layerDirs) {
+    const dotCodex = join(dir, ".codex");
+    if (!isDirectory(dotCodex) || canonicalPath(dotCodex) === codexHomeCanonical) continue;
+    const ownKeys = dir === canonicalCwd && originalCwd !== canonicalCwd ? [dir, originalCwd] : [dir];
+    const lookupKeys = [...ownKeys, projectRoot, ...(repoRoot ? [repoRoot] : [])];
+    let level: TrustLevel | null = null;
+    for (const key of lookupKeys) if ((level = trustFor(config, key)) !== null) break;
+    if (level === "trusted") collectRulesDir(join(dotCodex, "rules"), rules, unreadable);
+  }
+
+  return { rules, unreadable, warnings };
 }
 
-function formatPattern(pattern: string[]): string {
-  return pattern.length ? pattern.join(" ") : "*";
+function formatPattern(pattern: CodexPatternToken[]): string {
+  return pattern.length ? pattern.map((tok) => (Array.isArray(tok) ? tok.join("|") : tok)).join(" ") : "*";
+}
+
+function matchesPrefix(pattern: CodexPatternToken[], tokens: string[]): boolean {
+  return (
+    tokens.length >= pattern.length &&
+    pattern.every((tok, i) => (Array.isArray(tok) ? tok.includes(tokens[i]!) : tokens[i] === tok))
+  );
+}
+
+/**
+ * Remove shell line continuations (`\<newline>`) outside single quotes, as
+ * the shell does before word splitting. Without this, the per-line rescan
+ * below split `cat \<newline>.env` into `cat \` and `.env`, and neither
+ * matched a forbidden `["cat",".env"]` rule.
+ */
+function joinLineContinuations(text: string): string {
+  let out = "";
+  let single = false;
+  let double = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i]!;
+    if (single) {
+      if (c === "'") single = false;
+      out += c;
+    } else if (c === "'" && !double) (single = true), (out += c);
+    else if (c === '"') (double = !double), (out += c);
+    else if (c === "\\") {
+      if (text[i + 1] === "\n") i++;
+      else if (text[i + 1] === "\r" && text[i + 2] === "\n") i += 2;
+      else (out += c + (text[i + 1] ?? "")), i++;
+    } else out += c;
+  }
+  return out;
 }
 
 /**
@@ -601,7 +866,7 @@ export function createCodexPolicyChecker(
     try {
       const inspected = inspectCommandSubstitutionTree(cmd);
       for (const text of inspected.commands) {
-          for (const line of text.split("\n")) {
+          for (const line of joinLineContinuations(text).split("\n")) {
             for (const segment of splitCommandSegments(line)) {
               const trimmed = segment.trim();
               if (!trimmed) continue;
@@ -614,12 +879,9 @@ export function createCodexPolicyChecker(
               const tokenForms = rawTokens.length === strippedTokens.length && rawTokens.every((token, i) => token === strippedTokens[i])
                 ? [rawTokens]
                 : [rawTokens, strippedTokens];
-              const clauseForms = tokenForms;
               let winner: CodexRule | null = null;
               for (const rule of rules) {
-                const matches = clauseForms.some(
-                  (toks) => toks.length >= rule.pattern.length && rule.pattern.every((tok, i) => toks[i] === tok),
-                );
+                const matches = tokenForms.some((toks) => matchesPrefix(rule.pattern, toks));
                 if (matches && (!winner || SEVERITY[rule.decision] > SEVERITY[winner.decision])) winner = rule;
               }
               if (winner && winner.decision !== "allow") return formatPattern(winner.pattern);

@@ -44,7 +44,7 @@ trust_level = "untrusted"
     input: `[a."b.c".d]\nx = 1\n`,
   },
   {
-    name: "reopened-identical-header-merges",
+    name: "reopened-identical-header",
     input: `[mcp_servers.predexec]\ncommand = "npx"\n\n[mcp_servers.predexec]\nargs = ["-y"]\n`,
   },
   {
@@ -99,36 +99,98 @@ trust_level = "untrusted"
     name: "bare-and-quoted-keys",
     input: 'bare_key = 1\n"quoted key" = 2\n',
   },
+  // --- Task 13 (CX-1): constructs Codex itself writes or accepts ---
   {
-    name: "fail-inline-table",
+    name: "inline-tables",
     input: "a = 1\napproval_policy = { granular = {} }\n",
   },
   {
-    name: "fail-array-of-tables",
+    name: "array-of-tables-projects",
     input: 'a = 1\n[[projects]]\ntrust_level = "trusted"\n',
   },
   {
-    name: "fail-dotted-lhs-key",
+    name: "dotted-lhs-key",
     input: 'a = 1\nprojects.trust = "trusted"\n',
   },
   {
-    name: "fail-duplicate-key",
-    input: "[a]\nx = 1\ny = 2\nx = 3\n",
-  },
-  {
-    name: "fail-unterminated-string",
-    input: 'a = 1\nkey = "unterminated\n',
-  },
-  {
-    name: "fail-nested-array",
+    name: "nested-arrays",
     input: "a = [[1, 2], [3, 4]]\n",
   },
   {
-    name: "fail-string-concatenation",
+    // Every construct the audit (CX-1) found predexec rejecting in a
+    // host-written ~/.codex/config.toml, plus a valid trust entry.
+    name: "codex-host-written",
+    input: [
+      'model = "gpt-5"',
+      "tui.theme = 'dark'",
+      'note = "caf\\u00e9 é"',
+      "big = 1_000",
+      "sci = 1e5",
+      "hex = 0xff",
+      'blurb = """',
+      "multi",
+      'line\\""""',
+      "raw = '''",
+      "C:\\path'''",
+      'shell_environment_policy = { inherit = "core", set = { A = "1" } }',
+      "",
+      "[[skills.config]]",
+      'path = "/s/one"',
+      "enabled = false",
+      "",
+      "[[skills.config]]",
+      'path = "/s/two"',
+      "",
+      '[projects."/p"]',
+      'trust_level = "trusted"',
+      "",
+    ].join("\n"),
+  },
+  // --- fail closed: a parse error that touches `projects` / `project_root_markers` ---
+  {
+    name: "malformed-projects-section",
+    input: ["[[skills.config]]", 'path = "/s/one"', "", '[projects."/p"]', "trust_level = trusted", ""].join("\n"),
+  },
+  {
+    name: "malformed-projects-header",
+    input: ['model = "gpt-5"', '[projects."/p]', 'trust_level = "trusted"', ""].join("\n"),
+  },
+  {
+    name: "malformed-dotted-projects-key",
+    input: ['model = "gpt-5"', 'projects."/p".trust_level = "trusted', ""].join("\n"),
+  },
+  {
+    name: "malformed-project-root-markers",
+    input: ['project_root_markers = [".git"', ""].join("\n"),
+  },
+  // --- fail closed: duplicate table headers (CX-7), anywhere ---
+  {
+    name: "duplicate-table-header",
+    input: "[a]\nx = 1\n[a]\ny = 2\n",
+  },
+  {
+    name: "implicit-then-explicit-table",
+    input: "[a.b]\nx = 1\n[a]\ny = 2\n",
+  },
+  // --- tolerated: a parse error OUTSIDE `projects` is a warning, not a failure ---
+  {
+    name: "tolerated-duplicate-key",
+    input: "[a]\nx = 1\ny = 2\nx = 3\n",
+  },
+  {
+    name: "tolerated-unterminated-string",
+    input: 'a = 1\nkey = "unterminated\n',
+  },
+  {
+    name: "tolerated-string-concatenation",
     input: 'a = "x" "y"\n',
   },
   {
-    name: "fail-redefine-scalar-as-table",
+    name: "tolerated-redefine-scalar-as-table",
     input: "a = 1\n[a]\nb = 2\n",
+  },
+  {
+    name: "tolerated-error-before-projects",
+    input: ["[tui]", 'x = "broken', "", '[projects."/p"]', 'trust_level = "trusted"', ""].join("\n"),
   },
 ];

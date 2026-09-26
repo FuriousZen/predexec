@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -102,11 +102,14 @@ describe("readCodexRules — Starlark prefix_rule extraction", () => {
     expect(rules).toEqual([{ pattern: ["git", "push"], decision: "forbidden" }]);
   });
 
-  it("truncates the pattern at a glob-like string element too", () => {
+  it("treats a glob-looking \"*\" as a literal token, as Codex does (CX-6)", () => {
     const { codexHome, projectDir } = setup();
     writeRule(join(codexHome, "rules"), "a.rules", 'prefix_rule(pattern=["curl", "*"], decision="forbidden")\n');
     const { rules } = readCodexRules(projectDir, { codexHome });
-    expect(rules).toEqual([{ pattern: ["curl"], decision: "forbidden" }]);
+    expect(rules).toEqual([{ pattern: ["curl", "*"], decision: "forbidden" }]);
+    const check = createCodexPolicyChecker(rules, []);
+    expect(check("curl example.com")).toBe(null);
+    expect(check("curl '*'")).toBe("curl *");
   });
 
   it("multiple prefix_rule calls, comments, blank lines, load(...), and string/list variable assignments are all handled in one file", () => {
@@ -240,9 +243,9 @@ describe("readCodexRules — fail-closed end to end", () => {
     expect(createCodexPolicyChecker(rules, unreadable)("echo hi")).toContain("bad.rules");
   });
 
-  it("an unparseable config.toml (when one exists) is reported unreadable too", () => {
+  it("an unparseable config.toml projects section is reported unreadable too", () => {
     const { codexHome, projectDir } = setup();
-    writeFileSync(join(codexHome, "config.toml"), "{ this is not toml");
+    writeFileSync(join(codexHome, "config.toml"), '[projects."/x"]\ntrust_level = { this is not toml\n');
     const { rules, unreadable } = readCodexRules(projectDir, { codexHome });
     expect(rules).toEqual([]);
     expect(unreadable).toEqual([join(codexHome, "config.toml")]);
@@ -527,5 +530,263 @@ describe("engine — policyStop through the Codex checker", () => {
     const plan: PlanTree = { root: "a", nodes: [{ id: "a", commands: ["echo hi"] }] };
     const r = await runPlanTree(plan, { cwd: process.cwd(), checkOperationPolicy: check });
     expect(r.stoppedReason).toBe("leaf");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Task 13 — Codex policy fidelity (CX-1, CX-2, CX-3, CX-4, CX-6, CX-7)
+// ---------------------------------------------------------------------------
+
+/** An isolated fs layout with no system layer leaking in from the real machine. */
+function setupLayers() {
+  const { codexHome, projectDir } = setup();
+  const systemDir = join(tmp, "etc-codex");
+  return { codexHome, projectDir, systemDir, opts: { codexHome, systemDir, env: { HOME: join(tmp, "home") } } };
+}
+
+/** `<dir>/.git/HEAD` — a real repo marker (Codex requires HEAD in a `.git` dir). */
+function makeRepo(dir: string) {
+  mkdirSync(join(dir, ".git"), { recursive: true });
+  writeFileSync(join(dir, ".git", "HEAD"), "ref: refs/heads/main\n");
+}
+
+describe("readCodexRules — host-written rules files (CX-1)", () => {
+  it("skips network_rule(...) and host_executable(...) and keeps enforcing prefix rules", () => {
+    const { projectDir, codexHome, opts } = setupLayers();
+    writeRule(
+      join(codexHome, "rules"),
+      "default.rules",
+      [
+        'network_rule(host="example.com", protocol="https", decision="deny", justification="no (really)")',
+        'host_executable(name="git", paths=["/usr/bin/git", "/opt/homebrew/bin/git"])',
+        'prefix_rule(pattern=["rm"], decision="forbidden")',
+        "",
+      ].join("\n"),
+    );
+    const { rules, unreadable } = readCodexRules(projectDir, opts);
+    expect(unreadable).toEqual([]);
+    const check = createCodexPolicyChecker(rules, unreadable);
+    expect(check("ls")).toBe(null);
+    expect(check("rm x")).toBe("rm");
+  });
+
+  it("an unknown top-level call still fails the file closed", () => {
+    const { projectDir, codexHome, opts } = setupLayers();
+    writeRule(join(codexHome, "rules"), "a.rules", 'mystery_rule(pattern=["rm"])\nprefix_rule(pattern=["rm"], decision="forbidden")\n');
+    expect(readCodexRules(projectDir, opts).unreadable).toEqual([join(codexHome, "rules", "a.rules")]);
+  });
+});
+
+describe("readCodexRules — host-written config.toml (CX-1, CX-7)", () => {
+  const hostWritten = (projectDir: string, trustLine: string) =>
+    [
+      'model = "gpt-5"',
+      "tui.theme = 'dark'",
+      'note = "caf\\u00e9 é"',
+      "big = 1_000",
+      "sci = 1e5",
+      'blurb = """',
+      'multi line"""',
+      'shell_environment_policy = { inherit = "core" }',
+      "",
+      "[[skills.config]]",
+      'path = "/s/one"',
+      "enabled = false",
+      "",
+      `[projects."${projectDir}"]`,
+      trustLine,
+      "",
+    ].join("\n");
+
+  it("reads trust correctly through every construct Codex itself writes", () => {
+    const { projectDir, codexHome, opts } = setupLayers();
+    writeFileSync(join(codexHome, "config.toml"), hostWritten(projectDir, 'trust_level = "trusted"'));
+    writeRule(join(projectDir, ".codex", "rules"), "p.rules", 'prefix_rule(pattern=["rm"], decision="forbidden")\n');
+    const { rules, unreadable } = readCodexRules(projectDir, opts);
+    expect(unreadable).toEqual([]);
+    expect(rules).toEqual([{ pattern: ["rm"], decision: "forbidden" }]);
+  });
+
+  it("the same file with a malformed [projects.*] section fails closed", () => {
+    const { projectDir, codexHome, opts } = setupLayers();
+    writeFileSync(join(codexHome, "config.toml"), hostWritten(projectDir, "trust_level = trusted"));
+    expect(readCodexRules(projectDir, opts).unreadable).toEqual([join(codexHome, "config.toml")]);
+  });
+
+  it("a duplicate [a] header fails closed", () => {
+    const { projectDir, codexHome, opts } = setupLayers();
+    writeFileSync(join(codexHome, "config.toml"), "[a]\nx = 1\n[a]\ny = 2\n");
+    expect(readCodexRules(projectDir, opts).unreadable).toEqual([join(codexHome, "config.toml")]);
+  });
+
+  it("a tolerated error outside projects is a debug-only warning, never a stop", () => {
+    const { projectDir, codexHome, opts } = setupLayers();
+    writeFileSync(join(codexHome, "config.toml"), '[tui]\nx = "broken\n');
+    const result = readCodexRules(projectDir, opts);
+    expect(result.unreadable).toEqual([]);
+    expect(result.warnings).toEqual([expect.stringContaining("config.toml")]);
+    expect(createCodexPolicyChecker(result.rules, result.unreadable)("echo hi")).toBe(null);
+  });
+
+  it("a trust_level Codex would reject (not trusted/untrusted) fails closed", () => {
+    const { projectDir, codexHome, opts } = setupLayers();
+    writeFileSync(join(codexHome, "config.toml"), trustConfig(projectDir, true).replace('"trusted"', '"yes"'));
+    expect(readCodexRules(projectDir, opts).unreadable).toEqual([join(codexHome, "config.toml")]);
+  });
+});
+
+describe("readCodexRules — layered trust and project root (CX-2)", () => {
+  it("a session in <trusted repo>/sub/dir applies the repo's .codex/rules", () => {
+    const { projectDir, codexHome, opts } = setupLayers();
+    makeRepo(projectDir);
+    writeFileSync(join(codexHome, "config.toml"), trustConfig(projectDir, true));
+    writeRule(join(projectDir, ".codex", "rules"), "p.rules", 'prefix_rule(pattern=["cat", ".env"], decision="forbidden")\n');
+    const sub = join(projectDir, "sub", "dir");
+    mkdirSync(sub, { recursive: true });
+    const { rules, unreadable } = readCodexRules(sub, opts);
+    expect(unreadable).toEqual([]);
+    expect(createCodexPolicyChecker(rules, unreadable)("cat .env")).toBe("cat .env");
+  });
+
+  it("a session via a symlink to the repo applies the repo's .codex/rules", () => {
+    const { projectDir, codexHome, opts } = setupLayers();
+    makeRepo(projectDir);
+    writeFileSync(join(codexHome, "config.toml"), trustConfig(realpathSync(projectDir), true));
+    writeRule(join(projectDir, ".codex", "rules"), "p.rules", 'prefix_rule(pattern=["cat", ".env"], decision="forbidden")\n');
+    const link = join(tmp, "link");
+    symlinkSync(projectDir, link);
+    const { rules } = readCodexRules(join(link), opts);
+    expect(createCodexPolicyChecker(rules, [])("cat .env")).toBe("cat .env");
+  });
+
+  it("loads .codex/rules of every directory from the project root down to cwd", () => {
+    const { projectDir, codexHome, opts } = setupLayers();
+    makeRepo(projectDir);
+    writeFileSync(join(codexHome, "config.toml"), trustConfig(projectDir, true));
+    const sub = join(projectDir, "sub");
+    writeRule(join(projectDir, ".codex", "rules"), "root.rules", 'prefix_rule(pattern=["a"], decision="forbidden")\n');
+    writeRule(join(sub, ".codex", "rules"), "sub.rules", 'prefix_rule(pattern=["b"], decision="forbidden")\n');
+    const { rules } = readCodexRules(sub, opts);
+    expect(rules).toEqual([
+      { pattern: ["a"], decision: "forbidden" },
+      { pattern: ["b"], decision: "forbidden" },
+    ]);
+  });
+
+  it("a linked worktree inherits trust from the main worktree root", () => {
+    const { codexHome, opts } = setupLayers();
+    const main = join(tmp, "main");
+    makeRepo(main);
+    const admin = join(main, ".git", "worktrees", "wt");
+    mkdirSync(admin, { recursive: true });
+    writeFileSync(join(admin, "commondir"), "../..\n");
+    const wt = join(tmp, "wt");
+    mkdirSync(wt, { recursive: true });
+    writeFileSync(join(wt, ".git"), `gitdir: ${admin}\n`);
+    writeFileSync(join(codexHome, "config.toml"), trustConfig(main, true));
+    writeRule(join(wt, ".codex", "rules"), "w.rules", 'prefix_rule(pattern=["rm"], decision="forbidden")\n');
+    const { rules } = readCodexRules(wt, opts);
+    expect(rules).toEqual([{ pattern: ["rm"], decision: "forbidden" }]);
+  });
+
+  it("honors project_root_markers from config.toml", () => {
+    const { projectDir, codexHome, opts } = setupLayers();
+    writeFileSync(join(projectDir, ".root-marker"), "");
+    writeFileSync(
+      join(codexHome, "config.toml"),
+      `project_root_markers = [".root-marker"]\n${trustConfig(projectDir, true)}`,
+    );
+    writeRule(join(projectDir, ".codex", "rules"), "p.rules", 'prefix_rule(pattern=["rm"], decision="forbidden")\n');
+    const sub = join(projectDir, "deep");
+    mkdirSync(sub);
+    expect(readCodexRules(sub, opts).rules).toEqual([{ pattern: ["rm"], decision: "forbidden" }]);
+  });
+
+  it("an untrusted repo still skips every .codex layer", () => {
+    const { projectDir, codexHome, opts } = setupLayers();
+    makeRepo(projectDir);
+    writeFileSync(join(codexHome, "config.toml"), trustConfig(projectDir, false));
+    writeRule(join(projectDir, ".codex", "rules"), "p.rules", 'prefix_rule(pattern=["rm"], decision="forbidden")\n');
+    const sub = join(projectDir, "sub");
+    mkdirSync(sub);
+    expect(readCodexRules(sub, opts).rules).toEqual([]);
+  });
+});
+
+describe("readCodexRules — system layer and CODEX_HOME (CX-3, CX-4)", () => {
+  it("reads <systemDir>/rules (default /etc/codex/rules)", () => {
+    const { projectDir, systemDir, opts } = setupLayers();
+    writeRule(join(systemDir, "rules"), "x.rules", 'prefix_rule(pattern=["cat"], decision="forbidden")\n');
+    const { rules, unreadable } = readCodexRules(projectDir, opts);
+    expect(createCodexPolicyChecker(rules, unreadable)("cat notes.txt")).toBe("cat");
+  });
+
+  it("reads the system layer even when there is no Codex home at all", () => {
+    const { projectDir, systemDir } = setupLayers();
+    writeRule(join(systemDir, "rules"), "x.rules", 'prefix_rule(pattern=["cat"], decision="forbidden")\n');
+    const { rules } = readCodexRules(projectDir, { codexHome: join(tmp, "absent"), systemDir });
+    expect(rules).toEqual([{ pattern: ["cat"], decision: "forbidden" }]);
+  });
+
+  it("honors env CODEX_HOME for rules and trust", () => {
+    const { projectDir, systemDir } = setupLayers();
+    const ch = join(tmp, "ch");
+    writeRule(join(ch, "rules"), "a.rules", 'prefix_rule(pattern=["curl"], decision="forbidden")\n');
+    const { rules } = readCodexRules(projectDir, { systemDir, env: { CODEX_HOME: ch, HOME: join(tmp, "home") } });
+    expect(rules).toEqual([{ pattern: ["curl"], decision: "forbidden" }]);
+  });
+});
+
+describe("readCodexRules — pattern fidelity (CX-6)", () => {
+  const read = (rule: string) => {
+    const { projectDir, codexHome, opts } = setupLayers();
+    writeRule(join(codexHome, "rules"), "a.rules", `${rule}\n`);
+    const { rules, unreadable } = readCodexRules(projectDir, opts);
+    expect(unreadable).toEqual([]);
+    return createCodexPolicyChecker(rules, unreadable);
+  };
+
+  it("alternatives in the first position match either head, not everything", () => {
+    const check = read('prefix_rule(pattern=[["rm","rmdir"],"-rf"], decision="forbidden")');
+    expect(check("rmdir -rf x")).not.toBe(null);
+    expect(check("rm -rf x")).not.toBe(null);
+    expect(check("ls")).toBe(null);
+    expect(check("rm x")).toBe(null);
+  });
+
+  it("alternatives in a later position", () => {
+    const check = read('prefix_rule(pattern=["git",["push","pull"]], decision="forbidden")');
+    expect(check("git pull")).not.toBe(null);
+    expect(check("git status")).toBe(null);
+  });
+
+  it("backslash escapes are unescaped: \"a\\\\b\" matches a\\b", () => {
+    const check = read('prefix_rule(pattern=["a\\\\b"], decision="forbidden")');
+    expect(check("'a\\b'")).not.toBe(null);
+    expect(check("'a\\\\b'")).toBe(null);
+  });
+
+  it('"*" matches only a literal *', () => {
+    const check = read('prefix_rule(pattern=["*"], decision="forbidden")');
+    expect(check("ls")).toBe(null);
+    expect(check("'*'")).toBe("*");
+  });
+
+  it("an empty pattern is invalid in Codex, so the file fails closed", () => {
+    const { projectDir, codexHome, opts } = setupLayers();
+    writeRule(join(codexHome, "rules"), "a.rules", 'prefix_rule(pattern=[], decision="forbidden")\n');
+    expect(readCodexRules(projectDir, opts).unreadable).toEqual([join(codexHome, "rules", "a.rules")]);
+  });
+});
+
+describe("createCodexPolicyChecker — backslash-newline continuation (carried forward)", () => {
+  it("cat \\<newline>.env cannot dodge a forbidden [cat, .env] rule", () => {
+    const check = createCodexPolicyChecker([{ pattern: ["cat", ".env"], decision: "forbidden" }], []);
+    expect(check("cat \\\n.env")).toBe("cat .env");
+  });
+
+  it("a backslash-newline inside single quotes stays literal", () => {
+    const check = createCodexPolicyChecker([{ pattern: ["echo", "ab"], decision: "forbidden" }], []);
+    expect(check("echo 'a\\\nb'")).toBe(null);
   });
 });
