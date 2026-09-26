@@ -17,6 +17,18 @@
  * a dependency at all (npm-installed plugins get production deps only, and the
  * host does not provide that package at import time) — the `Plugin`/`ToolContext`
  * shapes this file needs are declared locally below.
+ *
+ * Permissions (opencode-only behavior change): when opencode hands the tool
+ * `context.ask` — its real permission service (`@opencode-ai/plugin@1.18.32`
+ * `src/tool.ts:19`, bridged in opencode `tool/registry.ts:143-153`) — every
+ * operation's permission request goes through it, so a rule that says `ask`
+ * now makes opencode PROMPT the user mid-walk instead of hard-stopping the
+ * plan. Approval (once or always) runs the operation; a rejection or a host
+ * deny is a policyStop naming opencode's reason. The static reader in
+ * ../../policy.ts still runs first: a static `deny` stops at once without a
+ * prompt. Without `context.ask` (older hosts) the static reader is the whole
+ * check and both deny and ask hard-stop, as before. Claude Code, Codex and pi
+ * cannot prompt mid-walk and keep hard-stopping on ask.
  */
 
 import { existsSync, statSync } from "node:fs";
@@ -41,23 +53,32 @@ import {
 } from "../../steering.ts";
 import { PLAN_SHAPE_DESCRIPTION } from "../../plan-language.ts";
 // PLAN_SHAPE_DESCRIPTION includes JSON_PATH_SINGLE_OP_LINE for the plan argument.
-import { createPolicyChecker, readOpencodeBashRules, readOpencodeOperationRules } from "../../policy.ts";
+import { createOpencodeAskBridge, createPolicyChecker, readOpencodeRuleset, type OpencodeAsk } from "../../policy.ts";
 
 const DESCRIPTION =
   DESCRIPTION_BASE +
   USAGE_LINE +
   RECOVERY_LINE +
-  "Shell and mapped file operations respect your opencode permission rules — deny/ask matches hard-stop before running. " +
+  "Shell and mapped file operations respect your opencode permission rules — a deny stops before running; an ask prompts through opencode when it can, else stops. " +
   VERIFY_FIRST_LINE;
 
 /**
  * Local structural stand-ins for the `@opencode-ai/plugin` types this file
- * touches: the plugin factory's `client` input, the `directory`/`abort`
- * fields of `ToolContext`, and the three hook keys this plugin returns.
+ * touches: the plugin factory's `client` input, the `directory`/`worktree`/
+ * `agent`/`abort`/`ask` fields of `ToolContext` (`src/tool.ts:3-27` in
+ * `@opencode-ai/plugin@1.18.32`; `ask` resolves on approval and rejects on
+ * deny/reject), and the three hook keys this plugin returns.
  * `@opencode-ai/plugin` is not imported at all — see the file header — so
  * these cover only what this adapter actually uses, not the full host contract.
  */
-type PluginToolContext = { directory: string; abort: AbortSignal };
+type PluginToolContext = {
+  directory: string;
+  abort: AbortSignal;
+  /** Optional so older hosts and bare test contexts still work. */
+  worktree?: string;
+  agent?: string;
+  ask?: OpencodeAsk;
+};
 
 type PluginHooks = {
   tool: {
@@ -265,14 +286,19 @@ const server: Plugin = async ({ client }) => ({
       },
       async execute(args: { plan: unknown }, context: PluginToolContext) {
         const executeToolOp = createToolExecutor(client as unknown as OpencodeClient, context.directory);
-        // Re-read per call (one small JSON read): config edits apply immediately,
-        // and an unconfigured host costs a cheap no-op checker.
-        const bashPolicy = readOpencodeBashRules(context.directory);
-        const nativePolicy = readOpencodeOperationRules(context.directory);
-        const checkBash = createPolicyChecker(bashPolicy.rules, bashPolicy.unreadable);
-        const checkNative = createPolicyChecker(nativePolicy.rules, nativePolicy.unreadable);
-        const checkOperationPolicy = (operation: import("../../core/types.ts").Operation) =>
-          typeof operation === "string" || operation.tool === "bash" ? checkBash(operation) : checkNative(operation);
+        // Re-read per call (a few small JSON reads): config edits apply
+        // immediately. One bridge per call = one walk, so its dedupe and
+        // stop-after-rejection state never leaks across tool calls.
+        const worktree = typeof context.worktree === "string" ? context.worktree : undefined;
+        const ruleset = readOpencodeRuleset(context.directory, process.env, {
+          ...(typeof context.agent === "string" ? { agent: context.agent } : {}),
+          ...(worktree ? { worktree } : {}),
+        });
+        const checkerOptions = { directory: context.directory, ...(worktree ? { worktree } : {}) };
+        const ask = typeof context.ask === "function" ? context.ask.bind(context) : undefined;
+        const checkOperationPolicy = ask
+          ? createOpencodeAskBridge(ask, ruleset, { ...checkerOptions, signal: context.abort })
+          : createPolicyChecker(ruleset, checkerOptions);
 
         const result = await executeAdapterPlan(args.plan, "opencode", {
           cwd: context.directory,

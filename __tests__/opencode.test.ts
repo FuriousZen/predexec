@@ -382,7 +382,7 @@ describe.each(variants)("opencode plugin ($name) — host permission policy e2e"
       nodes: [{ id: "a", commands: [{ tool: "find", path: ".", pattern: "README.md" }] }],
     });
     expect(out).toContain("POLICY HARD-STOP (not run)");
-    expect(out).toContain("'README.md'");
+    expect(out).toContain("'glob:README.md'");
   });
 
   it("without a permission block the same plan runs normally", async () => {
@@ -419,6 +419,67 @@ describe.each(variants)("opencode plugin ($name) — host permission policy e2e"
     const out = await execute(dir, plan);
     expect(out).toContain("plan validation failed");
     expect(out).not.toContain("node a (exit");
+  });
+});
+
+describe.each(variants)("opencode plugin ($name) — host context.ask bridge", ({ plugin }) => {
+  const execute = async (directory: string, plan: unknown, ask?: (input: any) => Promise<void>) => {
+    const hooks = await plugin.server({ client: {} } as any);
+    return (hooks as any).tool.predexec.execute(
+      { plan },
+      { directory, worktree: directory, agent: "build", abort: new AbortController().signal, ...(ask ? { ask } : {}) },
+    );
+  };
+  const project = (config: unknown) => {
+    const dir = mkdtempSync(join(tmpdir(), "px-oc-ask-"));
+    writeFileSync(join(dir, "opencode.json"), JSON.stringify(config));
+    writeFileSync(join(dir, "marker.txt"), "x");
+    return dir;
+  };
+  const catPlan = { root: "a", nodes: [{ id: "a", commands: ["cat marker.txt"] }] };
+
+  it("a static ask rule defers to context.ask; approval runs the command", async () => {
+    const dir = project({ permission: { bash: { "cat *": "ask" } } });
+    const asks: any[] = [];
+    const out = await execute(dir, catPlan, async (input) => {
+      asks.push(input);
+    });
+    expect(out).toContain("node a (exit 0)");
+    expect(asks).toEqual([
+      { permission: "bash", patterns: ["cat marker.txt"], always: [], metadata: { source: "predexec", operation: "cat marker.txt" } },
+    ]);
+  });
+
+  it("a context.ask rejection is a policy stop naming opencode's reason", async () => {
+    const dir = project({});
+    const out = await execute(dir, catPlan, async () => {
+      throw new Error("The user rejected permission to use this specific tool call.");
+    });
+    expect(out).toContain("POLICY HARD-STOP (not run)");
+    expect(out).toContain("opencode permission denied: The user rejected permission");
+    expect(out).not.toContain("node a (exit");
+  });
+
+  it("a static deny stops without prompting even when context.ask exists", async () => {
+    const dir = project({ permission: { bash: { "cat *": "deny" } } });
+    let asked = false;
+    const out = await execute(dir, catPlan, async () => {
+      asked = true;
+    });
+    expect(out).toContain("'cat *'");
+    expect(asked).toBe(false);
+  });
+
+  it("without context.ask a static ask still hard-stops", async () => {
+    const dir = project({ permission: { bash: { "cat *": "ask" } } });
+    const out = await execute(dir, catPlan);
+    expect(out).toContain("POLICY HARD-STOP (not run)");
+  });
+
+  it("the session agent's permission block applies", async () => {
+    const dir = project({ agent: { build: { permission: { bash: { "cat *": "deny" } } } } });
+    const out = await execute(dir, catPlan);
+    expect(out).toContain("'cat *'");
   });
 });
 
