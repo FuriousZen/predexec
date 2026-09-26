@@ -413,6 +413,37 @@ block as shipped rather than padding it.
 > unrecoverable and rely on the tool's own text result, never diagnostic logging, when a plan
 > fails.
 
+### Antigravity CLI (`agy`)
+
+The same stdio MCP server, started with `--host antigravity`. agy passes no host marker in the
+subprocess env (measured), so the flag is required. It selects the Antigravity policy reader
+(`mcp/policy-antigravity.ts`) and the `antigravity` stats label.
+
+**Session root.** agy starts a workspace MCP server in the directory `agy` was launched from,
+which may be a subdirectory. It starts a plugin server in the plugin's own directory, with
+`PLUGIN_ROOT` set (both measured). predexec therefore resolves its root in this order:
+
+1. `--root <dir>` in the server args, or `PREDEXEC_ROOT=<dir>` in the server env.
+2. If running as a plugin server (cwd == `PLUGIN_ROOT`) with neither set: every plan fails
+   with an error telling you to set one. The plugin directory is never used as the workspace.
+3. Otherwise, the nearest ancestor of the launch dir that contains `.git` or `.agents`.
+4. Otherwise, the launch dir itself.
+
+`--root` is rejected with any other `--host`.
+
+**Permissions.** Grants are read from `~/.gemini/antigravity-cli/settings.json`
+(`permissions.{deny,ask,allow}`, `toolPermission`, `allowNonWorkspaceAccess`), per
+<https://antigravity.google/docs/permissions>. Shell commands are checked against `command(...)`
+grants and read/grep/find/ls against `read_file(...)` grants, with Deny > Ask > Allow. A deny or
+ask match hard-stops the walk. Under `toolPermission: "strict"` (or an unknown mode), an
+operation stops unless an allow grant covers it. `allowNonWorkspaceAccess: false` stops tool ops
+that reach outside the workspace. A settings file that will not parse stops everything. So does
+a deny/ask grant predexec cannot evaluate, such as an unknown syntax or a `regex:` that could
+backtrack catastrophically. Grants made in the app/IDE UI and per-project grants are not
+readable and are not applied. agy runs MCP servers outside its terminal sandbox, even with
+`--sandbox` (measured), so, as with Codex, this policy check and predexec's read-only
+enforcement are the only containment.
+
 ### A prompt to see it work
 
 A read-only, structurally predictable task — predexec's sweet spot:
@@ -508,11 +539,12 @@ edits are always what's measured.)
 dist/                              compiled ESM JavaScript (emitted by tsconfig.build.json)
 .pi/extension/index.ts             pi adapter — JSON Schema + ctx wiring, delegates to core
 .opencode/plugins/predexec.ts      opencode adapter — zod schema + context wiring, delegates to core
-mcp/                               Claude Code / Codex adapter (stdio MCP), delegates to core
+mcp/                               Claude Code / Codex / Antigravity adapter (stdio MCP), delegates to core
   server.ts                        the MCP server: one `predexec` tool (`--host` picks the policy reader)
   tool-ops.ts                      read/grep/find/ls over node:fs (rg/fd accelerate when present)
   policy-claude.ts                 reads your Claude Code permission rules → policyStop
   policy-codex.ts                  reads Codex's config.toml + execpolicy rules → policyStop, fail-closed
+  policy-antigravity.ts            reads agy's settings.json grants (Deny > Ask > Allow) → policyStop, fail-closed
 core/                              PURE TS, zero harness imports (promotable to a standalone package)
   types.ts conditions.ts runner.ts engine.ts destructive.ts coerce.ts index.ts
 steering.ts                        shared steering text/marker + renderSkill (harness-facing; not in core/)
@@ -520,7 +552,7 @@ stats.ts                           request-accounting recorder (append-only JSON
 policy.ts                          opencode permission reader/checker (harness-facing)
 adapter-runtime.ts                 shared adapter execution & stats runtime
 bin/predexec.mjs                   CLI: doctor + stats + install-skill (node builtins only)
-bin/predexec-mcp.mjs               Claude Code / Codex MCP entrypoint (`--host codex` selects Codex)
+bin/predexec-mcp.mjs               MCP entrypoint (`--host codex|antigravity` selects the host; `--root` for antigravity)
 .pi/skills/predexec/SKILL.md       pi routing skill (loaded via pi.skills)       } generated from steering.ts
 skills/<harness>/predexec/SKILL.md claude / codex / opencode routing skills     } by `pnpm skills`;
 antigravity-plugin/skills/predexec/SKILL.md  Antigravity routing skill          } never edit by hand

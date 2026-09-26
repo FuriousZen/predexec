@@ -7,7 +7,7 @@
  * only wires the MCP boundary: schema → executeAdapterPlan (../adapter-runtime.ts:
  * coerce → run → record) → transcript.
  *
- * This ONE server file serves TWO hosts. Neither Claude Code nor Codex exposes
+ * This ONE server file serves THREE hosts (Claude Code, Codex, Antigravity CLI). Neither Claude Code nor Codex exposes
  * an in-process tool-registration API, so unlike the pi extension and the
  * opencode plugin this adapter is a SEPARATE PROCESS with no host APIs at all
  * — for either host. Which host is running it is selected explicitly via
@@ -27,9 +27,9 @@
  *     `policyStop` on any deny/ask/forbid match. predexec is strictly more
  *     conservative than the host, never a permission-laundering path, on
  *     either host.
- *  3. Codex spawns MCP servers OUTSIDE its own sandbox (measured), so on that
- *     host predexec's own read-only invariant + destructive.ts + the policy
- *     reader above are the *only* containment — there is no OS-level backstop
+ *  3. Codex and Antigravity spawn MCP servers OUTSIDE their own sandboxes
+ *     (both measured), so on those hosts predexec's own read-only invariant +
+ *     destructive.ts + the policy reader above are the *only* containment — there is no OS-level backstop
  *     the way Claude Code's sandboxing docs offer. The tool's
  *     `readOnlyHint: true` annotation matters most for Codex, whose default
  *     per-call approval mode treats an unannotated tool as destructive.
@@ -63,6 +63,11 @@ import { PLAN_SHAPE_DESCRIPTION } from "../plan-language.ts";
 // PLAN_SHAPE_DESCRIPTION includes JSON_PATH_SINGLE_OP_LINE for the MCP schema.
 import { createClaudeHostPolicyChecker, type ClaudePolicyOptions } from "./policy-claude.ts";
 import { createCodexPolicyChecker, readCodexRules, type CodexPolicyOptions } from "./policy-codex.ts";
+import {
+  createAntigravityPolicyChecker,
+  resolveAntigravityRoot,
+  type AntigravityPolicyOptions,
+} from "./policy-antigravity.ts";
 import { createToolExecutor } from "./tool-ops.ts";
 
 /** The tool name clients see as `mcp__predexec__predexec`. */
@@ -122,6 +127,8 @@ export interface PredexecServerOptions {
    * Session root. An MCP server gets exactly one signal about where it is —
    * the directory Claude Code spawned it in — so process.cwd() is both the
    * tool-ops root and the project dir the permission rules are read from.
+   * Under `host: "antigravity"` it is the launch dir instead, from which the
+   * session root is resolved (see `root`).
    */
   cwd?: string;
   /**
@@ -129,7 +136,7 @@ export interface PredexecServerOptions {
    * Code; codexHome / env for Codex). Tests point it at fixtures. Which shape
    * applies depends on `host`.
    */
-  policy?: ClaudePolicyOptions | CodexPolicyOptions;
+  policy?: ClaudePolicyOptions | CodexPolicyOptions | AntigravityHostPolicyOptions;
   /**
    * Which host is running this server — selects the policy reader AND the
    * stats harness label. Codex clears the subprocess env before spawning an
@@ -139,8 +146,23 @@ export interface PredexecServerOptions {
    * install with no flag must behave byte-for-byte as before this option
    * existed.
    */
-  host?: "claude-code" | "codex";
+  host?: Host;
+  /**
+   * Antigravity only (`--root`): the session root. agy starts a workspace MCP
+   * server in its LAUNCH dir (possibly a subdir) and a plugin server in the
+   * plugin's own dir (measured, docs/research/antigravity.md §a), so cwd is
+   * not reliably the workspace — see resolveAntigravityRoot. Ignored for the
+   * other hosts, whose cwd is the session dir.
+   */
+  root?: string;
+  /** Env for Antigravity root resolution (`PREDEXEC_ROOT`, `PLUGIN_ROOT`). Defaults to `process.env`. */
+  env?: NodeJS.ProcessEnv;
 }
+
+export type Host = "claude-code" | "codex" | "antigravity";
+
+/** Antigravity policy options minus the workspace, which the server supplies. */
+export type AntigravityHostPolicyOptions = Omit<AntigravityPolicyOptions, "cwd">;
 
 const textResult = (text: string, isError = false): ToolResult => ({
   content: [{ type: "text", text }],
@@ -178,8 +200,10 @@ async function runPredexecTool(
   opts: {
     cwd: string;
     executeToolOp: ToolExecutor;
-    policy?: ClaudePolicyOptions | CodexPolicyOptions;
-    host: "claude-code" | "codex";
+    policy?: ClaudePolicyOptions | CodexPolicyOptions | AntigravityHostPolicyOptions;
+    host: Host;
+    /** Antigravity: agy's own workspace dir, for relative grants and allowNonWorkspaceAccess. */
+    workspace: string;
     signal?: AbortSignal;
   },
 ): Promise<ToolResult> {
@@ -195,7 +219,12 @@ async function runPredexecTool(
           return (operation: import("../core/types.ts").Operation) =>
             checkShell(operation);
         })()
-      : createClaudeHostPolicyChecker(opts.cwd, (opts.policy as ClaudePolicyOptions) ?? {});
+      : opts.host === "antigravity"
+        ? createAntigravityPolicyChecker({
+            ...((opts.policy as AntigravityHostPolicyOptions) ?? {}),
+            cwd: opts.workspace,
+          })
+        : createClaudeHostPolicyChecker(opts.cwd, (opts.policy as ClaudePolicyOptions) ?? {});
 
   const result = await executeAdapterPlan(rawPlan, opts.host, {
     cwd: opts.cwd,
@@ -218,8 +247,18 @@ async function runPredexecTool(
  * a strict schema would reject before we ever saw them.
  */
 export function createServer(opts: PredexecServerOptions = {}): McpServer {
-  const cwd = resolve(opts.cwd ?? process.cwd());
+  const launchCwd = resolve(opts.cwd ?? process.cwd());
   const host = opts.host ?? "claude-code";
+  // Antigravity: the session root may differ from the launch dir, and may be
+  // unresolvable (plugin server without --root) — then every call fails with
+  // the explanation instead of silently reading the plugin dir.
+  const agyRoot =
+    host === "antigravity" ? resolveAntigravityRoot({ cwd: launchCwd, root: opts.root, env: opts.env }) : null;
+  const rootError = agyRoot && "error" in agyRoot ? agyRoot.error : null;
+  const cwd = agyRoot && "root" in agyRoot ? agyRoot.root : launchCwd;
+  // agy's own workspace is its launch dir unless the root was given explicitly.
+  const explicitRoot = host === "antigravity" && Boolean(opts.root || (opts.env ?? process.env).PREDEXEC_ROOT);
+  const workspace = explicitRoot ? cwd : launchCwd;
   // Built once: PATH and the session root do not change mid-process, and the
   // rg/fd lookups inside are per-construction.
   const executeToolOp = createToolExecutor({ cwd });
@@ -240,15 +279,18 @@ export function createServer(opts: PredexecServerOptions = {}): McpServer {
       annotations: { readOnlyHint: true },
     },
     async (args, extra) =>
-      runPredexecTool(args.plan, {
-        cwd,
-        executeToolOp,
-        policy: opts.policy,
-        host,
-        // The client's cancellation reaches the walk, so an abandoned request
-        // does not leave a subtree of commands running.
-        signal: extra.mcpReq?.signal,
-      }),
+      rootError
+        ? textResult(rootError, true)
+        : runPredexecTool(args.plan, {
+            cwd,
+            executeToolOp,
+            policy: opts.policy,
+            host,
+            workspace,
+            // The client's cancellation reaches the walk, so an abandoned request
+            // does not leave a subtree of commands running.
+            signal: extra.mcpReq?.signal,
+          }),
   );
 
   return server;

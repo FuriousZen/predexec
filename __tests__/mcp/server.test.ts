@@ -529,6 +529,104 @@ describe("mcp server — launcher `--host` flag", () => {
     }
   });
 
+  it("--host antigravity selects the Antigravity grant policy: a deny grant stops the command, an unmatched one still runs", async () => {
+    // Same shape as the --host=codex test above: `cat` is a read-only head,
+    // so only the POLICY path (not the mutation heuristic) can stop it.
+    const dir = project();
+    mkdirSync(join(dir, ".git"));
+    const home = mkdtempSync(join(tmpdir(), "px-agy-home-"));
+    mkdirSync(join(home, ".gemini", "antigravity-cli"), { recursive: true });
+    writeFileSync(
+      join(home, ".gemini", "antigravity-cli", "settings.json"),
+      JSON.stringify({ permissions: { deny: ["command(cat)"] } }),
+    );
+
+    const binPath = join(__dirname, "..", "..", "bin", "predexec-mcp.mjs");
+    // Two-token `--host antigravity` form, launched from a SUBDIR (agy starts a
+    // workspace server in its launch dir): the session root walks up to `.git`.
+    mkdirSync(join(dir, "sub"));
+    const client = spawnMcpClient(binPath, {
+      cwd: join(dir, "sub"),
+      args: ["--host", "antigravity"],
+      env: { HOME: home, PREDEXEC_ROOT: "", PLUGIN_ROOT: "" },
+    });
+
+    try {
+      const initRes = await client.request("initialize", {
+        protocolVersion: LATEST_PROTOCOL_VERSION,
+        capabilities: {},
+        clientInfo: { name: "predexec-antigravity-test", version: "1" },
+      });
+      expect(initRes.result.serverInfo.name).toBe("predexec");
+      client.notify("notifications/initialized");
+
+      const listed = await client.request("tools/list");
+      expect(listed.result.tools[0].description).toBe(DESCRIPTION);
+
+      const catRes = await client.request("tools/call", {
+        name: TOOL_NAME,
+        arguments: { plan: { root: "a", nodes: [{ id: "a", commands: ["cat marker.txt"] }] } },
+      });
+      const catText = textOf(catRes);
+      expect(catText).toContain("POLICY HARD-STOP (not run)");
+      expect(catText).toContain("command(cat)");
+      expect(catText).not.toContain("hello from predexec");
+
+      // The tool-ops root is the repo root, not the launch subdir.
+      const okRes = await client.request("tools/call", {
+        name: TOOL_NAME,
+        arguments: { plan: { root: "a", nodes: [{ id: "a", commands: [{ tool: "read", path: "marker.txt" }] }] } },
+      });
+      expect(textOf(okRes)).toContain("hello from predexec");
+      expect(okRes.result.isError).toBeUndefined();
+    } finally {
+      client.kill();
+    }
+  });
+
+  it("--host antigravity as a plugin server with no --root fails every plan with an explicit root error", async () => {
+    const plugin = mkdtempSync(join(tmpdir(), "px-agy-plugin-"));
+    const home = mkdtempSync(join(tmpdir(), "px-agy-home-"));
+    const binPath = join(__dirname, "..", "..", "bin", "predexec-mcp.mjs");
+    const client = spawnMcpClient(binPath, {
+      cwd: plugin,
+      args: ["--host=antigravity"],
+      env: { HOME: home, PLUGIN_ROOT: plugin, PREDEXEC_ROOT: "" },
+    });
+    try {
+      await client.request("initialize", {
+        protocolVersion: LATEST_PROTOCOL_VERSION,
+        capabilities: {},
+        clientInfo: { name: "predexec-antigravity-test", version: "1" },
+      });
+      client.notify("notifications/initialized");
+      const res = await client.request("tools/call", {
+        name: TOOL_NAME,
+        arguments: { plan: { root: "a", nodes: [{ id: "a", commands: ["printf ok"] }] } },
+      });
+      expect(res.result.isError).toBe(true);
+      expect(textOf(res)).toMatch(/--root/);
+      expect(textOf(res)).toMatch(/PREDEXEC_ROOT/);
+    } finally {
+      client.kill();
+    }
+  });
+
+  it("--root with a non-antigravity host exits 1 with a usage line on stderr", async () => {
+    const binPath = join(__dirname, "..", "..", "bin", "predexec-mcp.mjs");
+    const child = spawn(process.execPath, [binPath, "--root", "/tmp"], { stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = "";
+    let stderr = "";
+    child.stdout!.setEncoding("utf8");
+    child.stderr!.setEncoding("utf8");
+    child.stdout!.on("data", (c: string) => (stdout += c));
+    child.stderr!.on("data", (c: string) => (stderr += c));
+    const exitCode = await new Promise<number | null>((resolve) => child.on("exit", resolve));
+    expect(exitCode).toBe(1);
+    expect(stderr).toContain("--root");
+    expect(stdout).toBe("");
+  });
+
   it("an unrecognized --host value exits 1 with a usage line on stderr, before any protocol output", async () => {
     const binPath = join(__dirname, "..", "..", "bin", "predexec-mcp.mjs");
     const child = spawn(process.execPath, [binPath, "--host", "bogus"], {

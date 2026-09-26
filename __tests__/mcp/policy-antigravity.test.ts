@@ -1,0 +1,340 @@
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, describe, expect, it } from "vitest";
+import {
+  createAntigravityPolicyChecker,
+  parseAntigravityGrant,
+  resolveAntigravityRoot,
+} from "../../mcp/policy-antigravity.ts";
+import { runPlanTree } from "../../core/engine.ts";
+import type { Operation, PolicyCheckContext } from "../../core/types.ts";
+
+let tmp: string;
+afterEach(() => tmp && rmSync(tmp, { recursive: true, force: true }));
+
+/** A fresh `<tmp>/home` + `<tmp>/ws` pair — the real `~/.gemini` is never read. */
+function setup(settings?: unknown) {
+  tmp = realpathSync(mkdtempSync(join(tmpdir(), "px-agy-policy-")));
+  const home = join(tmp, "home");
+  const ws = join(tmp, "ws");
+  mkdirSync(join(home, ".gemini", "antigravity-cli"), { recursive: true });
+  mkdirSync(ws, { recursive: true });
+  if (settings !== undefined) {
+    writeFileSync(
+      join(home, ".gemini", "antigravity-cli", "settings.json"),
+      typeof settings === "string" ? settings : JSON.stringify(settings),
+    );
+  }
+  return { home, ws };
+}
+
+function checker(settings?: unknown) {
+  const { home, ws } = setup(settings);
+  const check = createAntigravityPolicyChecker({ home, cwd: ws, env: {} });
+  const ctx: PolicyCheckContext = { cwd: ws, sessionRoot: ws };
+  return { ws, home, run: (op: Operation, extra: Partial<PolicyCheckContext> = {}) => check(op, { ...ctx, ...extra }) };
+}
+
+describe("parseAntigravityGrant", () => {
+  it("parses prefix, regex and wildcard targets", () => {
+    expect(parseAntigravityGrant("command(git status)")).toEqual({
+      action: "command",
+      target: { kind: "prefix", value: "git status" },
+    });
+    expect(parseAntigravityGrant("command(regex:git .*)")).toEqual({
+      action: "command",
+      target: { kind: "regex", value: "git .*" },
+    });
+    expect(parseAntigravityGrant("read_file(*)")).toEqual({ action: "read_file", target: { kind: "any", value: "*" } });
+    expect(parseAntigravityGrant("mcp(server/*)")).toEqual({
+      action: "mcp",
+      target: { kind: "prefix", value: "server/*" },
+    });
+  });
+
+  it("returns null for anything that is not action(target)", () => {
+    expect(parseAntigravityGrant("git status")).toBeNull();
+    expect(parseAntigravityGrant("command()")).toBeNull();
+    expect(parseAntigravityGrant("command(git")).toBeNull();
+    expect(parseAntigravityGrant("Command(git)")).toBeNull();
+    expect(parseAntigravityGrant("")).toBeNull();
+  });
+});
+
+describe("antigravity policy — command grants", () => {
+  it("a missing settings file allows everything", async () => {
+    const { run } = checker();
+    expect(await run("git status")).toBeNull();
+    expect(await run({ tool: "read", path: "x.txt" })).toBeNull();
+  });
+
+  it("deny stops; deny beats an allow for the same command", async () => {
+    const { run } = checker({ permissions: { allow: ["command(git)"], deny: ["command(git log)"] } });
+    expect(await run("git log -1")).toMatch(/command\(git log\)/);
+    expect(await run("git status")).toBeNull();
+  });
+
+  it("ask stops (predexec cannot prompt mid-walk), even over an allow", async () => {
+    const { run } = checker({ permissions: { allow: ["command(cat)"], ask: ["command(cat)"] } });
+    expect(await run("cat a.txt")).toMatch(/ask.*command\(cat\)/);
+  });
+
+  it("prefix matching is on a word boundary: command(git) matches `git status`, not `gitk`", async () => {
+    const { run } = checker({ permissions: { deny: ["command(git)"] } });
+    expect(await run("git status")).not.toBeNull();
+    expect(await run("git")).not.toBeNull();
+    expect(await run("gitk --all")).toBeNull();
+  });
+
+  it("every pipeline/chain segment is judged, and transparent wrappers do not hide the head", async () => {
+    const { run } = checker({ permissions: { deny: ["command(cat)"] } });
+    expect(await run("echo hi && cat x")).not.toBeNull();
+    expect(await run("ls | cat")).not.toBeNull();
+    expect(await run("timeout 5 cat x")).not.toBeNull();
+    expect(await run("FOO=1 cat x")).not.toBeNull();
+    expect(await run("/bin/cat x")).not.toBeNull();
+    expect(await run("ca\\\nt x")).not.toBeNull();
+  });
+
+  it("command(*) matches every command", async () => {
+    const { run } = checker({ permissions: { ask: ["command(*)"] } });
+    expect(await run("ls")).not.toBeNull();
+  });
+
+  it("regex: grants are anchored per token and prefix-match by token", async () => {
+    const { run } = checker({ permissions: { deny: ["command(regex:git (log|show))"] } });
+    expect(await run("git log -1")).not.toBeNull();
+    expect(await run("git show HEAD")).not.toBeNull();
+    expect(await run("git status")).toBeNull();
+    // anchored: `logs` is not `log`
+    expect(await run("git logs")).toBeNull();
+  });
+
+  it("an unsafe regex: deny grant fails closed (stops every shell command)", async () => {
+    const { run } = checker({ permissions: { deny: ["command(regex:(a+)+)"] } });
+    expect(await run("ls")).toMatch(/regex/);
+    // it is a command grant, so tool ops are unaffected
+    expect(await run({ tool: "read", path: "x" })).toBeNull();
+  });
+
+  it("an unsafe regex: allow grant is ignored (only adds stops under strict)", async () => {
+    const { run } = checker({ toolPermission: "strict", permissions: { allow: ["command(regex:(a+)+)", "command(ls)"] } });
+    expect(await run("ls")).toBeNull();
+    expect(await run("aaa")).not.toBeNull();
+  });
+
+  it("deny/ask still see through command substitution", async () => {
+    const { run } = checker({ permissions: { deny: ["command(cat)"] } });
+    expect(await run("echo $(cat secret)")).not.toBeNull();
+    expect(await run("echo `cat secret`")).not.toBeNull();
+  });
+
+  it("a substitution construct needs an exact full-line allow (prefix allows do not cover it)", async () => {
+    const { run } = checker({
+      toolPermission: "strict",
+      permissions: { allow: ["command(echo)", "command(echo $(date))"] },
+    });
+    expect(await run("echo hi")).toBeNull();
+    expect(await run("echo $(date)")).toBeNull();
+    expect(await run("echo $(whoami)")).toMatch(/strict/);
+    expect(await run("echo `date`")).toMatch(/strict/);
+    expect(await run("diff <(echo a) b")).toMatch(/strict/);
+  });
+
+  it("strict: a command stops unless every segment matches an allow", async () => {
+    const { run } = checker({ toolPermission: "strict", permissions: { allow: ["command(git status)", "command(ls)"] } });
+    expect(await run("git status")).toBeNull();
+    expect(await run("timeout 5 git status")).toBeNull();
+    expect(await run("git status && ls")).toBeNull();
+    expect(await run("git status && pwd")).toMatch(/strict/);
+    expect(await run("pwd")).toMatch(/strict/);
+  });
+
+  it("strict does not re-demand an allow for an engine variant of an already-allowed operation", async () => {
+    const { run } = checker({ toolPermission: "strict", permissions: { allow: ["command(sh)"], deny: ["command(cat)"] } });
+    expect(await run("ls", { variant: true })).toBeNull();
+    // ...but deny still applies to variants
+    expect(await run("cat x", { variant: true })).not.toBeNull();
+  });
+
+  it("non-strict modes need no allow", async () => {
+    for (const toolPermission of ["always-proceed", "request-review"]) {
+      const { run } = checker({ toolPermission });
+      expect(await run("pwd")).toBeNull();
+    }
+  });
+
+  it("an unknown toolPermission value is treated as strict (fail closed)", async () => {
+    const { run } = checker({ toolPermission: "future-mode" });
+    expect(await run("pwd")).toMatch(/strict|toolPermission/);
+  });
+
+  it("{tool:'bash'} operations are shell commands", async () => {
+    const { run } = checker({ permissions: { deny: ["command(cat)"] } });
+    expect(await run({ tool: "bash", command: "cat x" })).not.toBeNull();
+  });
+});
+
+describe("antigravity policy — read_file grants and tool ops", () => {
+  it("a read_file deny applies to read/grep/find/ls tool ops, recursively below a directory", async () => {
+    const { run } = checker({ permissions: { deny: ["read_file(secrets)"] } });
+    expect(await run({ tool: "read", path: "secrets/key.txt" })).toMatch(/read_file\(secrets\)/);
+    expect(await run({ tool: "grep", pattern: "x", path: "secrets" })).not.toBeNull();
+    expect(await run({ tool: "find", pattern: "*", path: "secrets/sub" })).not.toBeNull();
+    expect(await run({ tool: "ls", path: "secrets" })).not.toBeNull();
+    expect(await run({ tool: "read", path: "secretsx/a" })).toBeNull();
+    expect(await run({ tool: "read", path: "README.md" })).toBeNull();
+  });
+
+  it("a read_file deny with an absolute path matches", async () => {
+    const { ws, home } = setup();
+    writeFileSync(
+      join(home, ".gemini", "antigravity-cli", "settings.json"),
+      JSON.stringify({ permissions: { deny: [`read_file(${join(ws, ".env")})`] } }),
+    );
+    const check = createAntigravityPolicyChecker({ home, cwd: ws, env: {} });
+    expect(await check({ tool: "read", path: ".env" }, { cwd: ws, sessionRoot: ws })).not.toBeNull();
+  });
+
+  it("a tool op with no path targets the node cwd", async () => {
+    const { run, ws } = checker({ permissions: { deny: ["read_file(sub)"] } });
+    expect(await run({ tool: "ls" }, { cwd: join(ws, "sub") })).not.toBeNull();
+    expect(await run({ tool: "ls" })).toBeNull();
+  });
+
+  it("read_file ask stops; read_file(*) matches everything", async () => {
+    const { run } = checker({ permissions: { ask: ["read_file(*)"] } });
+    expect(await run({ tool: "read", path: "a" })).not.toBeNull();
+  });
+
+  it("command grants do not touch tool ops, and read_file grants do not touch shell commands", async () => {
+    const { run } = checker({ permissions: { deny: ["command(cat)", "read_file(secrets)"] } });
+    expect(await run({ tool: "read", path: "cat" })).toBeNull();
+    expect(await run("ls secrets")).toBeNull();
+  });
+
+  it("strict: a tool op stops unless a read_file (or write_file) allow covers its path", async () => {
+    const { run } = checker({
+      toolPermission: "strict",
+      permissions: { allow: ["read_file(src)", "write_file(docs)"] },
+    });
+    expect(await run({ tool: "read", path: "src/a.ts" })).toBeNull();
+    expect(await run({ tool: "read", path: "docs/a.md" })).toBeNull();
+    expect(await run({ tool: "read", path: "other.txt" })).toMatch(/strict/);
+  });
+
+  it("allowNonWorkspaceAccess:false stops a tool op whose path resolves outside the workspace", async () => {
+    const { run } = checker({ allowNonWorkspaceAccess: false });
+    expect(await run({ tool: "read", path: "/etc/hosts" })).toMatch(/workspace/);
+    expect(await run({ tool: "read", path: "../elsewhere.txt" })).toMatch(/workspace/);
+    expect(await run({ tool: "read", path: "inside.txt" })).toBeNull();
+  });
+
+  it("allowNonWorkspaceAccess absent or true does not add a workspace stop", async () => {
+    expect(await checker({}).run({ tool: "read", path: "/etc/hosts" })).toBeNull();
+    expect(await checker({ allowNonWorkspaceAccess: true }).run({ tool: "read", path: "/etc/hosts" })).toBeNull();
+  });
+});
+
+describe("antigravity policy — fail closed", () => {
+  it("unparseable JSON stops every operation", async () => {
+    const { run } = checker("{ not json");
+    expect(await run("ls")).toMatch(/settings\.json/);
+    expect(await run({ tool: "read", path: "a" })).toMatch(/settings\.json/);
+  });
+
+  it("a structurally wrong permissions block fails closed", async () => {
+    expect(await checker({ permissions: { deny: "command(git)" } }).run("ls")).not.toBeNull();
+    expect(await checker({ permissions: [] }).run("ls")).not.toBeNull();
+    expect(await checker({ toolPermission: 3 }).run("ls")).not.toBeNull();
+    expect(await checker({ allowNonWorkspaceAccess: "no" }).run("ls")).not.toBeNull();
+    expect(await checker([1, 2]).run("ls")).not.toBeNull();
+  });
+
+  it("an unknown grant syntax in deny/ask fails closed", async () => {
+    expect(await checker({ permissions: { deny: ["git push"] } }).run("ls")).not.toBeNull();
+    expect(await checker({ permissions: { ask: ["delete_everything(x)"] } }).run({ tool: "read", path: "a" })).not.toBeNull();
+    expect(await checker({ permissions: { deny: ["read_file(regex:.*)"] } }).run({ tool: "read", path: "a" })).not.toBeNull();
+  });
+
+  it("an unknown grant syntax in allow is ignored", async () => {
+    const { run } = checker({ permissions: { allow: ["garbage", "whatever(x)"] } });
+    expect(await run("ls")).toBeNull();
+  });
+
+  it("grants for actions predexec never performs (mcp, read_url, write_file deny) are ignored, not failed closed", async () => {
+    const { run } = checker({
+      permissions: { deny: ["mcp(*)", "read_url(*)", "execute_url(*)", "write_file(*)"], ask: ["unsandboxed(ls)"] },
+    });
+    expect(await run("ls")).toBeNull();
+    expect(await run({ tool: "read", path: "a" })).toBeNull();
+  });
+});
+
+describe("antigravity policy — through the engine", () => {
+  it("a deny match is a policyStop before the command runs", async () => {
+    const { home, ws } = setup({ permissions: { deny: ["command(cat)"] } });
+    writeFileSync(join(ws, "marker.txt"), "SECRET");
+    const result = await runPlanTree(
+      { root: "a", nodes: [{ id: "a", commands: ["cat marker.txt"] }] },
+      { cwd: ws, checkOperationPolicy: createAntigravityPolicyChecker({ home, cwd: ws, env: {} }) },
+    );
+    expect(result.stoppedReason).toBe("policyStop");
+    expect(result.transcript).not.toContain("SECRET");
+  });
+});
+
+describe("resolveAntigravityRoot", () => {
+  function tree() {
+    tmp = realpathSync(mkdtempSync(join(tmpdir(), "px-agy-root-")));
+    const repo = join(tmp, "repo");
+    mkdirSync(join(repo, ".git"), { recursive: true });
+    mkdirSync(join(repo, "sub", "deeper"), { recursive: true });
+    return { repo };
+  }
+
+  it("--root wins, resolved against cwd", () => {
+    const { repo } = tree();
+    expect(resolveAntigravityRoot({ cwd: join(repo, "sub"), root: "..", env: { PREDEXEC_ROOT: "/nope" } })).toEqual({ root: repo });
+  });
+
+  it("PREDEXEC_ROOT is used when no --root is given", () => {
+    const { repo } = tree();
+    expect(resolveAntigravityRoot({ cwd: tmp, env: { PREDEXEC_ROOT: repo } })).toEqual({ root: repo });
+  });
+
+  it("an explicit root that is not a directory is an error, not a fallback", () => {
+    const { repo } = tree();
+    const r = resolveAntigravityRoot({ cwd: repo, root: join(repo, "missing") });
+    expect("error" in r && r.error).toMatch(/missing/);
+  });
+
+  it("walks up from a subdir to the nearest .git or .agents ancestor", () => {
+    const { repo } = tree();
+    expect(resolveAntigravityRoot({ cwd: join(repo, "sub", "deeper"), env: {} })).toEqual({ root: repo });
+    mkdirSync(join(repo, "sub", ".agents"));
+    expect(resolveAntigravityRoot({ cwd: join(repo, "sub", "deeper"), env: {} })).toEqual({ root: join(repo, "sub") });
+  });
+
+  it("falls back to cwd when no marker exists above it", () => {
+    tmp = realpathSync(mkdtempSync(join(tmpdir(), "px-agy-root-")));
+    // tmpdir() itself may sit below a marker on some machines; a nested dir
+    // with no marker anywhere up to / is not guaranteed, so assert the weaker
+    // property: the result is cwd or an ancestor of it.
+    const r = resolveAntigravityRoot({ cwd: tmp, env: {} });
+    expect("root" in r && tmp.startsWith(r.root)).toBe(true);
+  });
+
+  it("as a plugin server (cwd == PLUGIN_ROOT) with no explicit root, it is an error naming --root/PREDEXEC_ROOT", () => {
+    const { repo } = tree();
+    const plugin = join(repo, ".agents", "plugins", "predexec");
+    mkdirSync(plugin, { recursive: true });
+    const r = resolveAntigravityRoot({ cwd: plugin, env: { PLUGIN_ROOT: plugin } });
+    expect("error" in r).toBe(true);
+    expect((r as { error: string }).error).toMatch(/--root/);
+    expect((r as { error: string }).error).toMatch(/PREDEXEC_ROOT/);
+    // ...an explicit root fixes it
+    expect(resolveAntigravityRoot({ cwd: plugin, env: { PLUGIN_ROOT: plugin, PREDEXEC_ROOT: repo } })).toEqual({ root: repo });
+  });
+});

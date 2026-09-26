@@ -21,9 +21,12 @@
  * plain node-builtins-only code with no top-level output (verified) — it
  * must stay that way, or gain its own guard, for this guarantee to hold.
  *
- * `--host claude-code|codex` (also `--host=codex`) selects the policy adapter
- * and stats label downstream in mcp/server.ts; default stays "claude-code" so
- * an existing install with no flag is byte-for-byte unchanged. Codex clears
+ * `--host claude-code|codex|antigravity` (also `--host=codex`) selects the
+ * policy adapter and stats label downstream in mcp/server.ts; default stays
+ * "claude-code" so an existing install with no flag is byte-for-byte unchanged.
+ * `--root <dir>` (antigravity only) names the session root: agy starts a
+ * workspace server in its launch dir and a plugin server in the plugin dir,
+ * so cwd is not always the workspace (docs/research/antigravity.md §a). Codex clears
  * the subprocess env before spawning an MCP server (measured — no `CODEX_*`
  * marker reaches us), so host detection is impossible and the registration
  * command must declare it explicitly. parseHostArg() rejects an unrecognized
@@ -46,8 +49,8 @@ import { isDirectInvocation } from "./predexec.mjs";
 /** Resolved from this file, so a symlinked bin still finds the compiled entry. */
 const SERVER_URL = new URL("../dist/mcp/server.js", import.meta.url);
 
-const VALID_HOSTS = new Set(["claude-code", "codex"]);
-const USAGE = "usage: predexec-mcp [--host claude-code|codex]";
+const VALID_HOSTS = new Set(["claude-code", "codex", "antigravity"]);
+const USAGE = "usage: predexec-mcp [--host claude-code|codex|antigravity] [--root <dir>]";
 
 /**
  * Parse `--host <value>` / `--host=<value>` out of `argv`, stripping it
@@ -61,21 +64,32 @@ const USAGE = "usage: predexec-mcp [--host claude-code|codex]";
  */
 export function parseHostArg(argv) {
   let host = "claude-code";
+  let root;
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (arg === "--host") host = argv[++i];
     else if (arg.startsWith("--host=")) host = arg.slice("--host=".length);
+    else if (arg === "--root") root = argv[++i] ?? "";
+    else if (arg.startsWith("--root=")) root = arg.slice("--root=".length);
   }
   if (!VALID_HOSTS.has(host)) {
-    throw new Error(`predexec-mcp: invalid --host "${host}" (expected "claude-code" or "codex")\n${USAGE}`);
+    throw new Error(`predexec-mcp: invalid --host "${host}" (expected "claude-code", "codex" or "antigravity")\n${USAGE}`);
+  }
+  if (root !== undefined) {
+    // Claude Code and Codex start the server in the session dir; a --root
+    // there would be silently ignored, so refuse it instead.
+    if (host !== "antigravity") throw new Error(`predexec-mcp: --root is only supported with --host antigravity\n${USAGE}`);
+    if (!root) throw new Error(`predexec-mcp: --root needs a directory\n${USAGE}`);
+    return { host, root };
   }
   return { host };
 }
 
 export async function launch(argv = process.argv.slice(2)) {
   let host;
+  let root;
   try {
-    ({ host } = parseHostArg(argv));
+    ({ host, root } = parseHostArg(argv));
   } catch (err) {
     console.error(err.message);
     process.exitCode = 1;
@@ -100,7 +114,7 @@ export async function launch(argv = process.argv.slice(2)) {
   }
 
   try {
-    await server.main({ host });
+    await server.main(root === undefined ? { host } : { host, root });
   } catch (err) {
     // Reaching here means the transport never came up; the client sees an
     // immediate exit, so the reason has to be on stderr for it to be logged.

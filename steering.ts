@@ -163,7 +163,9 @@ const POLICY_PARAGRAPH: Readonly<Record<SkillHarness, string | null>> = Object.f
     "Known gap: rules visible only to the host are not applied to inner `sh -c` spellings.",
   antigravity:
     "Permissions: shell commands and file reads are re-checked against your Antigravity grants (`command(...)` / `read_file(...)`, Deny > Ask > Allow). " +
-    "A deny OR ask match hard-stops the walk (`policyStop`), because predexec cannot prompt mid-walk — run that step with your own tools instead.",
+    "A deny OR ask match hard-stops the walk (`policyStop`), because predexec cannot prompt mid-walk — run that step with your own tools instead. " +
+    "Under `toolPermission: \"strict\"` every step needs a matching allow, `allowNonWorkspaceAccess: false` stops tool ops outside the workspace, " +
+    "and an unreadable settings file stops everything until it is fixed.",
 });
 
 /** The host's own shell tool, named the way that host names it. */
@@ -172,7 +174,8 @@ const SHELL_TOOL: Readonly<Record<SkillHarness, string>> = Object.freeze({
   claude: "Bash",
   codex: "your shell tool",
   opencode: "bash",
-  antigravity: "your terminal tool",
+  // agy's own shell tool, as named in its tool list (measured, docs/research/antigravity.md §c).
+  antigravity: "`run_command`",
 });
 
 const HARNESS_TITLE: Readonly<Record<SkillHarness, string>> = Object.freeze({
@@ -182,6 +185,14 @@ const HARNESS_TITLE: Readonly<Record<SkillHarness, string>> = Object.freeze({
   opencode: "opencode",
   antigravity: "Antigravity",
 });
+
+/**
+ * agy exposes MCP tools only through its `call_mcp_tool` dispatcher, and
+ * always renames a plugin's server `<plugin>_<server>` (both measured,
+ * docs/research/antigravity.md §b/§e).
+ */
+const ANTIGRAVITY_TOOL_ID_LINE =
+  "Call the `predexec` tool via `call_mcp_tool` (ServerName `predexec`, or `predexec_predexec` when installed as the predexec plugin).";
 
 /** Hosts whose tool ops are predexec's own filesystem code (the MCP tool-ops module). */
 const OWN_TOOL_OPS: ReadonlySet<SkillHarness> = new Set<SkillHarness>(["claude", "codex", "antigravity"]);
@@ -194,7 +205,7 @@ export function renderSkill(h: SkillHarness): string {
   const shell = SHELL_TOOL[h];
   const policy = POLICY_PARAGRAPH[h];
   const bullets = [
-    OWN_TOOL_OPS.has(h) ? MCP_TOOL_ID_LINE : "Call the `predexec` tool.",
+    h === "antigravity" ? ANTIGRAVITY_TOOL_ID_LINE : OWN_TOOL_OPS.has(h) ? MCP_TOOL_ID_LINE : "Call the `predexec` tool.",
     USAGE_LINE.trim(),
     `A node's \`commands\` mixes shell strings and tool ops: \`${TOOL_OP_SYNTAX}\`.`,
     `Edge conditions — ${WHEN_SYNTAX_LINE.trim()}`,
