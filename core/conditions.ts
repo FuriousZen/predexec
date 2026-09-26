@@ -15,6 +15,7 @@
 
 import { existsSync, realpathSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { createContext, Script, type Context } from "node:vm";
 import {
   MAX_CONDITION_LENGTH,
   MAX_CONDITION_TOTAL_LENGTH,
@@ -35,12 +36,16 @@ const FILE_RE = /^file\s+(exists|missing)\s+(.+)$/;
 /**
  * Reject regexes prone to catastrophic backtracking.
  *
- * The screen is intentionally conservative: it rejects a quantified group
- * whose body ends open-ended — `(a+)+`, `([a-z]+)+`, `(\w+\s*)+` — and a
- * quantified alternation whose branches can consume the same prefix. The
- * latter is the ambiguity behind patterns such as `(a|aa)+` and `(a|a?)+`.
- * A body ending in a fixed atom is still allowed, so ordinary matchers like
- * `(?:\d+\.)+\d+` remain usable.
+ * The screen is intentionally conservative: it rejects a repeated group whose
+ * body can split one input across iterations in more than one way — `(a+)+`,
+ * `([a-z]+)+`, `(\w+\s*)+`, `(aa?)+` — and a quantified alternation whose
+ * branches can consume the same prefix, such as `(a|aa)+` and `(a|a?)+`.
+ * Lookarounds and `\b`/`\B` are zero-width and never count as separators. A
+ * body whose variable part is followed by a disjoint fixed atom is still
+ * allowed, so ordinary matchers like `(?:\d+\.)+\d+` remain usable.
+ *
+ * The screen is not complete (ungrouped `a*a*a*a*b` is polynomial and passes),
+ * so every execution also runs under REGEX_EVAL_TIMEOUT_MS.
  */
 const SYNTHETIC_TRUNCATION_MARKER_RE = /…\[truncated(?:: \d+ more chars)?\]/g;
 
@@ -281,6 +286,14 @@ function splitAlternatives(body: string): string[] {
   return alternatives;
 }
 
+const CONTROL_ESCAPES: Record<string, string> = { n: "\n", t: "\t", r: "\r", f: "\f", v: "\v" };
+
+/**
+ * Characters an escape `\<ch>` can match. Escapes that do not denote their own
+ * letter (`\x61`, `\u0061`, `\cA`, backreferences `\1` / `\k<n>`, and any other
+ * letter or digit) are "unknown": treating `\x61` as the letter `x` would
+ * manufacture a disjoint "separator" out of what is really an `a`.
+ */
 function escapeSet(ch: string): RegexCharSet {
   if (ch === "d") return ASCII_DIGITS;
   if (ch === "D") return "any";
@@ -288,7 +301,35 @@ function escapeSet(ch: string): RegexCharSet {
   if (ch === "W") return "any";
   if (ch === "s") return ASCII_SPACE;
   if (ch === "S" || ch === "p" || ch === "P") return "any";
+  if (CONTROL_ESCAPES[ch] !== undefined) return new Set(CONTROL_ESCAPES[ch]);
+  if (/^[A-Za-z0-9]$/.test(ch)) return "unknown";
   return new Set(ch);
+}
+
+/** Read one escape starting at the backslash `source[i]`, consuming its full length. */
+function readEscape(source: string, i: number): { set: RegexCharSet; next: number; zeroWidth: boolean } {
+  const ch = source[i + 1] ?? "";
+  let next = i + 2;
+  if (ch === "b" || ch === "B") return { set: new Set(), next, zeroWidth: true };
+  const skipTo = (close: string): void => {
+    const end = source.indexOf(close, next);
+    if (end >= 0) next = end + 1;
+  };
+  if ((ch === "p" || ch === "P" || ch === "u") && source[next] === "{") skipTo("}");
+  else if (ch === "k" && source[next] === "<") skipTo(">");
+  else if (ch === "x" && /^[0-9A-Fa-f]{2}/.test(source.slice(next))) next += 2;
+  else if (ch === "u" && /^[0-9A-Fa-f]{4}/.test(source.slice(next))) next += 4;
+  else if (ch === "c" && /^[A-Za-z]/.test(source[next] ?? "")) next += 1;
+  else if (/^[0-9]$/.test(ch)) while (/^[0-9]$/.test(source[next] ?? "")) next += 1;
+  return { set: escapeSet(ch), next, zeroWidth: false };
+}
+
+/** Group prefix (`?:`, `?<name>`, `?=`, `?!`, `?<=`, `?<!`, `?i:`) and whether it is a lookaround. */
+function groupPrefix(inner: string): { length: number; lookaround: boolean } {
+  const look = /^\?(?:[=!]|<[=!])/.exec(inner);
+  if (look) return { length: look[0].length, lookaround: true };
+  const other = /^\?(?:<[A-Za-z_$][\w$]*>|[imsx-]*:)/.exec(inner);
+  return { length: other?.[0].length ?? 0, lookaround: false };
 }
 
 function classSet(body: string): RegexCharSet {
@@ -357,8 +398,14 @@ function parseSequence(source: string): RegexSequence {
     let nestedTail: RegexCharSet = "unknown";
     let isGroup = false;
     if (ch === "\\") {
-      atomFirst = escapeSet(source[i + 1] ?? "");
-      i += 2;
+      const escape = readEscape(source, i);
+      if (escape.zeroWidth) {
+        // `\b` / `\B` consume nothing, so they can neither separate nor start anything.
+        i = readQuantifier(source, escape.next).next;
+        continue;
+      }
+      atomFirst = escape.set;
+      i = escape.next;
     } else if (ch === "[") {
       let end = i + 1;
       while (end < source.length) {
@@ -374,7 +421,12 @@ function parseSequence(source: string): RegexSequence {
         atomFirst = "unknown";
         i = source.length;
       } else {
-        const prefix = source.slice(i + 1, end).match(/^\?(?::|[=!]|<[=!]?[^>]*>)/)?.[0] ?? "";
+        const prefix = groupPrefix(source.slice(i + 1, end));
+        if (prefix.lookaround) {
+          // Lookarounds are zero-width: transparent to the sequence.
+          i = readQuantifier(source, end + 1).next;
+          continue;
+        }
         const nested = parseAlternativesSequence(source.slice(i + 1 + prefix.length, end));
         atomFirst = nested.first;
         nestedNullable = nested.nullable;
@@ -465,21 +517,26 @@ function ambiguousRepetition(body: string): boolean {
   const shapes = splitAlternatives(body).map((alternative) => parseSequence(alternative));
   let bodyFirst: RegexCharSet = new Set();
   for (const shape of shapes) bodyFirst = unionCharSets(bodyFirst, shape.first);
+  // Can the characters `variable` might or might not take at atoms[i] instead be
+  // taken by what follows, in more than one way?
+  const ambiguousAfter = (atoms: RegexAtom[], i: number, variable: RegexCharSet): boolean => {
+    for (let j = i + 1; j < atoms.length; j++) {
+      const next = atoms[j]!;
+      // Only the next atom's first character is adjacent to the variable part.
+      if (charSetsOverlap(variable, next.first)) {
+        if (next.optional || next.quantifiedOpenEnded) return true;
+      } else if (!next.optional) {
+        return false; // a disjoint fixed atom separates cleanly
+      }
+    }
+    return charSetsOverlap(variable, bodyFirst);
+  };
   for (const { atoms } of shapes) {
     for (let i = 0; i < atoms.length; i++) {
-      if (!atoms[i]!.quantifiedOpenEnded) continue;
-      const open = atoms[i]!.openSet;
-      let separated = false;
-      for (let j = i + 1; j < atoms.length; j++) {
-        const next = atoms[j]!;
-        if (charSetsOverlap(open, next.quantifiedOpenEnded ? unionCharSets(next.first, next.openSet) : next.first)) {
-          if (next.optional || next.quantifiedOpenEnded) return true;
-        } else if (!next.optional) {
-          separated = true;
-          break;
-        }
-      }
-      if (!separated && charSetsOverlap(open, bodyFirst)) return true;
+      const atom = atoms[i]!;
+      if (atom.quantifiedOpenEnded && ambiguousAfter(atoms, i, atom.openSet)) return true;
+      // Bounded optional atoms too: `(aa?)+` / `(a?a)+` split "aa" as one or two iterations.
+      if (atom.optional && ambiguousAfter(atoms, i, atom.first)) return true;
     }
   }
   return false;
@@ -499,7 +556,8 @@ export function isSafeRegex(pattern: string): boolean {
     const end = matchingParen(pattern, i);
     if (end < 0) continue;
     if (!readQuantifier(pattern, end + 1).repeats) continue;
-    const body = pattern.slice(i + 1, end).replace(/^\?(?::|[=!]|<[=!]?[^>]*>)/, "");
+    const inner = pattern.slice(i + 1, end);
+    const body = inner.slice(groupPrefix(inner).length);
     if (ambiguousRepetition(body) || ambiguousAlternation(body)) return false;
   }
   return true;
@@ -605,6 +663,36 @@ function quoteJsonString(value: string): string {
 }
 
 /**
+ * Wall-clock budget for one regex execution. isSafeRegex is a screen, not a
+ * proof: an ungrouped polynomial pattern such as `a*a*a*a*b` passes it yet runs
+ * for hours on OUTPUT_CAP characters. A try/catch cannot interrupt a running
+ * regex, but V8's vm timeout can (measured: `a*a*a*a*b` on 8192 chars and
+ * `(a+)+$` on 41 chars both stop at ~250ms).
+ */
+export const REGEX_EVAL_TIMEOUT_MS = 250;
+
+let regexSandbox: { context: Context; exec: Script } | undefined;
+
+/** `regex.exec(input)` under REGEX_EVAL_TIMEOUT_MS; `timedOut` instead of hanging. */
+function execWithDeadline(regex: RegExp, input: string): { timedOut: false; match: RegExpExecArray | null } | { timedOut: true } {
+  regexSandbox ??= { context: createContext({}), exec: new Script("regex.exec(input)") };
+  const { context, exec } = regexSandbox;
+  context.regex = regex;
+  context.input = input;
+  try {
+    return { timedOut: false, match: exec.runInContext(context, { timeout: REGEX_EVAL_TIMEOUT_MS }) as RegExpExecArray | null };
+  } catch (error) {
+    if ((error as { code?: unknown } | null)?.code === "ERR_SCRIPT_EXECUTION_TIMEOUT") return { timedOut: true };
+    throw error;
+  } finally {
+    context.regex = undefined;
+    context.input = undefined;
+  }
+}
+
+const TIMED_OUT_DETAIL = `regex exceeded its ${REGEX_EVAL_TIMEOUT_MS}ms time budget`;
+
+/**
  * True when `target` is `root` or lies beneath it. Both paths must already be
  * absolute and normalized; this is the one containment rule the engine uses
  * for plan `cwd` and for condition paths.
@@ -705,7 +793,9 @@ export function evaluateConditionWithDetail(
         if (!isSafeRegex(cond.extract)) {
           return { result: false, detail: `${label} → false (extract regex rejected: nested quantifier may not terminate)` };
         }
-        const m = new RegExp(cond.extract).exec(output.stdout);
+        const run = execWithDeadline(new RegExp(cond.extract), output.stdout);
+        if (run.timedOut) return { result: false, detail: `${label} → false (${TIMED_OUT_DETAIL})` };
+        const m = run.match;
         if (!m) return { result: false, detail: `${label} → false (regex matched nothing in stdout)` };
         const raw = m[1] ?? m[0];
         const n = Number(raw);
@@ -733,7 +823,12 @@ export function evaluateConditionWithDetail(
           };
         }
         const matchSource = sourceTruncated ? source.replace(SYNTHETIC_TRUNCATION_MARKER_RE, "") : source;
-        const hit = new RegExp(cond.regex).test(matchSource);
+        const run = execWithDeadline(new RegExp(cond.regex), matchSource);
+        if (run.timedOut) {
+          // Not matched either way: a timeout establishes neither presence nor absence.
+          return { result: false, detail: `${sourceName} ${cond.negate ? "!~" : "=~"} /${cond.regex}/ → false (${TIMED_OUT_DETAIL})` };
+        }
+        const hit = run.match !== null;
         const result = cond.negate ? !hit : hit;
         return {
           result,

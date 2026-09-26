@@ -2,7 +2,7 @@ import { mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { evaluateConditionWithDetail, isSafeRegex, parseConditionString } from "../../core/conditions.ts";
+import { evaluateConditionWithDetail, isSafeRegex, parseConditionString, REGEX_EVAL_TIMEOUT_MS } from "../../core/conditions.ts";
 import {
   MAX_JSON_VALUE_DEPTH,
   MAX_JSON_VALUE_NODES,
@@ -191,13 +191,23 @@ describe("evaluateCondition — match (low confidence)", () => {
     },
   );
 
-  const CATASTROPHIC = ["((a+))+$", "(a+b?)+$", "(\\w+\\s?)+$", "(a+){12}$", "((?:a|b)+c?)*$", "(x+x+)+y"];
-  const SAFE = ["(?:\\d+\\.)+\\d+", "^v\\d+(?:\\.\\d+){2}$", "(ab)+", "(a|b){3}", "\\w+", "(foo\\s)+bar"];
+  const CATASTROPHIC = [
+    "((a+))+$", "(a+b?)+$", "(\\w+\\s?)+$", "(a+){12}$", "((?:a|b)+c?)*$", "(x+x+)+y",
+    // zero-width assertions separate nothing
+    "(?:(?!b)a+)+$", "(?:\\Ba+)+$", "(?:a+(?!b))+$", "(?:a+\\B)+$", "(?:(?<=a)a+)+$",
+    // escapes that do not denote their own letter
+    "(?:\\x61a+)+$", "(a)(?:\\1a+)+$", "(?:\\ca+)+$", "(?<x>a)(?:\\k<x>a+)+$", "(?:a+\\x62)+$",
+    // bounded-optional repetition (Fibonacci growth)
+    "(aa?)+$", "(a?a)+$",
+  ];
+  const SAFE = ["(?:\\d+\\.)+\\d+", "^v\\d+(?:\\.\\d+){2}$", "(ab)+", "(a|b){3}", "\\w+", "(foo\\s)+bar",
+    // beyond the brief: an optional group after an open-ended atom is adjacent only through its first char
+    "(\\d+(?:\\.\\d+)?,)+"];
   it.each(CATASTROPHIC)("rejects %s", (p) => expect(isSafeRegex(p)).toBe(false));
   it.each(SAFE)("accepts %s", (p) => expect(isSafeRegex(p)).toBe(true));
 
   it("every accepted pattern runs in bounded time on adversarial input", () => {
-    const gen = ["a", "b?", "\\w", "\\s?", "a+", "(a+)", "(?:a|b)", "\\d+"];
+    const gen = ["a", "a?", "b?", "\\w", "\\s?", "a+", "(a+)", "(?:a|b)", "\\d+", "(?!b)", "(?=a)", "\\B", "\\b", "\\x61", "\\1"];
     const input = "a".repeat(28) + "!";
     for (const x of gen) for (const y of gen) for (const q of ["+", "*", "{2,}", "{5}"]) {
       const p = `(${x}${y})${q}$`;
@@ -213,6 +223,28 @@ describe("evaluateCondition — match (low confidence)", () => {
       }
       expect(best, p).toBeLessThan(50);
     }
+  });
+
+  it("bounds execution time for patterns the screen cannot classify", () => {
+    // Ungrouped, so isSafeRegex accepts it, but it is O(n^4) on 8192 chars.
+    expect(isSafeRegex("a*a*a*a*b")).toBe(true);
+    const stdout = "a".repeat(8192);
+    for (const cond of [
+      { kind: "match", source: "stdout", regex: "a*a*a*a*b" },
+      { kind: "match", source: "stdout", regex: "a*a*a*a*b", negate: true },
+      { kind: "numeric", source: "stdout", extract: "a*a*a*a*b(\\d+)", op: "eq", value: 1 },
+    ] as Condition[]) {
+      const t0 = performance.now();
+      const r = evaluateConditionWithDetail(out({ stdout }), cond, "/");
+      expect(performance.now() - t0).toBeLessThan(1000);
+      expect(r.result).toBe(false);
+      expect(r.detail).toContain(`exceeded its ${REGEX_EVAL_TIMEOUT_MS}ms time budget`);
+    }
+  });
+
+  it("still evaluates ordinary regexes after a timeout", () => {
+    expect(evaluateCondition(out({ stdout: "ok 42" }), { kind: "match", source: "stdout", regex: "ok \\d+" }, "/")).toBe(true);
+    expect(evaluateCondition(out({ stdout: "n=42" }), { kind: "numeric", source: "stdout", extract: "n=(\\d+)", op: "eq", value: 42 }, "/")).toBe(true);
   });
 
   it("uses preceding-backslash parity when deciding whether a group is escaped", () => {

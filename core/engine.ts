@@ -288,7 +288,7 @@ function normalizePolicyOperation(operation: Operation, sessionRoot: string, eff
     if (typeof value !== "string") return value;
     const candidate = resolve(effectiveCwd, value);
     const rel = relative(sessionRoot, candidate);
-    const inside = candidate === sessionRoot || (!isAbsolute(rel) && rel !== ".." && !rel.startsWith(`..${sep}`));
+    const inside = isInsideRoot(sessionRoot, candidate);
     // Preserve escaping targets outside the root. The executor remains the
     // authority that rejects them; normalization must not create an allowed
     // in-root spelling for an invalid operation.
