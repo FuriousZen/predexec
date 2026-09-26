@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -37,13 +37,23 @@ async function connected(opts: Parameters<typeof createServer>[0] = {}) {
     return answered;
   };
 
+  // Like `request`, but with an EXPLICIT id — `nextId` starts at 1 (id 0 is
+  // never assigned by `request`), so this is the only way to exercise a
+  // request whose JSON-RPC id is literally 0 (see the cancellation test:
+  // `notifications/cancelled` historically treated `requestId: 0` as falsy).
+  const rawRequest = (id: number, method: string, params?: Json): Promise<Json> => {
+    const answered = new Promise<Json>((resolve) => pending.set(id, resolve));
+    void clientTransport.send({ jsonrpc: "2.0", id, method, ...(params ? { params } : {}) });
+    return answered;
+  };
+
   await request("initialize", {
     protocolVersion: LATEST_PROTOCOL_VERSION,
     capabilities: {},
     clientInfo: { name: "predexec-test", version: "0" },
   });
   await clientTransport.send({ jsonrpc: "2.0", method: "notifications/initialized" });
-  return { server, request, clientTransport };
+  return { server, request, rawRequest, clientTransport };
 }
 
 /**
@@ -146,6 +156,71 @@ describe("mcp server — running a plan", () => {
 
     expect(textOf(response)).toContain("MUTATION HARD-STOP (not run)");
   });
+});
+
+/**
+ * @modelcontextprotocol/server's `Protocol._oncancel` used to read
+ * `if (!notification.params.requestId) return;` — `requestId: 0` is falsy in
+ * JS, so a cancellation for the very first request on a connection (id 0 is a
+ * legal, spec-compliant JSON-RPC id) was silently dropped. Fixed in 2.1.0.
+ * `extra.mcpReq.signal` in mcp/server.ts's tool handler is exactly the signal
+ * this wires up to, so this proves the fix reaches predexec's own abort path,
+ * not just the SDK in isolation.
+ */
+describe("mcp server — cancellation (request id 0)", () => {
+  it("aborts an in-flight plan when notifications/cancelled names requestId 0", async () => {
+    const dir = project();
+    const statsDir = mkdtempSync(join(tmpdir(), "px-mcp-cancel-stats-"));
+    const originalStateDir = process.env.PREDEXEC_STATE_DIR;
+    process.env.PREDEXEC_STATE_DIR = statsDir;
+
+    try {
+      const { rawRequest, clientTransport } = await connected({ cwd: dir, policy: policyOptions });
+      const started = Date.now();
+
+      // Fire-and-forget: a request the SDK successfully cancels never gets a
+      // response at all (once its AbortController fires, the SDK's own
+      // result-delivery code checks `abortController.signal.aborted` and
+      // skips sending it) — awaiting this promise would hang forever on a
+      // correctly-fixed SDK. The stats.jsonl line `recordRun` writes inside
+      // the tool handler, BEFORE the SDK ever gets a chance to suppress the
+      // response, is the only externally observable outcome left.
+      void rawRequest(0, "tools/call", {
+        name: TOOL_NAME,
+        arguments: {
+          plan: { root: "a", nodes: [{ id: "a", commands: ["sleep 5"] }] },
+        },
+      });
+
+      // Give the server a moment to actually spawn the child before cancelling.
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      await clientTransport.send({
+        jsonrpc: "2.0",
+        method: "notifications/cancelled",
+        params: { requestId: 0, reason: "test cancellation" },
+      });
+
+      const statsPath = join(statsDir, "stats.jsonl");
+      let record: { stoppedReason?: string } | undefined;
+      const deadline = Date.now() + 4_000;
+      while (Date.now() < deadline && !record) {
+        if (existsSync(statsPath)) {
+          const lines = readFileSync(statsPath, "utf8").trim().split("\n").filter(Boolean);
+          if (lines.length > 0) record = JSON.parse(lines[lines.length - 1]!);
+        }
+        if (!record) await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      const elapsed = Date.now() - started;
+
+      expect(record?.stoppedReason).toBe("aborted");
+      // Well under the 5s the shell command would need to finish on its own —
+      // proves the process was actually killed, not merely outrun.
+      expect(elapsed).toBeLessThan(3_000);
+    } finally {
+      if (originalStateDir === undefined) delete process.env.PREDEXEC_STATE_DIR;
+      else process.env.PREDEXEC_STATE_DIR = originalStateDir;
+    }
+  }, 10_000);
 });
 
 describe("mcp server — failures return a result instead of throwing", () => {
