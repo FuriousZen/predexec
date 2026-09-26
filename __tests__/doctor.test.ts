@@ -648,6 +648,45 @@ describe("doctor — codex checks", () => {
     expect(checks.some((c) => c.status === "fail" && /enabled = false/.test(c.name))).toBe(true);
   });
 
+  it("warns (info) when CODEX_HOME is set in the shell but the registration doesn't forward it", () => {
+    scratch();
+    write("codex-home/config.toml", configToml({ command: "npx", args: GOOD_ARGS, env_vars: [] }));
+    const checks = checkCodex(cxOpts({ env: { ...process.env, CODEX_HOME: "/somewhere/custom" } }));
+    const info = checks.find((c) => c.status === "info" && /does not forward CODEX_HOME/.test(c.name));
+    expect(info).toBeTruthy();
+    expect(info!.hint).toContain("env_vars");
+  });
+
+  it("does not warn when the registration already forwards CODEX_HOME", () => {
+    scratch();
+    write("codex-home/config.toml", configToml({ command: "npx", args: GOOD_ARGS, env_vars: ["CODEX_HOME"] }));
+    const checks = checkCodex(cxOpts({ env: { ...process.env, CODEX_HOME: "/somewhere/custom" } }));
+    expect(checks.some((c) => /does not forward CODEX_HOME/.test(c.name))).toBe(false);
+  });
+
+  it("does not warn about CODEX_HOME forwarding when the shell has no CODEX_HOME set at all", () => {
+    scratch();
+    write("codex-home/config.toml", configToml({ command: "npx", args: GOOD_ARGS, env_vars: [] }));
+    const env = { ...process.env };
+    delete env.CODEX_HOME;
+    const checks = checkCodex(cxOpts({ env }));
+    expect(checks.some((c) => /does not forward CODEX_HOME/.test(c.name))).toBe(false);
+  });
+
+  it("detects the missing CODEX_HOME forwarding via the json path too", () => {
+    scratch();
+    mkdirSync(join(tmp, "codex-home"), { recursive: true });
+    const fakeCodex = writeFakeCodex();
+    const checks = checkCodex(
+      cxOpts({
+        installed: true,
+        codexBin: fakeCodex,
+        env: { ...process.env, FAKE_CODEX_SCENARIO: "ok", CODEX_HOME: "/somewhere/custom" },
+      }),
+    );
+    expect(checks.some((c) => c.status === "info" && /does not forward CODEX_HOME/.test(c.name))).toBe(true);
+  });
+
   it("falls back to not-registered (info) via json when the fake codex reports no such server", () => {
     scratch();
     mkdirSync(join(tmp, "codex-home"), { recursive: true });

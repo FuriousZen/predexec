@@ -94,8 +94,10 @@ file-operation rule source for predexec to mirror, so native read/search operati
 through predexec's own read-only and containment guards.
 Second, Codex's default per-call approval mode treats an *unannotated* tool as destructive, so
 declaring `readOnlyHint: true` is load-bearing just to run a plan without a prompt under
-default settings (per Codex's source), not merely a nicety. What's better here: `AGENTS.md` is native to Codex, so declarative steering doesn't need
-a plugin wrapper the way Claude Code's does.
+default settings (per Codex's source), not merely a nicety. What's better here: Codex now
+supports both a self-hosting plugin (`.codex-plugin/`, `.agents/plugins/marketplace.json` — see
+[Codex CLI](#codex-cli) below) *and* a native `AGENTS.md` fallback that needs no plugin wrapper
+at all, unlike Claude Code, which has only the MCP/plugin route.
 
 ## Install
 
@@ -310,14 +312,46 @@ Codex has no in-process tool-registration API either, so predexec reaches it the
 reaches Claude Code: the identical stdio MCP server, `mcp/server.ts`. Only the policy reader and
 stats label differ, and — because Codex clears every `CODEX_*` env var before spawning the
 subprocess (measured; there is no equivalent of `CLAUDE_PROJECT_DIR`), so the server cannot
-detect its host on its own — they're selected explicitly with a flag:
+detect its host on its own — they're selected explicitly with a flag: `--host codex`.
+
+**Install as a plugin (recommended):**
+
+```bash
+codex plugin marketplace add FuriousZen/predexec
+codex plugin add predexec@predexec
+```
+
+This installs the version-pinned MCP server *and* the routing skill together, both declared in
+`.codex-plugin/plugin.json` / `.agents/plugins/marketplace.json` — no separate skill-install step.
+The plugin's MCP registration also forwards `CODEX_HOME` into the subprocess
+(`env_vars: ["CODEX_HOME"]`) — a bare `codex mcp add` cannot do this (see the sandbox note below).
+
+**Verify:**
+
+```bash
+codex mcp list           # predexec → enabled, Env column shows CODEX_HOME=*****
+npx -y predexec doctor   # shows the plugin install and its bundled skill
+```
+
+**Alternative: MCP server only, no plugin.** Skips the marketplace entirely:
 
 ```bash
 codex mcp add predexec -- npx -y --package=predexec predexec-mcp --host codex
+npx -y predexec install-skill codex
 ```
 
 `codex mcp add` registers **globally** (`~/.codex/config.toml`) — there's no per-project scope
-flag the way Claude Code has `--scope project`.
+flag the way Claude Code has `--scope project`. This path has no manifest to request env
+forwarding, so if your shell sets a custom `CODEX_HOME`, add it by hand (`npx -y predexec doctor`
+flags a registration that's missing this):
+
+```toml
+[mcp_servers.predexec]
+env_vars = ["CODEX_HOME"]
+```
+
+`install-skill codex` copies the routing skill in separately, since this path has no plugin
+manifest to bundle it.
 
 **Verify:**
 
@@ -328,24 +362,28 @@ npx -y predexec doctor           # shows the registered scope, flags a broken in
 
 **Timeouts.** `startup_timeout_sec` / `tool_timeout_sec` defaults are version-dependent (the
 docs say 10s/60s, the source at the time of writing says 30s/300s) — a long plan tree is safer
-with an explicit value. Add both to `~/.codex/config.toml`:
+with an explicit value. Add it to `~/.codex/config.toml`:
 
 ```toml
 [mcp_servers.predexec]
 command = "npx"
 args = ["-y", "--package=predexec", "predexec-mcp", "--host", "codex"]
+env_vars = ["CODEX_HOME"]
 tool_timeout_sec = 120
 ```
 
-Codex loads a project's `AGENTS.md` natively. To steer it declaratively, copy the routing
-block into your project's `AGENTS.md`:
+**Fallback: `AGENTS.md`, no MCP tool at all.** Only useful when you can't register an MCP server
+— this steers Codex's *prose*, it registers no tool and bundles no skill. Codex loads a project's
+`AGENTS.md` natively and concatenates it (repo root down to your working directory) under a
+32 KiB combined cap, so append to an existing file rather than clobbering it:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/FuriousZen/predexec/main/configs/codex/AGENTS.md -o AGENTS.md
+curl -fsSL https://raw.githubusercontent.com/FuriousZen/predexec/main/configs/codex/AGENTS.md >> AGENTS.md
 ```
 
-Codex concatenates AGENTS.md content (repo root down to your working directory) under a 32 KiB
-combined cap, so keep the block as shipped rather than padding it.
+`configs/codex/AGENTS.md` ships paste-ready (no install commentary in the file itself), so
+appending it straight into an existing `AGENTS.md` — or a fresh one — works either way; keep the
+block as shipped rather than padding it.
 
 #### Sandbox — read this one
 
@@ -488,6 +526,9 @@ skills/<harness>/predexec/SKILL.md claude / codex / opencode routing skills     
 antigravity-plugin/skills/predexec/SKILL.md  Antigravity routing skill          } never edit by hand
 .claude-plugin/plugin.json         Claude Code plugin manifest (MCP server + skills path)
 .claude-plugin/marketplace.json    self-hosting marketplace listing (source: "./") for `/plugin install`
+.codex-plugin/plugin.json          Codex plugin manifest (mcpServers/skills point at companion files)
+.codex-plugin/mcp.json             Codex plugin's MCP server config (env_vars forwards CODEX_HOME)
+.agents/plugins/marketplace.json   self-hosting marketplace listing (path: "./") for `codex plugin add`
 configs/opencode/AGENTS.md         drop-in routing block for opencode projects
-configs/codex/AGENTS.md            drop-in routing block for Codex projects
+configs/codex/AGENTS.md            paste-ready routing block for Codex projects (fallback, no plugin)
 ```

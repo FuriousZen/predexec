@@ -1,0 +1,20 @@
+{
+  "name": "predexec",
+  "interface": {
+    "displayName": "predexec"
+  },
+  "plugins": [
+    {
+      "name": "predexec",
+      "source": {
+        "source": "local",
+        "path": "./"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Developer Tools"
+    }
+  ]
+}

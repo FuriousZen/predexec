@@ -112,6 +112,8 @@ describe("packed artifact verification", () => {
     expect(list).toContain("antigravity-plugin/skills/predexec/SKILL.md");
     expect(list).toContain("configs/opencode/AGENTS.md");
     expect(list).toContain(".claude-plugin/plugin.json");
+    expect(list).toContain(".codex-plugin/plugin.json");
+    expect(list).toContain(".codex-plugin/mcp.json");
     expect(list).toContain("README.md");
     expect(list).toContain("package.json");
 

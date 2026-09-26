@@ -1,12 +1,3 @@
-# predexec routing
-
-Drop this block into your project's `AGENTS.md` so Codex loads the predexec routing rule
-natively — repo-root `AGENTS.md` is native to Codex, no plugin or config wiring needed. Codex
-concatenates AGENTS.md content (repo root down to your working directory) under a 32 KiB
-combined cap, so keep this block as shipped rather than padding it.
-
----
-
 Use predexec (the model sees it as `mcp__predexec__predexec`) for all read-only shell
 operations. Run shell commands directly only for writes/installs/deletes and interactive
 commands.

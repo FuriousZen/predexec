@@ -1,0 +1,17 @@
+{
+  "mcpServers": {
+    "predexec": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "--package=predexec@0.4.1",
+        "predexec-mcp",
+        "--host",
+        "codex"
+      ],
+      "env_vars": [
+        "CODEX_HOME"
+      ]
+    }
+  }
+}

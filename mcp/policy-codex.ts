@@ -3,9 +3,13 @@
  *
  * Harness-facing (NOT part of pure `core/`): fs + env access lives here, like
  * policy.ts/policy-claude.ts. This one is load-bearing in a way the other two
- * are not: CODEX-RESEARCH.md §4 (measured, not just documented) — Codex spawns
- * MCP servers with `.env_clear()` and NO sandbox wrapper at all
- * (`stdio_server_launcher.rs`). A probe subprocess wrote to disk under a
+ * are not: `openai/codex`'s `codex-rs/rmcp-client/src/stdio_server_launcher.rs`
+ * + `.../utils.rs`'s `create_env_for_mcp_server` (measured against source at
+ * commit 25270df, not just documented; full writeup in
+ * docs/research/codex-plugin.md §2) — a local stdio MCP server's child env
+ * starts EMPTY and is populated only from a small default allowlist plus
+ * whatever the registration's `env_vars` names, and it is spawned with no
+ * sandbox wrapper at all. A probe subprocess wrote to disk under a
  * read-only-sandboxed session with zero error. Codex's own approval flow
  * governs the *shell tool* it drives itself; it says nothing about what an MCP
  * server's subprocess does once predexec is inside the process boundary. So
@@ -14,7 +18,9 @@
  * heuristic are still the only things standing between a plan's shell commands
  * and the real filesystem/network here too — Codex just has *nothing else*.
  *
- * Scope for v1 (CODEX-RESEARCH.md §4): execpolicy prefix rules
+ * Scope for v1 (`openai/codex`'s `codex-rs/execpolicy/` crate, plus config
+ * layering in `codex-rs/config/src/requirements_layers/rules.rs`): execpolicy
+ * prefix rules
  * (`prefix_rule(pattern=[...], decision=...)`) from every layer Codex loads —
  * `/etc/codex/rules`, `$CODEX_HOME/rules`, and, for trusted directories, the
  * `.codex/rules` of each directory from the project root down to cwd (see
@@ -25,16 +31,15 @@
  * checker needs to enforce.
  *
  * Precedence is most-restrictive-wins — `forbidden > prompt > allow`
- * (§4, and the live docs page, learn.chatgpt.com/docs/agent-configuration/
+ * (the live docs page, learn.chatgpt.com/docs/agent-configuration/
  * rules) — NOT last-match (opencode) or first-match-in-fixed-order (Claude
  * Code). `prompt` stops here exactly like `ask` does in policy-claude.ts:
  * predexec cannot prompt mid-walk, so an ask-equivalent is a stop. `allow`
  * never widens what predexec runs — predexec's own read-only enforcement
  * (destructive.ts) still gates everything upstream of this checker.
  *
- * Absent `decision`: verified directly against the live docs page (not just
- * CODEX-RESEARCH.md, which doesn't state it) — "`decision` (defaults to
- * `"allow"`)". So a `prefix_rule(pattern=[...])` with no `decision=` kwarg is a
+ * Absent `decision`: verified directly against the live docs page — "`decision`
+ * (defaults to `"allow"`)". So a `prefix_rule(pattern=[...])` with no `decision=` kwarg is a
  * COMPLETE, parseable rule with `decision: "allow"`, not a reason to fail the
  * file closed.
  *
@@ -136,9 +141,16 @@ const DECISIONS: ReadonlySet<CodexDecision> = new Set(["allow", "prompt", "forbi
 const SEVERITY: Record<CodexDecision, number> = { allow: 0, prompt: 1, forbidden: 2 };
 
 /**
- * `opts.codexHome` > `env.CODEX_HOME` > `~/.codex`. The real Codex CLI never
- * forwards `CODEX_HOME` to the MCP subprocess (measured, CODEX-RESEARCH.md
- * §5), so this third tier is what almost every real invocation hits.
+ * `opts.codexHome` > `env.CODEX_HOME` > `~/.codex`. A Codex MCP subprocess's
+ * env starts EMPTY and is populated only from a small default allowlist plus
+ * whatever the registration's `env_vars` names (`openai/codex`'s
+ * `codex-rs/rmcp-client/src/utils.rs`'s `create_env_for_mcp_server`, measured
+ * against source at commit 25270df — `CODEX_HOME` is not in the default
+ * allowlist; full writeup in docs/research/codex-plugin.md §2). This repo's
+ * own plugin registration (`.codex-plugin/mcp.json`) requests it via
+ * `env_vars: ["CODEX_HOME"]`, but a bare `codex mcp add ... -- npx ...`
+ * registration has no CLI flag for that (only a literal `--env KEY=VALUE`),
+ * so this third tier is still what a non-plugin install hits in practice.
  * `env.HOME` is consulted before falling back to `os.homedir()` — POSIX
  * `homedir()` itself checks `process.env.HOME` first, so this only makes the
  * seam visible to a passed-in `env` for tests; it changes nothing for a real

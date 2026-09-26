@@ -12,7 +12,7 @@
  *    (seen as "double-logged" policyStop rows: one per policy test per run).
  */
 import { execFileSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -82,6 +82,87 @@ describe("release hygiene", () => {
     expect(plugin.version).toBe(pkg.version);
     expect(marketplace.version).toBe(pkg.version);
     expect(plugin.mcpServers.predexec.args).toContain(`--package=predexec@${pkg.version}`);
+  });
+
+  it("there is no root .mcp.json (a live Claude Code project-scope registration)", () => {
+    expect(existsSync(join(".mcp.json"))).toBe(false);
+  });
+
+  it(".codex-plugin/plugin.json and mcp.json parse and point at each other correctly", () => {
+    const plugin = JSON.parse(readFileSync(join(".codex-plugin", "plugin.json"), "utf8")) as {
+      name: string;
+      version: string;
+      mcpServers: string;
+      skills: string;
+    };
+    expect(plugin.mcpServers).toBe("./.codex-plugin/mcp.json");
+    // Codex resolves manifest paths relative to the plugin ROOT (the directory
+    // containing `.codex-plugin/`), never relative to `.codex-plugin/` itself —
+    // see docs/research/codex-plugin.md §1. `skills` must point one level above
+    // the harness-specific `predexec/SKILL.md` so Codex's one-level skill scan
+    // finds it, and must scope to codex/ only so it never sees skills/claude/ or
+    // skills/opencode/ (Controller ruling R4 — verified in the same doc).
+    expect(plugin.skills).toBe("./skills/codex/");
+
+    const mcp = JSON.parse(readFileSync(join(".codex-plugin", "mcp.json"), "utf8")) as {
+      mcpServers: { predexec: { command: string; args: string[]; env_vars: string[] } };
+    };
+    const server = mcp.mcpServers.predexec;
+    expect(server.command).toBe("npx");
+    // `--host codex` selects the Codex policy/stats adapter (mcp/policy-codex.ts);
+    // without it predexec silently falls back to Claude Code behavior (CX-4/steering.ts).
+    expect(server.args).toContain("--host");
+    expect(server.args[server.args.indexOf("--host") + 1]).toBe("codex");
+    // CX-4: Codex's MCP child process env starts EMPTY and is populated only from
+    // DEFAULT_ENV_VARS plus this list (docs/research/codex-plugin.md §2) — CODEX_HOME
+    // is not in DEFAULT_ENV_VARS, so without this the policy reader silently falls
+    // back to ~/.codex even when the user has a custom CODEX_HOME set.
+    expect(server.env_vars).toContain("CODEX_HOME");
+  });
+
+  it(".agents/plugins/marketplace.json lists the predexec plugin sourced from the repository root", () => {
+    const marketplace = JSON.parse(readFileSync(join(".agents", "plugins", "marketplace.json"), "utf8")) as {
+      name: string;
+      plugins: Array<{ name: string; source: { source: string; path: string } }>;
+    };
+    const entry = marketplace.plugins.find((p) => p.name === "predexec");
+    // "." / "./" resolve to the marketplace root itself (docs/research/codex-plugin.md §1,
+    // §3 live check) — this repo is the plugin, mirroring .claude-plugin/marketplace.json's
+    // own `source: "./"` convention.
+    expect(entry?.source).toEqual({ source: "local", path: "./" });
+  });
+
+  it("sync-plugin-version.mjs also syncs .codex-plugin/plugin.json and mcp.json's npx pin", () => {
+    const pluginPath = join(".codex-plugin", "plugin.json");
+    const mcpPath = join(".codex-plugin", "mcp.json");
+    const originalPlugin = readFileSync(pluginPath, "utf8");
+    const originalMcp = readFileSync(mcpPath, "utf8");
+    try {
+      // Deliberately desync both files first, so this test proves the script
+      // actually rewrites them rather than merely observing values that
+      // already happened to match package.json's version.
+      const plugin = JSON.parse(originalPlugin);
+      plugin.version = "0.0.0-stale";
+      writeFileSync(pluginPath, JSON.stringify(plugin, null, 2) + "\n", "utf8");
+      const mcp = JSON.parse(originalMcp);
+      const npxArgs = mcp.mcpServers.predexec.args;
+      npxArgs[npxArgs.findIndex((a: string) => a.startsWith("--package=predexec"))] =
+        "--package=predexec@0.0.0-stale";
+      writeFileSync(mcpPath, JSON.stringify(mcp, null, 2) + "\n", "utf8");
+
+      execFileSync(process.execPath, ["scripts/sync-plugin-version.mjs"], { stdio: "pipe" });
+
+      const pkg = JSON.parse(readFileSync("package.json", "utf8")) as { version: string };
+      const syncedPlugin = JSON.parse(readFileSync(pluginPath, "utf8")) as { version: string };
+      const syncedMcp = JSON.parse(readFileSync(mcpPath, "utf8")) as {
+        mcpServers: { predexec: { args: string[] } };
+      };
+      expect(syncedPlugin.version).toBe(pkg.version);
+      expect(syncedMcp.mcpServers.predexec.args).toContain(`--package=predexec@${pkg.version}`);
+    } finally {
+      writeFileSync(pluginPath, originalPlugin, "utf8");
+      writeFileSync(mcpPath, originalMcp, "utf8");
+    }
   });
 
   it("claude plugin validate . passes, when the claude CLI is on PATH", () => {

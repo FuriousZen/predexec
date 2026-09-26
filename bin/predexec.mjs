@@ -962,11 +962,13 @@ export function checkClaudeCode(opts = {}) {
 /**
  * Codex CLI: `$CODEX_HOME/config.toml` (default `~/.codex/config.toml`) holds
  * predexec's registration under `[mcp_servers.predexec]`. Codex's own CLI
- * exposes `codex mcp get <name> --json` with a stable, measured shape
- * (CODEX-RESEARCH.md "Measured on this machine": `transport.command` /
- * `transport.args` / `enabled`) — prefer that when the `codex` binary is
- * reachable; fall back to a direct parseTomlLite read of config.toml
- * otherwise, mirroring how this file already reads opencode's config.
+ * exposes `codex mcp get <name> --json` with a stable shape — measured
+ * directly against the installed `codex-cli` binary (`transport.command` /
+ * `transport.args` / `transport.env_vars` / `enabled`; see
+ * docs/research/codex-plugin.md §3 for a full transcript) — prefer that when
+ * the `codex` binary is reachable; fall back to a direct parseTomlLite read
+ * of config.toml otherwise, mirroring how this file already reads opencode's
+ * config.
  *
  * A registration missing `--host codex` in its args is not healthy: without
  * that flag the predexec MCP server silently falls back to Claude Code's
@@ -1040,6 +1042,7 @@ export function checkCodex(opts = {}) {
         registration = {
           command: data?.transport?.command ?? null,
           args: Array.isArray(data?.transport?.args) ? data.transport.args : [],
+          envVars: Array.isArray(data?.transport?.env_vars) ? data.transport.env_vars : [],
           enabled: data?.enabled !== false,
           source: "codex mcp get predexec --json",
         };
@@ -1067,6 +1070,7 @@ export function checkCodex(opts = {}) {
       registration = {
         command: server.command ?? null,
         args: Array.isArray(server.args) ? server.args : [],
+        envVars: Array.isArray(server.env_vars) ? server.env_vars : [],
         enabled: server.enabled !== false,
         source: configPath,
       };
@@ -1104,6 +1108,22 @@ export function checkCodex(opts = {}) {
       name: "codex: registration is missing --host codex",
       status: "fail",
       hint: "append `--host codex` to the registered args — without it predexec silently falls back to Claude Code policy/stats behavior",
+    });
+  }
+
+  // CX-4: a Codex MCP subprocess's env starts empty and is populated only from
+  // a small default allowlist plus whatever the registration's `env_vars`
+  // names (see mcp/policy-codex.ts's resolveCodexHome doc comment; measured
+  // against `openai/codex` source, docs/research/codex-plugin.md §2).
+  // `CODEX_HOME` is not in the default allowlist, so a registration without
+  // `env_vars: ["CODEX_HOME"]` silently falls back to `~/.codex` for policy
+  // enforcement even when the user's own shell has a custom `CODEX_HOME` —
+  // info, not fail: predexec still runs, just against the wrong config/rules.
+  if (env.CODEX_HOME && !registration.envVars.includes("CODEX_HOME")) {
+    checks.push({
+      name: "codex: registration does not forward CODEX_HOME",
+      status: "info",
+      hint: 'your shell has CODEX_HOME set, but this registration has no `env_vars` entry for it, so the predexec MCP subprocess falls back to ~/.codex for its execpolicy rules — add `env_vars = ["CODEX_HOME"]` to `[mcp_servers.predexec]` in config.toml (the plugin install path sets this automatically via .codex-plugin/mcp.json)',
     });
   }
 
