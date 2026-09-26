@@ -24,6 +24,7 @@ import { validateOperation } from "./validation.ts";
 import {
   DEFAULT_MAX_DEPTH,
   HIGH_CONFIDENCE_KINDS,
+  JSON_PATH_SINGLE_OP_MESSAGE,
   MAX_OPERATIONS_PER_NODE,
   MAX_PLAN_EDGES,
   MAX_PLAN_NODES,
@@ -221,7 +222,7 @@ export function validatePlan(plan: PlanTree, byId: Map<string, PlanNode>): strin
       const target = byId.get(edge.to);
       if (!target) return `edge from "${node.id}" points at missing node "${edge.to}"`;
       if (edge.when.kind === "jsonPath" && node.commands.length !== 1) {
-        return "jsonPath edges require a one-operation source node.";
+        return JSON_PATH_SINGLE_OP_MESSAGE;
       }
       if (!HIGH_CONFIDENCE_KINDS.has(edge.when.kind) && target.mutates) {
         return `low-confidence edge (${edge.when.kind}) from "${node.id}" may not gate mutating node "${edge.to}"`;

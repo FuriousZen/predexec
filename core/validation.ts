@@ -8,10 +8,11 @@ import {
   MAX_GREP_RESULTS,
   MAX_LS_ENTRIES,
   MAX_READ_LINES,
+  TOOL_NAMES,
   type ToolOp,
 } from "./types.ts";
 
-const SUPPORTED_TOOLS = new Set(["read", "grep", "find", "ls", "bash", "edit", "write"]);
+const SUPPORTED_TOOLS: ReadonlySet<string> = new Set([...TOOL_NAMES, "bash", "edit", "write"]);
 
 const optionalString = (op: ToolOp, key: string): string | null =>
   op[key] === undefined || typeof op[key] === "string" ? null : `${key} must be a string`;

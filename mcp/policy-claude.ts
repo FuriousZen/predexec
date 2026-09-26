@@ -42,12 +42,13 @@
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { homedir, platform } from "node:os";
 import { dirname, join, parse as parsePath } from "node:path";
-import { escapeRegExp, splitCommandSegments } from "../core/index.ts";
 import {
+  escapeRegExp,
   inspectCommandSubstitutionTree,
+  splitCommandSegments,
   stripLeadingAssignmentsAndWrappers,
   type WrapperInspectionOptions,
-} from "../command-inspection.ts";
+} from "../core/index.ts";
 import type { Operation } from "../core/types.ts";
 
 export type ClaudePolicyAction = "allow" | "ask" | "deny";

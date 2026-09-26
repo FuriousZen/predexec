@@ -10,7 +10,9 @@ import {
   PLAN_SHAPE_DESCRIPTION,
   RESOURCE_LIMIT_DESCRIPTION,
   TOOL_OPERATION_NAMES,
+  JSON_PATH_SINGLE_OP_LINE,
 } from "../plan-language.ts";
+import * as coreTypes from "../core/types.ts";
 
 describe("canonical plan language", () => {
   it("publishes canonical plan field names for schema projections", () => {
@@ -29,6 +31,13 @@ describe("canonical plan language", () => {
     expect(TOOL_OPERATION_NAMES).toEqual(["read", "grep", "find", "ls"]);
     expect(Object.isFrozen(CONDITION_KINDS)).toBe(true);
     expect(Object.isFrozen(TOOL_OPERATION_NAMES)).toBe(true);
+  });
+
+  it("derives its vocabularies from core's single-source constants (ARCH-4)", () => {
+    expect(CONDITION_KINDS).toBe(coreTypes.CONDITION_KINDS);
+    expect(TOOL_OPERATION_NAMES).toBe(coreTypes.TOOL_NAMES);
+    expect(JSON_PATH_SINGLE_OP_LINE).toBe(coreTypes.JSON_PATH_SINGLE_OP_MESSAGE);
+    expect([...coreTypes.HIGH_CONFIDENCE_KINDS]).toEqual(CONDITION_KINDS.filter((kind) => kind !== "match"));
   });
 
   it("teaches the complete bounded plan shape", () => {

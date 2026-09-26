@@ -94,13 +94,13 @@
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
-import { splitCommandSegments } from "../core/index.ts";
 import {
   inspectCommandSubstitutionTree,
+  splitCommandSegments,
   stripLeadingAssignmentsAndWrappers,
   tokenizeShellWords,
   type WrapperInspectionOptions,
-} from "../command-inspection.ts";
+} from "../core/index.ts";
 import type { Operation } from "../core/types.ts";
 import type { PolicyVerdict } from "./policy-claude.ts";
 import { parseTomlLite } from "./toml-lite.ts";

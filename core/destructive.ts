@@ -21,14 +21,33 @@
  */
 
 import {
+  effectiveHead,
+  ENV_ASSIGNMENT_RE,
+  envOption,
   extractShellCommandClauses,
   inspectCommandSubstitutions,
   inspectCommandSubstitutionTree,
   inspectShellCommandClauses,
-} from "../command-inspection.ts";
+  lexShellWords,
+  maskHeredocBodies,
+  normalizeEnvInvocation,
+  parenthesizedBodies,
+  splitCommandSegments,
+  tokenizeShellWords,
+  WRAPPER_DURATION_RE,
+  WRAPPER_OPTIONS_WITH_VALUE,
+  wrapperOptionHasAttachedValue,
+  WRAPPERS,
+  WRAPPERS_WITH_DURATION,
+  type TokenizeOptions,
+} from "./shell/lexer.ts";
+import { TOOL_NAMES } from "./types.ts";
+
+/** Argv inspection keeps each `$(...)`/backtick substitution in one word. */
+const ARGV: TokenizeOptions = { atomicSubstitutions: true };
 
 /** Tool names that are definitively read-only — no regex analysis needed. */
-export const READ_ONLY_TOOLS = new Set(["read", "grep", "find", "ls"]);
+export const READ_ONLY_TOOLS: ReadonlySet<string> = new Set(TOOL_NAMES);
 /** Tool names that are definitively mutating — hard-stop unconditionally. */
 export const MUTATING_TOOLS = new Set(["edit", "write"]);
 
@@ -43,64 +62,6 @@ export const MUTATING_TOOLS = new Set(["edit", "write"]);
  * are left alone: outside `[[ ]]`, `test $x > 5` IS a real redirect to a file
  * named `5`.
  */
-function maskHeredocBodies(cmd: string): string {
-  const chars = cmd.split("");
-  const ranges: Array<[number, number]> = [];
-  const pending: Array<{ delimiter: string; stripTabs: boolean; bodyStart: number }> = [];
-  let quote: "'" | '"' | null = null;
-  let lineStart = 0;
-  while (lineStart < cmd.length) {
-    const newline = cmd.indexOf("\n", lineStart);
-    const lineEnd = newline < 0 ? cmd.length : newline;
-    if (pending.length > 0) {
-      const candidate = cmd.slice(lineStart, lineEnd).replace(/\r$/, "");
-      const expected = pending[0]!;
-      const comparable = expected.stripTabs ? candidate.replace(/^\t+/, "") : candidate;
-      if (comparable === expected.delimiter) {
-        ranges.push([expected.bodyStart, newline < 0 ? lineEnd : newline + 1]);
-        pending.shift();
-        if (pending.length > 0) pending[0]!.bodyStart = newline < 0 ? lineEnd : newline + 1;
-      }
-      lineStart = newline < 0 ? cmd.length : newline + 1;
-      continue;
-    }
-    for (let i = lineStart; i < lineEnd; i++) {
-      const ch = cmd[i]!;
-      if (ch === "\\" && quote !== "'") { i++; continue; }
-      if (quote !== null) {
-        if (ch === quote) quote = null;
-        continue;
-      }
-      if (ch === "'" || ch === '"') { quote = ch; continue; }
-      if (ch !== "<" || cmd[i + 1] !== "<" || cmd[i + 2] === "<") continue;
-      let cursor = i + 2;
-      let stripTabs = false;
-      if (cmd[cursor] === "-") { stripTabs = true; cursor++; }
-      while (cursor < lineEnd && /[ \t]/.test(cmd[cursor]!)) cursor++;
-      let delimiter = "";
-      const delimiterQuote = cmd[cursor] === "'" || cmd[cursor] === '"' ? cmd[cursor++] : null;
-      while (cursor < lineEnd) {
-        const next = cmd[cursor]!;
-        if (delimiterQuote !== null) {
-          if (next === delimiterQuote) { cursor++; break; }
-          delimiter += next;
-        } else if (/[A-Za-z0-9_]/.test(next)) delimiter += next;
-        else break;
-        cursor++;
-      }
-      if (delimiter.length > 0) pending.push({ delimiter, stripTabs, bodyStart: lineEnd + (newline < 0 ? 0 : 1) });
-      i = Math.max(i, cursor - 1);
-    }
-    lineStart = newline < 0 ? cmd.length : newline + 1;
-  }
-  for (const [start, end] of ranges) {
-    for (let i = start; i < end; i++) {
-      if (chars[i] !== "\n" && chars[i] !== "\r") chars[i] = " ";
-    }
-  }
-  return chars.join("");
-}
-
 function sanitizeForRedirect(cmd: string): string {
   const dropAngles = (s: string) => s.replace(/[<>]/g, " ");
   return maskHeredocBodies(cmd)
@@ -1622,7 +1583,7 @@ const INTERPRETER_PRELOAD_ENV: Record<string, ReadonlySet<string>> = {
  * calls". `none` means the invocation runs a script or nothing inline.
  */
 function interpreterEvalPrograms(segment: string): EvalPrograms {
-  const normalized = normalizeEnvInvocation(shellWords(segment));
+  const normalized = normalizeEnvInvocation(tokenizeShellWords(segment, ARGV));
   if (!normalized.complete || normalized.argv.length === 0) return { kind: "violation", reason: "ambiguous invocation" };
   const head = normalized.argv[0]!.replace(/^.*\//, "");
   const argv = normalized.argv;
@@ -1769,7 +1730,7 @@ function interpreterEvalPrograms(segment: string): EvalPrograms {
 }
 
 function interpreterEvalPayload(segment: string): string {
-  const words = shellWords(segment);
+  const words = tokenizeShellWords(segment, ARGV);
   const normalized = normalizeEnvInvocation(words);
   if (!normalized.complete || normalized.argv.length === 0) return segment;
   const head = normalized.argv[0]!.replace(/^.*\//, "");
@@ -1865,7 +1826,7 @@ function interpreterLanguage(head: string): InterpolationLanguage {
  * invocation; callers can then proceed with ordinary shell classification.
  */
 function directInterpreterEvalPreflight(segment: string): { payloadLength: number; interpreter: string } | null {
-  const words = shellWords(segment);
+  const words = tokenizeShellWords(segment, ARGV);
   const normalized = normalizeEnvInvocation(words);
   if (!normalized.complete || normalized.argv.length === 0) return null;
   const interpreter = normalized.argv[0]!.replace(/^.*\//, "");
@@ -2863,100 +2824,13 @@ function moduleReferenceViolation(
 const OPAQUE_SUBSHELL_RE = /\$\(|`|<\(|>\(/;
 
 /**
- * Split a compound command into pipeline segments on unquoted `|`, `;`, `&&`,
- * `||`, newlines, and bare `&` (but not `>&`/`&&` fd-dup/joins). Exception-safe:
- * any confusion degrades to the whole command as one segment (= status-quo scan).
- */
-export function splitCommandSegments(cmd: string): string[] {
-  try {
-    const shellCommand = maskHeredocBodies(cmd);
-    const segments: string[] = [];
-    let current = "";
-    let inSingle = false;
-    let inDouble = false;
-    for (let i = 0; i < shellCommand.length; i++) {
-      const ch = shellCommand[i]!;
-      if (ch === "'" && !inDouble) inSingle = !inSingle;
-      else if (ch === '"' && !inSingle) inDouble = !inDouble;
-      if (!inSingle && !inDouble && (ch === "|" || ch === ";" || ch === "&" || ch === "\n" || ch === "\r")) {
-        // `2>&1` / `>&2`: an & directly after `>` is an fd dup, not a join.
-        if (ch === "&" && shellCommand[i - 1] === ">") {
-          current += ch;
-          continue;
-        }
-        if (current.trim()) segments.push(current.trim());
-        current = "";
-        // swallow the second char of `&&` / `||`
-        if (shellCommand[i + 1] === ch) i++;
-        // Treat CRLF as one command separator.
-        if (ch === "\r" && shellCommand[i + 1] === "\n") i++;
-        continue;
-      }
-      current += ch;
-    }
-    if (current.trim()) segments.push(current.trim());
-    return segments.length > 0 ? segments : [shellCommand];
-  } catch {
-    return [cmd];
-  }
-}
-
-/**
- * Wrapper commands that defer to the next token. `env` belongs here, not in
- * READ_ONLY_HEADS: bare `env` prints the environment, but `env rm -rf /` runs
- * rm. Treating it as a pure reader skipped the word scan entirely and let every
- * `env <writer>` through. As a wrapper, `env FOO=1 rm …` resolves to `rm` (the
- * VAR=val skip in effectiveHead already handles the assignment), and a bare
- * `env` falls through to the word scan, which is the safe direction.
- */
-// Exported only for the temporary parity test against command-inspection's
-// DEFAULT_WRAPPERS, until the two wrapper lexers are merged.
-export const WRAPPERS = new Set([
-  "time", "nice", "nohup", "command", "xargs", "env", "timeout", "stdbuf", "noglob",
-]);
-
-/** Wrappers that take one positional argument (a duration) before the command. */
-const WRAPPER_DURATION_RE = /^\d+(?:\.\d+)?[smhd]?$/;
-const WRAPPERS_WITH_DURATION = new Set(["timeout"]);
-
-/** Wrapper flags whose next token is a flag value rather than the command. */
-const WRAPPER_OPTIONS_WITH_VALUE: Record<string, Set<string>> = {
-  env: new Set(["-u", "--unset", "-C", "--chdir", "-S", "--split-string"]),
-  nice: new Set(["-n", "--adjustment"]),
-  xargs: new Set([
-    "-E", "-I", "-L", "-n", "-P", "-s", "-a", "--eof", "--end-of-file", "--replace",
-    "--max-lines", "--max-procs", "--max-chars", "--arg-file",
-  ]),
-  command: new Set(),
-  time: new Set(["-f", "--format", "-o", "--output"]),
-  nohup: new Set(),
-  timeout: new Set(["-s", "--signal", "-k", "--kill-after"]),
-  stdbuf: new Set(["-i", "--input", "-o", "--output", "-e", "--error"]),
-  noglob: new Set(),
-};
-
-function wrapperOptionHasAttachedValue(wrapper: string, option: string): boolean {
-  if (wrapper === "env") {
-    return /^-(?:u|C|S).+/.test(option) || /^(?:--unset|--chdir|--split-string)=/.test(option);
-  }
-  if (wrapper === "nice") return /^-n.+/.test(option) || /^--adjustment=/.test(option);
-  if (wrapper === "xargs") {
-    return /^-[EILnPsa].+/.test(option) || /^(?:--eof|--end-of-file|--replace|--max-lines|--max-procs|--max-chars|--arg-file)=/.test(option);
-  }
-  if (wrapper === "time") return /^(?:--format|--output)=/.test(option);
-  if (wrapper === "timeout") return /^-[sk].+/.test(option) || /^(?:--signal|--kill-after)=/.test(option);
-  if (wrapper === "stdbuf") return /^-[ioe].+/.test(option) || /^(?:--input|--output|--error)=/.test(option);
-  return false;
-}
-
-/**
  * Return the output option from a leading `time` wrapper, if present. Unlike
  * format-only options, `time -o FILE` and `time --output=FILE` open FILE
  * themselves before running the wrapped command, so resolving the inner head
  * first would incorrectly classify `time -o FILE printf ...` as a safe reader.
  */
 function timeOutputOption(segment: string): string | null {
-  const tokens = shellWords(segment);
+  const tokens = tokenizeShellWords(segment, ARGV);
   let wrapper: string | null = null;
   let pendingDuration = false;
   for (let i = 0; i < tokens.length; i++) {
@@ -3011,222 +2885,12 @@ function timeOutputOption(segment: string): string | null {
   return null;
 }
 
-/** Extract unquoted parenthesized command groups for recursive inspection. */
-function parenthesizedGroups(command: string): string[] {
-  const groups: string[] = [];
-  let quote: "'" | '"' | null = null;
-  for (let i = 0; i < command.length; i++) {
-    const ch = command[i]!;
-    if (ch === "\\") {
-      i++;
-      continue;
-    }
-    if (quote) {
-      if (ch === quote) quote = null;
-      continue;
-    }
-    if (ch === "'" || ch === '"') {
-      quote = ch;
-      continue;
-    }
-    if (ch !== "(") continue;
-    // `(( ... ))` is arithmetic syntax, not a command group. Continue scanning
-    // after its opening pair so command substitutions nested inside it remain
-    // visible to the existing opaque-substitution defense.
-    if (command[i + 1] === "(") {
-      i++;
-      continue;
-    }
-    if (i > 0 && !/[\s;|&(){}]/.test(command[i - 1]!)) continue;
-    let depth = 1;
-    let innerQuote: "'" | '"' | null = null;
-    for (let j = i + 1; j < command.length; j++) {
-      const inner = command[j]!;
-      if (inner === "\\") {
-        j++;
-        continue;
-      }
-      if (innerQuote) {
-        if (inner === innerQuote) innerQuote = null;
-        continue;
-      }
-      if (inner === "'" || inner === '"') {
-        innerQuote = inner;
-        continue;
-      }
-      if (inner === "(") depth++;
-      else if (inner === ")") {
-        depth--;
-        if (depth === 0) {
-          groups.push(command.slice(i + 1, j));
-          i = j;
-          break;
-        }
-      }
-    }
-  }
-  return groups;
-}
-
 /**
  * Privileged escalation heads. Never speculated on: a privileged command is
  * outside the recoverable read-only zone by definition, and detection would
  * otherwise rest entirely on the word scan matching whatever it wraps.
  */
 const PRIVILEGE_HEADS = new Set(["sudo", "doas", "pkexec"]);
-
-interface EnvOption {
-  takesArgument: boolean;
-  attached: boolean;
-  splitPayload?: string;
-  known: boolean;
-}
-
-/** Parse env's short clusters without mistaking an option value for a command. */
-function envOption(token: string): EnvOption {
-  if (token === "--ignore-environment") return { takesArgument: false, attached: false, known: true };
-  if (token === "--null" || token === "--debug") return { takesArgument: false, attached: false, known: true };
-  for (const name of ["--unset", "--chdir", "--argv0"]) {
-    if (token === name) return { takesArgument: true, attached: false, known: true };
-    if (token.startsWith(`${name}=`)) return { takesArgument: true, attached: true, known: true };
-  }
-  if (token === "--split-string") return { takesArgument: true, attached: false, splitPayload: "", known: true };
-  if (token.startsWith("--split-string=")) return {
-    takesArgument: true,
-    attached: true,
-    splitPayload: token.slice("--split-string=".length),
-    known: true,
-  };
-  if (token === "-i" || token === "-0" || token === "-v") return { takesArgument: false, attached: false, known: true };
-  if (!token.startsWith("-") || token.startsWith("--")) return { takesArgument: false, attached: false, known: false };
-  const flags = token.slice(1);
-  for (let i = 0; i < flags.length; i++) {
-    const flag = flags[i]!;
-    if (flag === "i" || flag === "0" || flag === "v") continue;
-    if (flag !== "u" && flag !== "C" && flag !== "S" && flag !== "P") return { takesArgument: false, attached: false, known: false };
-    const rest = flags.slice(i + 1);
-    return {
-      takesArgument: true,
-      attached: rest.length > 0,
-      ...(flag === "S" ? { splitPayload: rest } : {}),
-      known: true,
-    };
-  }
-  return { takesArgument: false, attached: false, known: true };
-}
-
-const ENV_ASSIGNMENT_RE = /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/s;
-
-interface EnvInvocationNormalization {
-  argv: string[];
-  assignments: string[];
-  envSeen: boolean;
-  complete: boolean;
-}
-
-const ENV_MAX_DEPTH = 8;
-const ENV_MAX_ARGV = 256;
-const ENV_MAX_CHARS = 64 * 1024;
-
-function incompleteEnvNormalization(): EnvInvocationNormalization {
-  return { argv: [], assignments: [], envSeen: true, complete: false };
-}
-
-/** Normalize only an effective executable prefix, including nested env. */
-function normalizeEnvInvocation(tokens: string[], depth = 0, inherited: string[] = []): EnvInvocationNormalization {
-  if (depth > ENV_MAX_DEPTH || tokens.length > ENV_MAX_ARGV || tokens.join(" ").length > ENV_MAX_CHARS) {
-    return incompleteEnvNormalization();
-  }
-  const assignments = [...inherited];
-  let index = 0;
-  let envSeen = false;
-  const consumeAssignments = () => {
-    while (index < tokens.length) {
-      const token = tokens[index]!;
-      if (ENV_ASSIGNMENT_RE.test(token)) { assignments.push(token); index++; continue; }
-      // shellWords keeps a trailing command separator attached to an
-      // assignment (`x=1; [[ ... ]]`). It is still an assignment prefix for
-      // head resolution; retaining the token keeps Git-name matching strict.
-      if (/^[A-Za-z_][A-Za-z0-9_]*=[^;|&(){}[\]]+[;|&(){}[\]]/.test(token)) {
-        assignments.push(token);
-        index++;
-      }
-      break;
-    }
-  };
-  const consumeWrapperOptions = (wrapper: string): boolean => {
-    while (index < tokens.length && tokens[index]!.startsWith("-")) {
-      const option = tokens[index]!;
-      if (option === "--") { index++; return true; }
-      const optionSet = WRAPPER_OPTIONS_WITH_VALUE[wrapper];
-      if (optionSet?.has(option) && !wrapperOptionHasAttachedValue(wrapper, option)) {
-        if (++index >= tokens.length) return false;
-      }
-      index++;
-    }
-    return true;
-  };
-
-  consumeAssignments();
-
-  while (index < tokens.length) {
-    const base = tokens[index]!.replace(/^.*\//, "");
-    if (base !== "env") {
-      if (tokens[index]!.includes("=") && !/[;|&(){}[\]]/.test(tokens[index]!)) return incompleteEnvNormalization();
-      if (!WRAPPERS.has(base)) return { argv: tokens.slice(index), assignments, envSeen, complete: true };
-      index++;
-      if (!consumeWrapperOptions(base)) return incompleteEnvNormalization();
-      if (WRAPPERS_WITH_DURATION.has(base)) {
-        // `timeout DURATION CMD`: a missing or malformed duration leaves the
-        // command position unknown, so fail closed rather than guess.
-        if (index >= tokens.length) return { argv: [], assignments, envSeen, complete: true };
-        if (!WRAPPER_DURATION_RE.test(tokens[index]!)) return incompleteEnvNormalization();
-        index++;
-      }
-      consumeAssignments();
-      continue;
-    }
-
-    envSeen = true;
-    index++;
-    while (index < tokens.length) {
-      const token = tokens[index]!;
-      if (ENV_ASSIGNMENT_RE.test(token)) { assignments.push(token); index++; continue; }
-      if (token === "--") { index++; break; }
-      if (!token.startsWith("-")) break;
-      const option = envOption(token);
-      if (!option.known) return incompleteEnvNormalization();
-      if (option.splitPayload !== undefined) {
-        let payload = option.splitPayload;
-        if (!option.attached) {
-          if (++index >= tokens.length) return incompleteEnvNormalization();
-          payload = tokens[index]!;
-        }
-        if (payload.length > ENV_MAX_CHARS) return incompleteEnvNormalization();
-        const parsed = shellArguments(payload);
-        if (!parsed.complete || parsed.args.some((argument) => argument.dynamic)) return incompleteEnvNormalization();
-        const composed = parsed.args.map((argument) => argument.value).concat(tokens.slice(index + 1));
-        if (composed.length > ENV_MAX_ARGV || composed.join(" ").length > ENV_MAX_CHARS) return incompleteEnvNormalization();
-        const nested = normalizeEnvInvocation(composed, depth + 1, assignments);
-        return { ...nested, envSeen: true };
-      }
-      if (option.takesArgument && !option.attached) {
-        if (++index >= tokens.length) return incompleteEnvNormalization();
-      }
-      index++;
-    }
-    consumeAssignments();
-    if (index >= tokens.length) return { argv: [], assignments, envSeen, complete: true };
-  }
-  return { argv: [], assignments, envSeen, complete: true };
-}
-
-export function effectiveHead(segment: string): string | null {
-  const normalized = normalizeEnvInvocation(shellWords(segment));
-  if (!normalized.complete || normalized.argv.length === 0) return null;
-  const base = normalized.argv[0]!.replace(/^.*\//, "");
-  return base || null;
-}
 
 /**
  * Inspect only the prefix that launches Git. Assignment-looking text in Git
@@ -3244,138 +2908,6 @@ function gitEnvironmentPrefixMutation(assignments: string[]): string | null {
   }
   return null;
 }
-/**
- * Split a command into shell words for Git's option/verb inspection. This is
- * intentionally narrower than a shell parser: quotes and escapes are kept
- * together so a quoted search pattern cannot become a false Git verb.
- */
-function shellWords(command: string): string[] {
-  const words: string[] = [];
-  let current = "";
-  let quote: "'" | '"' | null = null;
-  let escaped = false;
-  let substitutionDepth = 0;
-  let backtickDepth = 0;
-
-  for (let i = 0; i < command.length; i++) {
-    const ch = command[i]!;
-    if (escaped) {
-      // In a double-quoted shell word, backslash only quotes $, `, ", \,
-      // and newline. Preserve it for PHP namespaces and Perl single-quoted
-      // escape sequences such as \' so the eval payload remains intact.
-      if (quote === "\"" && !/[\\$`\"\n]/.test(ch)) current += "\\";
-      current += ch;
-      escaped = false;
-      continue;
-    }
-    if (ch === "\\" && quote !== "'") {
-      escaped = true;
-      continue;
-    }
-    if (quote) {
-      if (ch === quote) quote = null;
-      else current += ch;
-      continue;
-    }
-    if (ch === "'" || ch === '"') {
-      quote = ch;
-    } else if (ch === "$" && command[i + 1] === "(") {
-      current += "$(";
-      substitutionDepth++;
-      i++;
-    } else if (ch === "`") {
-      current += ch;
-      backtickDepth = backtickDepth === 0 ? 1 : 0;
-    } else if (substitutionDepth > 0 || backtickDepth > 0) {
-      if (substitutionDepth > 0) {
-        if (ch === "(") substitutionDepth++;
-        else if (ch === ")") substitutionDepth--;
-      }
-      current += ch;
-    } else if (/\s/.test(ch)) {
-      if (current) {
-        words.push(current);
-        current = "";
-      }
-    } else {
-      current += ch;
-    }
-  }
-  if (escaped) current += "\\";
-  if (current) words.push(current);
-  return words;
-}
-
-interface ShellArgument {
-  value: string;
-  /** True when the outer shell must expand this argument before `-c` runs. */
-  dynamic: boolean;
-}
-
-interface ShellArguments {
-  args: ShellArgument[];
-  complete: boolean;
-}
-
-/**
- * Parse shell argv while retaining whether each word contains an outer-shell
- * expansion. `shellWords` intentionally discards that distinction for normal
- * command classification; `sh -c` needs it because its next argv item is code.
- */
-function shellArguments(command: string): ShellArguments {
-  const args: ShellArgument[] = [];
-  let current = "";
-  let quote: "'" | '"' | null = null;
-  let escaped = false;
-  let dynamic = false;
-  let started = false;
-
-  const push = () => {
-    if (!started) return;
-    args.push({ value: current, dynamic });
-    current = "";
-    dynamic = false;
-    started = false;
-  };
-
-  for (const ch of command) {
-    if (escaped) {
-      if (quote === '"' && !/[\\$`"\n]/.test(ch)) current += "\\";
-      current += ch;
-      escaped = false;
-      started = true;
-      continue;
-    }
-    if (ch === "\\" && quote !== "'") {
-      escaped = true;
-      started = true;
-      continue;
-    }
-    if (quote !== null) {
-      if (ch === quote) quote = null;
-      else {
-        current += ch;
-        if (quote === '"' && (ch === "$" || ch === "`")) dynamic = true;
-      }
-      started = true;
-      continue;
-    }
-    if (ch === "'" || ch === '"') {
-      quote = ch;
-      started = true;
-    } else if (/\s/.test(ch)) {
-      push();
-    } else {
-      current += ch;
-      if (ch === "$" || ch === "`") dynamic = true;
-      started = true;
-    }
-  }
-  if (escaped || quote !== null) return { args, complete: false };
-  push();
-  return { args, complete: true };
-}
-
 interface ShellEvalPayload {
   payload: string | null;
   ambiguous: boolean;
@@ -3383,9 +2915,9 @@ interface ShellEvalPayload {
 
 /** Extract a static `-c` payload from an actual shell invocation, through wrappers. */
 function shellEvalPayload(segment: string): ShellEvalPayload | null {
-  const parsed = shellArguments(segment);
+  const parsed = lexShellWords(segment);
   if (!parsed.complete) return null;
-  const tokens = parsed.args.map((arg) => arg.value);
+  const tokens = parsed.words.map((word) => word.value);
   const normalized = normalizeEnvInvocation(tokens);
   if (!normalized.complete) return { payload: null, ambiguous: true };
   if (normalized.argv.length === 0) return null;
@@ -3399,7 +2931,7 @@ function shellEvalPayload(segment: string): ShellEvalPayload | null {
       const token = tokens[i]!;
       if (token === "--") break;
       if (token !== "-c" && !/^-[-\w]*c[^-]*$/.test(token)) continue;
-      const argument = parsed.args[i + 1];
+      const argument = parsed.words[i + 1];
       if (!argument || argument.dynamic) return { payload: null, ambiguous: true };
       if (argument.value.length > MAX_LANGUAGE_ARGUMENT_LENGTH) return { payload: null, ambiguous: true };
       return { payload: argument.value, ambiguous: false };
@@ -3421,7 +2953,7 @@ function shellEvalPayload(segment: string): ShellEvalPayload | null {
 
 /** Return a command-bearing assignment inherited by a shell `-c` payload. */
 function shellEnvironmentPrefixMutation(segment: string): string | null {
-  const normalized = normalizeEnvInvocation(shellWords(segment));
+  const normalized = normalizeEnvInvocation(tokenizeShellWords(segment, ARGV));
   return normalized.complete ? gitEnvironmentPrefixMutation(normalized.assignments) : null;
 }
 
@@ -3525,7 +3057,7 @@ function gitReadOnlyOptionMutation(tokens: string[], start: number): string | nu
  * only in this verb position; their values are never treated as commands.
  */
 function findGitMutationToken(segment: string): string | null {
-  const tokens = shellWords(segment);
+  const tokens = tokenizeShellWords(segment, ARGV);
   const normalized = normalizeEnvInvocation(tokens);
   if (!normalized.complete) return "ambiguous env invocation";
   if (normalized.argv.length === 0) return null;
@@ -3637,7 +3169,7 @@ function findInterpreterWriter(head: string, segment: string): string | null {
 
 /** Run the segment's READ_ONLY_HEAD_WRITES predicate, if its effective head has one. */
 function readOnlyHeadWrite(segment: string, depth: number, followingText: string | null): string | null {
-  const normalized = normalizeEnvInvocation(shellWords(segment));
+  const normalized = normalizeEnvInvocation(tokenizeShellWords(segment, ARGV));
   if (!normalized.complete || normalized.argv.length === 0) return null;
   const head = normalized.argv[0]!.replace(/^.*\//, "");
   const check = Object.hasOwn(READ_ONLY_HEAD_WRITES, head) ? READ_ONLY_HEAD_WRITES[head]! : undefined;
@@ -3655,7 +3187,7 @@ function readOnlyHeadWrite(segment: string, depth: number, followingText: string
  */
 function findDestructiveTokenInternal(cmd: string, depth: number): string | null {
   if (depth >= 32) return "complex shell syntax";
-  const normalized = normalizeEnvInvocation(shellWords(cmd));
+  const normalized = normalizeEnvInvocation(tokenizeShellWords(cmd, ARGV));
   if (!normalized.complete) return "ambiguous env invocation";
   // Avoid sending oversized interpreter payloads through the recursive shell
   // inspection machinery. They cannot be parsed within the language-call
@@ -3706,7 +3238,7 @@ function findDestructiveTokenInternal(cmd: string, depth: number): string | null
   // Parenthesized groups execute their contents even though the outer shell
   // segment starts with `(`. Inspect each group recursively, while the
   // quote-aware extractor leaves literal parentheses untouched.
-  for (const group of parenthesizedGroups(shellCommand)) {
+  for (const group of parenthesizedBodies(shellCommand)) {
     const nested = findDestructiveTokenInternal(group, depth + 1);
     if (nested) return nested;
   }

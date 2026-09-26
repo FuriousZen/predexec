@@ -1,14 +1,11 @@
 import { describe, expect, it } from "vitest";
 import {
-  effectiveHead,
   findDestructiveToken,
   interpreterEvalPreflight,
   isDestructiveCommand,
   LANGUAGE_CALL_CANDIDATE_BUDGET,
-  splitCommandSegments,
-  WRAPPERS,
 } from "../../core/destructive.ts";
-import { DEFAULT_WRAPPERS } from "../../command-inspection.ts";
+import { effectiveHead, splitCommandSegments } from "../../core/shell/lexer.ts";
 
 describe("isDestructiveCommand — heuristic coverage (2026-07 audit)", () => {
   // Writers the audit found the blocklist missing. Every one must be caught.
@@ -1686,9 +1683,4 @@ describe("wrapper parity and allowlist-based interpreter eval (CORE-4/5)", () =>
     "perl -lne 'print length' f",
     "ruby -ryaml -e 'puts 1'",
   ])("review-read-only: %s", (c) => expect(isDestructiveCommand(c)).toBe(false));
-
-  // Temporary scaffolding until the lexers merge; trivially true afterwards.
-  it("core WRAPPERS is a superset of command-inspection DEFAULT_WRAPPERS", () => {
-    for (const wrapper of DEFAULT_WRAPPERS) expect(WRAPPERS.has(wrapper), wrapper).toBe(true);
-  });
 });

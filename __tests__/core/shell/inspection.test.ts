@@ -7,7 +7,7 @@ import {
   inspectShellCommandClauses,
   stripLeadingAssignmentsAndWrappers,
   tokenizeShellWords,
-} from "../command-inspection.ts";
+} from "../../../core/shell/inspection.ts";
 
 describe("command inspection mechanics", () => {
   it.each([

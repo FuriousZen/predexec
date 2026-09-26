@@ -1,12 +1,18 @@
 /**
- * Harness-neutral shell inspection mechanics.
+ * predexec core — the one shell lexer.
+ *
+ * PURE TS, imports nothing outside core/. Every shell-syntax question core and
+ * the policy adapters ask goes through here: argv tokenizing (one tokenizer,
+ * `lexShellWords`), pipeline/clause splitting, parenthesized-body and
+ * substitution walking, heredoc masking, and wrapper/assignment stripping.
  *
  * This module deliberately does not know about policy syntax, precedence, or
- * verdicts. Hosts supply their wrapper vocabulary so policy adapters retain
- * ownership of those semantics.
+ * verdicts. Hosts supply their wrapper vocabulary to
+ * `stripLeadingAssignmentsAndWrappers` so policy adapters retain ownership of
+ * those semantics; core's own classifier vocabulary is `WRAPPERS`.
  */
 
-import { MAX_COMMAND_LENGTH } from "./core/types.ts";
+import { MAX_COMMAND_LENGTH } from "../types.ts";
 
 export interface WrapperInspectionOptions {
   wrappers?: ReadonlySet<string>;
@@ -19,20 +25,21 @@ export interface WrapperInspectionOptions {
   durationPattern?: RegExp;
 }
 
-/** Exported only for the temporary parity test against core `WRAPPERS`. */
-export const DEFAULT_WRAPPERS = new Set(["timeout", "time", "nice", "nohup", "stdbuf", "noglob"]);
-const DEFAULT_OPTION_TAKING_WRAPPERS = new Set(["timeout", "nice", "stdbuf"]);
-const DEFAULT_BARE_ONLY_WRAPPERS = new Set(["command", "builtin", "xargs"]);
-const DEFAULT_DURATION_PATTERN = /^\d+(?:\.\d+)?[smhd]?$/;
 const TOKEN_ASSIGNMENT_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*=/;
 
+/**
+ * Defaults for callers that pass no host vocabulary, derived from core's
+ * `WRAPPERS`. `command`/`builtin`/`xargs` are stripped only when bare
+ * (`command -v foo` looks a command up; `xargs -n1 grep` is an xargs command).
+ */
+const DEFAULT_BARE_ONLY_WRAPPERS: ReadonlySet<string> = new Set(["command", "builtin", "xargs"]);
 const wrapperOptions = (options: WrapperInspectionOptions = {}) => ({
-  wrappers: options.wrappers ?? DEFAULT_WRAPPERS,
+  wrappers: options.wrappers ?? DEFAULT_STRIP_WRAPPERS,
   optionTakingWrappers: options.optionTakingWrappers ?? DEFAULT_OPTION_TAKING_WRAPPERS,
   bareOnlyWrappers: options.bareOnlyWrappers ?? DEFAULT_BARE_ONLY_WRAPPERS,
-  optionArguments: options.optionArguments ?? new Map(),
-  splitStringOptions: options.splitStringOptions ?? new Map(),
-  durationPattern: options.durationPattern ?? DEFAULT_DURATION_PATTERN,
+  optionArguments: options.optionArguments ?? DEFAULT_OPTION_ARGUMENTS,
+  splitStringOptions: options.splitStringOptions ?? DEFAULT_SPLIT_STRING_OPTIONS,
+  durationPattern: options.durationPattern ?? WRAPPER_DURATION_RE,
 });
 
 export interface CommandSubstitutionInspection {
@@ -305,47 +312,131 @@ function executableBodyEvents(command: string): ExecutableBodyEvent[] {
   return events;
 }
 
-/** Tokenize one shell segment into argv-like words, removing shell quoting. */
-export function tokenizeShellWords(segment: string): string[] {
-  const tokens: string[] = [];
-  let cur = "";
-  let has = false;
-  let q: '"' | "'" | null = null;
-  for (let i = 0; i < segment.length; i++) {
-    const c = segment[i]!;
-    if (q) {
-      if (c === "\\" && q === '"') {
-        cur += segment[i + 1] ?? "";
-        i++;
-      } else if (c === q) q = null;
-      else cur += c;
-      has = true;
+/** One argv word: its unquoted value and where its source spelling sits. */
+export interface ShellWord {
+  value: string;
+  /** Offset of the word's first source character. */
+  start: number;
+  /** Offset one past the word's last source character. */
+  end: number;
+  /** True when the outer shell expands part of it (`$`, backticks) before use. */
+  dynamic: boolean;
+}
+
+export interface ShellWordLex {
+  words: ShellWord[];
+  /** False for an unterminated quote or a trailing lone backslash. */
+  complete: boolean;
+}
+
+export interface TokenizeOptions {
+  /**
+   * Keep an unquoted `$(...)` or backtick substitution inside one word even
+   * when its body contains whitespace. Argv inspection that must not mistake a
+   * substitution's body for the outer command's arguments (Git verbs, env
+   * normalization, read-only-head predicates) wants this; the clause and policy
+   * matchers keep the split spelling they have always compared against.
+   */
+  atomicSubstitutions?: boolean;
+}
+
+/**
+ * The one shell tokenizer. Removes quoting the way the shell does: single
+ * quotes are literal; inside double quotes a backslash escapes only `$`,
+ * backtick, `"`, `\` and newline (elsewhere it stays in the word); unquoted, a
+ * backslash escapes any next character. A quoted empty string is a word. A
+ * trailing lone backslash is kept in the value and marks the lex incomplete.
+ *
+ * Linear in the input length: one pass, no regex over the remainder.
+ */
+export function lexShellWords(text: string, options: TokenizeOptions = {}): ShellWordLex {
+  const atomic = options.atomicSubstitutions === true;
+  const words: ShellWord[] = [];
+  let value = "";
+  let start = -1;
+  let dynamic = false;
+  let quote: "'" | '"' | null = null;
+  let substitutionDepth = 0;
+  let backtick = false;
+  let complete = true;
+  const push = (end: number) => {
+    if (start === -1) return;
+    words.push({ value, start, end, dynamic });
+    value = "";
+    start = -1;
+    dynamic = false;
+  };
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i]!;
+    if (quote === "'") {
+      if (ch === "'") quote = null;
+      else value += ch;
       continue;
     }
-    if (c === '"' || c === "'") {
-      q = c;
-      has = true;
+    if (ch === "\\") {
+      if (start === -1) start = i;
+      if (i + 1 >= text.length) {
+        value += "\\";
+        complete = false;
+        continue;
+      }
+      const next = text[++i]!;
+      if (quote === '"' && next !== "\\" && next !== "$" && next !== "`" && next !== '"' && next !== "\n") value += "\\";
+      value += next;
       continue;
     }
-    if (/\s/.test(c)) {
-      if (has) {
-        tokens.push(cur);
-        cur = "";
-        has = false;
+    if (quote === '"') {
+      if (ch === '"') quote = null;
+      else {
+        value += ch;
+        if (ch === "$" || ch === "`") dynamic = true;
       }
       continue;
     }
-    if (c === "\\") {
-      cur += segment[i + 1] ?? "";
-      i++;
-      has = true;
+    if (ch === "'" || ch === '"') {
+      if (start === -1) start = i;
+      quote = ch;
       continue;
     }
-    cur += c;
-    has = true;
+    if (atomic && ch === "$" && text[i + 1] === "(") {
+      if (start === -1) start = i;
+      value += "$(";
+      dynamic = true;
+      substitutionDepth++;
+      i++;
+      continue;
+    }
+    if (atomic && ch === "`") {
+      if (start === -1) start = i;
+      value += ch;
+      dynamic = true;
+      backtick = !backtick;
+      continue;
+    }
+    if (substitutionDepth > 0 || backtick) {
+      if (substitutionDepth > 0) {
+        if (ch === "(") substitutionDepth++;
+        else if (ch === ")") substitutionDepth--;
+      }
+      value += ch;
+      continue;
+    }
+    if (ch === " " || ch === "\t" || ch === "\n" || ch === "\r" || ch === "\f" || ch === "\v" || /\s/.test(ch)) {
+      push(i);
+      continue;
+    }
+    if (start === -1) start = i;
+    value += ch;
+    if (ch === "$" || ch === "`") dynamic = true;
   }
-  if (has) tokens.push(cur);
-  return tokens;
+  if (quote !== null) complete = false;
+  push(text.length);
+  return { words, complete };
+}
+
+/** Tokenize one shell segment into argv-like words, removing shell quoting. */
+export function tokenizeShellWords(segment: string, options?: TokenizeOptions): string[] {
+  return lexShellWords(segment, options).words.map((word) => word.value);
 }
 
 /**
@@ -1046,7 +1137,7 @@ function stripRaw(command: string, options: ReturnType<typeof wrapperOptions>): 
   let cmd = command.trim();
   for (let pass = 0; pass < 16; pass++) {
     const before = cmd;
-    const spans = tokenizeShellWordSpans(cmd);
+    const spans = lexShellWords(cmd).words;
     const tokens = spans.map((span) => span.value);
     const assignmentCount = (() => {
       let i = 0;
@@ -1095,51 +1186,6 @@ function stripRaw(command: string, options: ReturnType<typeof wrapperOptions>): 
   return cmd;
 }
 
-interface ShellWordSpan {
-  value: string;
-  start: number;
-  end: number;
-}
-
-/** Tokenize while retaining source offsets so raw wrapper stripping preserves quotes/globs. */
-function tokenizeShellWordSpans(segment: string): ShellWordSpan[] {
-  const spans: ShellWordSpan[] = [];
-  let start = -1;
-  let value = "";
-  let quote: '"' | "'" | null = null;
-  for (let i = 0; i < segment.length; i++) {
-    const ch = segment[i]!;
-    if (start === -1 && /\s/.test(ch)) continue;
-    if (start === -1) start = i;
-    if (quote) {
-      if (ch === "\\" && quote === '"') {
-        value += segment[i + 1] ?? "";
-        i++;
-      } else if (ch === quote) quote = null;
-      else value += ch;
-      continue;
-    }
-    if (ch === "'" || ch === '"') {
-      quote = ch;
-      continue;
-    }
-    if (ch === "\\") {
-      value += segment[i + 1] ?? "";
-      i++;
-      continue;
-    }
-    if (/\s/.test(ch)) {
-      spans.push({ value, start, end: i });
-      start = -1;
-      value = "";
-      continue;
-    }
-    value += ch;
-  }
-  if (start !== -1) spans.push({ value, start, end: segment.length });
-  return spans;
-}
-
 /**
  * Strip leading assignments and wrappers. String input preserves the original
  * quote spelling for host glob matching; token input is useful for argv-style
@@ -1161,4 +1207,339 @@ export function stripLeadingAssignmentsAndWrappers(
     if (current.length === before.length && current.every((token, i) => token === before[i])) break;
   }
   return current;
+}
+
+/**
+ * Blank here-document bodies (keeping line breaks) so their text is data, not
+ * command clauses: a literal `>` or `;` in a heredoc is not shell syntax.
+ */
+export function maskHeredocBodies(cmd: string): string {
+  const chars = cmd.split("");
+  const ranges: Array<[number, number]> = [];
+  const pending: Array<{ delimiter: string; stripTabs: boolean; bodyStart: number }> = [];
+  let quote: "'" | '"' | null = null;
+  let lineStart = 0;
+  while (lineStart < cmd.length) {
+    const newline = cmd.indexOf("\n", lineStart);
+    const lineEnd = newline < 0 ? cmd.length : newline;
+    if (pending.length > 0) {
+      const candidate = cmd.slice(lineStart, lineEnd).replace(/\r$/, "");
+      const expected = pending[0]!;
+      const comparable = expected.stripTabs ? candidate.replace(/^\t+/, "") : candidate;
+      if (comparable === expected.delimiter) {
+        ranges.push([expected.bodyStart, newline < 0 ? lineEnd : newline + 1]);
+        pending.shift();
+        if (pending.length > 0) pending[0]!.bodyStart = newline < 0 ? lineEnd : newline + 1;
+      }
+      lineStart = newline < 0 ? cmd.length : newline + 1;
+      continue;
+    }
+    for (let i = lineStart; i < lineEnd; i++) {
+      const ch = cmd[i]!;
+      if (ch === "\\" && quote !== "'") { i++; continue; }
+      if (quote !== null) {
+        if (ch === quote) quote = null;
+        continue;
+      }
+      if (ch === "'" || ch === '"') { quote = ch; continue; }
+      if (ch !== "<" || cmd[i + 1] !== "<" || cmd[i + 2] === "<") continue;
+      let cursor = i + 2;
+      let stripTabs = false;
+      if (cmd[cursor] === "-") { stripTabs = true; cursor++; }
+      while (cursor < lineEnd && /[ \t]/.test(cmd[cursor]!)) cursor++;
+      let delimiter = "";
+      const delimiterQuote = cmd[cursor] === "'" || cmd[cursor] === '"' ? cmd[cursor++] : null;
+      while (cursor < lineEnd) {
+        const next = cmd[cursor]!;
+        if (delimiterQuote !== null) {
+          if (next === delimiterQuote) { cursor++; break; }
+          delimiter += next;
+        } else if (/[A-Za-z0-9_]/.test(next)) delimiter += next;
+        else break;
+        cursor++;
+      }
+      if (delimiter.length > 0) pending.push({ delimiter, stripTabs, bodyStart: lineEnd + (newline < 0 ? 0 : 1) });
+      i = Math.max(i, cursor - 1);
+    }
+    lineStart = newline < 0 ? cmd.length : newline + 1;
+  }
+  for (const [start, end] of ranges) {
+    for (let i = start; i < end; i++) {
+      if (chars[i] !== "\n" && chars[i] !== "\r") chars[i] = " ";
+    }
+  }
+  return chars.join("");
+}
+
+/**
+ * Split a compound command into pipeline segments on unquoted `|`, `;`, `&&`,
+ * `||`, newlines, and bare `&` (but not `>&`/`&&` fd-dup/joins). Backslash
+ * escapes outside single quotes are honored: `\;` is an argument, and `\"`
+ * opens no quoted span (CORE-7). Exception-safe: any confusion degrades to the
+ * whole command as one segment.
+ */
+export function splitCommandSegments(cmd: string): string[] {
+  try {
+    const shellCommand = maskHeredocBodies(cmd);
+    const segments: string[] = [];
+    let current = "";
+    let inSingle = false;
+    let inDouble = false;
+    for (let i = 0; i < shellCommand.length; i++) {
+      const ch = shellCommand[i]!;
+      if (ch === "\\" && !inSingle) {
+        current += ch + (shellCommand[i + 1] ?? "");
+        i++;
+        continue;
+      }
+      if (ch === "'" && !inDouble) inSingle = !inSingle;
+      else if (ch === '"' && !inSingle) inDouble = !inDouble;
+      if (!inSingle && !inDouble && (ch === "|" || ch === ";" || ch === "&" || ch === "\n" || ch === "\r")) {
+        // `2>&1` / `>&2`: an & directly after `>` is an fd dup, not a join.
+        if (ch === "&" && shellCommand[i - 1] === ">") {
+          current += ch;
+          continue;
+        }
+        if (current.trim()) segments.push(current.trim());
+        current = "";
+        // swallow the second char of `&&` / `||`
+        if (shellCommand[i + 1] === ch) i++;
+        // Treat CRLF as one command separator.
+        if (ch === "\r" && shellCommand[i + 1] === "\n") i++;
+        continue;
+      }
+      current += ch;
+    }
+    if (current.trim()) segments.push(current.trim());
+    return segments.length > 0 ? segments : [shellCommand];
+  } catch {
+    return [cmd];
+  }
+}
+
+/** Bodies of executable `(...)` groups (not substitutions or arithmetic). */
+export function parenthesizedBodies(command: string): string[] {
+  return inspectParenthesizedBodies(command).bodies.map((body) => body.text);
+}
+
+/**
+ * Wrapper commands that defer to the next token. `env` belongs here, not in
+ * READ_ONLY_HEADS: bare `env` prints the environment, but `env rm -rf /` runs
+ * rm. Treating it as a pure reader skipped the word scan entirely and let every
+ * `env <writer>` through. As a wrapper, `env FOO=1 rm …` resolves to `rm` (the
+ * VAR=val skip in effectiveHead already handles the assignment), and a bare
+ * `env` falls through to the word scan, which is the safe direction.
+ */
+export const WRAPPERS: ReadonlySet<string> = new Set([
+  "time", "nice", "nohup", "command", "xargs", "env", "timeout", "stdbuf", "noglob",
+]);
+
+/** Wrappers that take one positional argument (a duration) before the command. */
+export const WRAPPER_DURATION_RE = /^\d+(?:\.\d+)?[smhd]?$/;
+export const WRAPPERS_WITH_DURATION: ReadonlySet<string> = new Set(["timeout"]);
+
+/** Wrapper flags whose next token is a flag value rather than the command. */
+export const WRAPPER_OPTIONS_WITH_VALUE: Readonly<Record<string, ReadonlySet<string>>> = {
+  env: new Set(["-u", "--unset", "-C", "--chdir", "-S", "--split-string"]),
+  nice: new Set(["-n", "--adjustment"]),
+  xargs: new Set([
+    "-E", "-I", "-L", "-n", "-P", "-s", "-a", "--eof", "--end-of-file", "--replace",
+    "--max-lines", "--max-procs", "--max-chars", "--arg-file",
+  ]),
+  command: new Set(),
+  time: new Set(["-f", "--format", "-o", "--output"]),
+  nohup: new Set(),
+  timeout: new Set(["-s", "--signal", "-k", "--kill-after"]),
+  stdbuf: new Set(["-i", "--input", "-o", "--output", "-e", "--error"]),
+  noglob: new Set(),
+};
+
+export function wrapperOptionHasAttachedValue(wrapper: string, option: string): boolean {
+  if (wrapper === "env") {
+    return /^-(?:u|C|S).+/.test(option) || /^(?:--unset|--chdir|--split-string)=/.test(option);
+  }
+  if (wrapper === "nice") return /^-n.+/.test(option) || /^--adjustment=/.test(option);
+  if (wrapper === "xargs") {
+    return /^-[EILnPsa].+/.test(option) || /^(?:--eof|--end-of-file|--replace|--max-lines|--max-procs|--max-chars|--arg-file)=/.test(option);
+  }
+  if (wrapper === "time") return /^(?:--format|--output)=/.test(option);
+  if (wrapper === "timeout") return /^-[sk].+/.test(option) || /^(?:--signal|--kill-after)=/.test(option);
+  if (wrapper === "stdbuf") return /^-[ioe].+/.test(option) || /^(?:--input|--output|--error)=/.test(option);
+  return false;
+}
+
+/** Core's wrapper vocabulary as `stripLeadingAssignmentsAndWrappers` defaults. */
+const DEFAULT_STRIP_WRAPPERS: ReadonlySet<string> =
+  new Set([...WRAPPERS].filter((wrapper) => !DEFAULT_BARE_ONLY_WRAPPERS.has(wrapper)));
+const DEFAULT_OPTION_TAKING_WRAPPERS: ReadonlySet<string> = new Set(
+  [...DEFAULT_STRIP_WRAPPERS].filter((wrapper) =>
+    (WRAPPER_OPTIONS_WITH_VALUE[wrapper]?.size ?? 0) > 0 || WRAPPERS_WITH_DURATION.has(wrapper)),
+);
+const DEFAULT_SPLIT_STRING_OPTIONS: ReadonlyMap<string, ReadonlySet<string>> =
+  new Map([["env", new Set(["-S", "--split-string"])]]);
+const DEFAULT_OPTION_ARGUMENTS: ReadonlyMap<string, ReadonlySet<string>> = new Map(
+  [...DEFAULT_OPTION_TAKING_WRAPPERS].map((wrapper) => [
+    wrapper,
+    new Set([...(WRAPPER_OPTIONS_WITH_VALUE[wrapper] ?? [])]
+      .filter((option) => !DEFAULT_SPLIT_STRING_OPTIONS.get(wrapper)?.has(option))),
+  ]),
+);
+
+export interface EnvOption {
+  takesArgument: boolean;
+  attached: boolean;
+  splitPayload?: string;
+  known: boolean;
+}
+
+/** Parse env's short clusters without mistaking an option value for a command. */
+export function envOption(token: string): EnvOption {
+  if (token === "--ignore-environment") return { takesArgument: false, attached: false, known: true };
+  if (token === "--null" || token === "--debug") return { takesArgument: false, attached: false, known: true };
+  for (const name of ["--unset", "--chdir", "--argv0"]) {
+    if (token === name) return { takesArgument: true, attached: false, known: true };
+    if (token.startsWith(`${name}=`)) return { takesArgument: true, attached: true, known: true };
+  }
+  if (token === "--split-string") return { takesArgument: true, attached: false, splitPayload: "", known: true };
+  if (token.startsWith("--split-string=")) return {
+    takesArgument: true,
+    attached: true,
+    splitPayload: token.slice("--split-string=".length),
+    known: true,
+  };
+  if (token === "-i" || token === "-0" || token === "-v") return { takesArgument: false, attached: false, known: true };
+  if (!token.startsWith("-") || token.startsWith("--")) return { takesArgument: false, attached: false, known: false };
+  const flags = token.slice(1);
+  for (let i = 0; i < flags.length; i++) {
+    const flag = flags[i]!;
+    if (flag === "i" || flag === "0" || flag === "v") continue;
+    if (flag !== "u" && flag !== "C" && flag !== "S" && flag !== "P") return { takesArgument: false, attached: false, known: false };
+    const rest = flags.slice(i + 1);
+    return {
+      takesArgument: true,
+      attached: rest.length > 0,
+      ...(flag === "S" ? { splitPayload: rest } : {}),
+      known: true,
+    };
+  }
+  return { takesArgument: false, attached: false, known: true };
+}
+
+export const ENV_ASSIGNMENT_RE = /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/s;
+
+export interface EnvInvocationNormalization {
+  argv: string[];
+  assignments: string[];
+  envSeen: boolean;
+  complete: boolean;
+}
+
+const ENV_MAX_DEPTH = 8;
+const ENV_MAX_ARGV = 256;
+const ENV_MAX_CHARS = 64 * 1024;
+
+function incompleteEnvNormalization(): EnvInvocationNormalization {
+  return { argv: [], assignments: [], envSeen: true, complete: false };
+}
+
+/**
+ * Resolve the effective executable of an argv: skip leading `NAME=value`
+ * assignments and core `WRAPPERS` (with their options, durations and nested
+ * `env -S` payloads), collecting the assignments the command inherits.
+ * Bounded; anything it cannot place is `complete: false`.
+ */
+export function normalizeEnvInvocation(tokens: readonly string[], depth = 0, inherited: string[] = []): EnvInvocationNormalization {
+  if (depth > ENV_MAX_DEPTH || tokens.length > ENV_MAX_ARGV || tokens.join(" ").length > ENV_MAX_CHARS) {
+    return incompleteEnvNormalization();
+  }
+  const assignments = [...inherited];
+  let index = 0;
+  let envSeen = false;
+  const consumeAssignments = () => {
+    while (index < tokens.length) {
+      const token = tokens[index]!;
+      if (ENV_ASSIGNMENT_RE.test(token)) { assignments.push(token); index++; continue; }
+      // The argv tokenizer keeps a trailing command separator attached to an
+      // assignment (`x=1; [[ ... ]]`). It is still an assignment prefix for
+      // head resolution; retaining the token keeps Git-name matching strict.
+      if (/^[A-Za-z_][A-Za-z0-9_]*=[^;|&(){}[\]]+[;|&(){}[\]]/.test(token)) {
+        assignments.push(token);
+        index++;
+      }
+      break;
+    }
+  };
+  const consumeWrapperOptions = (wrapper: string): boolean => {
+    while (index < tokens.length && tokens[index]!.startsWith("-")) {
+      const option = tokens[index]!;
+      if (option === "--") { index++; return true; }
+      const optionSet = WRAPPER_OPTIONS_WITH_VALUE[wrapper];
+      if (optionSet?.has(option) && !wrapperOptionHasAttachedValue(wrapper, option)) {
+        if (++index >= tokens.length) return false;
+      }
+      index++;
+    }
+    return true;
+  };
+
+  consumeAssignments();
+
+  while (index < tokens.length) {
+    const base = tokens[index]!.replace(/^.*\//, "");
+    if (base !== "env") {
+      if (tokens[index]!.includes("=") && !/[;|&(){}[\]]/.test(tokens[index]!)) return incompleteEnvNormalization();
+      if (!WRAPPERS.has(base)) return { argv: tokens.slice(index), assignments, envSeen, complete: true };
+      index++;
+      if (!consumeWrapperOptions(base)) return incompleteEnvNormalization();
+      if (WRAPPERS_WITH_DURATION.has(base)) {
+        // `timeout DURATION CMD`: a missing or malformed duration leaves the
+        // command position unknown, so fail closed rather than guess.
+        if (index >= tokens.length) return { argv: [], assignments, envSeen, complete: true };
+        if (!WRAPPER_DURATION_RE.test(tokens[index]!)) return incompleteEnvNormalization();
+        index++;
+      }
+      consumeAssignments();
+      continue;
+    }
+
+    envSeen = true;
+    index++;
+    while (index < tokens.length) {
+      const token = tokens[index]!;
+      if (ENV_ASSIGNMENT_RE.test(token)) { assignments.push(token); index++; continue; }
+      if (token === "--") { index++; break; }
+      if (!token.startsWith("-")) break;
+      const option = envOption(token);
+      if (!option.known) return incompleteEnvNormalization();
+      if (option.splitPayload !== undefined) {
+        let payload = option.splitPayload;
+        if (!option.attached) {
+          if (++index >= tokens.length) return incompleteEnvNormalization();
+          payload = tokens[index]!;
+        }
+        if (payload.length > ENV_MAX_CHARS) return incompleteEnvNormalization();
+        const parsed = lexShellWords(payload);
+        if (!parsed.complete || parsed.words.some((word) => word.dynamic)) return incompleteEnvNormalization();
+        const composed = parsed.words.map((word) => word.value).concat(tokens.slice(index + 1));
+        if (composed.length > ENV_MAX_ARGV || composed.join(" ").length > ENV_MAX_CHARS) return incompleteEnvNormalization();
+        const nested = normalizeEnvInvocation(composed, depth + 1, assignments);
+        return { ...nested, envSeen: true };
+      }
+      if (option.takesArgument && !option.attached) {
+        if (++index >= tokens.length) return incompleteEnvNormalization();
+      }
+      index++;
+    }
+    consumeAssignments();
+    if (index >= tokens.length) return { argv: [], assignments, envSeen, complete: true };
+  }
+  return { argv: [], assignments, envSeen, complete: true };
+}
+
+/** The basename of a segment's effective executable, or null when unknowable. */
+export function effectiveHead(segment: string): string | null {
+  const normalized = normalizeEnvInvocation(tokenizeShellWords(segment, { atomicSubstitutions: true }));
+  if (!normalized.complete || normalized.argv.length === 0) return null;
+  const base = normalized.argv[0]!.replace(/^.*\//, "");
+  return base || null;
 }

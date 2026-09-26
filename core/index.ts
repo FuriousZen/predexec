@@ -5,7 +5,7 @@
  * Narrowed to exactly what the runtime harness adapters (pi, opencode, MCP)
  * and their shared helpers (adapter-runtime.ts, policy.ts, stats.ts, steering.ts) import:
  * plan execution, plan coercion, destructive-command checking, and
- * command-segment splitting — plus a regex-escaping helper and the
+ * shell inspection (segment splitting, tokenizing, wrapper stripping) — plus a regex-escaping helper and the
  * plan/result/tool types those functions' signatures require.
  * Focused tests import evaluator, runner, and validation internals directly
  * from their owning files (core/conditions.ts, core/runner.ts,
@@ -14,11 +14,17 @@
 
 export { runPlanTree } from "./engine.ts";
 export { OUTPUT_CAP } from "./runner.ts";
-export { isDestructiveCommand, splitCommandSegments } from "./destructive.ts";
+export { isDestructiveCommand } from "./destructive.ts";
 export { coercePlan } from "./coerce.ts";
 export { escapeRegExp, isSafeRegex } from "./conditions.ts";
 export { validateOperation } from "./validation.ts";
-export { inspectCommandSubstitutionTree } from "../command-inspection.ts";
+export {
+  inspectCommandSubstitutionTree,
+  splitCommandSegments,
+  stripLeadingAssignmentsAndWrappers,
+  tokenizeShellWords,
+  type WrapperInspectionOptions,
+} from "./shell/inspection.ts";
 export {
   MAX_OPERATIONS_PER_NODE,
   MAX_PARALLEL_CONCURRENCY,

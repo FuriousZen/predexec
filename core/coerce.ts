@@ -13,11 +13,12 @@ import {
   MAX_PLAN_EDGES,
   MAX_PLAN_NODES,
   MAX_OPERATIONS_PER_NODE,
+  CONDITION_KINDS,
   type Condition,
   type PlanTree,
 } from "./types.ts";
 
-const VALID_KINDS = "exitCode | fileExists | jsonPath | numeric | match | always";
+const VALID_KINDS = CONDITION_KINDS.join(" | ");
 
 const compilesAsRegex = (s: string): boolean => {
   try {

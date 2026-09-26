@@ -15,18 +15,14 @@ import {
   MAX_GREP_PATTERN_LENGTH,
   MAX_LS_ENTRIES,
   MAX_GREP_CONTEXT,
+  CONDITION_KINDS,
+  TOOL_NAMES,
+  JSON_PATH_SINGLE_OP_MESSAGE,
 } from "./core/types.ts";
 
-export const CONDITION_KINDS = Object.freeze([
-  "exitCode",
-  "fileExists",
-  "jsonPath",
-  "numeric",
-  "match",
-  "always",
-] as const);
+export { CONDITION_KINDS };
 
-export const TOOL_OPERATION_NAMES = Object.freeze(["read", "grep", "find", "ls"] as const);
+export const TOOL_OPERATION_NAMES = TOOL_NAMES;
 
 export const PLAN_FIELD_NAMES = Object.freeze({
   root: "root",
@@ -42,7 +38,7 @@ export const PLAN_FIELD_NAMES = Object.freeze({
   maxDepth: "maxDepth",
 } as const);
 
-export const JSON_PATH_SINGLE_OP_LINE = "jsonPath edges require a one-operation source node.";
+export const JSON_PATH_SINGLE_OP_LINE = JSON_PATH_SINGLE_OP_MESSAGE;
 export const PLAN_CWD_DESCRIPTION =
   "Base dir for commands and fileExists: a relative directory inside the session root; absolute or escaping paths are rejected.";
 export const RESOURCE_LIMIT_DESCRIPTION =

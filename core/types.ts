@@ -64,14 +64,34 @@ export type Condition =
 
 export type ConditionKind = Condition["kind"];
 
-/** Single source of truth for the tier boundary (see Condition doc above). */
-export const HIGH_CONFIDENCE_KINDS: ReadonlySet<ConditionKind> = new Set<ConditionKind>([
+/** Every condition kind, in documentation order. Single source for kind lists. */
+export const CONDITION_KINDS = Object.freeze([
   "exitCode",
   "fileExists",
   "jsonPath",
   "numeric",
+  "match",
   "always",
-]);
+] as const);
+
+// Compile-time proof that CONDITION_KINDS and the Condition union agree.
+type ExactKinds<A, B> = [A] extends [B] ? ([B] extends [A] ? true : never) : never;
+const conditionKindsMatchUnion: ExactKinds<(typeof CONDITION_KINDS)[number], ConditionKind> = true;
+void conditionKindsMatchUnion;
+
+/** The only low-confidence kind: fuzzy regex matching over output. */
+const LOW_CONFIDENCE_KINDS: ReadonlySet<ConditionKind> = new Set<ConditionKind>(["match"]);
+
+/** Single source of truth for the tier boundary (see Condition doc above). */
+export const HIGH_CONFIDENCE_KINDS: ReadonlySet<ConditionKind> = new Set<ConditionKind>(
+  CONDITION_KINDS.filter((kind) => !LOW_CONFIDENCE_KINDS.has(kind)),
+);
+
+/** Native read-only tool operations a plan node may call. */
+export const TOOL_NAMES = Object.freeze(["read", "grep", "find", "ls"] as const);
+
+/** Why a jsonPath edge needs a single-operation source node (engine error and schema prose). */
+export const JSON_PATH_SINGLE_OP_MESSAGE = "jsonPath edges require a one-operation source node.";
 
 export interface PlanTree {
   root: NodeId;
