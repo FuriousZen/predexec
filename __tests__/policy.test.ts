@@ -727,8 +727,11 @@ describe("readOpencodeRuleset — hostMajor 2: agent/mode markdown files", () =>
 
   it("an agent defined ONLY in markdown exists (not the missing-agent deny-all)", () => {
     const ctx = setup();
-    md(ctx.project, ".opencode/agent/review.md", "---\ndescription: Reviews code: carefully\nmode: subagent\n---\nReview.\n");
+    md(ctx.project, ".opencode/agent/review.md", '---\ndescription: "Reviews code: carefully"\nmode: subagent\n---\nReview.\n');
     expect(v2(ctx, "ls", "review")).toBe("allow");
+    // R45: the same colon left unquoted triggers v2's sanitize retry — doubt, so deny-all.
+    md(ctx.project, ".opencode/agent/review.md", "---\ndescription: Reviews code: carefully\nmode: subagent\n---\nReview.\n");
+    expect(v2(ctx, "ls", "review")).toBe("deny");
     md(ctx.project, ".opencode/agents/plain.md", "No frontmatter at all.\n");
     expect(v2(ctx, "ls", "plain")).toBe("allow");
   });
@@ -881,7 +884,7 @@ describe("readOpencodeRuleset — hostMajor 2: R44 agent files are certain or de
     );
     expect(buildVerdict(ctx)).toBe("deny");
     expect(buildVerdict(ctx, "ls")).toBe("allow");
-    md(ctx.project, ".opencode/agent/nat.md", "---\nmodel: {providerID: p, model: m}\nrequest: {headers: {x: y}, body: {k: [1]}}\ncolor: \"#aabbcc\"\nsteps: 2\n---\n");
+    md(ctx.project, ".opencode/agent/nat.md", "---\nmodel: {providerID: p, model: m}\nrequest: {headers: {x: z}, body: {k: [1]}}\ncolor: \"#aabbcc\"\nsteps: 2\n---\n");
     expect(evaluateOperation("ls", readOpencodeRuleset(ctx.project, ctx.env, { hostMajor: 2, agent: "nat" }), { directory: ctx.project, hostMajor: 2 }).action).toBe("allow");
   });
 
@@ -901,5 +904,103 @@ describe("readOpencodeRuleset — hostMajor 2: R44 agent files are certain or de
     expect(verdict).toBe("deny");
     md(ctx.project, ".opencode/agent/build.md", `---\ndescription: x\n---\n${"x".repeat(300 * 1024)}`);
     expect(buildVerdict(ctx, "ls")).toBe("deny");
+  });
+});
+
+// R45 — the accepted YAML subset is an unambiguous core. Every re-review-3
+// repro (scratchpad rr3/adv.mjs) gave allow where opencode v2 denies; each must
+// now come out deny (never allow). Controls: plain legacy/native files apply.
+describe("readOpencodeRuleset — hostMajor 2: R45 agent frontmatter is an unambiguous YAML core", () => {
+  const md = (dir: string, rel: string, text: string) => {
+    mkdirSync(join(dir, rel, ".."), { recursive: true });
+    writeFileSync(join(dir, rel), text);
+  };
+  const buildVerdict = (ctx: ReturnType<typeof setup>, op: Operation = "cat marker.txt") =>
+    evaluateOperation(op, readOpencodeRuleset(ctx.project, ctx.env, { hostMajor: 2, agent: "build" }), { directory: ctx.project, hostMajor: 2 }).action;
+  const F = (y: string) => `---\n${y}\n---\n`;
+
+  it.each([
+    ["A: colon in a top-level description + flow permission (v2 sanitize retry)", F("description: Reviews code: finds bugs\npermission: {bash: allow}")],
+    ["A: unquoted colon in any top-level value", F("model: openrouter/x:free\npermission: {bash: allow}")],
+    ["B: duplicate key in a nested flow map", F('permission: {bash: {"cat *": deny, "cat *": allow}}')],
+    ["B: duplicate key in a flow map", F("permission: {bash: deny, bash: allow}")],
+    ["C: plain value starting with `-`", F("description: - foo\npermission:\n  bash: allow")],
+    ["C: plain value starting with `,`", F("description: , foo\npermission:\n  bash: allow")],
+    ["C: plain value starting with `]`", F("description: ] foo\npermission:\n  bash: allow")],
+    ["D: plain value starting with `?`", F("description: ? foo\npermission:\n  bash: allow")],
+    ["E: control character in a value", F("description: a\x01b\npermission:\n  bash: allow")],
+    ["E: DEL in a value", F("description: a\x7fb\npermission:\n  bash: allow")],
+    ["G: __proto__ key (legacy)", F("foo: 1\n__proto__: {permission: {bash: allow}}")],
+    ["G: __proto__ key (native)", F('__proto__:\n  permissions:\n    - action: bash\n      resource: "*"\n      effect: allow')],
+    ["G: quoted __proto__ key inside permission", F('permission: {"__proto__": {bash: allow}}')],
+    ["G: constructor key", F("constructor: x\npermission: {bash: allow}")],
+    ["plain value with trailing tab", F("description: x\t\npermission: {bash: allow}")],
+    ["quoted key outside a permission map", F('"permission": {bash: allow}')],
+    ["escape sequence in a quoted permission key", F('permission: {bash: {"c\\x61t *": allow}}')],
+    ["plain key with trailing space before the colon", F("permission :\n  bash: allow")],
+    ["YAML 1.1 bool plain value", F("hidden: yes\npermission: {bash: allow}")],
+  ])("global `cat *` deny stands (never allow): %s", (_label, text) => {
+    const ctx = setup();
+    ctx.globalConfig({ permission: { bash: { "cat *": "deny" } } });
+    md(ctx.project, ".opencode/agent/build.md", text);
+    expect(buildVerdict(ctx)).toBe("deny");
+  });
+
+  it.each([
+    ["F: lone CR (js-yaml line break) hides the file's own deny", F('description: x\rpermission: {bash: {"cat *": deny}}')],
+    ["F: lone CR after a colon value", F('description: x: y\rpermission: {bash: {"cat *": deny}}')],
+  ])("a file's own deny is never lost (no global): %s", (_label, text) => {
+    const ctx = setup();
+    md(ctx.project, ".opencode/agent/build.md", text);
+    expect(buildVerdict(ctx)).toBe("deny");
+  });
+
+  it.each([
+    ["float key 1.0", 'permission:\n  bash:\n    "*": deny\n    1.0: allow', "1.0"],
+    ["date key", 'permission:\n  bash:\n    "*": deny\n    2024-01-01: allow', "2024-01-01"],
+    ["exp key 1e3", 'permission:\n  bash:\n    "*": allow\n    1e3: deny', "1000"],
+    ["hex key", 'permission:\n  bash:\n    "*": allow\n    0x10: deny', "16"],
+    ["tilde key", 'permission:\n  bash:\n    "*": allow\n    ~: deny', "null"],
+    ["sexagesimal key", 'permission:\n  bash:\n    "*": allow\n    1:30: deny', "90"],
+    ["underscore key", 'permission:\n  bash:\n    "*": allow\n    1_000: deny', "1000"],
+    ["underscore-leading int key", 'permission:\n  bash:\n    "*": allow\n    _1: deny', "1"],
+    ["YAML 1.1 bool key", 'permission:\n  bash:\n    "*": allow\n    n: deny', "false"],
+    ["flow exp key", 'permission: {bash: {"*": allow, 1e3: deny}}', "1000"],
+  ])("H: plain keys js-yaml types as non-strings ⇒ deny-all: %s", (_label, yaml, op) => {
+    const ctx = setup();
+    md(ctx.project, ".opencode/agent/build.md", F(yaml));
+    expect(buildVerdict(ctx, op)).toBe("deny");
+    expect(buildVerdict(ctx, "ls")).toBe("deny");
+  });
+
+  it.each([
+    ["octal-leading-0 steps", "steps: 010"],
+    ["hex steps", "steps: 0x10"],
+    ["exp temperature", "temperature: 1e-1"],
+    ["inf temperature", "temperature: .inf"],
+    ["null description", "description: ~"],
+    ["timestamp description", "description: 2024-01-01"],
+    ["numeric description", "description: 5"],
+  ])("H: plain values js-yaml types differently ⇒ deny-all: %s", (_label, line) => {
+    const ctx = setup();
+    ctx.globalConfig({ permission: { bash: { "cat *": "deny" } } });
+    md(ctx.project, ".opencode/agent/build.md", F(`${line}\npermission: {bash: allow}`));
+    expect(buildVerdict(ctx)).toBe("deny");
+    expect(buildVerdict(ctx, "ls")).toBe("deny");
+  });
+
+  it("controls: plain legacy and native files still apply", () => {
+    const ctx = setup();
+    ctx.globalConfig({ permission: { bash: { "cat *": "deny" } } });
+    md(
+      ctx.project,
+      ".opencode/agent/build.md",
+      F('description: Reviews code and finds bugs # trailing comment\nmodel: "openrouter/x:free"\ntemperature: 0.2\nsteps: 10\nhidden: false\npermission:\n  bash:\n    "cat *": allow\n    ls: deny\n  edit: deny'),
+    );
+    expect(buildVerdict(ctx)).toBe("allow");
+    expect(buildVerdict(ctx, "ls")).toBe("deny");
+    md(ctx.project, ".opencode/agent/nat.md", F('description: Native\nsteps: 2\npermissions:\n  - action: shell\n    resource: "cat *"\n    effect: deny'));
+    expect(evaluateOperation("cat x", readOpencodeRuleset(ctx.project, ctx.env, { hostMajor: 2, agent: "nat" }), { directory: ctx.project, hostMajor: 2 }).action).toBe("deny");
+    expect(evaluateOperation("ls", readOpencodeRuleset(ctx.project, ctx.env, { hostMajor: 2, agent: "nat" }), { directory: ctx.project, hostMajor: 2 }).action).toBe("allow");
   });
 });
