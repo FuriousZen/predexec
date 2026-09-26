@@ -28,6 +28,7 @@ import {
   extractShellCommandClauses,
   hasAnsiCEscapedQuote,
   inspectCommandSubstitutions,
+  isAppendAssignment,
   inspectCommandSubstitutionTree,
   inspectShellCommandClauses,
   lexShellWords,
@@ -674,7 +675,7 @@ const READ_ONLY_HEAD_WRITES: Record<string, ReadOnlyHeadWriteCheck> = {
   less: (args, { assignments }) => {
     for (const assignment of assignments) {
       const [, name, value] = ENV_ASSIGNMENT_RE.exec(assignment) ?? [];
-      if (name !== undefined && lessEnvironmentWrite(name, value)) return name;
+      if (name !== undefined && lessEnvironmentWrite(name, isAppendAssignment(assignment) ? undefined : value)) return name;
     }
     return lessArgvWrite(args);
   },
@@ -2930,14 +2931,17 @@ function commandBearingEnvironmentSetting(segment: string): string | null {
   const normalized = normalizeEnvInvocation(tokenizeShellWords(segment, ARGV));
   if (!normalized.complete) return null;
   let settings: readonly string[];
+  // Assignments (`NAME=v`, `NAME+=v`, `NAME[i]=v`) name the bare variable;
+  // an append leaves the final value unknown. A bare operand (`export NAME`,
+  // `declare -x NAME[0]`) sets an unknown value.
   if (normalized.argv.length === 0) settings = normalized.assignments;
   else if (DECLARATION_HEADS.has(normalized.argv[0]!.replace(/^.*\//, ""))) {
     settings = normalized.argv.slice(1).filter((operand) => !/^[-+]/.test(operand));
   } else return null;
   for (const setting of settings) {
-    const equals = setting.indexOf("=");
-    const name = equals < 0 ? setting : setting.slice(0, equals);
-    const value = equals < 0 ? undefined : setting.slice(equals + 1);
+    const assignment = ENV_ASSIGNMENT_RE.exec(setting);
+    const name = assignment ? assignment[1]! : setting.replace(/\[.*$/s, "");
+    const value = assignment && !isAppendAssignment(setting) ? assignment[2] : undefined;
     if (commandBearingEnvironment(name, value)) return name;
   }
   return null;

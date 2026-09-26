@@ -25,7 +25,11 @@ export interface WrapperInspectionOptions {
   durationPattern?: RegExp;
 }
 
-const TOKEN_ASSIGNMENT_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*=/;
+/**
+ * A shell variable assignment word: `NAME=`, `NAME+=` (append) and
+ * `NAME[subscript]=` / `NAME[subscript]+=` (array element) all assign.
+ */
+const TOKEN_ASSIGNMENT_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*(?:\[[^\]]*\])?\+?=/;
 
 /**
  * Defaults for callers that pass no host vocabulary, derived from core's
@@ -1532,7 +1536,7 @@ export function parenthesizedBodies(command: string): string[] {
  * `env` falls through to the word scan, which is the safe direction.
  */
 export const WRAPPERS: ReadonlySet<string> = new Set([
-  "time", "nice", "nohup", "command", "xargs", "env", "timeout", "stdbuf", "noglob",
+  "time", "nice", "nohup", "command", "builtin", "xargs", "env", "timeout", "stdbuf", "noglob",
 ]);
 
 /** Wrappers that take one positional argument (a duration) before the command. */
@@ -1548,6 +1552,7 @@ export const WRAPPER_OPTIONS_WITH_VALUE: Readonly<Record<string, ReadonlySet<str
     "--max-lines", "--max-procs", "--max-chars", "--arg-file",
   ]),
   command: new Set(),
+  builtin: new Set(),
   time: new Set(["-f", "--format", "-o", "--output"]),
   nohup: new Set(),
   timeout: new Set(["-s", "--signal", "-k", "--kill-after"]),
@@ -1626,7 +1631,18 @@ export function envOption(token: string): EnvOption {
   return { takesArgument: false, attached: false, known: true };
 }
 
-export const ENV_ASSIGNMENT_RE = /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/s;
+/**
+ * An assignment word, with the same grammar as TOKEN_ASSIGNMENT_PATTERN.
+ * Groups: 1 the bare variable name (subscript and `+` stripped), 2 the value.
+ * Use `isAppendAssignment` to tell `NAME+=v` (value appended to an unknown
+ * current value) from `NAME=v`.
+ */
+export const ENV_ASSIGNMENT_RE = /^([A-Za-z_][A-Za-z0-9_]*)(?:\[[^\]]*\])?\+?=(.*)$/s;
+
+/** True for `NAME+=...` / `NAME[i]+=...`: the resulting value is not just the text given. */
+export function isAppendAssignment(token: string): boolean {
+  return /^[A-Za-z_][A-Za-z0-9_]*(?:\[[^\]]*\])?\+=/.test(token);
+}
 
 export interface EnvInvocationNormalization {
   argv: string[];
@@ -1688,7 +1704,13 @@ export function normalizeEnvInvocation(tokens: readonly string[], depth = 0, inh
   while (index < tokens.length) {
     const base = tokens[index]!.replace(/^.*\//, "");
     if (base !== "env") {
-      if (tokens[index]!.includes("=") && !/[;|&(){}[\]]/.test(tokens[index]!)) return incompleteEnvNormalization();
+      // An `=` in the head position that is not an assignment (those were
+      // consumed above) leaves the command unknowable. Only the text before
+      // the `=` decides: a value may hold any character (`X+='|x'`), while
+      // shell syntax in the name part (`(a=b`) is not an assignment at all.
+      const head = tokens[index]!;
+      const equals = head.indexOf("=");
+      if (equals !== -1 && !/[;|&(){}]/.test(head.slice(0, equals))) return incompleteEnvNormalization();
       if (!WRAPPERS.has(base)) return { argv: tokens.slice(index), assignments, envSeen, complete: true };
       index++;
       if (!consumeWrapperOptions(base)) return incompleteEnvNormalization();

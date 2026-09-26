@@ -1724,6 +1724,20 @@ describe("shell-lexer must-fix (task 5)", () => {
     "LESSKEYIN=k; export LESSKEYIN; less f",
     "if true; then export LESS='+!x'; fi; less f",
     "export GIT_PAGER='sh -c x'; git log",
+    // Review round 1: append/subscript assignment grammar and `builtin`.
+    "export LESSOPEN+='|x'; less f",
+    "declare -x LESSOPEN+='|x'; less f",
+    "typeset -x LESSOPEN+='|x'; less f",
+    "export NODE_OPTIONS+=' --require=x'; node -e 1",
+    "export GIT_PAGER+='sh -c x'; git log",
+    "LESSOPEN+='|x'; less f",
+    "LESSOPEN[0]='|x'; less f",
+    "export LESSOPEN[0]='|x'; less f",
+    "builtin export LESSOPEN='|x'; less f",
+    "command export LESSOPEN='|x'; less f",
+    "LESSOPEN+='|x' less f",
+    "LESSOPEN[0]='|x' less f",
+    "NODE_OPTIONS+=' --require=x' node -e 1",
   ])("dangerous environment set in an earlier segment is mutating: %s", (command) => {
     expect(isDestructiveCommand(command)).toBe(true);
   });

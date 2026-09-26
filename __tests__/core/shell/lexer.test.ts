@@ -65,3 +65,15 @@ describe("merged-lexer disagreements", () => {
     expect(isDestructiveCommand('echo \\"; touch X; echo \\"')).toBe(true);
   });
 });
+
+describe("assignment grammar (review round 1)", () => {
+  it("treats append and subscript assignments as assignments", () => {
+    expect(stripLeadingAssignmentsAndWrappers(tokenizeShellWords("X+=1 A[0]=2 B[k]+=3 git push"))).toEqual(["git", "push"]);
+    expect(effectiveHead("LESSOPEN+='|x' less f")).toBe("less");
+  });
+
+  it("resolves through builtin as a wrapper", () => {
+    expect(WRAPPERS.has("builtin")).toBe(true);
+    expect(effectiveHead("builtin export X=1")).toBe("export");
+  });
+});
