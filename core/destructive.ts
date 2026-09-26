@@ -21,14 +21,17 @@
  */
 
 import {
+  blankQuotedAngles,
   effectiveHead,
   ENV_ASSIGNMENT_RE,
   envOption,
   extractShellCommandClauses,
+  hasAnsiCEscapedQuote,
   inspectCommandSubstitutions,
   inspectCommandSubstitutionTree,
   inspectShellCommandClauses,
   lexShellWords,
+  longestWordLength,
   maskHeredocBodies,
   normalizeEnvInvocation,
   parenthesizedBodies,
@@ -41,7 +44,7 @@ import {
   WRAPPERS_WITH_DURATION,
   type TokenizeOptions,
 } from "./shell/lexer.ts";
-import { TOOL_NAMES } from "./types.ts";
+import { MAX_CLASSIFY_WORD_LENGTH, MAX_COMMAND_LENGTH, TOOL_NAMES } from "./types.ts";
 
 /** Argv inspection keeps each `$(...)`/backtick substitution in one word. */
 const ARGV: TokenizeOptions = { atomicSubstitutions: true };
@@ -64,9 +67,10 @@ export const MUTATING_TOOLS = new Set(["edit", "write"]);
  */
 function sanitizeForRedirect(cmd: string): string {
   const dropAngles = (s: string) => s.replace(/[<>]/g, " ");
-  return maskHeredocBodies(cmd)
-    .replace(/'[^']*'/g, dropAngles)
-    .replace(/"[^"]*"/g, dropAngles)
+  // Quoted spans come from the backslash-aware lexer walker, not a
+  // `'[^']*'` regex: an escaped quote (`echo \' > out \'`) opens no span, so
+  // the redirect between two of them stays visible.
+  return blankQuotedAngles(maskHeredocBodies(cmd))
     .replace(/\[\[[\s\S]*?\]\]/g, dropAngles)
     .replace(/\(\([\s\S]*?\)\)/g, dropAngles);
 }
@@ -529,6 +533,20 @@ const awkWrite: ReadOnlyHeadWriteCheck = (args) => {
   return program === undefined ? null : awkProgramWrite(program);
 };
 
+/**
+ * Whether setting `name` (to `value`, or to an unknown value) makes `less`
+ * run a command or write: LESSOPEN/LESSCLOSE are input preprocessors, lesskey
+ * sources can set them, and $LESS holds options parsed like argv.
+ */
+function lessEnvironmentWrite(name: string, value: string | undefined): boolean {
+  if (name === "LESSOPEN" || name === "LESSCLOSE" || name.startsWith("LESSKEY")) return true;
+  if (name !== "LESS") return false;
+  if (value === undefined) return true;
+  // $LESS options may omit the leading dash (`LESS=FRX`).
+  const words = value.split(/\s+/).filter(Boolean).map((word) => /^[-+]/.test(word) ? word : `-${word}`);
+  return lessArgvWrite(words) !== null;
+}
+
 /** xxd options whose value is the next argv item (by xxd's first-letter dispatch). */
 const XXD_VALUE_SPELLINGS = new Set(["-cols", "-groupsize", "-len", "-name", "-seek", "-offset"]);
 
@@ -623,8 +641,9 @@ const READ_ONLY_HEAD_WRITES: Record<string, ReadOnlyHeadWriteCheck> = {
         let j = i + 1;
         for (; j < args.length; j++) {
           const word = args[j]!;
-          // A trailing lone `\` is what is left of `\;` once the segment
-          // splitter (which ignores escapes) has cut at the `;`.
+          // A trailing lone `\` is a `\;` cut at the `;` by a splitter that
+          // ignored escapes. splitCommandSegments honors them now (CORE-7), so
+          // this should not trigger; it stays as the fail-closed guard (R11a).
           if (word === "\\" && j === args.length - 1) {
             const tail = followingText === null ? null : /^;[ \t]*(?:$|[|&;\n\r])/.exec(followingText);
             if (tail === null) return `find ${arg} \\;`;
@@ -655,12 +674,7 @@ const READ_ONLY_HEAD_WRITES: Record<string, ReadOnlyHeadWriteCheck> = {
   less: (args, { assignments }) => {
     for (const assignment of assignments) {
       const [, name, value] = ENV_ASSIGNMENT_RE.exec(assignment) ?? [];
-      if (name === "LESSOPEN" || name === "LESSCLOSE" || name?.startsWith("LESSKEY")) return name;
-      if (name === "LESS") {
-        // $LESS options may omit the leading dash (`LESS=FRX`).
-        const words = value!.split(/\s+/).filter(Boolean).map((word) => /^[-+]/.test(word) ? word : `-${word}`);
-        if (lessArgvWrite(words)) return "LESS";
-      }
+      if (name !== undefined && lessEnvironmentWrite(name, value)) return name;
     }
     return lessArgvWrite(args);
   },
@@ -2892,6 +2906,43 @@ function timeOutputOption(segment: string): string | null {
  */
 const PRIVILEGE_HEADS = new Set(["sudo", "doas", "pkexec"]);
 
+/** Shell builtins whose operands set (and may export) variables. */
+const DECLARATION_HEADS = new Set(["export", "declare", "typeset", "readonly", "local"]);
+
+/** Every interpreter preload variable, whichever interpreter reads it. */
+const PRELOAD_ENV_NAMES: ReadonlySet<string> = new Set(
+  Object.values(INTERPRETER_PRELOAD_ENV).flatMap((names) => [...names]),
+);
+
+/** Whether a variable, set to `value` (undefined: unknown), can make a later command run code. */
+function commandBearingEnvironment(name: string, value: string | undefined): boolean {
+  if (lessEnvironmentWrite(name, value)) return true;
+  if (PRELOAD_ENV_NAMES.has(name)) return true;
+  return gitEnvironmentPrefixMutation([`${name}=`]) !== null;
+}
+
+/**
+ * The command-bearing variable a segment sets, if any: a bare assignment
+ * segment (`LESSOPEN=x`) or a declaration builtin operand (`export X=1`,
+ * `declare -x X`, `export X`). Options (`-x`, `+x`, `--`) are skipped.
+ */
+function commandBearingEnvironmentSetting(segment: string): string | null {
+  const normalized = normalizeEnvInvocation(tokenizeShellWords(segment, ARGV));
+  if (!normalized.complete) return null;
+  let settings: readonly string[];
+  if (normalized.argv.length === 0) settings = normalized.assignments;
+  else if (DECLARATION_HEADS.has(normalized.argv[0]!.replace(/^.*\//, ""))) {
+    settings = normalized.argv.slice(1).filter((operand) => !/^[-+]/.test(operand));
+  } else return null;
+  for (const setting of settings) {
+    const equals = setting.indexOf("=");
+    const name = equals < 0 ? setting : setting.slice(0, equals);
+    const value = equals < 0 ? undefined : setting.slice(equals + 1);
+    if (commandBearingEnvironment(name, value)) return name;
+  }
+  return null;
+}
+
 /**
  * Inspect only the prefix that launches Git. Assignment-looking text in Git
  * arguments (especially after `--`) is data and must not trigger this check.
@@ -3205,6 +3256,9 @@ function findDestructiveTokenInternal(cmd: string, depth: number): string | null
   // core classifier and host policy adapters. Incomplete or over-budget shell
   // syntax is never allowed to fall through to the safe tier.
   if (!inspectCommandSubstitutionTree(shellCommand).complete) return "complex shell syntax";
+  // Only the tokenizer decodes `$'...'`; the other quote walkers would end an
+  // ANSI-C string at an escaped `\'` and misplace every later quote.
+  if (hasAnsiCEscapedQuote(shellCommand)) return "complex shell syntax";
   const sanitized = sanitizeForRedirect(shellCommand);
 
   const redirect = REDIRECT_RE.exec(sanitized);
@@ -3280,6 +3334,16 @@ function findDestructiveTokenInternal(cmd: string, depth: number): string | null
     if (head && SHELL_COMMAND_CONTROL_HEADS.has(head)) return head;
   }
 
+  // An environment variable that makes a later reader run a command
+  // (LESSOPEN, NODE_OPTIONS, GIT_PAGER, ...) is as dangerous set by an earlier
+  // segment (`export LESSOPEN=...; less f`) as by a command prefix, which the
+  // per-head checks already see. Any segment that sets or exports one is a
+  // mutation of the environment the rest of the command runs in.
+  for (const segment of segments) {
+    const name = commandBearingEnvironmentSetting(stripShellControlPrefix(segment));
+    if (name) return name;
+  }
+
   // Read-only heads skip the word scan, so each one's own write/exec forms
   // (`sed -n 'w F'`, `sort --output=F`, awk `print | "sh"`, `find -okdir rm`)
   // are decided here from its argv, before the safe tier can wave it through.
@@ -3352,6 +3416,20 @@ function findDestructiveTokenInternal(cmd: string, depth: number): string | null
   const word = WORD_RE.exec(sanitizeForRedirect(wordScanText));
   if (word) return word[0].trim();
 
+  // The scan above reads source spelling, so a writer spelled through shell
+  // quoting (`r\m`, `'r'm`, `$'\x72\x6d'`, a line continuation) is invisible
+  // to it. Rescan each segment's unquoted argv; interpreter and shell program
+  // text stays with the language scanners below.
+  const argvText = wordScanSegments.map((segment) => {
+    const normalized = normalizeEnvInvocation(tokenizeShellWords(stripShellControlPrefix(segment), ARGV));
+    if (!normalized.complete || normalized.argv.length === 0) return "";
+    const head = normalized.argv[0]!.replace(/^.*\//, "");
+    if (EVAL_INTERPRETERS.has(head) || EVAL_SHELLS.has(head)) return head;
+    return [head, ...normalized.argv.slice(1)].join(" ");
+  }).join(" | ");
+  const argvWord = WORD_RE.exec(argvText);
+  if (argvWord) return argvWord[0].trim();
+
   // Interpreter eval payloads: scan the RAW segment — writer APIs live inside
   // the quotes the sanitizer deliberately preserves words in.
   for (let i = 0; i < segments.length; i++) {
@@ -3396,7 +3474,14 @@ function findDestructiveTokenInternal(cmd: string, depth: number): string | null
   return null;
 }
 
+/**
+ * The classifier's public entry. Input past MAX_COMMAND_LENGTH, or with one
+ * whitespace-free run past MAX_CLASSIFY_WORD_LENGTH, is mutating without a
+ * scan: the evaluator must terminate promptly on any input.
+ */
 export function findDestructiveToken(cmd: string): string | null {
+  if (cmd.length > MAX_COMMAND_LENGTH) return "oversized command";
+  if (longestWordLength(cmd) > MAX_CLASSIFY_WORD_LENGTH) return "oversized shell word";
   return findDestructiveTokenInternal(cmd, 0);
 }
 

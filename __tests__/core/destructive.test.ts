@@ -5,7 +5,8 @@ import {
   isDestructiveCommand,
   LANGUAGE_CALL_CANDIDATE_BUDGET,
 } from "../../core/destructive.ts";
-import { effectiveHead, splitCommandSegments } from "../../core/shell/lexer.ts";
+import { effectiveHead, splitCommandSegments, tokenizeShellWords } from "../../core/shell/lexer.ts";
+import { MAX_CLASSIFY_WORD_LENGTH } from "../../core/types.ts";
 
 describe("isDestructiveCommand — heuristic coverage (2026-07 audit)", () => {
   // Writers the audit found the blocklist missing. Every one must be caught.
@@ -447,7 +448,8 @@ describe("interpreter eval — fs-writer APIs are caught", () => {
     `php -r "fopen('in', 'r');"`,
     `php -r "FOPEN('in', 'rb');"`,
     `ruby -e "puts 'File.write(\'out\', \'x\')' # FileUtils.rm_rf(\'d\')"`,
-    `perl -e "print '# open FH, \">\", \\"out\\"'; # unlink('out')"`,
+    // Shell-escaped `\">\"`: the whole program is one double-quoted word.
+    `perl -e "print '# open FH, \\">\\", \\"out\\"'; # unlink('out')"`,
     `php -r "echo 'file_put_contents(\'out\', \'x\')'; // unlink('out');"`,
   ];
   it.each(extendedLanguageReaders)("allows extended interpreter read/data %s", (cmd) => {
@@ -1683,4 +1685,106 @@ describe("wrapper parity and allowlist-based interpreter eval (CORE-4/5)", () =>
     "perl -lne 'print length' f",
     "ruby -ryaml -e 'puts 1'",
   ])("review-read-only: %s", (c) => expect(isDestructiveCommand(c)).toBe(false));
+});
+
+// Task 5 must-fix: termination on long words, cross-segment environment
+// escapes, ANSI-C quoting, and heads or redirects hidden by shell escapes.
+describe("shell-lexer must-fix (task 5)", () => {
+  it("classifies a 4000-character clustered switch word within 1s", () => {
+    const started = performance.now();
+    isDestructiveCommand("python3 -" + "I".repeat(4000) + "c 'print(1)'");
+    expect(performance.now() - started).toBeLessThan(1000);
+  });
+
+  it("stays fast on other long identifier-shaped words", () => {
+    for (const command of [
+      "echo " + "a".repeat(8000) + "()",
+      "echo " + "function ".repeat(1000),
+      "cat " + "x_".repeat(4000),
+    ]) {
+      const started = performance.now();
+      findDestructiveToken(command);
+      expect(performance.now() - started, command.slice(0, 20)).toBeLessThan(1000);
+    }
+  });
+
+  it("fails closed on a word longer than MAX_CLASSIFY_WORD_LENGTH", () => {
+    expect(findDestructiveToken("cat " + "a".repeat(MAX_CLASSIFY_WORD_LENGTH + 1))).toBe("oversized shell word");
+    expect(findDestructiveToken("cat " + "a".repeat(MAX_CLASSIFY_WORD_LENGTH))).toBe(null);
+  });
+
+  it.each([
+    "export LESSOPEN='|x'; less f",
+    "LESSOPEN='|x'; export LESSOPEN; less f",
+    "export NODE_OPTIONS=--require=x; node -e 1",
+    "declare -x LESSOPEN='|x'; less f",
+    "typeset -x PERL5OPT=-Mx; perl -e 1",
+    "export -- PYTHONSTARTUP=x.py && python3 -c 1",
+    "readonly RUBYOPT=-rx; export RUBYOPT; ruby -e 1",
+    "LESSKEYIN=k; export LESSKEYIN; less f",
+    "if true; then export LESS='+!x'; fi; less f",
+    "export GIT_PAGER='sh -c x'; git log",
+  ])("dangerous environment set in an earlier segment is mutating: %s", (command) => {
+    expect(isDestructiveCommand(command)).toBe(true);
+  });
+
+  it.each([
+    "export PAGER_WIDTH=80; less f",
+    "FOO=1; echo $FOO",
+    "export PATH=\"$PATH:/x\"; ls",
+  ])("ordinary environment assignments stay read-only: %s", (command) => {
+    expect(isDestructiveCommand(command)).toBe(false);
+  });
+
+  it.each([
+    String.raw`$'\x72\x6d' -rf x`,
+    String.raw`$'\162\155' -rf x`,
+    "$'" + "\\" + "u0072m' -rf x",
+    String.raw`git $'\x70ush'`,
+    String.raw`sh -c $'rm\tx'`,
+    String.raw`r\m -rf x`,
+    `'r'm -rf x`,
+    `"r"m -rf x`,
+    "r\\\nm -rf x",
+    String.raw`n\pm install x`,
+  ])("a head or argument hidden by shell quoting is still seen: %s", (command) => {
+    expect(isDestructiveCommand(command)).toBe(true);
+  });
+
+  it("decodes ANSI-C quoting in the tokenizer", () => {
+    const unicode = "\\" + "u00e9"; // shell source text: backslash, u, 00e9
+    expect(tokenizeShellWords(String.raw`$'\x72\x6d' $'a\nb' $'\'' $'\\' $'\101` + unicode + String.raw`\t'`)).toEqual([
+      "rm", "a\nb", "'", "\\", "A" + String.fromCharCode(0xe9) + "\t",
+    ]);
+  });
+
+  it("treats backslash-newline as a line continuation in the tokenizer", () => {
+    expect(tokenizeShellWords("r\\\nm -rf \\\n x")).toEqual(["rm", "-rf", "x"]);
+  });
+
+  it("fails closed on an ANSI-C string containing an escaped quote", () => {
+    // Every quote-state walker except the tokenizer would read `\'` as closing it.
+    expect(isDestructiveCommand(String.raw`echo $'\'' ; rm x ; echo $'\''`)).toBe(true);
+    expect(isDestructiveCommand(String.raw`echo $'a\'b'`)).toBe(true);
+  });
+
+  it("a quote pair spanning two double-quoted words does not hide the redirect between them", () => {
+    // Formerly an extendedLanguageReaders entry: the JS template dropped its
+    // backslashes, so the shell sees `"print '# open FH, " > ", \"out\"'; ..."`
+    // and bash creates a file. The old `'[^']*'` sanitizer blanked that `>`.
+    expect(findDestructiveToken(`perl -e "print '# open FH, ">", \\"out\\"'; # unlink('out')"`)).toBe(">");
+  });
+
+  it("an escaped quote does not hide a redirect", () => {
+    expect(findDestructiveToken(String.raw`echo \' > out \'`)).toBe(">");
+    expect(findDestructiveToken(String.raw`echo \" > out \"`)).toBe(">");
+  });
+
+  it.each([
+    `echo "a > b"`,
+    `awk '$1 > 2' f`,
+    `echo $'a > b'`,
+  ])("a quoted comparison is still not a redirect: %s", (command) => {
+    expect(isDestructiveCommand(command)).toBe(false);
+  });
 });

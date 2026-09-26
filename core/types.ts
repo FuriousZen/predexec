@@ -207,6 +207,13 @@ export const MAX_PLAN_NODES = 256;
 export const MAX_PLAN_EDGES = 1024;
 /** Maximum length of any shell command or tool string argument. */
 export const MAX_COMMAND_LENGTH = 64 * 1024;
+/**
+ * Longest whitespace-free run the destructive-command classifier will scan.
+ * Longer input is classified mutating ("oversized shell word") without
+ * scanning: a backstop that keeps the evaluator total even if some lexer path
+ * turns out super-linear on one long word.
+ */
+export const MAX_CLASSIFY_WORD_LENGTH = 32 * 1024;
 /** Maximum length of a node/edge identifier. */
 export const MAX_NODE_ID_LENGTH = 256;
 /** Maximum length of one model-authored condition string or payload. */

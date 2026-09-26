@@ -344,8 +344,10 @@ export interface TokenizeOptions {
  * The one shell tokenizer. Removes quoting the way the shell does: single
  * quotes are literal; inside double quotes a backslash escapes only `$`,
  * backtick, `"`, `\` and newline (elsewhere it stays in the word); unquoted, a
- * backslash escapes any next character. A quoted empty string is a word. A
- * trailing lone backslash is kept in the value and marks the lex incomplete.
+ * backslash escapes any next character; backslash-newline is a line
+ * continuation and vanishes; `$'...'` ANSI-C strings are decoded (`$'\x72m'`
+ * is `rm`). A quoted empty string is a word. A trailing lone backslash is kept
+ * in the value and marks the lex incomplete.
  *
  * Linear in the input length: one pass, no regex over the remainder.
  */
@@ -374,6 +376,10 @@ export function lexShellWords(text: string, options: TokenizeOptions = {}): Shel
       continue;
     }
     if (ch === "\\") {
+      if (text[i + 1] === "\n") {
+        i++;
+        continue;
+      }
       if (start === -1) start = i;
       if (i + 1 >= text.length) {
         value += "\\";
@@ -390,6 +396,24 @@ export function lexShellWords(text: string, options: TokenizeOptions = {}): Shel
       else {
         value += ch;
         if (ch === "$" || ch === "`") dynamic = true;
+      }
+      continue;
+    }
+    if (ch === "$" && (text[i + 1] === "'" || text[i + 1] === '"') && substitutionDepth === 0 && !backtick) {
+      if (start === -1) start = i;
+      if (text[i + 1] === '"') {
+        // `$"..."` is a locale-translated double-quoted string.
+        quote = '"';
+        i++;
+        continue;
+      }
+      const decoded = decodeAnsiCString(text, i + 2);
+      value += decoded.value;
+      if (decoded.close === -1) {
+        complete = false;
+        i = text.length;
+      } else {
+        i = decoded.close;
       }
       continue;
     }
@@ -432,6 +456,151 @@ export function lexShellWords(text: string, options: TokenizeOptions = {}): Shel
   if (quote !== null) complete = false;
   push(text.length);
   return { words, complete };
+}
+
+const ANSI_C_SIMPLE_ESCAPES: Readonly<Record<string, string>> = {
+  a: "\x07", b: "\b", e: "\x1b", E: "\x1b", f: "\f", n: "\n", r: "\r", t: "\t", v: "\v",
+  "\\": "\\", "'": "'", '"': '"', "?": "?",
+};
+
+/**
+ * Decode the body of a `$'...'` string starting at `from` (just past the
+ * opening quote). Returns the decoded text and the index of the closing quote,
+ * or -1 when it is unterminated. Unknown escapes keep their backslash, as bash
+ * does.
+ */
+function decodeAnsiCString(text: string, from: number): { value: string; close: number } {
+  let value = "";
+  for (let i = from; i < text.length; i++) {
+    const ch = text[i]!;
+    if (ch === "'") return { value, close: i };
+    if (ch !== "\\" || i + 1 >= text.length) {
+      value += ch;
+      continue;
+    }
+    const next = text[i + 1]!;
+    const simple = ANSI_C_SIMPLE_ESCAPES[next];
+    if (simple !== undefined) {
+      value += simple;
+      i++;
+      continue;
+    }
+    const numeric = /^(?:[0-7]{1,3}|x[0-9A-Fa-f]{1,2}|u[0-9A-Fa-f]{1,4}|U[0-9A-Fa-f]{1,8})/.exec(text.slice(i + 1, i + 10));
+    if (numeric) {
+      const digits = numeric[0];
+      const code = /^[0-7]/.test(digits) ? parseInt(digits, 8) : parseInt(digits.slice(1), 16);
+      value += code <= 0x10ffff ? String.fromCodePoint(code) : "";
+      i += digits.length;
+      continue;
+    }
+    if (next === "c" && i + 2 < text.length) {
+      value += String.fromCharCode(text.charCodeAt(i + 2) & 0x1f);
+      i += 2;
+      continue;
+    }
+    value += "\\" + next;
+    i++;
+  }
+  return { value, close: -1 };
+}
+
+/**
+ * True when a `$'...'` string contains an escaped quote (`$'it\'s'`). The
+ * tokenizer decodes it correctly, but every quote-state walker that treats
+ * `$'...'` as a plain single-quoted span would see the `\'` close it and
+ * disagree about where the quote ends, so classifiers fail closed on it.
+ */
+export function hasAnsiCEscapedQuote(text: string): boolean {
+  let quote: "'" | '"' | "$'" | null = null;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i]!;
+    if (quote === "'") {
+      if (ch === "'") quote = null;
+      continue;
+    }
+    if (quote === "$'") {
+      if (ch === "\\") {
+        if (text[i + 1] === "'") return true;
+        i++;
+      } else if (ch === "'") quote = null;
+      continue;
+    }
+    if (ch === "\\") {
+      i++;
+      continue;
+    }
+    if (quote === '"') {
+      if (ch === '"') quote = null;
+      continue;
+    }
+    if (ch === "$" && text[i + 1] === "'") {
+      quote = "$'";
+      i++;
+      continue;
+    }
+    if (ch === "'" || ch === '"') quote = ch;
+  }
+  return false;
+}
+
+/**
+ * Blank every `<` and `>` inside a quoted span (single, double or `$'...'`),
+ * leaving all other text in place. Backslash escapes are honored, so `\'`
+ * opens no span; an escaped angle outside quotes is kept (conservatively still
+ * a redirect candidate).
+ */
+export function blankQuotedAngles(text: string): string {
+  const blank = (c: string | undefined) => (c === "<" || c === ">" ? " " : c ?? "");
+  let out = "";
+  let quote: "'" | '"' | "$'" | null = null;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i]!;
+    if (quote === "'") {
+      if (ch === "'") quote = null;
+      out += blank(ch);
+      continue;
+    }
+    if (quote === "$'") {
+      if (ch === "\\") {
+        out += ch + blank(text[i + 1]);
+        i++;
+        continue;
+      }
+      if (ch === "'") quote = null;
+      out += blank(ch);
+      continue;
+    }
+    if (ch === "\\") {
+      out += ch + (quote === '"' ? blank(text[i + 1]) : text[i + 1] ?? "");
+      i++;
+      continue;
+    }
+    if (quote === '"') {
+      if (ch === '"') quote = null;
+      out += blank(ch);
+      continue;
+    }
+    if (ch === "$" && text[i + 1] === "'") {
+      quote = "$'";
+      out += "$'";
+      i++;
+      continue;
+    }
+    if (ch === "'" || ch === '"') quote = ch;
+    out += ch;
+  }
+  return out;
+}
+
+/** Length of the longest run of non-whitespace characters. */
+export function longestWordLength(text: string): number {
+  let longest = 0;
+  let run = 0;
+  for (let i = 0; i < text.length; i++) {
+    if (/\s/.test(text[i]!)) run = 0;
+    else if (++run > longest) longest = run;
+  }
+  return longest;
 }
 
 /** Tokenize one shell segment into argv-like words, removing shell quoting. */
@@ -578,33 +747,40 @@ function inspectFunctionDefinitions(segment: string): { bodies: ShellClauseEvent
       continue;
     }
 
+    // A function name starts at the first name character of an identifier
+    // run: every later start in the same run reaches the same `()` (or none),
+    // so re-matching there is only quadratic work on long words. Heads are
+    // matched sticky at `i`, never by searching the rest of the segment.
+    if (!isNameStart(segment, i)) continue;
     let braceStart = -1;
-    const namedHead = /[A-Za-z_][A-Za-z0-9_]*\s*\(\s*\)/.exec(segment.slice(i));
-    if (namedHead && namedHead.index === 0 && functionPrefixAllowed(segment, i)) {
-      const afterHead = segment.slice(i + namedHead[0].length).trimStart();
-      if (!afterHead.startsWith("{")) {
+    NAMED_FUNCTION_HEAD.lastIndex = i;
+    const namedHead = NAMED_FUNCTION_HEAD.exec(segment);
+    if (namedHead && functionPrefixAllowed(segment, i)) {
+      braceStart = findFunctionBrace(segment, i + namedHead[0].length);
+      if (braceStart === -1) {
         complete = false;
         i += namedHead[0].length - 1;
         continue;
       }
-      braceStart = findFunctionBrace(segment, i + namedHead[0].length);
     } else {
-      const documentedHead = /function\s+[A-Za-z_][A-Za-z0-9_]*(?:\s*\(\s*\))?/.exec(segment.slice(i));
-      if (documentedHead && documentedHead.index === 0 && functionPrefixAllowed(segment, i)) {
-        const afterHead = segment.slice(i + documentedHead[0].length).trimStart();
-        if (!afterHead.startsWith("{")) {
+      DOCUMENTED_FUNCTION_HEAD.lastIndex = i;
+      const documentedHead = DOCUMENTED_FUNCTION_HEAD.exec(segment);
+      if (documentedHead && functionPrefixAllowed(segment, i)) {
+        braceStart = findFunctionBrace(segment, i + documentedHead[0].length);
+        if (braceStart === -1) {
           complete = false;
           i += documentedHead[0].length - 1;
           continue;
         }
-        braceStart = findFunctionBrace(segment, i + documentedHead[0].length);
       }
     }
     if (braceStart === -1) continue;
     const close = findMatchingBrace(segment, braceStart);
     if (close === -1) {
+      // An unclosed body makes the whole inspection incomplete (fail closed);
+      // scanning on would re-walk the same unclosed tail for every later head.
       complete = false;
-      continue;
+      break;
     }
     const body = trimSpan(segment, braceStart + 1, close);
     if (body) bodies.push(body);
@@ -614,14 +790,39 @@ function inspectFunctionDefinitions(segment: string): { bodies: ShellClauseEvent
   return { bodies, complete };
 }
 
+const NAMED_FUNCTION_HEAD = /[A-Za-z_][A-Za-z0-9_]*\s*\(\s*\)/y;
+const DOCUMENTED_FUNCTION_HEAD = /function\s+[A-Za-z_][A-Za-z0-9_]*(?:\s*\(\s*\))?/y;
+const FUNCTION_PREFIX_WORDS = new Set(["if", "then", "elif", "else", "while", "until", "do", "for", "select", "!", "function"]);
+
+/** True at the first name character (`[A-Za-z_]`) of an identifier run. */
+function isNameStart(segment: string, i: number): boolean {
+  if (!/[A-Za-z_]/.test(segment[i]!)) return false;
+  for (let j = i - 1; j >= 0; j--) {
+    const ch = segment[j]!;
+    if (/[A-Za-z_]/.test(ch)) return false;
+    if (!/[0-9]/.test(ch)) return true;
+  }
+  return true;
+}
+
+/**
+ * A function header may start a clause: after a separator or group
+ * character, or after a lone control word (`if f() { ...; }`). Reads only the
+ * one word before `start`, so it is not quadratic across many headers.
+ */
 function functionPrefixAllowed(segment: string, start: number): boolean {
   let i = start - 1;
   while (i >= 0 && /\s/.test(segment[i]!)) i--;
   if (i < 0) return true;
-  const boundary = segment[i]!;
-  if (";\n\r|&{}()".includes(boundary)) return true;
-  const prefix = segment.slice(0, start).trim().split(/[;\n\r|&]/).pop()?.trim() ?? "";
-  return /^(?:if|then|elif|else|while|until|do|for|select|!|function)$/.test(prefix) || /\)\s*$/.test(prefix);
+  if (";\n\r|&{}()".includes(segment[i]!)) return true;
+  const wordEnd = i + 1;
+  while (i >= 0 && !/\s/.test(segment[i]!) && !";\n\r|&".includes(segment[i]!)) i--;
+  const word = segment.slice(i + 1, wordEnd);
+  while (i >= 0 && /\s/.test(segment[i]!)) i--;
+  // Anything but a separator before the word means the clause prefix has
+  // several words, which is never a lone control word.
+  if (i >= 0 && !";\n\r|&".includes(segment[i]!)) return false;
+  return FUNCTION_PREFIX_WORDS.has(word);
 }
 
 function findFunctionBrace(segment: string, from: number): number {
