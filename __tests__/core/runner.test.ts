@@ -1,3 +1,4 @@
+import { spawnSync } from "node:child_process";
 import { describe, expect, it } from "vitest";
 import { runNode, isToolOp, formatToolOpLabel, OUTPUT_CAP } from "../../core/runner.ts";
 import type { ToolOp, RunOptions } from "../../core/types.ts";
@@ -184,9 +185,87 @@ describe("runNode — termination", () => {
   }, 5_000);
 
   it("kills a command that exceeds commandTimeoutMs, including its children", async () => {
-    const r = await runNode({ id: "n", commands: ["sh -c 'sleep 30 & sleep 30'"] }, { cwd, commandTimeoutMs: 1_000 });
+    const started = Date.now();
+    const r = await runNode(
+      { id: "n", commands: ["sh -c 'sleep 30 & echo $!; sleep 30'"] },
+      { cwd, commandTimeoutMs: 1_000 },
+    );
+    // Well under the 2s post-kill grace: the group kill itself closed the pipes.
+    expect(Date.now() - started).toBeLessThan(1_800);
     expect(r.exitCode).toBe(124);
     expect(r.stderr).toContain("[predexec] command timed out after 1000ms");
+    const childPid = Number(r.stdout.trim());
+    expect(childPid).toBeGreaterThan(0);
+    expect(() => process.kill(childPid, 0)).toThrow(expect.objectContaining({ code: "ESRCH" }));
+  }, 5_000);
+
+  it("keeps the timeout notice when stderr already overflowed OUTPUT_CAP", async () => {
+    const r = await runNode(
+      { id: "n", commands: [`node -e 'process.stderr.write("x".repeat(${OUTPUT_CAP * 2}))'; sleep 30`] },
+      { cwd, commandTimeoutMs: 1_000 },
+    );
+    expect(r.exitCode).toBe(124);
+    expect(r.stderrTruncated).toBe(true);
+    expect(r.stderr).toMatch(/…\[truncated: \d+ more chars\]/);
+    expect(r.stderr).toContain("[predexec] command timed out after 1000ms");
+  }, 5_000);
+
+  it("keeps the timeout notice under the per-command budget of a multi-command batch", async () => {
+    const r = await runNode(
+      {
+        id: "n",
+        commands: ["echo first", `node -e 'process.stderr.write("x".repeat(${OUTPUT_CAP * 2}))'; sleep 30`],
+      },
+      { cwd, commandTimeoutMs: 1_000 },
+    );
+    expect(r.exitCode).toBe(124);
+    expect(r.stderr).toMatch(/\[2\]\n[\s\S]*\[predexec\] command timed out after 1000ms/);
+  }, 5_000);
+
+  it("keeps the timeout notice when the batch-wide backstop cap engages", async () => {
+    const flood = `head -c ${OUTPUT_CAP} /dev/zero | tr '\\0' x >&2`;
+    const commands = [...Array.from({ length: 40 }, () => flood), "sleep 30"];
+    const r = await runNode({ id: "n", commands }, { cwd, commandTimeoutMs: 1_000 });
+    expect(r.exitCode).toBe(124);
+    expect(r.stderrTruncated).toBe(true);
+    expect(r.stderr).toContain("[41] [predexec] command timed out after 1000ms");
+  }, 5_000);
+
+  it.skipIf(spawnSync("perl", ["-e", "1"]).status !== 0)(
+    "settles after the grace period when a descendant escapes the process group",
+    async () => {
+      // The forked child calls setsid(), leaving the group while still holding
+      // the stdout/stderr pipes, so the group kill alone never closes them.
+      const script = "use POSIX; $|=1; if (fork()==0) { setsid(); print \"$$\\n\"; sleep 30; exit 0 } sleep 30";
+      const started = Date.now();
+      const r = await runNode({ id: "n", commands: [`perl -e '${script}'`] }, { cwd, commandTimeoutMs: 1_000 });
+      const elapsed = Date.now() - started;
+      const escapedPid = Number(r.stdout.trim());
+      try {
+        expect(elapsed).toBeLessThan(4_500);
+        expect(r.exitCode).toBe(124);
+        expect(r.stderr).toContain("[predexec] command timed out after 1000ms");
+      } finally {
+        if (escapedPid > 0) {
+          try {
+            process.kill(escapedPid, "SIGKILL");
+          } catch {
+            // already gone
+          }
+        }
+      }
+    },
+    6_000,
+  );
+
+  it("marks an aborted command with a notice and a non-zero exit", async () => {
+    const controller = new AbortController();
+    setTimeout(() => controller.abort(), 200);
+    const started = Date.now();
+    const r = await runNode({ id: "n", commands: ["sleep 30"] }, { cwd, signal: controller.signal });
+    expect(Date.now() - started).toBeLessThan(1_800);
+    expect(r.exitCode).toBe(1);
+    expect(r.stderr).toContain("[predexec] command aborted");
   }, 5_000);
 
   it("clamps commandTimeoutMs up to the 1s floor", async () => {

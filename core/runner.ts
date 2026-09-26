@@ -38,6 +38,12 @@ interface CommandResult {
   stderr: string;
   stdoutTotal: number;
   stderrTotal: number;
+  /**
+   * Runner-authored termination notice (timeout/abort). Kept outside `stderr`
+   * and appended after capping, so a command that already flooded stderr
+   * cannot push the reason it was killed out of the transcript.
+   */
+  notice?: string;
   exitCode: number;
   stdoutTruncated: boolean;
   stderrTruncated: boolean;
@@ -223,19 +229,22 @@ function runShell(command: string, opts: RunOptions): Promise<CommandResult> {
       clearTimeout(timer);
       if (graceTimer) clearTimeout(graceTimer);
       opts.signal?.removeEventListener("abort", onAbort);
+      let notice: string | undefined;
       if (timedOut) {
-        appendStderr(`${stderr && !stderr.endsWith("\n") ? "\n" : ""}[predexec] command timed out after ${timeoutMs}ms\n`);
+        notice = `[predexec] command timed out after ${timeoutMs}ms`;
         exitCode = TIMEOUT_EXIT_CODE;
       } else if (aborted) {
-        appendStderr(`${stderr && !stderr.endsWith("\n") ? "\n" : ""}[predexec] command aborted\n`);
+        notice = "[predexec] command aborted";
         if (exitCode === 0) exitCode = 1;
       }
+      if (notice) opts.onCommandOutput?.(`${notice}\n`);
       resolvePromise({
         command,
         stdout,
         stderr,
         stdoutTotal,
         stderrTotal,
+        notice,
         exitCode,
         stdoutTruncated: stdoutTotal > OUTPUT_CAP,
         stderrTruncated: stderrTotal > OUTPUT_CAP,
@@ -305,26 +314,38 @@ function joinLabeled(results: IndexedResult[], stream: Stream): { text: string; 
   if (results.length === 1) return render(results[0]!.result, stream, OUTPUT_CAP);
 
   const budget = Math.max(256, Math.floor(OUTPUT_CAP / results.length));
+  // Final backstop for the (rare) case where the per-command floor sums above
+  // OUTPUT_CAP. Applied only then: re-capping an already-marked join would
+  // clip the last command's marker and misreport its dropped count.
+  const needsBackstop = budget * results.length > OUTPUT_CAP;
   let truncated = false;
   const text = results
     .map(({ index, result }) => {
-      if (!result[stream]) return "";
+      if (!result[stream] && !(stream === "stderr" && result.notice)) return "";
       // Index label, not the full command: the command is already in the plan
       // (tool-call args), so echoing it back double-counts it in context.
-      const capped = render(result, stream, budget);
+      const capped = render(result, stream, budget, !needsBackstop);
       truncated ||= capped.truncated;
       return `[${index + 1}]\n${capped.text}`;
     })
     .filter(Boolean)
     .join("\n");
-  // Final backstop for the (rare) case where the per-command floor sums above
-  // OUTPUT_CAP. Applied only then: re-capping an already-marked join would
-  // clip the last command's marker and misreport its dropped count.
-  if (budget * results.length > OUTPUT_CAP) {
-    const backstop = cap(text);
-    return { text: backstop.text, truncated: truncated || backstop.truncated };
-  }
-  return { text, truncated };
+  if (!needsBackstop) return { text, truncated };
+  // Notices ride after the backstop so it can never clip them.
+  const backstop = cap(text);
+  const notices = stream === "stderr"
+    ? results.filter(({ result }) => result.notice).map(({ index, result }) => `[${index + 1}] ${result.notice}`)
+    : [];
+  return {
+    text: withNotice(backstop.text, notices.join("\n") || undefined),
+    truncated: truncated || backstop.truncated,
+  };
+}
+
+function withNotice(text: string, notice: string | undefined): string {
+  if (!notice) return text;
+  if (!text) return notice;
+  return text.endsWith("\n") ? `${text}${notice}` : `${text}\n${notice}`;
 }
 
 type Stream = "stdout" | "stderr";
@@ -334,7 +355,18 @@ type Stream = "stdout" | "stderr";
  * comes from the command's true total, not from the kept text. A result the
  * adapter itself truncated with no known total gets the count-less marker.
  */
-function render(r: CommandResult, stream: Stream, limit: number): { text: string; truncated: boolean } {
+function render(
+  r: CommandResult,
+  stream: Stream,
+  limit: number,
+  includeNotice = true,
+): { text: string; truncated: boolean } {
+  const body = renderBody(r, stream, limit);
+  const notice = stream === "stderr" && includeNotice ? r.notice : undefined;
+  return { text: withNotice(body.text, notice), truncated: body.truncated };
+}
+
+function renderBody(r: CommandResult, stream: Stream, limit: number): { text: string; truncated: boolean } {
   const text = r[stream];
   const total = stream === "stdout" ? r.stdoutTotal : r.stderrTotal;
   const flagged = stream === "stdout" ? r.stdoutTruncated : r.stderrTruncated;
