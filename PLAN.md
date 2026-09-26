@@ -663,6 +663,38 @@ Covers CC-5 (packaging) and CC-6.
   Record the result in `docs/research/opencode-skills.md`. If the hook ordering fails, fall back to documenting `install-skill opencode`, and have doctor report `[ ] skill`.
 - [ ] **Step 4:** Tests pass. **Step 5:** Commit: `feat(opencode): register packaged skill via config hook; system-transform fallback`.
 
+### Task 17a: opencode v2 plugin API support
+
+Added mid-execution by ruling R41. During Task 17's live measurement, the installed opencode v2.0.16 rejected predexec's `{id, server}` plugin export with `PluginModule.LoadError: Missing key ["default"]["effect"]/["default"]["setup"]`. The audit had treated 1.18.32 as latest, so opencode v2 users currently get no predexec at all.
+
+**Files:**
+- Modify: `.opencode/plugins/predexec.ts`. It may split into `.opencode/plugins/{v1,v2,shared}.ts` if needed.
+- Modify: `package.json` (`main`/`exports` only if a separate v2 entry is required), `__tests__/opencode.test.ts`
+- Create: `docs/research/opencode-v2-plugins.md`
+
+**Interfaces:**
+- Produces: one default export that loads on BOTH opencode 1.18.x (`{id, server}`) and 2.x (`{id, setup | effect}`). If a single object can't satisfy both loaders' schemas, fall back to separate entries, chosen by whatever mechanism v2 documents for resolving plugin entries.
+
+- [ ] **Step 1: Research.** Get opencode's v2 plugin contract from source. Clone the tag matching the installed binary (`opencode --version`) into the scratchpad and read `@opencode-ai/plugin/v2/{promise,effect}`, `core/config/plugin/external.ts` and the v2 tool/hook/permission APIs. Record the contract with file:line cites in `docs/research/opencode-v2-plugins.md`. It must cover:
+  - tool registration and argument schemas (which zod version the host pins)
+  - the system-prompt hook, if any
+  - the config/skills registration hook
+  - the `ask` equivalent for permissions
+  - the file/find/grep client API
+- [ ] **Step 2: Failing tests.** Mock both loaders' validation: the v1 shape check and a transcription of the v2 schema check. Assert the default export passes both. Assert the v2 `setup` registers the `predexec` tool, the skills path and the steering fallback, and that it wires the permission bridge.
+- [ ] **Step 3: Implement.**
+  - Put adapter logic behind a shared core so v1 and v2 stay thin shims.
+  - Keep every Task 10/11/17 behavior: static-policy pre-check, host ask bridge with variant/stop semantics, exit-2 conventions, truncation flags, realpath containment, and skill registration.
+  - If a v2 capability is missing, degrade explicitly and document it. For example, if there is no `ask`, use static policy with a hard stop.
+- [ ] **Step 4: Live verification.** Run against the installed v2.0.16 in a scratch project with scratch `HOME`/`XDG_*`. Never touch `~/.config/opencode`. Check that:
+  - the plugin loads with no LoadError;
+  - the `predexec` tool is listed;
+  - one read-only plan runs;
+  - the skill is discoverable.
+
+  Record the results in the research doc. Also re-run the v1 path's existing tests.
+- [ ] **Step 5:** Full gate, then commit: `feat(opencode): support the v2 plugin API alongside v1`.
+
 ### Task 18: Codex plugin + skill packaging
 
 Covers CX-4 (registration) and CX-7 (docs).
