@@ -706,6 +706,11 @@ async function grepOp(
 
   const notes: string[] = [];
   let matches: Match[];
+  // R26 follow-up: a skipped file means the search did NOT fully run over
+  // everything it should have — that must be visible in the EXIT CODE, not
+  // just a stderr note an edge never looks at (CLAUDE.md's "exit 2 = the
+  // search never — or not fully — ran").
+  let hadSkippedFile = false;
   if (rg) {
     const found = await grepViaRg(
       rg,
@@ -735,6 +740,7 @@ async function grepOp(
     if (found.err) return found.err;
     if (found.capped) notes.push(walkCapNote("grep", found.capReason ?? "work"));
     notes.push(...found.skippedNotes);
+    hadSkippedFile = found.skippedNotes.length > 0;
     matches = found.matches;
   }
 
@@ -749,11 +755,17 @@ async function grepOp(
     notes.push(`grep: ${limit} match limit reached — use limit=${limit * 2} for more, or narrow the pattern`);
   }
   const stdout = await formatMatches(matches.slice(0, limit), base, context, signal);
+  // A skipped file makes "no matches" untrustworthy — 1 means "searched,
+  // found nothing" as a fact, and that was never established here — so it
+  // takes the same exit 2 as any other "didn't fully run" case. With SOME
+  // matches, the search is still incomplete but not worthless: exit 0, with
+  // the truncation flag and the existing skip note carrying the caveat.
+  const exitCode = stdout ? 0 : hadSkippedFile ? 2 : 1;
   return {
     stdout,
-    stderr: notes.join("\n"),
-    exitCode: stdout ? 0 : 1,
-    ...(matches.length > limit || notes.some((note) => note.includes("results are incomplete"))
+    stderr: notes.filter(Boolean).join("\n"),
+    exitCode,
+    ...(matches.length > limit || hadSkippedFile || notes.some((note) => note.includes("results are incomplete"))
       ? { stdoutTruncated: true }
       : {}),
   };
@@ -948,14 +960,21 @@ async function grepViaNode(
     let chunkBytes = 0;
     let timedOut = false;
     let timedOutAtLine: number | undefined;
+    // A genuine regex-execution malfunction (anything the vm sandbox throws
+    // OTHER than its own recognized timeout — e.g. a V8 stack-overflow
+    // RangeError) is not a "this file is unreadable" condition and must not
+    // be downgraded into one: it says something is wrong with the PATTERN or
+    // the engine, not this one file, so it fails the whole op rather than
+    // being swallowed by the generic per-file catch below.
+    let regexError: unknown;
     // Test the accumulated batch in ONE vm invocation; returns whether
-    // scanning this file should continue (false = limit reached or budget
-    // exhausted). A `false` return deactivates scanTextLines's callback,
-    // which also stops it from reading any further than it has to — EXCEPT
-    // for a file whose only real lines fit in a single trailing batch (there
-    // is nothing to stop mid-scan for), which is why the limit check further
-    // down is keyed on `matches.length + pending.length`, not on whether this
-    // function returned false.
+    // scanning this file should continue (false = limit reached, budget
+    // exhausted, or a regex execution error). A `false` return deactivates
+    // scanTextLines's callback, which also stops it from reading any further
+    // than it has to — EXCEPT for a file whose only real lines fit in a
+    // single trailing batch (there is nothing to stop mid-scan for), which is
+    // why the limit check further down is keyed on `matches.length +
+    // pending.length`, not on whether this function returned false.
     const flushChunk = (): boolean => {
       if (chunkText.length === 0) return true;
       if (regexBudgetRemainingMs <= 0) {
@@ -968,7 +987,17 @@ async function grepViaNode(
       }
       const callTimeout = regexBudgetRemainingMs;
       const startedAt = Date.now();
-      const result = execChunkWithDeadline(re, chunkText, callTimeout);
+      let result: ReturnType<typeof execChunkWithDeadline>;
+      try {
+        result = execChunkWithDeadline(re, chunkText, callTimeout);
+      } catch (err) {
+        regexBudgetRemainingMs -= Date.now() - startedAt;
+        regexError = err;
+        chunkText = [];
+        chunkLineNos = [];
+        chunkBytes = 0;
+        return false;
+      }
       regexBudgetRemainingMs -= Date.now() - startedAt;
       if (result.timedOut) {
         timedOut = true;
@@ -1017,21 +1046,34 @@ async function grepViaNode(
           ),
         };
       }
-      // Once this file alone has already pushed the running total past
-      // `limit`, the matches collected are from lines scanTextLines already
-      // decoded as complete and valid — a binary/oversized signal from
-      // whatever came AFTER them in the same file doesn't retroactively
-      // invalidate matches already found from clean content, and (for a file
-      // whose matching lines all arrive before scanTextLines can even be
-      // asked to stop, e.g. a handful of short lines followed immediately by
-      // one huge unterminated tail) there was no earlier point at which the
-      // scan COULD have been stopped to avoid discovering it.
+      // A vm-level regex execution error is a fact about the PATTERN or the
+      // engine, not this one file — fail the whole op rather than silently
+      // downgrading it to a per-file skip the way an I/O error is handled
+      // below.
+      if (regexError !== undefined) {
+        return { err: fail("grep", `${rel}: unexpected error evaluating the pattern: ${errText(regexError)}`) };
+      }
+      // Binary is a whole-file fact scanTextLines always determines (the raw
+      // NUL check runs on every chunk regardless of callback state — see
+      // scanTextLines), so it is NOT gated on how much we already have: an rg
+      // search skips a binary file's matches unconditionally, and the
+      // fallback must agree, or the two paths disagree on a plain `exit == 0`
+      // edge depending only on `limit` (measured: a NUL-laden file's matches
+      // came back as exit 0 raw-binary stdout at a small limit and exit 1 at
+      // a larger one, with rg returning exit 1 for both).
+      if (scan.binary) continue;
+      // Oversized is different: it fires only once scanTextLines actually
+      // hits a line too long to safely buffer, and once this file alone has
+      // already pushed the running total past `limit`, the matches collected
+      // are from lines scanTextLines already decoded as complete and valid —
+      // a later oversized line doesn't retroactively invalidate them, and
+      // (for a file whose matching lines all arrive before scanTextLines can
+      // even be asked to stop, e.g. a handful of short lines immediately
+      // followed by one huge unterminated tail) there was no earlier point at
+      // which the scan COULD have been stopped to avoid hitting it.
       const haveEnough = matches.length + pending.length > limit;
-      if (!haveEnough) {
-        if (scan.binary) continue;
-        if (scan.oversized) {
-          return { err: fail("grep", `${rel}: line exceeds the ${MAX_TEXT_LINE_BYTES} byte fallback scan limit`) };
-        }
+      if (!haveEnough && scan.oversized) {
+        return { err: fail("grep", `${rel}: line exceeds the ${MAX_TEXT_LINE_BYTES} byte fallback scan limit`) };
       }
       matches.push(...pending);
     } catch (err) {

@@ -728,7 +728,7 @@ describe("mcp tool-ops — executor contract", () => {
   });
 
   it.skipIf(!permissionDenialWorks)(
-    "names a file it could not scan instead of silently skipping it (R26)",
+    "names a file it could not scan instead of silently skipping it, and marks the result incomplete (R26)",
     async () => {
       const dir = join(root, "partial-unreadable");
       mkdirSync(dir, { recursive: true });
@@ -740,16 +740,91 @@ describe("mcp tool-ops — executor contract", () => {
         const r = await run({ tool: "grep", pattern: "hit", path: "partial-unreadable" }, NODE_ONLY);
         // The readable file's match still comes through — one unscannable
         // file must not fail the whole op — but the skip is NAMED, never
-        // silent (predexec's truncation-must-never-be-silent invariant).
+        // silent (predexec's truncation-must-never-be-silent invariant), AND
+        // the result is marked incomplete: an edge branching on exit==0 alone
+        // would otherwise treat this identically to a fully-run search.
         expect(r.exitCode).toBe(0);
         expect(r.stdout).toBe("partial-unreadable/readable.txt:1:hit");
         expect(r.stderr).toContain("blocked.txt");
         expect(r.stderr).toContain("skipping");
+        expect(r.stdoutTruncated).toBe(true);
       } finally {
         chmodSync(blocked, 0o644);
       }
     },
   );
+
+  it.skipIf(!permissionDenialWorks)(
+    "returns exit 2, not 1, when the only candidate file could not be scanned at all",
+    async () => {
+      // exit 1 means "searched, found nothing" — a FACT. With the sole file
+      // unreadable, that fact was never established: the search did not
+      // fully run, which is exactly what exit 2 means elsewhere in this file
+      // (a broken pattern, a dead accelerator, an abort). The rg path already
+      // reports exit 2 for a permission error on its only target; the
+      // fallback must not disagree by reporting a false "absent" via exit 1.
+      const dir = join(root, "all-unreadable");
+      mkdirSync(dir, { recursive: true });
+      const blocked = join(dir, "blocked-only.txt");
+      writeFileSync(blocked, "key\n");
+      chmodSync(blocked, 0o000);
+      try {
+        const r = await run({ tool: "grep", pattern: "key", path: "all-unreadable" }, NODE_ONLY);
+        expect(r.exitCode).toBe(2);
+        expect(r.stdout).toBe("");
+        expect(r.stderr).toContain("blocked-only.txt");
+      } finally {
+        chmodSync(blocked, 0o644);
+      }
+    },
+  );
+
+  it.skipIf(!hasRg)("agrees with ripgrep's exit 2 on a permission-denied sole target", async () => {
+    const dir = join(root, "all-unreadable-parity");
+    mkdirSync(dir, { recursive: true });
+    const blocked = join(dir, "blocked-only.txt");
+    writeFileSync(blocked, "key\n");
+    chmodSync(blocked, 0o000);
+    try {
+      const withRg = await run({ tool: "grep", pattern: "key", path: "all-unreadable-parity" });
+      expect(withRg.exitCode).toBe(2);
+    } finally {
+      chmodSync(blocked, 0o644);
+    }
+  });
+
+  it("fails the whole op, not just one file, on a non-timeout regex execution error", async () => {
+    // A vm-level throw that ISN'T the recognized timeout (e.g. a V8 regex
+    // stack-overflow RangeError, per the ruling's own example) says something
+    // is wrong with the pattern or the engine — not with any one file — so it
+    // must not be swallowed into a per-file "skip" the way an I/O error is.
+    // RegExp objects retain their prototype chain across the vm sandbox
+    // boundary (verified: the sandbox never clones them), so patching
+    // RegExp.prototype.test reliably reaches the exact call the batch
+    // matcher makes, without needing to construct a genuinely pathological
+    // native regex. The patch is restored BEFORE any assertion runs (not in a
+    // `finally` after them): vitest's own failure-diffing machinery calls
+    // `.test()` internally, so leaving the patch active while an assertion is
+    // still being evaluated makes an unrelated failure look like an escaped
+    // RangeError instead of a normal assertion mismatch (verified — this bit
+    // during RED-phase testing here, when the pre-fix exit code legitimately
+    // failed the assertion below while the patch was still in place).
+    write("regex-error-dir/a.txt", "hit\n");
+    write("regex-error-dir/b.txt", "hit\n");
+    const originalTest = RegExp.prototype.test;
+    RegExp.prototype.test = function () {
+      throw new RangeError("Maximum call stack size exceeded");
+    };
+    let r: Awaited<ReturnType<typeof run>>;
+    try {
+      r = await run({ tool: "grep", pattern: "hit", path: "regex-error-dir" }, NODE_ONLY);
+    } finally {
+      RegExp.prototype.test = originalTest;
+    }
+    expect(r.exitCode).toBe(2);
+    expect(r.stdout).toBe("");
+    expect(r.stderr).toMatch(/RangeError|Maximum call stack/);
+  });
 
   it("parses accelerator records whose filenames contain newlines", async () => {
     const filename = "line\nname.txt";
@@ -873,24 +948,58 @@ describe("mcp tool-ops — bounded fallback scans", () => {
     expect(grep).toMatchObject({ exitCode: 0, stdout: "legacy-lines.txt:2:two\rthree" });
   });
 
-  it("keeps matches already found before the retention cap even if the file turns out to be binary afterward", async () => {
-    // A file's binary-ness discovered only PAST the point where the retention
-    // cap was already satisfied by earlier, cleanly-decoded lines must not
-    // retroactively discard those matches: they were pushed only after
-    // scanTextLines parsed them as complete, valid text, and there was no
-    // earlier point in a batch this small (4 real lines, then one immediate
-    // unterminated tail) at which the scan could have been stopped to avoid
-    // ever seeing the NUL byte in the first place.
-    write(
-      "binary-after-cap.dat",
-      Buffer.concat([Buffer.from("hit\nhit\nhit\nhit\n", "utf8"), Buffer.alloc(128 * 1024, 97), Buffer.from([0])]),
-    );
+  it("discards ALL matches when the file is binary, regardless of the retention cap", async () => {
+    // Binary-ness is a whole-file fact scanTextLines always determines (the
+    // raw NUL check runs on every chunk independent of callback state), so it
+    // must never depend on `limit` or on how many matches were already
+    // collected — rg itself skips a binary file's matches unconditionally,
+    // and the fallback must agree, or an `exit == 0` edge fires on raw binary
+    // content depending only on which `limit` the plan happened to pick.
+    write("binary-after-cap.dat", Buffer.concat([Buffer.from("hit\nhit\nhit\nhit\n", "utf8"), Buffer.from([0, 1, 2, 3])]));
     const r = await run({ tool: "grep", pattern: "hit", path: "binary-after-cap.dat", limit: 3 }, NODE_ONLY);
+    expect(r.exitCode).toBe(1);
+    expect(r.stdout).toBe("");
+    expect(r.stderr).not.toContain("match limit reached");
+  });
+
+  it("keeps matches already found before the retention cap when a LATER line is merely oversized (not binary)", async () => {
+    // Distinct from binary: oversized fires only once scanTextLines actually
+    // hits a line too long to safely buffer, and — unlike a NUL byte, which
+    // taints the whole file — a later oversized line doesn't retroactively
+    // invalidate matches already collected from earlier, cleanly-decoded
+    // lines. No NUL byte anywhere in this fixture, so `scan.binary` stays
+    // false throughout; only `scan.oversized` fires.
+    write("oversized-after-cap.dat", `hit\nhit\nhit\nhit\n${"a".repeat(128 * 1024)}\n`);
+    const r = await run({ tool: "grep", pattern: "hit", path: "oversized-after-cap.dat", limit: 3 }, NODE_ONLY);
     expect(r.exitCode).toBe(0);
     expect(r.stdout).toBe(
-      ["binary-after-cap.dat:1:hit", "binary-after-cap.dat:2:hit", "binary-after-cap.dat:3:hit"].join("\n"),
+      ["oversized-after-cap.dat:1:hit", "oversized-after-cap.dat:2:hit", "oversized-after-cap.dat:3:hit"].join("\n"),
     );
     expect(r.stderr).toContain("match limit reached");
+  });
+
+  it("discards binary matches the same way regardless of `limit` (limit:2 vs limit:3 parity)", async () => {
+    // Lines that themselves carry embedded NUL bytes mixed with matching
+    // text — the file is binary throughout, not just in trailing garbage —
+    // reproducing the exact regression: exit 0 with raw binary content at a
+    // small `limit`, exit 1 at a larger one, for the SAME file.
+    const lines = Array.from({ length: 5 }, (_, i) => `key${i}\0extra`);
+    write("embedded-nul.bin", `${lines.join("\n")}\n`);
+    for (const limit of [2, 3, 100]) {
+      const r = await run({ tool: "grep", pattern: "key", path: "embedded-nul.bin", limit }, NODE_ONLY);
+      expect(r.exitCode, `limit=${limit}`).toBe(1);
+      expect(r.stdout, `limit=${limit}`).toBe("");
+    }
+  });
+
+  it.skipIf(!hasRg)("agrees with ripgrep that a binary file's matches are excluded, at every limit", async () => {
+    write("embedded-nul-parity.bin", "key1\0extra\nkey2\0extra\n");
+    for (const limit of [1, 2, 100]) {
+      const withRg = await run({ tool: "grep", pattern: "key", path: "embedded-nul-parity.bin", limit });
+      const withoutRg = await run({ tool: "grep", pattern: "key", path: "embedded-nul-parity.bin", limit }, NODE_ONLY);
+      expect(withRg.exitCode, `rg limit=${limit}`).toBe(1);
+      expect(withoutRg.exitCode, `node limit=${limit}`).toBe(1);
+    }
   });
 
   it("classifies aborted fallback read and grep as search-not-run where applicable", async () => {
