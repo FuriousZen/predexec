@@ -236,4 +236,46 @@ describe("install-skill CLI", () => {
     expect(run.stdout).toContain("dry run — nothing written");
     expect(readFileSync(join(skillDir, "SKILL.md"), "utf8")).toBe(originalContent);
   });
+
+  it("prints installed (non-dry-run) with exact action text and writes the file", () => {
+    scratch();
+    const home = join(tmp, "home");
+    const proj = join(tmp, "proj");
+    mkdirSync(proj, { recursive: true });
+    const run = spawnSync(process.execPath, [bin, "install-skill", "claude"], {
+      encoding: "utf8",
+      cwd: proj,
+      env: { ...process.env, HOME: home },
+    });
+    expect(run.status).toBe(0);
+    expect(run.stdout).toContain("installed:");
+    expect(run.stdout).toContain("destination:");
+    expect(run.stdout).not.toContain("dry run");
+    const installed = readFileSync(join(home, ".claude", "skills", "predexec", "SKILL.md"), "utf8");
+    expect(installed).toBe(readFileSync(join(repoRoot, SKILL_PATHS.claude), "utf8"));
+  });
+
+  it("prints up-to-date (not up to-date) on second unchanged run", () => {
+    scratch();
+    const home = join(tmp, "home");
+    const proj = join(tmp, "proj");
+    mkdirSync(proj, { recursive: true });
+    // First run: install
+    const run1 = spawnSync(process.execPath, [bin, "install-skill", "claude"], {
+      encoding: "utf8",
+      cwd: proj,
+      env: { ...process.env, HOME: home },
+    });
+    expect(run1.status).toBe(0);
+    expect(run1.stdout).toContain("installed:");
+    // Second run: should report up-to-date (with both hyphens preserved)
+    const run2 = spawnSync(process.execPath, [bin, "install-skill", "claude"], {
+      encoding: "utf8",
+      cwd: proj,
+      env: { ...process.env, HOME: home },
+    });
+    expect(run2.status).toBe(0);
+    expect(run2.stdout).toContain("up-to-date:");
+    expect(run2.stdout).not.toContain("up to-date:");
+  });
 });

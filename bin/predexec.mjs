@@ -1931,9 +1931,17 @@ function installSkillCli(args) {
     return result.ok ? 0 : 1;
   }
 
+  const actionLabels = {
+    "would-install": "would install",
+    "would-overwrite": "would overwrite",
+    "installed": "installed",
+    "overwritten": "overwritten",
+    "up-to-date": "up-to-date",
+    "conflict": "conflict",
+  };
+
   for (const r of result.results) {
-    // Transform action names for display: "would-install" -> "would install"
-    const displayAction = r.action.replace("-", " ");
+    const displayAction = actionLabels[r.action] ?? r.action;
     console.log(`${displayAction}: ${r.path}`);
     if (r.action === "conflict") {
       console.log("  differs from the packaged skill — pass --force to overwrite, or --dry-run to preview");
