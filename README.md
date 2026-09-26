@@ -6,15 +6,17 @@ into a tree of deterministic predicates, and an engine walks the tree with **no 
 between levels**. On a request-limited free provider this trades abundant tokens for scarce
 provider requests.
 
-This package ships four adapters, each registering one tool, `predexec`:
-a [pi coding agent](https://www.npmjs.com/package/@earendil-works/pi-coding-agent) extension,
-an [opencode](https://opencode.ai) plugin, a
-[Claude Code](https://code.claude.com/docs/en/overview) MCP server, and a
-[Codex CLI](https://github.com/openai/codex) MCP server — the same stdio server as Claude
-Code's, started with `--host codex` to select Codex's policy reader and stats label.
+This package ships adapters for **five** coding-agent harnesses, each registering one tool,
+`predexec`: a [pi coding agent](https://www.npmjs.com/package/@earendil-works/pi-coding-agent)
+extension, an [opencode](https://opencode.ai) plugin (both its 1.x and 2.x plugin APIs), a
+[Claude Code](https://code.claude.com/docs/en/overview) MCP server, a
+[Codex CLI](https://github.com/openai/codex) MCP server, and an
+[Antigravity CLI](https://antigravity.google/) (`agy`) MCP server — Codex and Antigravity share
+the same stdio server as Claude Code's, started with `--host codex`/`--host antigravity` to
+select that host's policy reader and stats label.
 See [How it works](#how-it-works) below for the design and current status.
 
-> **Status: read-only.** The pure-TS core and all four adapters are done and unit-tested.
+> **Status: read-only.** The pure-TS core and all five adapters are done and unit-tested.
 > predexec speculates **read-only only** — any write/install/delete hard-stops before running.
 
 ## How it works
@@ -49,16 +51,16 @@ How completely predexec's design survives contact with each harness. The score i
 quality of the harness — it drops when predexec has to reimplement or approximate something the
 design wants to get natively.
 
-| | **pi** | **opencode** | **Claude Code** | **Codex** |
-| :-- | :-- | :-- | :-- | :-- |
-| Integration | in-process extension | in-process plugin | out-of-process **stdio MCP** | out-of-process **stdio MCP** (same server as Claude Code) |
-| Tool registration | native (`pi.extensions`) | native (`plugin` array) | MCP tool — the only route CC offers a third party | MCP tool — the only route Codex offers a third party |
-| `read`/`grep`/`find`/`ls` | the host's **own tool factories** — exact parity | host SDK, with real caps | **own implementation** over `node:fs` (`rg`/`fd` accelerate) | same implementation as Claude Code (`mcp/tool-ops.ts` is shared) |
-| Steering | skill auto-loaded via `pi.skills` | guarded system-prompt push, or `AGENTS.md` | skill via plugin wrapper + tool description | `AGENTS.md` native (no plugin wrapper needed) + tool description |
-| Streaming progress | yes (`onUpdate`) | no | no | no |
-| Host permission rules | n/a — pi has no per-command rules (project-trust only) | **self-checked** from `permission.bash` plus supported native `read`/`grep`/`glob` rules (with local `list` compatibility), last-match-wins | **self-enforced** from `settings.json`, including mapped native read/search operations via supported `Read`/`Grep`/`Glob` rules (host rules don't reach a subprocess) | **self-enforced** from persisted `config.toml` + execpolicy rules for shell/Bash only — no persisted native file-operation source and **no OS sandbox backstop** (MCP servers run outside it entirely, measured) |
-| Published format | compiled ESM (`dist/`) | compiled ESM (`dist/`) | compiled ESM (`dist/`) | compiled ESM (`dist/`) |
-| **Fit** | **9 / 10** | **7 / 10** | **6 / 10** | **5 / 10** |
+| | **pi** | **opencode** | **Claude Code** | **Codex** | **Antigravity** |
+| :-- | :-- | :-- | :-- | :-- | :-- |
+| Integration | in-process extension | in-process plugin (v1 `{id,server}` and v2 `{id,setup}`) | out-of-process **stdio MCP** | out-of-process **stdio MCP** (same server as Claude Code) | out-of-process **stdio MCP** (same server as Claude Code) |
+| Tool registration | native (`pi.extensions`) | native (`plugin` array) | MCP tool — the only route CC offers a third party | MCP tool — the only route Codex offers a third party | MCP tool — the only route agy offers a third party |
+| `read`/`grep`/`find`/`ls` | the host's **own tool factories** — exact parity | v1: host SDK, with real caps. v2: no file API at all, so it shares Claude Code's `mcp/tool-ops.ts` | **own implementation** over `node:fs` (`rg`/`fd` accelerate) | same implementation as Claude Code (`mcp/tool-ops.ts` is shared) | same implementation as Claude Code (`mcp/tool-ops.ts` is shared) |
+| Steering | skill auto-loaded via `pi.skills` | guarded system-prompt push, `AGENTS.md`, or (v1) an auto-registered packaged skill | skill via plugin wrapper + tool description | `AGENTS.md` native (no plugin wrapper needed) + tool description, or a plugin-bundled skill | plugin-bundled skill, `install-skill`, or `AGENTS.md`/`GEMINI.md` fallback + tool description |
+| Streaming progress | yes (`onUpdate`) | no | no | no | no |
+| Host permission rules | n/a — pi has no per-command rules (project-trust only) | **self-checked** from `permission.bash` plus supported native `read`/`grep`/`glob` rules (with local `list` compatibility), last-match-wins; v1 can bridge an `ask` rule to a real host prompt via `context.ask`, v2 cannot | **self-enforced** from `settings.json`, including mapped native read/search operations via supported `Read`/`Grep`/`Glob` rules (host rules don't reach a subprocess) | **self-enforced** from persisted `config.toml` + execpolicy rules for shell/Bash only — no persisted native file-operation source and **no OS sandbox backstop** (MCP servers run outside it entirely, measured) | **self-enforced** from `~/.gemini/antigravity-cli/settings.json` grants (Deny>Ask>Allow), covering both shell and `read_file` tool ops — and **no OS sandbox backstop** (MCP servers run outside it too, measured) |
+| Published format | compiled ESM (`dist/`) | compiled ESM (`dist/`) | compiled ESM (`dist/`) | compiled ESM (`dist/`) | compiled ESM (`dist/`) |
+| **Fit** | **9 / 10** | **7 / 10** | **6 / 10** | **5 / 10** | **5 / 10** |
 
 **pi — 9.** Everything the design wants exists natively: predexec borrows pi's real tool
 implementations, so a plan's `read` is *the* `read`; the routing skill auto-registers; progress
@@ -99,7 +101,46 @@ supports both a self-hosting plugin (`.codex-plugin/`, `.agents/plugins/marketpl
 [Codex CLI](#codex-cli) below) *and* a native `AGENTS.md` fallback that needs no plugin wrapper
 at all, unlike Claude Code, which has only the MCP/plugin route.
 
+**Antigravity — 5.** Same shape as Codex's slot, for the same reason: the identical
+`mcp/server.ts`/`mcp/tool-ops.ts`, started with `--host antigravity`, so the same out-of-process
+costs apply. Also the same worst-case sandbox story — measured, not inferred: agy runs MCP
+servers entirely outside its own terminal sandbox, even under `--sandbox`, so
+`mcp/policy-antigravity.ts`'s settings-grant reading and predexec's own `destructive.ts` are the
+only containment, exactly as with Codex. Session-root resolution is a genuine extra cost this
+harness pays that the others don't: a non-plugin server's cwd is wherever `agy` was launched from
+(no `CLAUDE_PROJECT_DIR`-equivalent, no env host marker at all), and a *plugin* server's cwd is
+always the plugin's own directory, never the workspace, so the plugin form additionally needs
+`PREDEXEC_ROOT`/`--root` to work at all (see [Antigravity CLI](#antigravity-cli-agy) below). What
+keeps it at parity with Codex rather than below it: unlike Codex's Bash-only persisted policy,
+Antigravity's settings grants cover **both** shell commands and `read_file`-style tool ops, so
+native read/search operations get the same host-permission enforcement shell commands do, not just
+predexec's own containment.
+
 ## Install
+
+The short version — every host takes a **plugin path** (bundles the MCP/extension registration
+and the routing skill together, one command), a **manual path** (register the tool yourself, no
+plugin), and a **skill step** (only needed on the manual path, or as a fallback):
+
+| harness | plugin path | manual path | skill step |
+| :-- | :-- | :-- | :-- |
+| pi | `pi install npm:predexec` (bundles the skill) | — (pi has no separate manual form) | none needed |
+| opencode | — (opencode has no plugin-bundle concept; `"plugin": ["predexec"]` in `opencode.json` IS the whole install) | same `"plugin": ["predexec"]` step | none needed — v1's `config` hook / v2's `ctx.skill.transform` auto-register the packaged skill; `install-skill opencode` is a manual fallback |
+| Claude Code | `/plugin marketplace add FuriousZen/predexec` + `/plugin install predexec@predexec` (bundles the skill) | `claude mcp add predexec -- npx -y --package=predexec predexec-mcp` | `npx -y predexec install-skill claude` (manual path only) |
+| Codex | `codex plugin marketplace add FuriousZen/predexec` + `codex plugin add predexec@predexec` (bundles the skill, forwards `CODEX_HOME`) | `codex mcp add predexec -- npx -y --package=predexec predexec-mcp --host codex` | `npx -y predexec install-skill codex` (manual path only); or the no-MCP `AGENTS.md` fallback |
+| Antigravity | `agy plugin install <path to node_modules/predexec/antigravity-plugin>` (bundles the skill; needs `PREDEXEC_ROOT`, see below) | `agy mcp add predexec npx -- -y --package=predexec predexec-mcp --host antigravity` (**recommended** — no extra config needed) | `npx -y predexec install-skill antigravity` (manual path only); or the no-MCP `AGENTS.md`/`GEMINI.md` fallback |
+
+Every host also gets the same two verification commands once installed:
+
+```bash
+npx -y predexec doctor               # static install + skill checks for all five hosts at once
+npx -y predexec doctor --live        # + spawns opencode and probes tool registration (opencode only)
+```
+
+`doctor`'s `[x]`/`[!]`/`[ ]`/`[-]` states and its skill-discovery checks are explained in
+[Doctor & stats](#doctor--stats) below; `install-skill`'s per-harness destination paths are in the
+table there too. The per-harness sections below go into the install and permissions detail that
+table can't hold — read the one for your harness.
 
 ### pi coding agent
 
@@ -200,6 +241,14 @@ not a mere mention of the name) and skips its own injection — no duplication.
 
 For local development, opencode also auto-discovers `.opencode/plugins/*.ts`, so running opencode
 **inside a clone of this repo** picks up `.opencode/plugins/predexec.ts` directly.
+
+**opencode 1.x and 2.x both work from the same install above.** opencode 2.x rejected the 1.x
+plugin export shape outright until this package's default export started satisfying both; no
+separate config or install step is needed for either major. Two things differ on 2.x: its plugin
+API has no `ask`, so a static `ask` permission rule always hard-stops the plan instead of
+prompting (1.x can bridge it to a real host prompt via `context.ask`); and it has no file/find API
+at all, so `read`/`grep`/`find`/`ls` run through the same `mcp/tool-ops.ts` implementation Claude
+Code and Codex use, not the opencode SDK client 1.x uses.
 
 **Prerequisites:** the [opencode](https://opencode.ai) CLI installed and authenticated for some
 provider.
@@ -595,23 +644,44 @@ edits are always what's measured.)
 ## Layout
 
 ```
-dist/                              compiled ESM JavaScript (emitted by tsconfig.build.json)
+dist/                              compiled ESM JavaScript (tsconfig.build.json, atomic swap via
+                                    scripts/clean-build.mjs)
+core/                              PURE TS, zero harness imports (promotable to a standalone package)
+  types.ts conditions.ts runner.ts engine.ts destructive.ts validation.ts coerce.ts index.ts
+  shell/                           single-sourced shell mechanics (lexer, host-neutral inspection,
+                                    read-only heads, interpreter eval, language scanning, reader
+                                    allowlists, git, command-bearing env vars) — used by both
+                                    destructive.ts and every host policy adapter below
+plan-language.ts                   shared plan-shape prose + tool-op syntax every adapter's tool
+                                    description is built from
+yaml-frontmatter.ts                certainty-or-fail-closed YAML-frontmatter reader for opencode
+                                    v2 agent/mode markdown, feeding policy.ts's v2 ruleset model
 .pi/extension/index.ts             pi adapter — JSON Schema + ctx wiring, delegates to core
-.opencode/plugins/predexec.ts      opencode adapter — zod schema + context wiring, delegates to core
+.opencode/plugins/predexec.ts      opencode adapter — ONE export loading opencode v1 (`{id,server}`)
+                                    AND v2 (`{id,setup}`); v1 hooks live here
+.opencode/lib/shared.ts            logic shared by the v1 and v2 shims
+.opencode/lib/v2.ts                opencode v2 (2.x) shim — no `ask`, no file API ⇒ tool ops run
+                                    through mcp/tool-ops.ts, the same executor Claude Code/Codex use
 mcp/                               Claude Code / Codex / Antigravity adapter (stdio MCP), delegates to core
   server.ts                        the MCP server: one `predexec` tool (`--host` picks the policy reader)
-  tool-ops.ts                      read/grep/find/ls over node:fs (rg/fd accelerate when present)
+  tool-ops.ts                      read/grep/find/ls over node:fs (rg/fd accelerate when present);
+                                    shared verbatim by Claude Code, Codex, Antigravity, AND opencode v2
   policy-claude.ts                 reads your Claude Code permission rules → policyStop
   policy-codex.ts                  reads Codex's config.toml + execpolicy rules → policyStop, fail-closed
   policy-antigravity.ts            reads agy's settings.json grants (Deny > Ask > Allow) → policyStop, fail-closed
-core/                              PURE TS, zero harness imports (promotable to a standalone package)
-  types.ts conditions.ts runner.ts engine.ts destructive.ts coerce.ts index.ts
+  toml-lite.ts                     hand-rolled TOML reader for ~/.codex/config.toml (no TOML dependency)
+  gitignore-match.ts               pure gitignore-pattern matcher backing policy-claude.ts's Read/Edit rules
 steering.ts                        shared steering text/marker + renderSkill (harness-facing; not in core/)
 stats.ts                           request-accounting recorder (append-only JSONL; harness-facing)
-policy.ts                          opencode permission reader/checker (harness-facing)
+policy.ts                          opencode permission reader/checker, v1 and v2 (harness-facing)
 adapter-runtime.ts                 shared adapter execution & stats runtime
 bin/predexec.mjs                   CLI: doctor + stats + install-skill (node builtins only)
 bin/predexec-mcp.mjs               MCP entrypoint (`--host codex|antigravity` selects the host; `--root` for antigravity)
+scripts/gen-skills.mjs             renders every harness's SKILL.md from steering.ts (`pnpm skills`)
+scripts/sync-plugin-version.mjs    syncs every plugin manifest's version from package.json on `npm version`
+scripts/clean-build.mjs            build wrapper: compiles to a scratch dir, atomically swaps into dist/
+scripts/probes/                    throwaway measurement scripts behind docs/research/* findings
+docs/research/*.md                 measured-not-assumed findings (codex-plugin, antigravity, opencode skills/v2)
 .pi/skills/predexec/SKILL.md       pi routing skill (loaded via pi.skills)       } generated from steering.ts
 skills/<harness>/predexec/SKILL.md claude / codex / opencode routing skills     } by `pnpm skills`;
 antigravity-plugin/skills/predexec/SKILL.md  Antigravity routing skill          } never edit by hand
@@ -620,6 +690,8 @@ antigravity-plugin/skills/predexec/SKILL.md  Antigravity routing skill          
 .codex-plugin/plugin.json          Codex plugin manifest (mcpServers/skills point at companion files)
 .codex-plugin/mcp.json             Codex plugin's MCP server config (env_vars forwards CODEX_HOME)
 .agents/plugins/marketplace.json   self-hosting marketplace listing (path: "./") for `codex plugin add`
+antigravity-plugin/                self-hosting Antigravity plugin: plugin.json, mcp_config.json, skill
 configs/opencode/AGENTS.md         drop-in routing block for opencode projects
 configs/codex/AGENTS.md            paste-ready routing block for Codex projects (fallback, no plugin)
+configs/antigravity/AGENTS.md      paste-ready routing block for Antigravity projects (fallback, no plugin)
 ```
