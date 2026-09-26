@@ -20,7 +20,8 @@
  * WRITER_HEAD_MODES for mode-sensitive writers such as tar/unzip/gzip), git.ts,
  * env.ts (command-bearing environment variables), interpreters.ts (eval-flag
  * grammars, preflight, shell eval payloads), language-scan.ts (inline program
- * scanning), and reader-allowlists.ts.
+ * scanning), reader-allowlists.ts, and taint.ts (arithmetic over data-derived
+ * variables, the pipeline's last stage).
  *
  * Deliberately out of scope: allowlist-only inversion for commands in general
  * (the adapters' `mutates` guidance wants tests/builds speculating), and
@@ -73,6 +74,7 @@ import {
 import {
   interpreterReaderViolation,
 } from "./shell/reader-allowlists.ts";
+import { findTaintedArithmetic } from "./shell/taint.ts";
 import {
   EVAL_INTERPRETERS,
   interpreterFamily,
@@ -485,7 +487,7 @@ function findDestructiveTokenInternal(cmd: string, depth: number): string | null
       const gitReadOnly = head === "git" && gitTokens[i] === null;
       return head !== null && (READ_ONLY_HEADS.has(head) || gitReadOnly);
     });
-  if (allSafe) return null;
+  if (allSafe) return findTaintedArithmetic(cmd);
 
   const caseInspection = inspectShellCommandClauses(shellCommand);
   const wordScanSegments = /^case\b/.test(shellCommand.trim()) && caseInspection.complete && caseInspection.clauses.length > 0
@@ -576,7 +578,10 @@ function findDestructiveTokenInternal(cmd: string, depth: number): string | null
     }
   }
 
-  return null;
+  // Last, so it only turns a read-only verdict into a stop: arithmetic that
+  // evaluates a data-derived variable's value can run a command substitution.
+  // It reads the unmasked command: an unquoted heredoc body expands `$((…))`.
+  return findTaintedArithmetic(cmd);
 }
 
 /**

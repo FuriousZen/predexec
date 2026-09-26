@@ -125,3 +125,26 @@ describe("ordinary writers (final review minor #4)", () => {
   it.each(WRITER_ESCAPES)("mutating: %s", (c) => expect(isDestructiveCommand(c)).toBe(true));
   it.each(WRITER_SAFE)("read-only: %s", (c) => expect(isDestructiveCommand(c)).toBe(false));
 });
+
+// E-A: arithmetic contexts evaluate a variable's value as an expression, so a
+// value derived from data within the command can run a command substitution.
+const TAINTED_ARITHMETIC = [
+  "c=$(cat f); echo $((c))", "c=`cat f`; (( c ))", "read c < f; let c", "read -r c <<< \"$x\"; echo $((c+1))",
+  "mapfile -t a < f; echo ${a[0]}; echo $((a))", "printf -v c '%s' \"$(cat f)\"; echo ${s:c:1}",
+  "for c in $(cat f); do echo $((c)); done", "c=$(cat f); d=$c; echo $((d))", "c=$(cat f); [[ c -eq 1 ]]",
+  "c=$(cat f); declare -i n=c", "c=$(cat f); echo ${arr[c]}", "c=$(cat f); echo $(( $c ))",
+  "c=$(cat f); echo \"$(( c * 2 ))\"",
+  // the rule also runs on a shell's -c payload
+  "bash -c 'read c; echo $((c))'", "sh -c 'c=$(cat f); echo $((c))'",
+  // an unquoted heredoc body expands arithmetic too
+  "c=$(cat f)\ncat <<EOF\n$((c))\nEOF",
+];
+
+const UNTAINTED_ARITHMETIC = [
+  "x=5; echo $((x+1))", "echo $((3*4))", "echo $((RANDOM % 10))", "n=$(wc -l < f); echo \"$n\"", "echo ${#arr[@]}",
+];
+
+describe("arithmetic over data-derived variables (E-A)", () => {
+  it.each(TAINTED_ARITHMETIC)("mutating: %s", (c) => expect(isDestructiveCommand(c)).toBe(true));
+  it.each(UNTAINTED_ARITHMETIC)("read-only: %s", (c) => expect(isDestructiveCommand(c)).toBe(false));
+});
