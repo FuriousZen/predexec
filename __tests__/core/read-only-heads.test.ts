@@ -148,3 +148,15 @@ describe("arithmetic over data-derived variables (E-A)", () => {
   it.each(TAINTED_ARITHMETIC)("mutating: %s", (c) => expect(isDestructiveCommand(c)).toBe(true));
   it.each(UNTAINTED_ARITHMETIC)("read-only: %s", (c) => expect(isDestructiveCommand(c)).toBe(false));
 });
+
+// R5: a data-derived value used as a variable name (verified live on bash 3.2 and sh).
+const TAINTED_NAMES = [
+  "c=$(cat f); echo ${!c}", "c=$(cat f); [[ -v $c ]]", "c=$(cat f); printf -v \"$c\" x", "c=$(cat f); read \"$c\" <<< x",
+  "c=$(cat f); declare \"$c=1\"", "c=$(cat f); export \"$c=1\"", "c=$(cat f); f(){ local \"$c=1\"; }; f",
+];
+const UNTAINTED_NAMES = ["c=$(cat f); echo \"$c\"", "echo ${!prefix*}", "declare -n r=literal"];
+
+describe("data-derived values used as variable names (R5)", () => {
+  it.each(TAINTED_NAMES)("mutating: %s", (c) => expect(isDestructiveCommand(c)).toBe(true));
+  it.each(UNTAINTED_NAMES)("read-only: %s", (c) => expect(isDestructiveCommand(c)).toBe(false));
+});

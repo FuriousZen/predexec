@@ -12,6 +12,16 @@
  * and its siblings, array subscripts, `${var:off:len}`, and integer-declared
  * (`declare -i`) assignments.
  *
+ * The same evaluation happens when a data-derived value is used as a variable
+ * NAME: bash parses the name, and a subscript in it runs. Measured on bash 3.2
+ * and macOS /bin/sh with c='a[$(echo PWNED >&2)]', these evaluate: `${!c}`
+ * (any operator form except the `${!c[@]}` key list), `[[ -v $c ]]`,
+ * `printf -v "$c"`, `read "$c"` (and `-a`), `getopts o "$c"`,
+ * `declare|typeset|local|export|readonly "$c=…"`, bare `export|readonly "$c"`,
+ * `declare -p "$c"`, and (sh only) `unset -f "$c"`. These do not: namerefs
+ * (`declare -n`, bash >= 4.3 only), `test -v`/`[ -v`, plain `unset "$c"`, and
+ * bare `declare|local "$c"`.
+ *
  * The analysis is deliberately flow-insensitive and over-approximating: order
  * is ignored, quoting is ignored for context detection, and any identifier in
  * an assignment value counts as a dependency (bash re-evaluates a bare name's
@@ -39,6 +49,10 @@ const IDENTIFIER_RE = /(?<![0-9A-Za-z_#])[A-Za-z_][A-Za-z0-9_]*/g;
 const IDENTIFIER_WORD_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const ARITHMETIC_TEST_OPERATORS = new Set(["-eq", "-ne", "-lt", "-le", "-gt", "-ge"]);
 const DECLARE_HEADS = new Set(["declare", "typeset", "local", "export", "readonly"]);
+/** `$name` / `${name…}` references in a word's raw text. */
+const VARIABLE_REFERENCE_RE = /\$\{?([A-Za-z_][A-Za-z0-9_]*)/g;
+/** `read` options whose next word is not a variable name. */
+const READ_VALUE_OPTIONS = new Set(["-p", "-d", "-i", "-n", "-N", "-t", "-u"]);
 const COMMAND_PREFIX_WORDS = new Set(["command", "builtin"]);
 /** Control-syntax prefixes; `for`/`select` stay, their loop variable is a source. */
 const CONTROL_PREFIX_RE = /^(?:(?:if|then|elif|else|fi|while|until|do|done|function|coproc|time)(?=\s|$)|[!{}()])\s*/;
@@ -49,6 +63,10 @@ const DATA_CONSTRUCT_RE = /\$\(|`|\b(?:read|mapfile|readarray|getopts|printf|for
 
 function identifiers(text: string): string[] {
   return text.match(IDENTIFIER_RE) ?? [];
+}
+
+function variableReferences(text: string): string[] {
+  return [...text.matchAll(VARIABLE_REFERENCE_RE)].map((m) => m[1]!);
 }
 
 /**
@@ -75,6 +93,8 @@ function matchBrackets(text: string): Int32Array {
 
 interface ArithmeticRanges {
   identifiers: string[];
+  /** Variables whose values the raw text uses as a name: `${!c}`, `[[ -v $c ]]`. */
+  nameReferences: string[];
   complete: boolean;
 }
 
@@ -87,6 +107,7 @@ function arithmeticRangeIdentifiers(text: string): ArithmeticRanges {
   // Difference array over covered positions keeps nested contexts linear.
   const cover = new Int32Array(text.length + 1);
   let complete = true;
+  const nameReferences: string[] = [];
   const mark = (start: number, end: number) => {
     if (start >= end) return;
     cover[start]!++;
@@ -120,10 +141,14 @@ function arithmeticRangeIdentifiers(text: string): ArithmeticRanges {
       }
       // `${[#!]NAME[sub]:off:len}`: the offset and length are arithmetic.
       let cursor = i + 2;
-      if (text[cursor] === "#" || text[cursor] === "!") cursor++;
+      const indirect = text[cursor] === "!";
+      if (text[cursor] === "#" || indirect) cursor++;
       const name = /^(?:[A-Za-z_][A-Za-z0-9_]*|[0-9]+|[@*])/.exec(text.slice(cursor, Math.min(close, cursor + 256)));
       if (!name) continue;
       cursor += name[0].length;
+      // `${!c…}` expands the variable NAMED by c's value, except the key list
+      // `${!c[@]}` and the name-prefix lists `${!c*}` / `${!c@}`.
+      if (indirect && !/^(?:\[[@*]\]\}|[@*]\})/.test(text.slice(cursor, cursor + 4))) nameReferences.push(name[0]);
       if (text[cursor] === "[") {
         const subscriptClose = match[cursor]!;
         if (subscriptClose === -1 || subscriptClose > close) continue;
@@ -137,7 +162,7 @@ function arithmeticRangeIdentifiers(text: string): ArithmeticRanges {
       const bodyEnd = close === -1 || close < i ? text.length : close - 1;
       if (bodyEnd === text.length) complete = false;
       testEnd = bodyEnd;
-      markTestOperands(text, i + 2, bodyEnd, mark);
+      markTestOperands(text, i + 2, bodyEnd, mark, nameReferences);
     }
   }
   const covered: string[] = [];
@@ -152,11 +177,20 @@ function arithmeticRangeIdentifiers(text: string): ArithmeticRanges {
       runStart = -1;
     }
   }
-  return { identifiers: covered.flatMap(identifiers), complete };
+  return { identifiers: covered.flatMap(identifiers), nameReferences, complete };
 }
 
-/** Mark the words on either side of each arithmetic comparison in a `[[ … ]]` body. */
-function markTestOperands(text: string, start: number, end: number, mark: (start: number, end: number) => void): void {
+/**
+ * Mark the words on either side of each arithmetic comparison in a `[[ … ]]`
+ * body, and record the variables a `-v` operand names.
+ */
+function markTestOperands(
+  text: string,
+  start: number,
+  end: number,
+  mark: (start: number, end: number) => void,
+  nameReferences: string[],
+): void {
   const words: Array<[number, number]> = [];
   let wordStart = -1;
   for (let i = start; i <= end; i++) {
@@ -169,7 +203,11 @@ function markTestOperands(text: string, start: number, end: number, mark: (start
   }
   for (let w = 0; w < words.length; w++) {
     const [s, e] = words[w]!;
-    if (!ARITHMETIC_TEST_OPERATORS.has(text.slice(s, e))) continue;
+    const word = text.slice(s, e);
+    if (word === "-v" && w + 1 < words.length) {
+      nameReferences.push(...variableReferences(text.slice(words[w + 1]![0], words[w + 1]![1])));
+    }
+    if (!ARITHMETIC_TEST_OPERATORS.has(word)) continue;
     if (w > 0) mark(words[w - 1]![0], words[w - 1]![1]);
     if (w + 1 < words.length) mark(words[w + 1]![0], words[w + 1]![1]);
   }
@@ -184,6 +222,8 @@ interface Flow {
   arithmetic: string[];
   /** Names declared integer; their assignments are arithmetic contexts. */
   integerNames: Set<string>;
+  /** Variables whose values a builtin takes as a variable name (`printf -v "$c"`). */
+  nameReferences: string[];
   /** Every assignment's name and value identifiers, for the integer pass. */
   assignments: Array<{ name: string; values: string[] }>;
   complete: boolean;
@@ -251,6 +291,7 @@ function scanSegment(flow: Flow, rawSegment: string): void {
       flow.integerNames.add(word.value);
     }
   }
+  recordNameOperands(flow, segment, command, args);
   switch (command) {
     case "read":
     case "mapfile":
@@ -287,6 +328,52 @@ function scanSegment(flow: Flow, rawSegment: string): void {
   }
 }
 
+const rawWord = (segment: string, word: ShellWord) => segment.slice(word.start, word.end);
+
+/** Record the variables whose values `command` would use as variable names. */
+function recordNameOperands(flow: Flow, segment: string, command: string, args: readonly ShellWord[]): void {
+  const name = (word: ShellWord | undefined) => {
+    if (word) flow.nameReferences.push(...variableReferences(rawWord(segment, word)));
+  };
+  const options = args.filter((word) => /^[-+]/.test(word.value)).map((word) => word.value);
+  switch (command) {
+    case "read":
+      for (let i = 0; i < args.length; i++) {
+        const value = args[i]!.value;
+        if (REDIRECTION_WORD_RE.test(value)) break;
+        if (READ_VALUE_OPTIONS.has(value)) i++;
+        else if (!value.startsWith("-") || value === "-a") name(value === "-a" ? args[++i] : args[i]);
+      }
+      break;
+    case "printf":
+      for (let i = 0; i < args.length; i++) if (args[i]!.value === "-v") name(args[i + 1]);
+      break;
+    case "getopts":
+      name(args[1]);
+      break;
+    case "unset":
+      if (options.some((option) => /^-[A-Za-z]*f/.test(option))) args.forEach(name);
+      break;
+    case "declare":
+    case "typeset":
+    case "local":
+    case "export":
+    case "readonly": {
+      // A bare name is only parsed as one by export/readonly and `-p`.
+      const bareIsName = command === "export" || command === "readonly" ||
+        options.some((option) => /^-[A-Za-z]*p/.test(option));
+      for (const word of args) {
+        if (/^[-+]/.test(word.value)) continue;
+        const raw = rawWord(segment, word);
+        const equals = raw.indexOf("=");
+        if (equals !== -1) flow.nameReferences.push(...variableReferences(raw.slice(0, equals)));
+        else if (bareIsName) flow.nameReferences.push(...variableReferences(raw));
+      }
+      break;
+    }
+  }
+}
+
 function taintedNames(flow: Flow): Set<string> {
   const dependents = new Map<string, string[]>();
   for (const [name, froms] of flow.dependencies) {
@@ -309,8 +396,9 @@ function taintedNames(flow: Flow): Set<string> {
 }
 
 /**
- * The reason a command evaluates a data-derived variable arithmetically, e.g.
- * `"arithmetic over data-derived variable c"`, or null when it does not.
+ * The reason a command evaluates a data-derived variable's value, e.g.
+ * `"arithmetic over data-derived variable c"` or
+ * `"data-derived variable c used as a variable name"`, or null when it does not.
  */
 export function findTaintedArithmetic(command: string): string | null {
   const ranges = arithmeticRangeIdentifiers(command);
@@ -319,6 +407,7 @@ export function findTaintedArithmetic(command: string): string | null {
     dependencies: new Map(),
     arithmetic: [],
     integerNames: new Set(),
+    nameReferences: [],
     assignments: [],
     complete: ranges.complete,
   };
@@ -331,12 +420,13 @@ export function findTaintedArithmetic(command: string): string | null {
     if (flow.integerNames.has(name)) flow.arithmetic.push(...values);
   }
   const referenced = [...ranges.identifiers, ...flow.arithmetic];
-  if (referenced.length === 0) return null;
+  const names = [...ranges.nameReferences, ...flow.nameReferences];
+  if (referenced.length === 0 && names.length === 0) return null;
   const tainted = taintedNames(flow);
-  let hit = referenced.find((name) => tainted.has(name));
-  // Unparsed: any arithmetic identifier counts once the command reads data at all.
-  if (hit === undefined && !flow.complete && (flow.sources.size > 0 || DATA_CONSTRUCT_RE.test(command))) {
-    hit = referenced[0];
-  }
-  return hit === undefined ? null : `arithmetic over data-derived variable ${hit}`;
+  // Unparsed: any reference counts once the command reads data at all.
+  const unparsed = !flow.complete && (flow.sources.size > 0 || DATA_CONSTRUCT_RE.test(command));
+  const arithmetic = referenced.find((name) => tainted.has(name)) ?? (unparsed ? referenced[0] : undefined);
+  if (arithmetic !== undefined) return `arithmetic over data-derived variable ${arithmetic}`;
+  const name = names.find((ref) => tainted.has(ref)) ?? (unparsed ? names[0] : undefined);
+  return name === undefined ? null : `data-derived variable ${name} used as a variable name`;
 }

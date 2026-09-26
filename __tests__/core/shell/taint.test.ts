@@ -85,3 +85,36 @@ describe("findTaintedArithmetic", () => {
     expect(performance.now() - started).toBeLessThan(2_000);
   });
 });
+
+// R5: a data-derived value used as a variable NAME. Bash parses the name, and
+// a subscript in it (`a[$(cmd)]`) runs cmd. Every row was verified to run the
+// subscript on /bin/bash 3.2 and /bin/sh (macOS) with c='a[$(echo PWNED >&2)]'.
+const TAINTED_NAMES = [
+  "c=$(cat f); echo ${!c}", "c=$(cat f); echo \"${!c}\"", "c=$(cat f); echo ${!c:-x}", "c=$(cat f); echo ${!c#x}",
+  "c=$(cat f); [[ -v $c ]]", "c=$(cat f); [[ -v \"$c\" ]]",
+  "c=$(cat f); printf -v \"$c\" x", "c=$(cat f); printf -v \"${c}\" x",
+  "c=$(cat f); read \"$c\" <<< x", "c=$(cat f); read -r \"$c\" <<< x", "c=$(cat f); read -a \"$c\" <<< x",
+  "c=$(cat f); getopts a \"$c\" -a",
+  "c=$(cat f); declare \"$c=1\"", "c=$(cat f); typeset \"$c=1\"", "c=$(cat f); export \"$c=1\"",
+  "c=$(cat f); f(){ local \"$c=1\"; }; f", "c=$(cat f); export \"$c\"", "c=$(cat f); readonly \"$c\"",
+  "c=$(cat f); declare -p \"$c\"", "c=$(cat f); unset -f \"$c\"",
+  "for c in *; do echo ${!c}; done",
+];
+
+// Measured NOT to evaluate on bash 3.2 / sh (namerefs need bash >= 4.3,
+// `test -v` is unsupported there), or no data-derived name is involved.
+const CLEAN_NAMES = [
+  "c=$(cat f); echo \"$c\"", "echo ${!prefix*}", "echo ${!prefix@}", "declare -n r=literal",
+  "c=$(cat f); echo ${!c[@]}", "c=$(cat f); declare \"$c\"", "c=$(cat f); f(){ local \"$c\"; }; f",
+  "c=$(cat f); unset \"$c\"", "c=$(cat f); test -v \"$c\"", "c=$(cat f); read -p \"$c\" x",
+  "c=lit; echo ${!c}", "c=lit; printf -v \"$c\" x",
+];
+
+describe("data-derived values used as variable names", () => {
+  it.each(TAINTED_NAMES)("tainted: %s", (command) => {
+    expect(findTaintedArithmetic(command)).toMatch(/^data-derived variable (c|OPTARG) used as a variable name$/);
+  });
+  it.each(CLEAN_NAMES)("clean: %s", (command) => {
+    expect(findTaintedArithmetic(command)).toBeNull();
+  });
+});
