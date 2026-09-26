@@ -5,17 +5,30 @@ import { join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import {
-  checkCodex,
-  checkNodeVersion,
+  agentsFileHasRouting,
+  ancestorsOf,
+  antigravitySkillRoots,
+  checkAntigravitySkill,
   checkClaudeCode,
+  checkClaudeSkill,
+  checkCodex,
+  checkCodexSkill,
+  checkNodeVersion,
   checkOpencode,
+  checkOpencodeSkill,
   checkPi,
+  claudeSkillRoots,
+  codexSkillRoots,
   findOpencodeConfigs,
+  findPredexecSkills,
   isDirectInvocation,
   onPath,
+  opencodeSkillRoots,
   parseStatsLines,
   parseTomlLite,
   piPackageSource,
+  projectDirsFromRootToCwd,
+  skillCheck,
   stripJsonComments,
   summarizeStats,
 } from "../bin/predexec.mjs";
@@ -404,6 +417,56 @@ describe("doctor — claude code checks", () => {
     expect(checks[0]!.status).toBe("info");
     expect(checks[0]!.hint).toContain("plugin form");
   });
+
+  it("finds a local-scope server registered from an ancestor directory (CC-6)", () => {
+    scratch();
+    const projectRoot = join(tmp, "proj");
+    const subDir = join(projectRoot, "sub", "dir");
+    mkdirSync(subDir, { recursive: true });
+    write(
+      "home/.claude.json",
+      JSON.stringify({ projects: { [projectRoot]: { mcpServers: { predexec: { command: "npx" } } } } }),
+    );
+    const checks = checkClaudeCode(ccOpts({ cwd: subDir }));
+    expect(checks[0]!.status).toBe("ok");
+    expect(checks[0]!.name).toContain("(local)");
+    expect(checks[0]!.detail).toContain(projectRoot);
+  });
+
+  it("does not match a local-scope registration from an unrelated sibling directory", () => {
+    scratch();
+    const sibling = join(tmp, "other-project");
+    mkdirSync(join(tmp, "proj"), { recursive: true });
+    mkdirSync(sibling, { recursive: true });
+    write("home/.claude.json", JSON.stringify({ projects: { [sibling]: { mcpServers: { predexec: {} } } } }));
+    expect(checkClaudeCode(ccOpts({ installed: true }))[0]!.status).toBe("info");
+  });
+});
+
+describe("ancestorsOf / projectDirsFromRootToCwd", () => {
+  it("walks every ancestor up to the filesystem root, closest first", () => {
+    const dirs = ancestorsOf(join("/a", "b", "c"));
+    expect(dirs[0]).toBe(join("/a", "b", "c"));
+    expect(dirs[dirs.length - 1]).toBe(join("/"));
+  });
+
+  it("layers from the nearest git root down to cwd", () => {
+    scratch();
+    const root = join(tmp, "repo");
+    const sub = join(root, "sub", "dir");
+    mkdirSync(join(root, ".git"), { recursive: true });
+    mkdirSync(sub, { recursive: true });
+    expect(projectDirsFromRootToCwd(sub)).toEqual([root, join(root, "sub"), sub]);
+  });
+
+  it("stops at the filesystem root when no .git is found", () => {
+    scratch();
+    const dir = join(tmp, "no-git-here");
+    mkdirSync(dir, { recursive: true });
+    const dirs = projectDirsFromRootToCwd(dir);
+    expect(dirs[dirs.length - 1]).toBe(dir);
+    expect(dirs[0]).toBe(join("/"));
+  });
 });
 
 describe("doctor — codex checks", () => {
@@ -596,6 +659,238 @@ describe("doctor — codex checks", () => {
     );
     expect(checks.some((c) => c.status === "info" && /not registered/.test(c.name))).toBe(true);
     expect(checks.every((c) => c.status !== "fail")).toBe(true);
+  });
+});
+
+const skillFrontmatter = (body = "body") => `---\nname: predexec\ndescription: x\n---\n\n${body}\n`;
+
+describe("skill discovery: findPredexecSkills", () => {
+  it("finds a SKILL.md one level under a discovery root", () => {
+    scratch();
+    write("root/predexec/SKILL.md", skillFrontmatter("claude variant"));
+    const skills = findPredexecSkills([join(tmp, "root")]);
+    expect(skills).toHaveLength(1);
+    expect(skills[0]!.path).toBe(join(tmp, "root", "predexec", "SKILL.md"));
+  });
+
+  it("ignores a SKILL.md whose frontmatter name isn't predexec", () => {
+    scratch();
+    write("root/other-skill/SKILL.md", "---\nname: something-else\ndescription: x\n---\n");
+    expect(findPredexecSkills([join(tmp, "root")])).toHaveLength(0);
+  });
+
+  it("ignores a file with no frontmatter at all", () => {
+    scratch();
+    write("root/predexec/SKILL.md", "not a skill file");
+    expect(findPredexecSkills([join(tmp, "root")])).toHaveLength(0);
+  });
+
+  it("de-duplicates the same file reached through two identical roots", () => {
+    scratch();
+    write("root/predexec/SKILL.md", skillFrontmatter());
+    expect(findPredexecSkills([join(tmp, "root"), join(tmp, "root")])).toHaveLength(1);
+  });
+
+  it("tolerates a missing discovery root", () => {
+    scratch();
+    expect(findPredexecSkills([join(tmp, "does-not-exist")])).toEqual([]);
+  });
+});
+
+describe("skillCheck", () => {
+  it("is silent (no check at all) when nothing is found and the host isn't registered", () => {
+    scratch();
+    expect(skillCheck("x", "x", [join(tmp, "nope")], false)).toEqual([]);
+  });
+
+  it("hints install-skill when nothing is found but the host is registered", () => {
+    scratch();
+    const checks = skillCheck("claude code", "claude", [join(tmp, "nope")], true);
+    expect(checks[0]!.status).toBe("info");
+    expect(checks[0]!.hint).toContain("install-skill claude");
+  });
+
+  it("reports ok for exactly one skill", () => {
+    scratch();
+    write("root/predexec/SKILL.md", skillFrontmatter());
+    expect(skillCheck("x", "x", [join(tmp, "root")], true)[0]!.status).toBe("ok");
+  });
+
+  it("reports info for identical duplicates visible from two roots", () => {
+    scratch();
+    write("a/predexec/SKILL.md", skillFrontmatter("same"));
+    write("b/predexec/SKILL.md", skillFrontmatter("same"));
+    const checks = skillCheck("x", "x", [join(tmp, "a"), join(tmp, "b")], true);
+    expect(checks[0]!.status).toBe("info");
+    expect(checks[0]!.name).toContain("duplicate copies");
+  });
+
+  it("reports fail (`[!]`) for two DIFFERENT skills visible to the same host", () => {
+    scratch();
+    write("a/predexec/SKILL.md", skillFrontmatter("claude wording"));
+    write("b/predexec/SKILL.md", skillFrontmatter("opencode wording"));
+    const checks = skillCheck("opencode", "opencode", [join(tmp, "a"), join(tmp, "b")], true);
+    expect(checks[0]!.status).toBe("fail");
+    expect(checks[0]!.name).toContain("multiple different predexec skills visible");
+  });
+});
+
+describe("skill discovery roots", () => {
+  it("claudeSkillRoots honors CLAUDE_CONFIG_DIR and adds the project scope", () => {
+    const roots = claudeSkillRoots({ home: "/home/u", cwd: "/proj", configDir: "/custom/cfg" });
+    expect(roots).toEqual([join("/custom/cfg", "skills"), join("/proj", ".claude", "skills")]);
+  });
+
+  it("codexSkillRoots layers .agents/skills from the project (git) root down to cwd", () => {
+    scratch();
+    const root = join(tmp, "repo");
+    const sub = join(root, "sub");
+    mkdirSync(join(root, ".git"), { recursive: true });
+    mkdirSync(sub, { recursive: true });
+    const roots = codexSkillRoots({ home: join(tmp, "home"), cwd: sub, codexHome: join(tmp, "codex-home") });
+    expect(roots).toContain(join(tmp, "home", ".agents", "skills"));
+    expect(roots).toContain(join(tmp, "codex-home", "skills"));
+    expect(roots).toContain(join(sub, ".codex", "skills"));
+    expect(roots).toContain(join(root, ".agents", "skills"));
+    expect(roots).toContain(join(sub, ".agents", "skills"));
+    expect(roots).toContain(join("/etc", "codex", "skills"));
+  });
+
+  it("opencodeSkillRoots includes a project config's skills.paths entries", () => {
+    scratch();
+    mkdirSync(join(tmp, "proj", ".git"), { recursive: true }); // stop the config walk at proj
+    write("proj/opencode.json", JSON.stringify({ skills: { paths: ["custom-skills"] } }));
+    const roots = opencodeSkillRoots({ home: join(tmp, "home"), cwd: join(tmp, "proj") });
+    expect(roots).toContain(join(tmp, "proj", "custom-skills"));
+  });
+
+  it("antigravitySkillRoots covers the project scope and every global gemini location", () => {
+    const roots = antigravitySkillRoots({ home: "/home/u", cwd: "/proj" });
+    expect(roots).toEqual([
+      join("/proj", ".agents", "skills"),
+      join("/proj", ".agent", "skills"),
+      join("/home/u", ".gemini", "config", "skills"),
+      join("/home/u", ".gemini", "antigravity", "skills"),
+      join("/home/u", ".gemini", "antigravity-cli", "skills"),
+    ]);
+  });
+});
+
+describe("agentsFileHasRouting", () => {
+  it("detects a routing block via marker quorum", () => {
+    scratch();
+    write("proj/AGENTS.md", "Use predexec for read-only shell operations. mutationStop recovers.");
+    expect(agentsFileHasRouting(join(tmp, "proj"))).toBe(true);
+  });
+
+  it("is false for an AGENTS.md that merely mentions the name once", () => {
+    scratch();
+    write("proj/AGENTS.md", "This project uses predexec somewhere.");
+    expect(agentsFileHasRouting(join(tmp, "proj"))).toBe(false);
+  });
+
+  it("is false when there is no AGENTS.md at all", () => {
+    scratch();
+    mkdirSync(join(tmp, "proj"), { recursive: true });
+    expect(agentsFileHasRouting(join(tmp, "proj"))).toBe(false);
+  });
+});
+
+describe("doctor — skill checks (claude)", () => {
+  const skOpts = (over: Record<string, unknown> = {}) => ({
+    home: join(tmp, "home"),
+    cwd: join(tmp, "proj"),
+    configDir: join(tmp, "home", ".claude"),
+    ...over,
+  });
+
+  it("is silent when unregistered and no skill exists", () => {
+    scratch();
+    expect(checkClaudeSkill(skOpts(), false)).toEqual([]);
+  });
+
+  it("hints install-skill when registered but no skill is found", () => {
+    scratch();
+    const checks = checkClaudeSkill(skOpts(), true);
+    expect(checks[0]!.status).toBe("info");
+    expect(checks[0]!.hint).toContain("install-skill claude");
+  });
+
+  it("reports ok once the packaged skill is installed at the global root", () => {
+    scratch();
+    write("home/.claude/skills/predexec/SKILL.md", skillFrontmatter());
+    expect(checkClaudeSkill(skOpts(), true)[0]!.status).toBe("ok");
+  });
+
+  it("short-circuits to ok when the plugin form bundles its own skill", () => {
+    scratch();
+    write("plugin/skills/claude/predexec/SKILL.md", skillFrontmatter());
+    const checks = checkClaudeSkill(skOpts({ plugin: { installPath: join(tmp, "plugin") } }), true);
+    expect(checks[0]!.status).toBe("ok");
+    expect(checks[0]!.name).toContain("bundled with plugin");
+  });
+});
+
+describe("doctor — skill checks (codex)", () => {
+  it("flags an AGENTS.md routing block and a skill both being active", () => {
+    scratch();
+    write("proj/AGENTS.md", "Use predexec for read-only shell operations. mutationStop recovers.");
+    write("home/.agents/skills/predexec/SKILL.md", skillFrontmatter());
+    const checks = checkCodexSkill(
+      { home: join(tmp, "home"), cwd: join(tmp, "proj"), codexHome: join(tmp, "codex-home") },
+      true,
+    );
+    expect(checks.some((c) => c.status === "ok")).toBe(true);
+    expect(checks.some((c) => c.status === "info" && /AGENTS\.md/.test(c.name))).toBe(true);
+  });
+
+  it("does not mention AGENTS.md when there is no skill at all", () => {
+    scratch();
+    write("proj/AGENTS.md", "Use predexec for read-only shell operations. mutationStop recovers.");
+    const checks = checkCodexSkill(
+      { home: join(tmp, "home"), cwd: join(tmp, "proj"), codexHome: join(tmp, "codex-home") },
+      true,
+    );
+    expect(checks.some((c) => /AGENTS\.md/.test(c.name))).toBe(false);
+  });
+});
+
+describe("doctor — skill checks (opencode)", () => {
+  it("flags a stale claude-flavored skill visible alongside opencode's own (cross-host duplicate)", () => {
+    scratch();
+    write("proj/.claude/skills/predexec/SKILL.md", skillFrontmatter("claude wording"));
+    write("proj/.opencode/skills/predexec/SKILL.md", skillFrontmatter("opencode wording"));
+    const checks = checkOpencodeSkill({ home: join(tmp, "home"), cwd: join(tmp, "proj") }, true);
+    expect(checks[0]!.status).toBe("fail");
+  });
+
+  it("reports ok for a single opencode skill with no cross-host overlap", () => {
+    scratch();
+    write("proj/.opencode/skills/predexec/SKILL.md", skillFrontmatter());
+    const checks = checkOpencodeSkill({ home: join(tmp, "home"), cwd: join(tmp, "proj") }, true);
+    expect(checks[0]!.status).toBe("ok");
+  });
+});
+
+describe("doctor — skill checks (antigravity)", () => {
+  it("skips when there is no sign of antigravity at all", () => {
+    scratch();
+    expect(checkAntigravitySkill({ home: join(tmp, "home") })[0]!.status).toBe("skip");
+  });
+
+  it("hints install-skill when ~/.gemini exists but no skill is found", () => {
+    scratch();
+    mkdirSync(join(tmp, "home", ".gemini"), { recursive: true });
+    const checks = checkAntigravitySkill({ home: join(tmp, "home"), cwd: join(tmp, "proj") });
+    expect(checks[0]!.status).toBe("info");
+    expect(checks[0]!.hint).toContain("install-skill antigravity");
+  });
+
+  it("reports ok once the skill is installed", () => {
+    scratch();
+    write("home/.gemini/config/skills/predexec/SKILL.md", skillFrontmatter());
+    const checks = checkAntigravitySkill({ home: join(tmp, "home"), cwd: join(tmp, "proj") });
+    expect(checks[0]!.status).toBe("ok");
   });
 });
 

@@ -8,10 +8,10 @@
  * executed directly.
  */
 
-import { readFileSync, readdirSync, existsSync, realpathSync } from "node:fs";
+import { readFileSync, readdirSync, existsSync, mkdirSync, realpathSync, writeFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
-import { dirname, join, parse as parsePath } from "node:path";
+import { dirname, isAbsolute, join, parse as parsePath } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { spawn, spawnSync } from "node:child_process";
 
@@ -859,7 +859,29 @@ export function findClaudeCodePlugin(configDir) {
   const plugins = data && typeof data.plugins === "object" ? data.plugins : null;
   if (!plugins) return null;
   const key = Object.keys(plugins).find((k) => /^predexec(@|$)/.test(k));
-  return key ? { key, path } : null;
+  if (!key) return null;
+  const entries = Array.isArray(plugins[key]) ? plugins[key] : [];
+  const installPath = entries.find((e) => e && typeof e.installPath === "string")?.installPath ?? null;
+  return { key, path, installPath };
+}
+
+/**
+ * `dir` and every ancestor up to the filesystem root, closest first.
+ * Shared by the local-scope Claude Code project lookup (CC-6) and skill
+ * discovery walks that mirror it.
+ */
+export function ancestorsOf(dir) {
+  const root = parsePath(dir).root;
+  const dirs = [];
+  let d = dir;
+  for (;;) {
+    dirs.push(d);
+    if (d === root) break;
+    const parent = dirname(d);
+    if (parent === d) break;
+    d = parent;
+  }
+  return dirs;
 }
 
 export function checkClaudeCode(opts = {}) {
@@ -874,13 +896,19 @@ export function checkClaudeCode(opts = {}) {
   const named = (servers) =>
     servers && typeof servers === "object" ? Object.keys(servers).find((k) => /predexec/.test(k)) : undefined;
 
+  // Local-scope registrations are recorded under the project directory they
+  // were added from, which is not always the exact cwd — a subdirectory of an
+  // already-registered project must still see it (CC-6: this used to match
+  // only an exact cwd).
+  const localDir = ancestorsOf(cwd).find((dir) => named(userConfig.projects?.[dir]?.mcpServers));
+
   const found = [
     { scope: "project", key: named(projectMcp?.mcpServers), where: join(cwd, ".mcp.json") },
     { scope: "user", key: named(userConfig.mcpServers), where: join(home, ".claude.json") },
     {
       scope: "local",
-      key: named(userConfig.projects?.[cwd]?.mcpServers),
-      where: `${join(home, ".claude.json")} → projects[${cwd}]`,
+      key: localDir ? named(userConfig.projects?.[localDir]?.mcpServers) : undefined,
+      where: localDir ? `${join(home, ".claude.json")} → projects[${localDir}]` : undefined,
     },
   ].filter((s) => s.key);
 
@@ -1139,6 +1167,380 @@ export async function liveProbe({ timeoutMs = 12000, cwd = tmpdir(), expectRegis
   }
 }
 
+// ── skills: install-skill + doctor skill checks ────────────
+//
+// Task 14 renders every harness's routing SKILL.md from `steering.ts`'s
+// `SKILL_PATHS` at build/publish time; this section is the runtime half —
+// copying a packaged skill into a host's own skill directory
+// (`install-skill`) and detecting whether one is already visible to a host
+// (doctor's `skill` checks). `SKILL_SOURCE_PATHS` below is a plain-JS twin of
+// `steering.ts`'s `SKILL_PATHS` (this file imports no TS — see CLAUDE.md);
+// __tests__/install-skill.test.ts asserts the two stay in parity.
+
+export const SKILL_HARNESSES = Object.freeze(["claude", "codex", "opencode", "antigravity", "pi"]);
+
+/** Repo-relative path to each harness's packaged SKILL.md. Twin of steering.ts's SKILL_PATHS. */
+export const SKILL_SOURCE_PATHS = Object.freeze({
+  pi: ".pi/skills/predexec/SKILL.md",
+  claude: "skills/claude/predexec/SKILL.md",
+  codex: "skills/codex/predexec/SKILL.md",
+  opencode: "skills/opencode/predexec/SKILL.md",
+  antigravity: "antigravity-plugin/skills/predexec/SKILL.md",
+});
+
+/** The installed package's root directory (one level up from this file). */
+export function packageRoot(moduleUrl = import.meta.url) {
+  return join(dirname(fileURLToPath(moduleUrl)), "..");
+}
+
+/** predexec's own skill frontmatter identity: `{ path, text }`, or null if this isn't one of ours. */
+export function readSkillIdentity(path) {
+  let text;
+  try {
+    text = readFileSync(path, "utf8");
+  } catch {
+    return null;
+  }
+  const frontmatter = text.match(/^---\r?\n([\s\S]*?)\r?\n---/);
+  if (!frontmatter) return null;
+  const name = frontmatter[1].match(/^name:\s*(.+?)\s*$/m);
+  if (!name || name[1] !== "predexec") return null;
+  return { path, text };
+}
+
+/** SKILL.md candidates directly under `root`, or one level below it (a "root/<dir>/SKILL.md" layout). */
+export function findSkillFiles(root) {
+  const found = [];
+  if (existsSync(join(root, "SKILL.md"))) found.push(join(root, "SKILL.md"));
+  let entries;
+  try {
+    entries = readdirSync(root, { withFileTypes: true });
+  } catch {
+    return found;
+  }
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const candidate = join(root, entry.name, "SKILL.md");
+    if (existsSync(candidate)) found.push(candidate);
+  }
+  return found;
+}
+
+/** Every distinct predexec skill file found across `roots` (de-duplicated by path). */
+export function findPredexecSkills(roots) {
+  const seen = new Set();
+  const skills = [];
+  for (const root of roots) {
+    for (const path of findSkillFiles(root)) {
+      if (seen.has(path)) continue;
+      seen.add(path);
+      const id = readSkillIdentity(path);
+      if (id) skills.push(id);
+    }
+  }
+  return skills;
+}
+
+/**
+ * Directories from the nearest git root down to `cwd`, inclusive, closest-to-root
+ * first. Mirrors the git-root walk `findOpencodeConfigs` already does (and the
+ * project-root layering Codex's own execpolicy rules resolution uses — see
+ * mcp/policy-codex.ts) for the "current project" scope of a skills scan.
+ */
+export function projectDirsFromRootToCwd(cwd) {
+  const root = parsePath(cwd).root;
+  const dirs = [];
+  let dir = cwd;
+  for (;;) {
+    dirs.unshift(dir);
+    if (existsSync(join(dir, ".git"))) break;
+    const parent = dirname(dir);
+    if (parent === dir || dir === root) break;
+    dir = parent;
+  }
+  return dirs;
+}
+
+/** Claude Code skill discovery roots: `${CLAUDE_CONFIG_DIR:-~/.claude}/skills`, `<proj>/.claude/skills`. */
+export function claudeSkillRoots(opts = {}) {
+  const home = opts.home ?? homedir();
+  const cwd = opts.cwd ?? process.cwd();
+  const configDir = opts.configDir ?? process.env.CLAUDE_CONFIG_DIR ?? join(home, ".claude");
+  return [join(configDir, "skills"), join(cwd, ".claude", "skills")];
+}
+
+/**
+ * Codex skill discovery roots: `~/.agents/skills`, `$CODEX_HOME/skills`
+ * (deprecated), `<proj>/.codex/skills`, `.agents/skills` layered from the
+ * project (git) root down to cwd, and `/etc/codex/skills`.
+ */
+export function codexSkillRoots(opts = {}) {
+  const home = opts.home ?? homedir();
+  const cwd = opts.cwd ?? process.cwd();
+  const codexHome = resolveCodexHome({ home, env: opts.env, codexHome: opts.codexHome });
+  return [
+    join(home, ".agents", "skills"),
+    join(codexHome, "skills"),
+    join(cwd, ".codex", "skills"),
+    ...projectDirsFromRootToCwd(cwd).map((dir) => join(dir, ".agents", "skills")),
+    join("/etc", "codex", "skills"),
+  ];
+}
+
+/**
+ * opencode skill discovery roots: `.opencode/{skill,skills}`,
+ * `~/.config/opencode/skills`, `.claude/skills`, `.agents/skills` (project +
+ * global), plus any `skills.paths` entries from the effective opencode config.
+ */
+export function opencodeSkillRoots(opts = {}) {
+  const home = opts.home ?? homedir();
+  const cwd = opts.cwd ?? process.cwd();
+  const roots = [
+    join(cwd, ".opencode", "skill"),
+    join(cwd, ".opencode", "skills"),
+    join(home, ".config", "opencode", "skills"),
+    join(cwd, ".claude", "skills"),
+    join(cwd, ".agents", "skills"),
+    join(home, ".agents", "skills"),
+  ];
+  const configs = opts.configs ?? findOpencodeConfigs(cwd, home);
+  for (const config of configs) {
+    const paths = config.json?.skills?.paths;
+    if (!Array.isArray(paths)) continue;
+    for (const p of paths) {
+      if (typeof p === "string") roots.push(isAbsolute(p) ? p : join(dirname(config.path), p));
+    }
+  }
+  return roots;
+}
+
+/**
+ * Antigravity skill discovery roots: `.agents/skills` (+ legacy
+ * `.agent/skills`), and the three `~/.gemini/...` global locations.
+ * `~/.gemini/config/skills` is Ruling R3's provisional install-skill target;
+ * the other two are read-only discovery roots in case Antigravity itself
+ * writes there.
+ */
+export function antigravitySkillRoots(opts = {}) {
+  const home = opts.home ?? homedir();
+  const cwd = opts.cwd ?? process.cwd();
+  return [
+    join(cwd, ".agents", "skills"),
+    join(cwd, ".agent", "skills"),
+    join(home, ".gemini", "config", "skills"),
+    join(home, ".gemini", "antigravity", "skills"),
+    join(home, ".gemini", "antigravity-cli", "skills"),
+  ];
+}
+
+/**
+ * True when `<cwd>/AGENTS.md` already carries predexec's routing instructions
+ * (same marker-quorum idea as steering.ts's systemHasRoutingInstructions,
+ * duplicated here for the same plain-JS reason as SKILL_SOURCE_PATHS above).
+ * Used to flag the (harmless) case where a project's AGENTS.md block AND an
+ * installed skill both load the same routing text.
+ */
+export function agentsFileHasRouting(cwd) {
+  let text;
+  try {
+    text = readFileSync(join(cwd, "AGENTS.md"), "utf8");
+  } catch {
+    return false;
+  }
+  const markers = ["read-only shell operations", "predexec", "mutationStop"];
+  const hit = (m) => (m.includes(" ") ? text.includes(m) : new RegExp(`(?:^|\\W)${m}(?:\\W|$)`).test(text));
+  return markers.filter(hit).length >= 2;
+}
+
+/**
+ * The shared doctor verdict for one harness's skill visibility:
+ *   - nothing found: `info` (with an install-skill hint) only when the
+ *     harness is otherwise registered — an unregistered harness has nothing
+ *     actionable to say about a missing skill.
+ *   - one or more copies, all byte-identical: `ok` (or `info` when there is
+ *     more than one, since that's a harmless duplicate worth naming) — a
+ *     harness-specific skill installed into a root another host also scans
+ *     (e.g. `.claude/skills/predexec` visible to opencode too) lands here.
+ *   - two or more DIFFERENT skills visible to the same host: `fail` (`[!]`).
+ */
+export function skillCheck(label, installName, roots, registered) {
+  const skills = findPredexecSkills(roots);
+  if (skills.length === 0) {
+    return registered
+      ? [
+          {
+            name: `${label}: skill not found`,
+            status: "info",
+            hint: `run \`predexec install-skill ${installName}\``,
+          },
+        ]
+      : [];
+  }
+
+  const distinct = new Set(skills.map((s) => s.text));
+  if (distinct.size > 1) {
+    return [
+      {
+        name: `${label}: multiple different predexec skills visible`,
+        status: "fail",
+        detail: skills.map((s) => s.path).join(", "),
+        hint: "remove the stale copy, or reinstall with `--force` so only one predexec skill is visible to this host",
+      },
+    ];
+  }
+  if (skills.length > 1) {
+    return [
+      {
+        name: `${label}: skill (duplicate copies, identical content)`,
+        status: "info",
+        detail: skills.map((s) => s.path).join(", "),
+        hint: "harmless — the same skill is visible from more than one location",
+      },
+    ];
+  }
+  return [{ name: `${label}: skill`, status: "ok", detail: skills[0].path }];
+}
+
+export function checkClaudeSkill(opts = {}, registered = false) {
+  const home = opts.home ?? homedir();
+  const cwd = opts.cwd ?? process.cwd();
+  const configDir = opts.configDir ?? process.env.CLAUDE_CONFIG_DIR ?? join(home, ".claude");
+  const plugin = opts.plugin ?? findClaudeCodePlugin(configDir);
+  if (plugin?.installPath && existsSync(join(plugin.installPath, "skills", "claude", "predexec", "SKILL.md"))) {
+    return [{ name: "claude code: skill (bundled with plugin)", status: "ok", detail: plugin.installPath }];
+  }
+  return skillCheck("claude code", "claude", claudeSkillRoots({ home, cwd, configDir }), registered);
+}
+
+export function checkCodexSkill(opts = {}, registered = false) {
+  const cwd = opts.cwd ?? process.cwd();
+  const roots = codexSkillRoots(opts);
+  const checks = skillCheck("codex", "codex", roots, registered);
+  if (findPredexecSkills(roots).length > 0 && agentsFileHasRouting(cwd)) {
+    checks.push({
+      name: "codex: AGENTS.md routing block and skill are both active",
+      status: "info",
+      detail: "routing instructions load twice (harmless, but redundant)",
+    });
+  }
+  return checks;
+}
+
+export function checkOpencodeSkill(opts = {}, registered = false) {
+  const cwd = opts.cwd ?? process.cwd();
+  const roots = opencodeSkillRoots(opts);
+  const checks = skillCheck("opencode", "opencode", roots, registered);
+  if (findPredexecSkills(roots).length > 0 && agentsFileHasRouting(cwd)) {
+    checks.push({
+      name: "opencode: AGENTS.md routing block and skill are both active",
+      status: "info",
+      detail: "routing instructions load twice (harmless, but redundant)",
+    });
+  }
+  return checks;
+}
+
+/**
+ * Antigravity has no doctor-tracked MCP-style registration in this codebase
+ * yet (Task 19/20/21), so its skill check stands alone: skip when there's no
+ * sign of Antigravity at all (`~/.gemini` absent), otherwise the same
+ * present/duplicate/conflicting verdict as the other harnesses.
+ */
+export function checkAntigravitySkill(opts = {}) {
+  const home = opts.home ?? homedir();
+  const geminiDir = opts.geminiDir ?? join(home, ".gemini");
+  if (!existsSync(geminiDir)) {
+    return [{ name: "antigravity not installed", status: "skip", detail: "no ~/.gemini directory" }];
+  }
+  return skillCheck("antigravity", "antigravity", antigravitySkillRoots(opts), true);
+}
+
+/**
+ * `install-skill` targets. `--project` is unsupported for pi (it has none —
+ * pi loads the skill from the installed package itself).
+ *
+ * | harness     | global                                        | --project                |
+ * |-------------|-----------------------------------------------|---------------------------|
+ * | claude      | `${CLAUDE_CONFIG_DIR:-~/.claude}/skills/predexec/` | `.claude/skills/predexec/` |
+ * | codex       | `~/.agents/skills/predexec/`                   | `.agents/skills/predexec/` |
+ * | opencode    | `~/.config/opencode/skills/predexec/`          | `.opencode/skills/predexec/` |
+ * | antigravity | `~/.gemini/config/skills/predexec/` (Ruling R3, provisional) | `.agents/skills/predexec/` |
+ * | pi          | n/a — no-op                                    | —                         |
+ */
+export function skillInstallTarget(harness, opts = {}) {
+  const home = opts.home ?? homedir();
+  const cwd = opts.cwd ?? process.cwd();
+  const project = Boolean(opts.project);
+  switch (harness) {
+    case "claude": {
+      const configDir = opts.configDir ?? process.env.CLAUDE_CONFIG_DIR ?? join(home, ".claude");
+      return project ? join(cwd, ".claude", "skills", "predexec") : join(configDir, "skills", "predexec");
+    }
+    case "codex":
+      return project ? join(cwd, ".agents", "skills", "predexec") : join(home, ".agents", "skills", "predexec");
+    case "opencode":
+      return project
+        ? join(cwd, ".opencode", "skills", "predexec")
+        : join(home, ".config", "opencode", "skills", "predexec");
+    case "antigravity":
+      return project
+        ? join(cwd, ".agents", "skills", "predexec")
+        : join(home, ".gemini", "config", "skills", "predexec");
+    default:
+      return null;
+  }
+}
+
+/**
+ * Copy the packaged skill for `harness` into its install-skill target.
+ * Refuses to overwrite a destination file whose content differs from the
+ * packaged one unless `force` is set; `dryRun` reports what would happen
+ * without touching disk. Returns `{ ok, target, results }` for every harness
+ * except pi, which returns `{ ok: true, message }` (a documented no-op).
+ */
+export function installSkill(harness, opts = {}) {
+  if (!SKILL_HARNESSES.includes(harness)) {
+    return { ok: false, message: `unknown harness "${harness}" — expected one of ${SKILL_HARNESSES.join(", ")}` };
+  }
+  if (harness === "pi") {
+    return { ok: true, message: "pi loads the predexec skill from the installed package itself — nothing to install." };
+  }
+
+  const target = skillInstallTarget(harness, opts);
+  const sourceDir = dirname(join(opts.packageRoot ?? packageRoot(), SKILL_SOURCE_PATHS[harness]));
+  const dryRun = Boolean(opts.dryRun);
+  const force = Boolean(opts.force);
+
+  const results = [];
+  for (const file of readdirSync(sourceDir)) {
+    const srcPath = join(sourceDir, file);
+    const destPath = join(target, file);
+    const content = readFileSync(srcPath, "utf8");
+    let existing = null;
+    try {
+      existing = readFileSync(destPath, "utf8");
+    } catch {
+      /* nothing there yet */
+    }
+
+    if (existing !== null && existing === content) {
+      results.push({ path: destPath, action: "up-to-date" });
+      continue;
+    }
+    if (existing !== null && existing !== content && !force) {
+      results.push({ path: destPath, action: "conflict" });
+      continue;
+    }
+    if (!dryRun) {
+      mkdirSync(dirname(destPath), { recursive: true });
+      writeFileSync(destPath, content);
+    }
+    results.push({ path: destPath, action: existing === null ? "installed" : "overwritten" });
+  }
+
+  return { ok: !results.some((r) => r.action === "conflict"), target, results };
+}
+
 // ── stats aggregation ─────────────────────────────────────
 
 export function parseStatsLines(text) {
@@ -1191,7 +1593,29 @@ function printCheck(c) {
 }
 
 async function doctor(args) {
-  const checks = [checkNodeVersion(), ...checkPi(), ...checkOpencode(), ...checkClaudeCode(), ...checkCodex()];
+  const opencodeChecks = checkOpencode();
+  const claudeChecks = checkClaudeCode();
+  const codexChecks = checkCodex();
+
+  const opencodeRegistered = opencodeChecks.some(
+    (c) => c.status === "ok" && c.name.startsWith("opencode config: plugin"),
+  );
+  const claudeRegistered = claudeChecks.some(
+    (c) => c.status === "ok" && (c.name.startsWith("claude code mcp (") || c.name === "claude code: predexec plugin installed"),
+  );
+  const codexRegistered = codexChecks.some((c) => c.status === "ok" && c.name.startsWith("codex mcp registration:"));
+
+  const checks = [
+    checkNodeVersion(),
+    ...checkPi(),
+    ...opencodeChecks,
+    ...checkOpencodeSkill({}, opencodeRegistered),
+    ...claudeChecks,
+    ...checkClaudeSkill({}, claudeRegistered),
+    ...codexChecks,
+    ...checkCodexSkill({}, codexRegistered),
+    ...checkAntigravitySkill(),
+  ];
   if (args.includes("--live")) {
     // Only a silent loader skip counts as a failure — see liveProbe.
     const configCheck = checks.find((c) => c.status === "ok" && c.name.startsWith("opencode config:"));
@@ -1244,16 +1668,46 @@ async function stats() {
   return 0;
 }
 
+function installSkillCli(args) {
+  const flags = new Set(args.filter((a) => a.startsWith("--")));
+  const harness = args.find((a) => !a.startsWith("--"));
+  if (!harness) {
+    console.log("usage: predexec install-skill <claude|codex|opencode|antigravity|pi> [--project] [--dry-run] [--force]");
+    return 1;
+  }
+
+  const result = installSkill(harness, {
+    project: flags.has("--project"),
+    dryRun: flags.has("--dry-run"),
+    force: flags.has("--force"),
+  });
+
+  if (result.message) {
+    console.log(result.message);
+    return result.ok ? 0 : 1;
+  }
+
+  for (const r of result.results) {
+    console.log(`${r.action}: ${r.path}`);
+    if (r.action === "conflict") {
+      console.log("  differs from the packaged skill — pass --force to overwrite, or --dry-run to preview");
+    }
+  }
+  console.log(`destination: ${result.target}`);
+  return result.ok ? 0 : 1;
+}
+
 async function main() {
   const [cmd, ...args] = process.argv.slice(2);
   if (cmd === "doctor") process.exit(await doctor(args));
   if (cmd === "stats") process.exit(await stats());
+  if (cmd === "install-skill") process.exit(installSkillCli(args));
   if (cmd === "--version" || cmd === "-v") {
     const pkg = readJson(join(dirname(fileURLToPath(import.meta.url)), "..", "package.json"));
     console.log(pkg?.version ?? "unknown");
     process.exit(0);
   }
-  const usage = "usage: predexec <doctor [--live] | stats | --version>";
+  const usage = "usage: predexec <doctor [--live] | stats | install-skill <harness> | --version>";
   if (cmd === undefined || cmd === "--help" || cmd === "-h") {
     console.log(usage);
     process.exit(0);

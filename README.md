@@ -364,9 +364,10 @@ predexec ships a CLI (`bin/predexec.mjs`, node builtins only) for install diagno
 request accounting:
 
 ```bash
-npx -y predexec doctor              # node version + pi / opencode / Claude Code / Codex wiring
+npx -y predexec doctor              # node version + pi / opencode / Claude Code / Codex wiring + skill checks
 npx -y predexec doctor --live       # + spawns opencode and probes tool registration
 npx -y predexec stats               # aggregate recorded runs: ops collapsed, requests saved, edge hit-rate
+npx -y predexec install-skill <claude|codex|opencode|antigravity|pi> [--project] [--dry-run] [--force]
 ```
 
 `doctor` reports four states and **exits non-zero only for `[!]`** — a machine that simply
@@ -378,6 +379,28 @@ doesn't use a given harness is healthy, not broken:
 | `[!]` | predexec IS wired here but is broken — the only state that fails |
 | `[ ]` | harness installed, predexec not wired (actionable) |
 | `[-]` | harness not installed |
+
+Alongside each MCP/plugin registration check, `doctor` also looks for the harness's own routing
+`SKILL.md` in that host's documented skill-discovery locations: `[x]` when found (or bundled with
+the Claude Code plugin form), `[ ]` with an `install-skill` hint when the harness is registered but
+no skill is visible, `[!]` when **two different** predexec skills are visible to the same host
+(e.g. opencode also scans `.claude/skills`, so a stale Claude-flavored copy left there conflicts
+with opencode's own), and an `info` note when a project's `AGENTS.md` routing block and an
+installed skill are both active (harmless — the routing text just loads twice). Identical
+duplicate copies of the same skill across two discovery roots are `info`, not `[!]`.
+
+`install-skill` copies the packaged skill for one harness into that host's own skill directory
+(pi needs no such step — it loads the skill straight out of the installed package):
+
+| harness | `--project` off (global) | `--project` |
+| :-- | :-- | :-- |
+| claude | `${CLAUDE_CONFIG_DIR:-~/.claude}/skills/predexec/` | `.claude/skills/predexec/` |
+| codex | `~/.agents/skills/predexec/` | `.agents/skills/predexec/` |
+| opencode | `~/.config/opencode/skills/predexec/` | `.opencode/skills/predexec/` |
+| antigravity | `~/.gemini/config/skills/predexec/` (provisional) | `.agents/skills/predexec/` |
+
+It refuses to overwrite a destination file whose content differs from the packaged one unless
+`--force` is given, and `--dry-run` prints what it would do without touching disk.
 
 Stats are append-only JSONL in `$PREDEXEC_STATE_DIR` (or `$XDG_STATE_HOME/predexec`, or
 `~/.local/state/predexec`). Each adapter calls `recordRun` after every `runPlanTree` — fire-and-forget,
@@ -422,7 +445,7 @@ steering.ts                        shared steering text/marker + renderSkill (ha
 stats.ts                           request-accounting recorder (append-only JSONL; harness-facing)
 policy.ts                          opencode permission reader/checker (harness-facing)
 adapter-runtime.ts                 shared adapter execution & stats runtime
-bin/predexec.mjs                   CLI: doctor + stats (node builtins only)
+bin/predexec.mjs                   CLI: doctor + stats + install-skill (node builtins only)
 bin/predexec-mcp.mjs               Claude Code / Codex MCP entrypoint (`--host codex` selects Codex)
 .pi/skills/predexec/SKILL.md       pi routing skill (loaded via pi.skills)       } generated from steering.ts
 skills/<harness>/predexec/SKILL.md claude / codex / opencode routing skills     } by `pnpm skills`;
