@@ -31,7 +31,7 @@
  * cannot prompt mid-walk and keep hard-stopping on ask.
  */
 
-import { existsSync, statSync } from "node:fs";
+import { existsSync, realpathSync, statSync } from "node:fs";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 import { z } from "zod";
 import {
@@ -137,6 +137,19 @@ function withinPrefix(relPath: string, prefix: string): boolean {
   return p === prefix || p.startsWith(prefix + "/");
 }
 
+/** Separator-aware containment: `/root2` is never "within" `/root`. */
+function isWithin(root: string, target: string): boolean {
+  return target === root || target.startsWith(root.endsWith(sep) ? root : root + sep);
+}
+
+function realpathOrNull(p: string): string | null {
+  try {
+    return realpathSync(p);
+  } catch {
+    return null;
+  }
+}
+
 const errText = (e: unknown): string =>
   typeof e === "string" ? e : e instanceof Error ? e.message : JSON.stringify(e);
 
@@ -195,7 +208,23 @@ export function createToolExecutor(client: OpencodeClient, cwd: string): ToolExe
       // whole root and report a false "no matches" (withinPrefix can never
       // match a `..`-laden prefix against the SDK's root-relative paths), or
       // reintroduce the exact cross-instance routing risk OC-6 fixed.
-      if (abs !== directory && !abs.startsWith(directory + sep)) {
+      //
+      // Lexical containment alone is wrong two ways: a session root and an
+      // absolute path can each be spelled through a DIFFERENT alias of the
+      // SAME real directory (macOS's /var vs /private/var, or any symlinked
+      // root) and lexically mismatch despite being identical on disk; and a
+      // path that lexically sits inside the root can still escape it through
+      // a symlinked intermediate directory. realpath is checked whenever
+      // it's resolvable (existence was already confirmed above, via
+      // `missing()`) and is authoritative when available — mirrors
+      // mcp/tool-ops.ts's `locate()`/`target()` two-pass containment. The
+      // lexical result is only a fallback for the (here, essentially
+      // unreachable) case where realpath itself can't be resolved.
+      const realRoot = realpathOrNull(directory);
+      const realAbs = realpathOrNull(abs);
+      const withinReal = realRoot !== null && realAbs !== null ? isWithin(realRoot, realAbs) : null;
+      const outside = withinReal !== null ? !withinReal : !isWithin(directory, abs);
+      if (outside) {
         return {
           err: {
             stdout: "",
@@ -217,7 +246,14 @@ export function createToolExecutor(client: OpencodeClient, cwd: string): ToolExe
       } catch {
         /* stat raced away; missing() already vetted existence */
       }
-      const prefix = relative(directory, abs).split(sep).join("/");
+      // Compute the prefix from whichever pair of forms actually agreed above
+      // — mixing a lexical root with a realpath target (or vice versa) would
+      // produce a nonsense `relative()` full of `..` segments when the two
+      // inputs were spelled through different aliases.
+      const prefix =
+        realRoot !== null && realAbs !== null
+          ? relative(realRoot, realAbs).split(sep).join("/")
+          : relative(directory, abs).split(sep).join("/");
       return { prefix: prefix === "." ? "" : prefix };
     };
     const sliceLimit = <T>(items: T[], limit: unknown): T[] =>

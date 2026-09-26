@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -434,6 +434,90 @@ describe.each(variants)("opencode createToolExecutor ($name) — grep/find arg h
   it("grep: a `path` that resolves outside the session root is an explicit exit-2 refusal", async () => {
     const client = { find: { text: async () => { throw new Error("SDK should not be called"); } } };
     const r = await run(client, { tool: "grep", pattern: "x", path: ".." });
+    expect(r.exitCode).toBe(2);
+    expect(r.stderr).toContain("outside session root");
+  });
+
+  // Fix round 2 (review): the outside-root check must be realpath-aware, not
+  // bare lexical `startsWith` — a session root and a `path` can each be
+  // spelled through a different alias of the SAME real directory (macOS's
+  // /var vs /private/var, or any symlinked root), and lexical comparison
+  // alone would wrongly refuse those as "outside".
+  it("grep: a session root and path expressed through DIFFERENT aliases of the SAME real directory are allowed (not refused)", async () => {
+    const root = mkdtempSync(join(tmpdir(), "px-oc-alias-"));
+    mkdirSync(join(root, "sub"));
+    const realRoot = realpathSync(root);
+    // realRoot differs lexically from `root` on macOS (/private/var vs
+    // /var) — if it doesn't on this machine, the alias case can't be
+    // exercised, so skip rather than produce a false pass/fail either way.
+    if (realRoot === root) return;
+    const client = { find: { text: async () => ({ data: [{ path: { text: "sub/a.ts" }, lines: { text: "x" }, line_number: 1 }] }) } };
+    const executor = createToolExecutor(client as any, root);
+    // `directory` is the LEXICAL (/var) root; `path` is the SAME subdirectory
+    // spelled through the REALPATH (/private/var) alias.
+    const r = await executor({ tool: "grep", pattern: "x", path: join(realRoot, "sub") }, { cwd: root });
+    expect(r.exitCode).toBe(0);
+    expect(r.stdout).toBe("sub/a.ts:1:x");
+  });
+
+  it("find: a session root and path expressed through DIFFERENT aliases of the SAME real directory are allowed (not refused)", async () => {
+    const root = mkdtempSync(join(tmpdir(), "px-oc-alias-"));
+    mkdirSync(join(root, "sub"));
+    const realRoot = realpathSync(root);
+    if (realRoot === root) return;
+    const client = { find: { files: async () => ({ data: ["sub/a.ts"] }) } };
+    const executor = createToolExecutor(client as any, root);
+    // Reverse direction: `directory` is the REALPATH (/private/var) root;
+    // `path` is spelled through the LEXICAL (/var) alias.
+    const r = await executor({ tool: "find", pattern: "*.ts", path: root }, { cwd: realRoot });
+    expect(r.exitCode).toBe(0);
+    expect(r.stdout).toBe("sub/a.ts");
+  });
+
+  it("grep: a symlinked subdirectory pointing OUTSIDE the session root is refused, even though it's lexically inside", async () => {
+    const root = mkdtempSync(join(tmpdir(), "px-oc-symlink-"));
+    const outside = mkdtempSync(join(tmpdir(), "px-oc-outside-"));
+    writeFileSync(join(outside, "secret.ts"), "x");
+    symlinkSync(outside, join(root, "escape"));
+    const client = { find: { text: async () => { throw new Error("SDK should not be called"); } } };
+    const executor = createToolExecutor(client as any, root);
+    const r = await executor({ tool: "grep", pattern: "x", path: "escape" }, { cwd: root });
+    expect(r.exitCode).toBe(2);
+    expect(r.stderr).toContain("outside session root");
+  });
+
+  it("find: a symlinked subdirectory pointing OUTSIDE the session root is refused, even though it's lexically inside", async () => {
+    const root = mkdtempSync(join(tmpdir(), "px-oc-symlink-"));
+    const outside = mkdtempSync(join(tmpdir(), "px-oc-outside-"));
+    writeFileSync(join(outside, "secret.ts"), "x");
+    symlinkSync(outside, join(root, "escape"));
+    const client = { find: { files: async () => { throw new Error("SDK should not be called"); } } };
+    const executor = createToolExecutor(client as any, root);
+    const r = await executor({ tool: "find", pattern: "*.ts", path: "escape" }, { cwd: root });
+    expect(r.exitCode).toBe(2);
+    expect(r.stderr).toContain("outside session root");
+  });
+
+  it("grep: a sibling directory sharing the root's name as a prefix (`<root>2`) is refused, not treated as inside", async () => {
+    const root = mkdtempSync(join(tmpdir(), "px-oc-root-"));
+    const sibling = `${root}2`;
+    mkdirSync(sibling);
+    writeFileSync(join(sibling, "secret.ts"), "x");
+    const client = { find: { text: async () => { throw new Error("SDK should not be called"); } } };
+    const executor = createToolExecutor(client as any, root);
+    const r = await executor({ tool: "grep", pattern: "x", path: sibling }, { cwd: root });
+    expect(r.exitCode).toBe(2);
+    expect(r.stderr).toContain("outside session root");
+  });
+
+  it("find: a sibling directory sharing the root's name as a prefix (`<root>2`) is refused, not treated as inside", async () => {
+    const root = mkdtempSync(join(tmpdir(), "px-oc-root-"));
+    const sibling = `${root}2`;
+    mkdirSync(sibling);
+    writeFileSync(join(sibling, "secret.ts"), "x");
+    const client = { find: { files: async () => { throw new Error("SDK should not be called"); } } };
+    const executor = createToolExecutor(client as any, root);
+    const r = await executor({ tool: "find", pattern: "*.ts", path: sibling }, { cwd: root });
     expect(r.exitCode).toBe(2);
     expect(r.stderr).toContain("outside session root");
   });
