@@ -337,6 +337,107 @@ describe.each(variants)("opencode createToolExecutor ($name) — grep/find arg h
     expect(r.stderr).toContain("more than 2 matches exist");
   });
 
+  // C1 (review round 1): at exactly `limit: 200` (no `path`), `probeLimit`
+  // collapses to `effectiveLimit` (both 200) because the peek can never cross
+  // opencode's hard ceiling — the extra-row trick simply has no room to work.
+  // A full 200-row page is then ambiguous: it looks identical whether the
+  // real total is exactly 200 or far more. Flag it either way rather than
+  // silently reporting exitCode 0 with no truncation signal.
+  it("find: limit:200 with 250 real matches — server can only ever return 200, must still flag truncation", async () => {
+    let seen: any;
+    // The server enforces the 1..200 bound itself, so it can only ever hand
+    // back at most `probeLimit` (200) rows regardless of how many real
+    // matches exist upstream — 250 real matches and exactly 200 real matches
+    // are, from the client's perspective, indistinguishable.
+    const rows = Array.from({ length: 200 }, (_, i) => `f${i}.ts`);
+    const client = { find: { files: async (o: any) => ((seen = o), { data: rows }) } };
+    const r = await run(client, { tool: "find", pattern: "*.ts", limit: 200 });
+    expect(seen.query.limit).toBe(200);
+    expect(r.stdout.split("\n")).toHaveLength(200);
+    expect(r.stdoutTruncated).toBe(true);
+    expect(r.stderr).toContain("may be truncated at opencode's 200-result ceiling");
+    expect(r.exitCode).toBe(0);
+  });
+
+  it("find: limit:200 with exactly 200 real matches — still flagged 'may be' truncated (can't distinguish from more)", async () => {
+    let seen: any;
+    const rows = Array.from({ length: 200 }, (_, i) => `f${i}.ts`);
+    const client = { find: { files: async (o: any) => ((seen = o), { data: rows }) } };
+    const r = await run(client, { tool: "find", pattern: "*.ts", limit: 200 });
+    // Byte-identical response to the 250-real-matches case above: the client
+    // has no way to tell these two situations apart, so it must warn in both.
+    expect(seen.query.limit).toBe(200);
+    expect(r.stdoutTruncated).toBe(true);
+    expect(r.stderr).toContain("may be truncated at opencode's 200-result ceiling");
+  });
+
+  it("find: limit:199 with 250 real matches — the peek has room and gives a definite (not merely 'may be') truncation signal", async () => {
+    let seen: any;
+    // probeLimit = min(199+1,200) = 200, so the server (capped at 200) hands
+    // back 200 rows — one more than effectiveLimit(199), which definitively
+    // proves more than 199 matches exist.
+    const rows = Array.from({ length: 200 }, (_, i) => `f${i}.ts`);
+    const client = { find: { files: async (o: any) => ((seen = o), { data: rows }) } };
+    const r = await run(client, { tool: "find", pattern: "*.ts", limit: 199 });
+    expect(seen.query.limit).toBe(200);
+    expect(r.stdout.split("\n")).toHaveLength(199);
+    expect(r.stdoutTruncated).toBe(true);
+    expect(r.stderr).toContain("more than 199 matches exist");
+    expect(r.stderr).not.toContain("may be truncated");
+  });
+
+  // I2 (review round 1): a `path`-scoped find that comes back empty after
+  // client-side filtering, while the root-wide fetch itself was full, never
+  // actually got far enough to certify "no matches in scope" — that's not
+  // "ran, found nothing" (exit 1), it's "didn't cover the scope" (exit 2),
+  // so a HIGH_CONFIDENCE `exitCode` edge can't mistake it for a true miss.
+  it("find: a scoped search that comes up empty while the root-wide fetch was full is exit 2, not a silent miss", async () => {
+    mkdirSync(join(repo, "src2"), { recursive: true });
+    // Every row the server returns sits OUTSIDE "src2/" even though the
+    // root-wide fetch filled its entire probe window (101 rows for the
+    // default limit of 100) — the search never got far enough to look inside
+    // "src2/" at all.
+    const rows = Array.from({ length: 101 }, (_, i) => `other/f${i}.ts`);
+    const client = { find: { files: async () => ({ data: rows }) } };
+    const r = await run(client, { tool: "find", pattern: "*.ts", path: "src2" });
+    expect(r.exitCode).toBe(2);
+    expect(r.stdout).toBe("");
+    expect(r.stderr).toContain("did not cover");
+    expect(r.stderr).toContain("src2");
+  });
+
+  it("find: a scoped search with SOME matches while the root-wide fetch was full stays exit 0 + truncated (unchanged)", async () => {
+    mkdirSync(join(repo, "src2"), { recursive: true });
+    const rows = [
+      ...Array.from({ length: 98 }, (_, i) => `other/f${i}.ts`),
+      "src2/a.ts",
+      "src2/b.ts",
+      "src2/c.ts",
+    ];
+    const client = { find: { files: async () => ({ data: rows }) } };
+    const r = await run(client, { tool: "find", pattern: "*.ts", path: "src2" });
+    expect(r.exitCode).toBe(0);
+    expect(r.stdout.split("\n")).toEqual(["src2/a.ts", "src2/b.ts", "src2/c.ts"]);
+    expect(r.stdoutTruncated).toBe(true);
+  });
+
+  // R34 Minor 5 (review round 1): a path that resolves outside the session
+  // root (an existing directory, just not under it) must refuse explicitly —
+  // not silently search-and-miss.
+  it("find: a `path` that resolves outside the session root is an explicit exit-2 refusal", async () => {
+    const client = { find: { files: async () => { throw new Error("SDK should not be called"); } } };
+    const r = await run(client, { tool: "find", pattern: "*.ts", path: ".." });
+    expect(r.exitCode).toBe(2);
+    expect(r.stderr).toContain("outside session root");
+  });
+
+  it("grep: a `path` that resolves outside the session root is an explicit exit-2 refusal", async () => {
+    const client = { find: { text: async () => { throw new Error("SDK should not be called"); } } };
+    const r = await run(client, { tool: "grep", pattern: "x", path: ".." });
+    expect(r.exitCode).toBe(2);
+    expect(r.stderr).toContain("outside session root");
+  });
+
   it("grep: warns when opencode's hard 10-match cap may have truncated results", async () => {
     const rows = Array.from({ length: 10 }, (_, i) => matchRow(`f${i}.ts`, i + 1));
     const client = { find: { text: async () => ({ data: rows }) } };
@@ -351,6 +452,50 @@ describe.each(variants)("opencode createToolExecutor ($name) — grep/find arg h
     const client = { find: { text: async () => ({ data: [matchRow("a.ts", 1)] }) } };
     const r = await run(client, { tool: "grep", pattern: "x" });
     expect(r.stderr).toBe("");
+  });
+
+  // R34 Minor 4 (review round 1): both a caller `limit` AND the host's
+  // 10-match cap can be hit at once — the host-cap explanation must not be
+  // dropped just because the caller-limit one also applies.
+  it("grep: reports BOTH the caller-limit and host-cap explanations when both apply", async () => {
+    const rows = Array.from({ length: 10 }, (_, i) => matchRow(`f${i}.ts`, i + 1));
+    const client = { find: { text: async () => ({ data: rows }) } };
+    const r = await run(client, { tool: "grep", pattern: "x", limit: 5 });
+    expect(r.stdout.split("\n")).toHaveLength(5);
+    expect(r.stderr).toContain("caller limit 5 reached");
+    expect(r.stderr).toContain("caps results at 10");
+    expect(r.stdoutTruncated).toBe(true);
+  });
+
+  // I2 (review round 1): a `path`-scoped grep that comes back empty after
+  // client-side filtering, while the root-wide fetch hit its un-raisable
+  // 10-match cap, never actually got far enough to certify "no matches in
+  // scope" — exit 2 ("didn't cover the scope"), not exit 1 ("ran, found
+  // nothing"), so a HIGH_CONFIDENCE `exitCode` edge can't mistake it for a
+  // true miss.
+  it("grep: a scoped search that comes up empty while the host cap was hit is exit 2, not a silent miss", async () => {
+    mkdirSync(join(repo, "src2"), { recursive: true });
+    const rows = Array.from({ length: 10 }, (_, i) => matchRow(`other/f${i}.ts`, i + 1));
+    const client = { find: { text: async () => ({ data: rows }) } };
+    const r = await run(client, { tool: "grep", pattern: "x", path: "src2" });
+    expect(r.exitCode).toBe(2);
+    expect(r.stdout).toBe("");
+    expect(r.stderr).toContain("did not cover");
+    expect(r.stderr).toContain("src2");
+  });
+
+  it("grep: a scoped search with SOME matches while the host cap was hit stays exit 0 + truncated (unchanged)", async () => {
+    mkdirSync(join(repo, "src2"), { recursive: true });
+    const rows = [
+      ...Array.from({ length: 8 }, (_, i) => matchRow(`other/f${i}.ts`, i + 1)),
+      matchRow("src2/a.ts", 1),
+      matchRow("src2/b.ts", 2),
+    ];
+    const client = { find: { text: async () => ({ data: rows }) } };
+    const r = await run(client, { tool: "grep", pattern: "x", path: "src2" });
+    expect(r.exitCode).toBe(0);
+    expect(r.stdout.split("\n")).toEqual(["src2/a.ts:1:const x = 1", "src2/b.ts:2:const x = 1"]);
+    expect(r.stdoutTruncated).toBe(true);
   });
 
   it("ls: `limit` slices entries", async () => {

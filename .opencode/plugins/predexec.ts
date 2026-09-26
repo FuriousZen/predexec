@@ -189,6 +189,21 @@ export function createToolExecutor(client: OpencodeClient, cwd: string): ToolExe
       const gone = missing(path);
       if (gone) return { err: { ...gone, exitCode: NEVER_RAN } };
       const abs = isAbsolute(path) ? path : resolve(directory, path);
+      // A path that exists but resolves outside the session root (an
+      // absolute path elsewhere, or `..` walking past the root) must refuse
+      // explicitly. Silently letting it through would either search the
+      // whole root and report a false "no matches" (withinPrefix can never
+      // match a `..`-laden prefix against the SDK's root-relative paths), or
+      // reintroduce the exact cross-instance routing risk OC-6 fixed.
+      if (abs !== directory && !abs.startsWith(directory + sep)) {
+        return {
+          err: {
+            stdout: "",
+            stderr: `${tool}: "${path}" resolves outside session root (${directory}) — refusing to scope there`,
+            exitCode: NEVER_RAN,
+          },
+        };
+      }
       try {
         if (!statSync(abs).isDirectory()) {
           return {
@@ -266,20 +281,38 @@ export function createToolExecutor(client: OpencodeClient, cwd: string): ToolExe
           // survived that root-wide cap, so a full ten-row raw page is a warning
           // sign regardless of how many rows the prefix filter kept.
           const hostCapped = raw.length >= OPENCODE_GREP_CAP;
-          let stderr = "";
+          // A scoped search that came back empty while the ROOT-WIDE cap was
+          // hit never actually got far enough to certify "no matches in
+          // scope" — that's not "ran, found nothing" (1), it's "didn't cover
+          // the scope" (2), so a HIGH_CONFIDENCE `exitCode` edge can't read
+          // it as a confirmed miss.
+          if (scoped.prefix && matches.length === 0 && hostCapped) {
+            return {
+              stdout: "",
+              stderr:
+                `grep: opencode's ${OPENCODE_GREP_CAP}-match cap on the whole session root was reached before any ` +
+                `results under "${scoped.prefix}" were found — the search did not cover this directory; narrow ` +
+                `further or use a shell \`rg\`/\`grep\` scoped to the directory`,
+              exitCode: NEVER_RAN,
+            };
+          }
+          const notes: string[] = [];
           if (callerCapped) {
-            stderr = `grep: caller limit ${String(op.limit)} reached — results may be incomplete; use a larger limit or narrow the pattern`;
-          } else if (hostCapped) {
-            stderr = scoped.prefix
-              ? `grep: opencode caps results at ${OPENCODE_GREP_CAP} matches searched across the whole session root ` +
-                `(directory scoping is applied client-side) — matches under "${scoped.prefix}" may be crowded out by ` +
-                `matches elsewhere; use a shell \`rg\`/\`grep\` scoped to the directory for an exhaustive search`
-              : `grep: opencode caps results at ${OPENCODE_GREP_CAP} matches and cannot raise it — ` +
-                `results may be incomplete; use a shell \`rg\`/\`grep\` for an exhaustive search`;
+            notes.push(`grep: caller limit ${String(op.limit)} reached — results may be incomplete; use a larger limit or narrow the pattern`);
+          }
+          if (hostCapped) {
+            notes.push(
+              scoped.prefix
+                ? `grep: opencode caps results at ${OPENCODE_GREP_CAP} matches searched across the whole session root ` +
+                  `(directory scoping is applied client-side) — matches under "${scoped.prefix}" may be crowded out by ` +
+                  `matches elsewhere; use a shell \`rg\`/\`grep\` scoped to the directory for an exhaustive search`
+                : `grep: opencode caps results at ${OPENCODE_GREP_CAP} matches and cannot raise it — ` +
+                  `results may be incomplete; use a shell \`rg\`/\`grep\` for an exhaustive search`,
+            );
           }
           return {
             stdout,
-            stderr,
+            stderr: notes.join(" "),
             exitCode: stdout ? 0 : 1,
             ...(callerCapped || hostCapped ? { stdoutTruncated: true } : {}),
           };
@@ -308,8 +341,28 @@ export function createToolExecutor(client: OpencodeClient, cwd: string): ToolExe
           const filtered = scoped.prefix ? raw.filter((p) => withinPrefix(p, scoped.prefix)) : raw;
           const results = filtered.slice(0, effectiveLimit);
           const stdout = results.join("\n");
+          // A scoped search that came back empty while the ROOT-WIDE fetch
+          // itself was already full never actually got far enough to certify
+          // "no matches in scope" — exit 2 ("didn't cover the scope"), not
+          // exit 1 ("ran, found nothing"), so a HIGH_CONFIDENCE `exitCode`
+          // edge can't read it as a confirmed miss.
+          if (scoped.prefix && results.length === 0 && raw.length >= probeLimit) {
+            return {
+              stdout: "",
+              stderr:
+                `find: opencode's root-wide fetch (${probeLimit} rows) was already full before any results under ` +
+                `"${scoped.prefix}" were found — the search did not cover this directory; narrow the pattern or path`,
+              exitCode: NEVER_RAN,
+            };
+          }
           const probedMore = filtered.length > effectiveLimit;
           const ceilingHit = requestedLimit > OPENCODE_FIND_CEILING;
+          // The peek can never see past the ceiling itself, so a full page
+          // AT the ceiling is inherently ambiguous — indistinguishable from
+          // "exactly this many exist" — regardless of what was requested or
+          // whether a `path` scope is active. Mirrors grep's unconditional
+          // `hostCapped` (no scope gate) above.
+          const atCeiling = raw.length >= OPENCODE_FIND_CEILING;
           // A `path` scope can only ever narrow a root-wide fetch; if that fetch
           // itself came back full, matches under the scope may have been pushed
           // out of the fetched window entirely — flag it, don't guess quietly.
@@ -320,8 +373,14 @@ export function createToolExecutor(client: OpencodeClient, cwd: string): ToolExe
               `find: opencode's server caps results at ${OPENCODE_FIND_CEILING} per request — asked for ${requestedLimit}; results are truncated`,
             );
           } else if (probedMore) {
+            // A real peeked-extra-row: a DEFINITE fact, not a guess.
             notes.push(
               `find: more than ${effectiveLimit} matches exist — results are truncated; narrow the pattern or path, or raise limit up to ${OPENCODE_FIND_CEILING}`,
+            );
+          } else if (atCeiling) {
+            notes.push(
+              `find: opencode caps results at ${OPENCODE_FIND_CEILING} per request — results may be truncated at ` +
+                `opencode's ${OPENCODE_FIND_CEILING}-result ceiling; narrow the pattern or path`,
             );
           }
           if (scopeMayUndercount) {
@@ -329,7 +388,7 @@ export function createToolExecutor(client: OpencodeClient, cwd: string): ToolExe
               `find: "${String(op.path)}" scoping is applied client-side after a root-wide search — matches outside the fetched window may be missing`,
             );
           }
-          const truncated = ceilingHit || probedMore || scopeMayUndercount;
+          const truncated = ceilingHit || probedMore || atCeiling || scopeMayUndercount;
           return { stdout, stderr: notes.join(" "), exitCode: stdout ? 0 : 1, ...(truncated ? { stdoutTruncated: true } : {}) };
         }
         case "ls": {
