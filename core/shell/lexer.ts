@@ -344,6 +344,9 @@ export interface TokenizeOptions {
   atomicSubstitutions?: boolean;
 }
 
+/** Argv inspection keeps each `$(...)`/backtick substitution in one word. */
+export const ARGV: TokenizeOptions = { atomicSubstitutions: true };
+
 /**
  * The one shell tokenizer. Removes quoting the way the shell does: single
  * quotes are literal; inside double quotes a backslash escapes only `$`,
