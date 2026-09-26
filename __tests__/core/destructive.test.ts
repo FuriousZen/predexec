@@ -1802,3 +1802,61 @@ describe("shell-lexer must-fix (task 5)", () => {
     expect(isDestructiveCommand(command)).toBe(false);
   });
 });
+
+// Carried forward (controller ruling R16): versioned/alias interpreter heads
+// are their family for every interpreter and preload check, and loader/startup
+// environment variables are mutations in every setting form.
+describe("versioned interpreter heads and dangerous environment (task 7)", () => {
+  it.each([
+    `python3.12 -c "import os; os.system('id')"`,
+    `python3.12-dbg -c "import os; os.system('id')"`,
+    `python2.7 -c "import os; os.system('id')"`,
+    `pypy3 -c "import os; os.system('id')"`,
+    `/usr/bin/python3.12 -c "import os; os.system('id')"`,
+    `nodejs -e "require('child_process').execSync('id')"`,
+    `perl5.36 -e 'system "id"'`,
+    `perl5.36.0 -e 'system "id"'`,
+    `ruby3.3 -e 'system "id"'`,
+    `php8.2 -r 'system("id");'`,
+    `PYTHONPATH=x python3.12 -c "print(1)"`,
+    `NODE_OPTIONS=--require=x nodejs -e "1"`,
+    `PERL5OPT=-Mx perl5.36 -e 1`,
+    `perl5.36 -Mevil -e 'print 1'`,
+    `nodejs -r ./evil.js -e "console.log(1)"`,
+    `python3.12 -c "import subprocess"`,
+  ])("versioned interpreter mutating: %s", (c) => expect(isDestructiveCommand(c)).toBe(true));
+
+  it.each([
+    `python3.12 -c "print(1)"`,
+    `python2.7 -c "print(1)"`,
+    `pypy3 -c "print(1)"`,
+    `nodejs -e "console.log(1)"`,
+    `perl5.36 -e 'print 1'`,
+    `ruby3.3 -e 'puts 1'`,
+    `php8.2 -r 'echo 1;'`,
+    `python3 -W ignore::DeprecationWarning -c "print(1)"`,
+    `python3 -Wignore -c "print(1)"`,
+  ])("versioned interpreter read-only: %s", (c) => expect(isDestructiveCommand(c)).toBe(false));
+
+  const dangerous = [
+    "LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT", "DYLD_INSERT_LIBRARIES", "DYLD_LIBRARY_PATH",
+    "DYLD_FRAMEWORK_PATH", "BASH_ENV", "ENV", "PYTHONWARNINGS",
+  ];
+  it.each(dangerous.flatMap((name) => [
+    `${name}=x cat f`,
+    `env ${name}=x cat f`,
+    `export ${name}=x; cat f`,
+    `declare -x ${name}=x; cat f`,
+    `${name}= ls`,
+  ]))("dangerous environment: %s", (c) => expect(isDestructiveCommand(c)).toBe(true));
+
+  it.each([
+    `BASH_ENV=x bash -c 'ls'`,
+    `ENV=x sh -c ls`,
+    `PYTHONWARNINGS=ignore python3 -c 1`,
+    `python3 -W "ignore::foo.Bar" -c "print(1)"`,
+    `python3 -Wignore::foo.Bar -c "print(1)"`,
+    `python3.12 -W 'error:msg:evil.Category' -c "print(1)"`,
+    `python -W ignore::x.Y script.py`,
+  ])("dangerous environment/warning category: %s", (c) => expect(isDestructiveCommand(c)).toBe(true));
+});

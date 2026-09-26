@@ -72,6 +72,7 @@ import {
 } from "./shell/reader-allowlists.ts";
 import {
   EVAL_INTERPRETERS,
+  interpreterFamily,
   EVAL_SHELLS,
   INPLACE_EDIT_RE,
   interpreterEvalPayload,
@@ -287,6 +288,12 @@ function readOnlyHeadWrite(segment: string, depth: number, followingText: string
   });
 }
 
+/** A segment's effective head, with interpreter aliases mapped to their family. */
+function interpreterEffectiveHead(segment: string): string | null {
+  const head = effectiveHead(segment);
+  return head === null ? null : interpreterFamily(head);
+}
+
 /**
  * The classifier. Returns the offending token for the hard-stop message, or
  * null when the command is (heuristically) read-only.
@@ -383,7 +390,9 @@ function findDestructiveTokenInternal(cmd: string, depth: number): string | null
     if (output) return `time ${output}`;
   }
 
-  const heads = segments.map(effectiveHead);
+  // Interpreter heads are compared by family: `python3.12`/`nodejs`/`perl5.36`
+  // are the interpreters every check below is keyed on.
+  const heads = segments.map(interpreterEffectiveHead);
 
   // Privileged escalation is never speculated on, whatever it wraps.
   for (const head of heads) {
@@ -472,7 +481,7 @@ function findDestructiveTokenInternal(cmd: string, depth: number): string | null
     // the wrapped interpreter instead of scanning its quoted program text as
     // ordinary shell words.
     const scanSegment = stripShellControlPrefix(segment);
-    return languageWordScanSegment(effectiveHead(scanSegment) ?? heads[i] ?? "", scanSegment);
+    return languageWordScanSegment(interpreterEffectiveHead(scanSegment) ?? heads[i] ?? "", scanSegment);
   }).join(" | ");
   const word = WORD_RE.exec(sanitizeForRedirect(wordScanText));
   if (word) return word[0].trim();
@@ -485,7 +494,8 @@ function findDestructiveTokenInternal(cmd: string, depth: number): string | null
     const normalized = normalizeEnvInvocation(tokenizeShellWords(stripShellControlPrefix(segment), ARGV));
     if (!normalized.complete || normalized.argv.length === 0) return "";
     const head = normalized.argv[0]!.replace(/^.*\//, "");
-    if (EVAL_INTERPRETERS.has(head) || EVAL_SHELLS.has(head)) return head;
+    const family = interpreterFamily(head);
+    if (EVAL_INTERPRETERS.has(family) || EVAL_SHELLS.has(head)) return family;
     return [head, ...normalized.argv.slice(1)].join(" ");
   }).join(" | ");
   const argvWord = WORD_RE.exec(argvText);

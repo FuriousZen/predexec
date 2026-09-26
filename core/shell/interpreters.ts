@@ -27,6 +27,30 @@ import {
 export const EVAL_INTERPRETERS = new Set(["node", "deno", "bun", "python", "python3", "ruby", "perl", "php"]);
 export const EVAL_SHELLS = new Set(["sh", "bash", "zsh", "dash"]);
 
+/**
+ * Versioned and distro-alias interpreter executables (`python3.12`,
+ * `python3.12-dbg`, `pypy3`, `nodejs`, `perl5.36.0`, `ruby3.3`, `php8.2`) run
+ * the same eval grammar and read the same preload variables as their family.
+ * Checking only the canonical spelling let `python3.12 -c "os.system(...)"`
+ * skip every interpreter screen.
+ */
+const INTERPRETER_ALIAS_RE: ReadonlyArray<readonly [RegExp, string]> = [
+  [/^(?:python|pypy)\d*(?:\.\d+)*[a-z]?(?:-dbg)?$/, "python"],
+  [/^nodejs$/, "node"],
+  [/^perl\d+(?:\.\d+)*$/, "perl"],
+  [/^ruby\d+(?:\.\d+)*$/, "ruby"],
+  [/^php\d+(?:\.\d+)*$/, "php"],
+];
+
+/** The interpreter family a (basename) head belongs to; other heads are returned unchanged. */
+export function interpreterFamily(head: string): string {
+  if (EVAL_INTERPRETERS.has(head)) return head;
+  for (const [pattern, family] of INTERPRETER_ALIAS_RE) {
+    if (pattern.test(head)) return family;
+  }
+  return head;
+}
+
 type EvalPrograms =
   | { kind: "none" }
   | { kind: "eval"; programs: string[]; join: boolean }
@@ -52,7 +76,8 @@ const NODE_PRELOAD_OPTION_RE =
 export function interpreterEvalPrograms(segment: string): EvalPrograms {
   const normalized = normalizeEnvInvocation(tokenizeShellWords(segment, ARGV));
   if (!normalized.complete || normalized.argv.length === 0) return { kind: "violation", reason: "ambiguous invocation" };
-  const head = normalized.argv[0]!.replace(/^.*\//, "");
+  const rawHead = normalized.argv[0]!.replace(/^.*\//, "");
+  const head = interpreterFamily(rawHead);
   const argv = normalized.argv;
   const programs: string[] = [];
   const violation = (reason: string): EvalPrograms => ({ kind: "violation", reason });
@@ -87,7 +112,12 @@ export function interpreterEvalPrograms(segment: string): EvalPrograms {
         }
         if (letter === "m") return { kind: "none" };
         if (letter === "W" || letter === "X") {
-          if (j === word.length - 1) i++;
+          const value = j === word.length - 1 ? argv[++i] : word.slice(j + 1);
+          // A warning filter's category (`action:message:category:...`) is
+          // imported by name, so a module-qualified one runs that module.
+          if (letter === "W" && value !== undefined && (value.split(":")[2] ?? "").includes(".")) {
+            return violation(`-W ${value}`);
+          }
           break;
         }
         if (!"bBdEhiIOPqsSuvVxR".includes(letter)) return violation(`-${letter}`);
@@ -136,7 +166,7 @@ export function interpreterEvalPrograms(segment: string): EvalPrograms {
             // not paired the way we think; fail closed.
             if (value.startsWith("-") && letter !== "e" && letter !== "E") return violation(`-${letter} ${value}`);
           } else if ((letter === "e" || letter === "E") && j === 1) {
-            value = attachedEvalProgram(segment, head as "perl" | "ruby") ?? value;
+            value = attachedEvalProgram(segment, rawHead) ?? value;
           }
         } else if (!attachOnly.includes(letter)) {
           return violation(`-${letter}`);
@@ -200,7 +230,8 @@ export function interpreterEvalPayload(segment: string): string {
   const words = tokenizeShellWords(segment, ARGV);
   const normalized = normalizeEnvInvocation(words);
   if (!normalized.complete || normalized.argv.length === 0) return segment;
-  const head = normalized.argv[0]!.replace(/^.*\//, "");
+  const rawHead = normalized.argv[0]!.replace(/^.*\//, "");
+  const head = interpreterFamily(rawHead);
   const evalFlag = /^(?:--eval|--print|--run|-r|-[epnc]|-[pn]*e[pn]*)$/;
   const index = normalized.argv.findIndex((word, i) => i > 0 && evalFlag.test(word));
   if (index >= 0) return normalized.argv.slice(index + 1).join(" ");
@@ -210,7 +241,7 @@ export function interpreterEvalPayload(segment: string): string {
   if (head === "ruby" || head === "perl") {
     const attached = normalized.argv.findIndex((word, i) => i > 0 && /^-e.+/.test(word));
     if (attached >= 0) {
-      const raw = attachedEvalProgram(segment, head);
+      const raw = attachedEvalProgram(segment, rawHead);
       return raw ?? [normalized.argv[attached]!.slice(2), ...normalized.argv.slice(attached + 1)].join(" ");
     }
   }
@@ -225,8 +256,9 @@ export function interpreterEvalPayload(segment: string): string {
  * starts before any program text is an outer shell wrapper; quotes encountered
  * after text has started are retained as language syntax.
  */
-function attachedEvalProgram(segment: string, interpreter: "ruby" | "perl"): string | null {
-  const match = new RegExp(`(?:^|\\s)(?:[^\\s]*\\/)?${interpreter}\\s+(-e)`).exec(segment);
+function attachedEvalProgram(segment: string, interpreter: string): string | null {
+  const name = interpreter.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const match = new RegExp(`(?:^|\\s)(?:[^\\s]*\\/)?${name}\\s+(-e)`).exec(segment);
   if (!match) return null;
   const tokenStart = match.index + match[0]!.indexOf(match[1]!);
   let tokenEnd = tokenStart + match[1]!.length;
@@ -296,7 +328,7 @@ function directInterpreterEvalPreflight(segment: string): { payloadLength: numbe
   const words = tokenizeShellWords(segment, ARGV);
   const normalized = normalizeEnvInvocation(words);
   if (!normalized.complete || normalized.argv.length === 0) return null;
-  const interpreter = normalized.argv[0]!.replace(/^.*\//, "");
+  const interpreter = interpreterFamily(normalized.argv[0]!.replace(/^.*\//, ""));
   if (!EVAL_INTERPRETERS.has(interpreter)) return null;
   const evalFlag = /^(?:--eval|--print|--run|-r|-[epnc]|-[pn]*e[pn]*)$/;
   let flagIndex = normalized.argv.findIndex((word, i) => i > 0 && evalFlag.test(word));

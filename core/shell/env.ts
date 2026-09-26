@@ -37,6 +37,25 @@ export const INTERPRETER_PRELOAD_ENV: Record<string, ReadonlySet<string>> = {
   python3: new Set(["PYTHONPATH", "PYTHONSTARTUP", "PYTHONHOME"]),
 };
 
+/**
+ * Loader and shell/interpreter startup variables that run code in whatever
+ * process inherits them, whichever command that is: dynamic-linker preloads
+ * (`LD_PRELOAD`, `DYLD_INSERT_LIBRARIES`, library search paths), shell
+ * startup files (`BASH_ENV`, POSIX `ENV`), and `PYTHONWARNINGS`, whose
+ * category field imports a module. Any value, any head, any setting form.
+ */
+export const DANGEROUS_ENV: ReadonlySet<string> = new Set([
+  "LD_PRELOAD",
+  "LD_LIBRARY_PATH",
+  "LD_AUDIT",
+  "DYLD_INSERT_LIBRARIES",
+  "DYLD_LIBRARY_PATH",
+  "DYLD_FRAMEWORK_PATH",
+  "BASH_ENV",
+  "ENV",
+  "PYTHONWARNINGS",
+]);
+
 /** Shell builtins whose operands set (and may export) variables. */
 const DECLARATION_HEADS = new Set(["export", "declare", "typeset", "readonly", "local"]);
 
@@ -48,18 +67,24 @@ const PRELOAD_ENV_NAMES: ReadonlySet<string> = new Set(
 /** Whether a variable, set to `value` (undefined: unknown), can make a later command run code. */
 function commandBearingEnvironment(name: string, value: string | undefined): boolean {
   if (lessEnvironmentWrite(name, value)) return true;
-  if (PRELOAD_ENV_NAMES.has(name)) return true;
+  if (PRELOAD_ENV_NAMES.has(name) || DANGEROUS_ENV.has(name)) return true;
   return gitEnvironmentPrefixMutation([`${name}=`]) !== null;
 }
 
 /**
  * The command-bearing variable a segment sets, if any: a bare assignment
  * segment (`LESSOPEN=x`) or a declaration builtin operand (`export X=1`,
- * `declare -x X`, `export X`). Options (`-x`, `+x`, `--`) are skipped.
+ * `declare -x X`, `export X`). Options (`-x`, `+x`, `--`) are skipped. A
+ * DANGEROUS_ENV variable also counts as a command prefix or `env` operand
+ * (`LD_PRELOAD=x cat f`), since it acts on any head.
  */
 export function commandBearingEnvironmentSetting(segment: string): string | null {
   const normalized = normalizeEnvInvocation(tokenizeShellWords(segment, ARGV));
   if (!normalized.complete) return null;
+  for (const assignment of normalized.assignments) {
+    const name = ENV_ASSIGNMENT_RE.exec(assignment)?.[1];
+    if (name && DANGEROUS_ENV.has(name)) return name;
+  }
   let settings: readonly string[];
   // Assignments (`NAME=v`, `NAME+=v`, `NAME[i]=v`) name the bare variable;
   // an append leaves the final value unknown. A bare operand (`export NAME`,
