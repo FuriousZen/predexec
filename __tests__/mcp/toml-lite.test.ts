@@ -174,6 +174,15 @@ describe("parseTomlLite — fail closed on anything touching projects / project_
     expect(result.ok === false && result.error).toMatch(line);
   });
 
+  it.each(["array-of-tables-then-table", "table-then-array-of-tables"])(
+    "fails closed when [[a]] and [a] define the same name (%s)",
+    (name) => {
+      const result = parseTomlLite(fixture(name));
+      expect(result.ok).toBe(false);
+      expect(result.ok === false && result.error).toMatch(/^line 3:/);
+    },
+  );
+
   it("fails closed on a duplicate [a] table header, naming the second one's line (CX-7)", () => {
     const result = parseTomlLite(fixture("duplicate-table-header"));
     expect(result.ok).toBe(false);

@@ -169,6 +169,14 @@ trust_level = "untrusted"
     input: "[a]\nx = 1\n[a]\ny = 2\n",
   },
   {
+    name: "array-of-tables-then-table",
+    input: "[[a]]\nx = 1\n[a]\ny = 2\n",
+  },
+  {
+    name: "table-then-array-of-tables",
+    input: "[a]\nx = 1\n[[a]]\ny = 2\n",
+  },
+  {
     name: "implicit-then-explicit-table",
     input: "[a.b]\nx = 1\n[a]\ny = 2\n",
   },

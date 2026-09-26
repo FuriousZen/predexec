@@ -442,6 +442,8 @@ export const parseTomlLite = (() => {
         }
         else if (Array.isArray(existing) && this.tableArrays.has(existing))
           existing.push(table);
+        else if (this.isTable(existing) && this.headerDefined.has(existing))
+          throw new TomlError(pos, `table ${header} defined more than once (already a [table])`, true);
         else
           throw new TomlError(pos, `cannot redefine "${last}" as an array of tables`);
         return table;
@@ -460,6 +462,8 @@ export const parseTomlLite = (() => {
         this.headerDefined.add(existing);
         return existing;
       }
+      if (Array.isArray(existing) && this.tableArrays.has(existing))
+        throw new TomlError(pos, `table ${header} defined more than once (already an [[array of tables]])`, true);
       throw new TomlError(pos, `cannot redefine "${last}" as a table`);
     }
   }

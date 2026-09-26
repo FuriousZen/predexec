@@ -2,12 +2,23 @@ import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSyn
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { createCodexPolicyChecker, readCodexRules } from "../../mcp/policy-codex.ts";
+import {
+  createCodexPolicyChecker,
+  readCodexRules as readCodexRulesUnisolated,
+  type CodexPolicyOptions,
+} from "../../mcp/policy-codex.ts";
 import { runPlanTree } from "../../core/engine.ts";
 import type { PlanTree } from "../../core/types.ts";
 
 let tmp: string;
 afterEach(() => tmp && rmSync(tmp, { recursive: true, force: true }));
+
+/**
+ * Hermetic by default: without an explicit `systemDir`, the reader would pick
+ * up the real `/etc/codex/rules` of whatever machine runs the suite.
+ */
+const readCodexRules = (cwd: string, opts: CodexPolicyOptions = {}) =>
+  readCodexRulesUnisolated(cwd, { systemDir: join(tmp ?? tmpdir(), "no-system-layer"), ...opts });
 
 /** A fresh `<tmp>/codexHome` + `<tmp>/project` pair, isolated from the real machine. */
 function setup() {
@@ -788,5 +799,120 @@ describe("createCodexPolicyChecker — backslash-newline continuation (carried f
   it("a backslash-newline inside single quotes stays literal", () => {
     const check = createCodexPolicyChecker([{ pattern: ["echo", "ab"], decision: "forbidden" }], []);
     expect(check("echo 'a\\\nb'")).toBe(null);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Task 13 review, fix round 1 (I1, I2, I3, Minor 1, R37)
+// ---------------------------------------------------------------------------
+
+describe("readCodexRules — triple-quoted strings in rules files (review I1)", () => {
+  const read = (body: string) => {
+    const { projectDir, codexHome, opts } = setupLayers();
+    writeRule(join(codexHome, "rules"), "a.rules", body);
+    return readCodexRules(projectDir, opts);
+  };
+
+  it("an apostrophe inside a ''' justification does not make the file unreadable", () => {
+    const { rules, unreadable } = read(
+      "prefix_rule(pattern=[\"git\",\"push\"], decision=\"forbidden\", justification='''Don't push''')\n",
+    );
+    expect(unreadable).toEqual([]);
+    expect(rules).toEqual([{ pattern: ["git", "push"], decision: "forbidden" }]);
+  });
+
+  it('a forbidden rule between two network_rule calls with odd-quote """ strings is still enforced', () => {
+    const { rules, unreadable } = read(
+      'network_rule(host="a", protocol="https", decision="allow", justification="""a"b"""); ' +
+        "prefix_rule(pattern=['rm'], decision='forbidden'); " +
+        'network_rule(host="c", protocol="https", decision="allow", justification="""c"d""")\n',
+    );
+    expect(unreadable).toEqual([]);
+    expect(createCodexPolicyChecker(rules, unreadable)("rm x")).toBe("rm");
+  });
+
+  it('a forbidden rule after a prefix_rule carrying an odd-quote """ justification is still enforced', () => {
+    const { rules, unreadable } = read(
+      'prefix_rule(pattern=["ls"], justification="""a"b"""); prefix_rule(pattern=["rm"], decision="forbidden")\n',
+    );
+    expect(unreadable).toEqual([]);
+    expect(createCodexPolicyChecker(rules, unreadable)("rm x")).toBe("rm");
+  });
+
+  it("a multi-line ''' string containing parens and # is one string, not code", () => {
+    const { rules, unreadable } = read(
+      "prefix_rule(\n  pattern=[\"rm\"],\n  decision=\"forbidden\",\n  justification='''no (really)\n# not a comment\n''',\n)\n",
+    );
+    expect(unreadable).toEqual([]);
+    expect(rules).toEqual([{ pattern: ["rm"], decision: "forbidden" }]);
+  });
+});
+
+describe("readCodexRules — skipped / ignored arguments must be literals (review I2, Minor 1)", () => {
+  const unreadableFor = (body: string) => {
+    const { projectDir, codexHome, opts } = setupLayers();
+    writeRule(join(codexHome, "rules"), "a.rules", body);
+    return readCodexRules(projectDir, opts).unreadable;
+  };
+
+  it.each([
+    [
+      "a nested prefix_rule inside a skipped network_rule",
+      'network_rule(host="a", protocol="https", decision="allow", justification=str(prefix_rule(pattern=["rm"], decision="forbidden")))\n',
+    ],
+    [
+      "a nested prefix_rule inside an ignored prefix_rule kwarg",
+      'prefix_rule(pattern=["ls"], justification=str(prefix_rule(pattern=["rm"], decision="forbidden")))\n',
+    ],
+    ["an identifier reference inside host_executable", 'host_executable(name="git", paths=GIT_PATHS)\n'],
+    ["a duplicate decision kwarg", 'prefix_rule(pattern=["rm"], decision="forbidden", decision="allow")\n'],
+    ["an unknown (typo'd) kwarg", 'prefix_rule(pattern=["rm"], decison="forbidden")\n'],
+  ])("%s fails the file closed", (_name, body) => {
+    expect(unreadableFor(body)).toHaveLength(1);
+  });
+
+  it("literal-only arguments are still accepted, including match/not_match examples", () => {
+    const { projectDir, codexHome, opts } = setupLayers();
+    writeRule(
+      join(codexHome, "rules"),
+      "a.rules",
+      [
+        'network_rule(host="example.com", protocol="https", decision="deny", justification="no")',
+        'host_executable(name="git", paths=["/usr/bin/git"])',
+        'prefix_rule(pattern=["git","push"], decision="forbidden", match=[["git","push"], "git push -f"], not_match=["git status"], justification="no")',
+        "",
+      ].join("\n"),
+    );
+    const { rules, unreadable } = readCodexRules(projectDir, opts);
+    expect(unreadable).toEqual([]);
+    expect(rules).toEqual([{ pattern: ["git", "push"], decision: "forbidden" }]);
+  });
+});
+
+describe("createCodexPolicyChecker — absolute-path program heads (review I3)", () => {
+  it("/bin/rm x matches an [rm] rule by basename, as Codex's resolve_host_executables does", () => {
+    const check = createCodexPolicyChecker([{ pattern: ["rm"], decision: "forbidden" }], []);
+    expect(check("/bin/rm x")).toBe("rm");
+    expect(check("/usr/bin/env ls")).toBe(null);
+  });
+
+  it("the basename form also applies to multi-token rules", () => {
+    const check = createCodexPolicyChecker([{ pattern: ["cat", ".env"], decision: "prompt" }], []);
+    expect(check("/usr/bin/cat .env")).toBe("cat .env");
+  });
+});
+
+describe("readCodexRules — project-root search has no ceiling (review R37)", () => {
+  it("finds a marker above $HOME's parent, as Codex does", () => {
+    const { codexHome, systemDir } = setupLayers();
+    const repo = join(tmp, "repo");
+    makeRepo(repo);
+    const home = join(repo, "users", "me");
+    const cwd = join(home, "work");
+    mkdirSync(cwd, { recursive: true });
+    writeFileSync(join(codexHome, "config.toml"), trustConfig(repo, true));
+    writeRule(join(repo, ".codex", "rules"), "r.rules", 'prefix_rule(pattern=["rm"], decision="forbidden")\n');
+    const { rules } = readCodexRules(cwd, { codexHome, systemDir, env: { HOME: home } });
+    expect(rules).toEqual([{ pattern: ["rm"], decision: "forbidden" }]);
   });
 });

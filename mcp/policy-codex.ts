@@ -152,143 +152,85 @@ function resolveCodexHome(opts: CodexPolicyOptions): string {
   return join(homedir(), ".codex");
 }
 
-/** Index of the first `target` char outside a quoted string (`'` or `"`), or -1. */
-function firstUnquotedIndex(text: string, target: string): number {
-  let q: '"' | "'" | null = null;
-  for (let i = 0; i < text.length; i++) {
-    const c = text[i]!;
-    if (q) {
-      if (c === "\\") i++;
-      else if (c === q) q = null;
-    } else if (c === '"' || c === "'") q = c;
-    else if (c === target) return i;
+/**
+ * Index just past the Starlark string literal whose opening quote is at
+ * `text[i]`, or -1 when it never closes. `"""` / `'''` are recognised BEFORE a
+ * single quote: every scanner below used to toggle on each lone quote, so an
+ * odd number of quotes inside a triple-quoted literal (`'''Don't push'''`)
+ * flipped the quote state for the rest of the statement — locking the user
+ * out, or silently merging a forbidden `prefix_rule` into a neighbouring
+ * skipped call (review I1). A backslash always protects the next character,
+ * raw strings included (a raw string still cannot end on `\"`); `r`/`b`
+ * prefixes are ordinary characters before the quote. A single-quoted literal
+ * may not span a newline.
+ */
+function stringEnd(text: string, i: number): number {
+  const q = text[i]!;
+  const delim = text.startsWith(q.repeat(3), i) ? q.repeat(3) : q;
+  for (let j = i + delim.length; j < text.length; j++) {
+    const c = text[j]!;
+    if (c === "\\") j++;
+    else if (delim.length === 1 && c === "\n") return -1;
+    else if (text.startsWith(delim, j)) return j + delim.length;
   }
   return -1;
 }
 
-/** Strip a `#` comment, string-aware (a `#` inside a quoted value survives). */
-function stripLineComment(line: string): string {
-  const idx = firstUnquotedIndex(line, "#");
-  return idx === -1 ? line : line.slice(0, idx);
-}
-
-/** Net paren/bracket depth change of one line, ignoring quoted content. `(` and `[`
- * are tracked together — this extractor only needs to know when a statement
- * has fully closed, not which bracket kind closed it. */
-function parenDelta(line: string): number {
-  let depth = 0;
-  let q: '"' | "'" | null = null;
-  for (let i = 0; i < line.length; i++) {
-    const c = line[i]!;
-    if (q) {
-      if (c === "\\") i++;
-      else if (c === q) q = null;
-    } else if (c === '"' || c === "'") q = c;
-    else if (c === "(" || c === "[") depth++;
-    else if (c === ")" || c === "]") depth--;
-  }
-  return depth;
-}
+const OPENERS = new Set(["(", "[", "{"]);
+const CLOSERS = new Set([")", "]", "}"]);
 
 /**
- * Group a `.rules` file's lines into top-level statements (a `prefix_rule(...)`
- * call may span many lines; blank lines and comments are dropped first).
- * Returns `null` when brackets never balance — an unterminated statement is
- * exactly the "cannot confidently classify" case the whole file fails closed
- * on.
+ * Group a `.rules` file into top-level statements: a statement ends at a
+ * newline or `;` at bracket depth 0, outside strings and comments. `#`
+ * comments are dropped; blank statements skipped. Returns `null` when a string
+ * never closes or brackets never balance — the "cannot confidently classify"
+ * case the whole file fails closed on.
  *
- * A single bracket-balanced chunk can still hold MULTIPLE top-level
- * statements joined by `;` — real, valid Starlark
- * (`prefix_rule(...); prefix_rule(...)`) — so each chunk is further split on
- * top-level (depth-0, outside-quotes) `;` before being returned. Without this,
- * two complete calls on one line collapse into a single "statement" whose
- * `pattern`/`decision` kwargs get merged by `parsePrefixRuleCall`'s last-kwarg-
- * wins loop, silently dropping or downgrading whichever rule's kwargs lose the
- * merge (P1, adversarial review).
+ * `;`-joined statements (`prefix_rule(...); prefix_rule(...)`, real Starlark)
+ * come back separately, so two calls' kwargs are never merged (P1,
+ * adversarial review).
  */
 function splitStatements(text: string): string[] | null {
-  const rawChunks: string[] = [];
+  const statements: string[] = [];
   let buf = "";
   let depth = 0;
-  for (const raw of text.split(/\r\n|\n/)) {
-    const line = stripLineComment(raw);
-    if (depth === 0 && line.trim() === "") continue;
-    buf += (buf ? "\n" : "") + line;
-    depth += parenDelta(line);
-    if (depth < 0) return null;
-    if (depth === 0) {
-      const trimmed = buf.trim();
-      if (trimmed !== "") rawChunks.push(trimmed);
-      buf = "";
+  const flush = () => {
+    const trimmed = buf.trim();
+    if (trimmed !== "") statements.push(trimmed);
+    buf = "";
+  };
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i]!;
+    if (c === '"' || c === "'") {
+      const end = stringEnd(text, i);
+      if (end === -1) return null;
+      buf += text.slice(i, end);
+      i = end - 1;
+    } else if (c === "#") {
+      while (i + 1 < text.length && text[i + 1] !== "\n") i++;
+    } else if (depth === 0 && (c === "\n" || c === ";")) flush();
+    else {
+      if (OPENERS.has(c)) depth++;
+      else if (CLOSERS.has(c) && --depth < 0) return null;
+      buf += c;
     }
   }
-  if (depth !== 0 || buf.trim() !== "") return null;
-
-  const statements: string[] = [];
-  for (const chunk of rawChunks) {
-    const parts = splitTopLevelSemicolons(chunk);
-    if (parts === null) return null;
-    statements.push(...parts);
-  }
+  if (depth !== 0) return null;
+  flush();
   return statements;
 }
 
-/**
- * Split one already bracket-balanced chunk on top-level (depth 0, outside
- * quotes) `;` characters. `null` only if the chunk's own bracket/quote state
- * somehow doesn't end balanced — shouldn't happen given `chunk` was already
- * grouped to net-zero depth by `splitStatements`, kept as a safety net rather
- * than trusted blindly.
- */
-function splitTopLevelSemicolons(chunk: string): string[] | null {
-  const parts: string[] = [];
+/** Index of the bracket closing the one opened at `text[openIdx]`, string-aware — or `null` if it never closes. */
+function matchingClose(text: string, openIdx: number): number | null {
   let depth = 0;
-  let q: '"' | "'" | null = null;
-  let cur = "";
-  for (let i = 0; i < chunk.length; i++) {
-    const c = chunk[i]!;
-    if (q) {
-      cur += c;
-      if (c === "\\") (cur += chunk[i + 1] ?? ""), i++;
-      else if (c === q) q = null;
-      continue;
-    }
-    if (c === '"' || c === "'") (q = c), (cur += c);
-    else if (c === "(" || c === "[") (depth++, (cur += c));
-    else if (c === ")" || c === "]") {
-      depth--;
-      if (depth < 0) return null;
-      cur += c;
-    } else if (c === ";" && depth === 0) {
-      const trimmed = cur.trim();
-      if (trimmed !== "") parts.push(trimmed);
-      cur = "";
-    } else cur += c;
-  }
-  if (depth !== 0 || q !== null) return null;
-  const trimmed = cur.trim();
-  if (trimmed !== "") parts.push(trimmed);
-  return parts;
-}
-
-/** Index of the char closing the paren opened at `stmt[openIdx]` (which must
- * be `(`), quote-aware — or `null` if it is never closed within `stmt`. */
-function matchingParenClose(stmt: string, openIdx: number): number | null {
-  let depth = 1;
-  let q: '"' | "'" | null = null;
-  for (let i = openIdx + 1; i < stmt.length; i++) {
-    const c = stmt[i]!;
-    if (q) {
-      if (c === "\\") i++;
-      else if (c === q) q = null;
-      continue;
-    }
+  for (let i = openIdx; i < text.length; i++) {
+    const c = text[i]!;
     if (c === '"' || c === "'") {
-      q = c;
-      continue;
-    }
-    if (c === "(" || c === "[") depth++;
-    else if (c === ")" || c === "]") {
+      const end = stringEnd(text, i);
+      if (end === -1) return null;
+      i = end - 1;
+    } else if (OPENERS.has(c)) depth++;
+    else if (CLOSERS.has(c)) {
       depth--;
       if (depth === 0) return i;
       if (depth < 0) return null;
@@ -305,39 +247,112 @@ function matchingParenClose(stmt: string, openIdx: number): number | null {
  * that splitting somehow missed, by nothing at all, or by any other separator
  * this extractor doesn't know about. "Cannot confidently classify" means the
  * file fails closed, not that the extra content is harmless (P1, adversarial
- * review — the belt to `splitTopLevelSemicolons`'s suspenders).
+ * review).
  */
 function isExactBalancedCall(stmt: string, head: string): boolean {
   if (!stmt.startsWith(head)) return false;
-  const openIdx = head.length - 1; // head ends in "("
-  const closeIdx = matchingParenClose(stmt, openIdx);
-  return closeIdx !== null && closeIdx === stmt.length - 1;
+  return matchingClose(stmt, head.length - 1) === stmt.length - 1; // head ends in "("
 }
 
-/** Split `text` on top-level commas — depth-aware over `()`/`[]`, quote-aware. */
+/**
+ * Split `text` on top-level `sep` — depth-aware over `()`/`[]`/`{}`,
+ * string-aware. A trailing empty part (a trailing comma) is dropped; an empty
+ * part anywhere else is kept as `""` so callers can reject it.
+ */
 function splitTopLevel(text: string, sep: string): string[] {
   const parts: string[] = [];
   let depth = 0;
-  let q: '"' | "'" | null = null;
-  let cur = "";
+  let start = 0;
   for (let i = 0; i < text.length; i++) {
     const c = text[i]!;
-    cur += c;
-    if (q) {
-      if (c === "\\") (cur += text[i + 1] ?? ""), i++;
-      else if (c === q) q = null;
-      continue;
-    }
-    if (c === '"' || c === "'") q = c;
-    else if (c === "(" || c === "[") depth++;
-    else if (c === ")" || c === "]") depth--;
+    if (c === '"' || c === "'") {
+      const end = stringEnd(text, i);
+      if (end === -1) break; // unbalanced: the remainder stays one part and fails to parse
+      i = end - 1;
+    } else if (OPENERS.has(c)) depth++;
+    else if (CLOSERS.has(c)) depth--;
     else if (c === sep && depth === 0) {
-      parts.push(cur.slice(0, -1));
-      cur = "";
+      parts.push(text.slice(start, i).trim());
+      start = i + 1;
     }
   }
-  if (cur.trim() !== "") parts.push(cur);
+  const last = text.slice(start).trim();
+  if (last !== "") parts.push(last);
   return parts;
+}
+
+/** Index of the first top-level (depth 0, outside strings) `target`, or -1. */
+function firstTopLevelIndex(text: string, target: string): number {
+  let depth = 0;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i]!;
+    if (c === '"' || c === "'") {
+      const end = stringEnd(text, i);
+      if (end === -1) return -1;
+      i = end - 1;
+    } else if (OPENERS.has(c)) depth++;
+    else if (CLOSERS.has(c)) depth--;
+    else if (c === target && depth === 0) return i;
+  }
+  return -1;
+}
+
+const NUMBER_RE = /^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$|^0[xX][0-9A-Fa-f]+$|^0[oO][0-7]+$/;
+
+/**
+ * True when `text` is a plain Starlark literal: a string, number, `True` /
+ * `False` / `None`, or a list / tuple / dict built only from literals. Any
+ * call or identifier reference makes it false. The arguments of a skipped
+ * call and a `prefix_rule`'s non-matching kwargs must pass this: Starlark
+ * EVALUATES them, so `justification=str(prefix_rule(...))` registers a rule
+ * Codex enforces — skipping that text unread silently dropped it (review I2).
+ */
+function isLiteralExpr(text: string): boolean {
+  const t = text.trim();
+  if (t === "") return false;
+  if (parseStarlarkString(t) !== null) return true;
+  if (NUMBER_RE.test(t) || t === "True" || t === "False" || t === "None") return true;
+  const open = t[0]!;
+  if (!OPENERS.has(open) || matchingClose(t, 0) !== t.length - 1) return false;
+  const parts = splitTopLevel(t.slice(1, -1), ",");
+  if (open === "{") {
+    return parts.every((entry) => {
+      const kv = splitTopLevel(entry, ":");
+      return kv.length === 2 && isLiteralExpr(kv[0]!) && isLiteralExpr(kv[1]!);
+    });
+  }
+  return parts.every(isLiteralExpr);
+}
+
+/**
+ * The comma-separated arguments of a balanced call `head(...)`, as
+ * `{ key, value }` (`key` null for a positional one) — or `null` when the
+ * argument list is malformed: an empty argument, a keyword that is not an
+ * identifier, or a keyword given twice (Starlark rejects all three).
+ */
+function callArguments(stmt: string, head: string): Array<{ key: string | null; value: string }> | null {
+  const args: Array<{ key: string | null; value: string }> = [];
+  const seen = new Set<string>();
+  for (const arg of splitTopLevel(stmt.slice(head.length, -1), ",")) {
+    if (arg === "") return null;
+    const eq = firstTopLevelIndex(arg, "=");
+    if (eq === -1 || arg[eq + 1] === "=") {
+      args.push({ key: null, value: arg });
+      continue;
+    }
+    const key = arg.slice(0, eq).trim();
+    if (!IDENTIFIER_RE.test(key) || seen.has(key)) return null;
+    seen.add(key);
+    args.push({ key, value: arg.slice(eq + 1).trim() });
+  }
+  return args;
+}
+
+/** A call this extractor may skip only when every argument is a plain literal (review I2). */
+function isLiteralOnlyCall(stmt: string, head: string): boolean {
+  if (!isExactBalancedCall(stmt, head)) return false;
+  const args = callArguments(stmt, head);
+  return args !== null && args.every((a) => isLiteralExpr(a.value));
 }
 
 const STARLARK_SIMPLE_ESCAPES: Record<string, string> = {
@@ -436,9 +451,18 @@ function parseRulesFile(text: string): CodexRule[] | null {
     // Codex's own UI appends `network_rule(...)` to default.rules
     // (codex-rs/execpolicy/src/amend.rs:85-123), and `host_executable(...)`
     // is a documented builtin (execpolicy/src/parser.rs:410,437). Neither
-    // says anything about which shell commands may run, so each is skipped
-    // as one balanced call; any OTHER unknown call still fails the file.
-    if (isExactBalancedCall(stmt, "network_rule(") || isExactBalancedCall(stmt, "host_executable(")) continue;
+    // registers a prefix rule, so each is skipped — but only when every
+    // argument is a plain literal: Starlark evaluates the arguments, so a
+    // nested `prefix_rule(...)` in one is a rule Codex enforces (review I2).
+    // `host_executable` narrows which absolute paths a rule's basename match
+    // accepts (execpolicy/src/policy.rs:344-370); predexec matches every
+    // absolute-path head by basename instead (see `createCodexPolicyChecker`),
+    // which over-blocks, so skipping the narrowing is safe. Any other call,
+    // or a skipped call with a non-literal argument, fails the file.
+    if (stmt.startsWith("network_rule(") || stmt.startsWith("host_executable(")) {
+      if (isLiteralOnlyCall(stmt, stmt.startsWith("network_rule(") ? "network_rule(" : "host_executable(")) continue;
+      return null;
+    }
 
     if (stmt.startsWith("prefix_rule(")) {
       // Must be EXACTLY one complete call — trailing content of any kind
@@ -464,6 +488,8 @@ function parseRulesFile(text: string): CodexRule[] | null {
 }
 
 const TRUNCATE = Symbol("truncate");
+/** `prefix_rule`'s other parameters (execpolicy/src/parser.rs:349-356) — they never affect matching. */
+const PREFIX_RULE_IGNORED_KWARGS = new Set(["match", "not_match", "justification"]);
 const IDENTIFIER_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
 /**
@@ -482,7 +508,6 @@ function parsePatternToken(el: string): CodexPatternToken | typeof TRUNCATE | nu
   if (el.startsWith("[") && el.endsWith("]")) {
     const alts: string[] = [];
     for (const alt of splitTopLevel(el.slice(1, -1), ",")) {
-      if (alt.trim() === "") continue;
       const literal = parseStarlarkString(alt);
       if (literal === null) return null;
       alts.push(literal);
@@ -496,29 +521,22 @@ function parsePatternToken(el: string): CodexPatternToken | typeof TRUNCATE | nu
 /** Parse one balanced `prefix_rule(...)` statement's kwargs into a `CodexRule`,
  * or `null` when `pattern`/`decision` can't be confidently extracted. */
 function parsePrefixRuleCall(stmt: string): CodexRule | null {
-  const inner = stmt.slice("prefix_rule(".length, -1);
-  const args = splitTopLevel(inner, ",")
-    .map((a) => a.trim())
-    .filter((a) => a !== "");
+  const args = callArguments(stmt, "prefix_rule(");
+  if (args === null) return null; // empty / duplicate / malformed argument (Minor 1)
 
   let patternText: string | null = null;
   let decisionText: string | null = null;
-  for (const arg of args) {
-    const eq = firstUnquotedIndex(arg, "=");
-    if (eq === -1) return null; // positional args aren't a documented shape
-    const key = arg.slice(0, eq).trim();
-    const value = arg.slice(eq + 1).trim();
+  for (const { key, value } of args) {
+    if (key === null) return null; // positional args aren't a documented shape
     if (key === "pattern") patternText = value;
     else if (key === "decision") decisionText = value;
-    // Other kwargs (e.g. a `comment=` string) say nothing about matching and
-    // are structurally already consumed by the top-level split — safe to skip.
+    else if (!PREFIX_RULE_IGNORED_KWARGS.has(key)) return null; // Codex rejects an unknown kwarg (a typo'd `decison=`)
+    else if (!isLiteralExpr(value)) return null; // evaluated by Starlark: must not hide a call (review I2)
   }
   if (patternText === null) return null; // a prefix_rule with no pattern can't be matched at all
 
-  if (!patternText.startsWith("[") || !patternText.endsWith("]")) return null;
-  const elements = splitTopLevel(patternText.slice(1, -1), ",")
-    .map((el) => el.trim())
-    .filter((el, i, all) => el !== "" || i < all.length - 1);
+  if (!patternText.startsWith("[") || matchingClose(patternText, 0) !== patternText.length - 1) return null;
+  const elements = splitTopLevel(patternText.slice(1, -1), ",");
   if (elements.length === 0) return null; // Codex: "pattern cannot be empty" (parser.rs parse_pattern)
   const pattern: CodexPatternToken[] = [];
   for (const el of elements) {
@@ -586,16 +604,16 @@ function isDirectory(path: string): boolean {
 }
 
 /**
- * `dir` and its ancestors, nearest first. The walk stops at the filesystem
- * root or at `$HOME`'s parent, whichever comes first (ruling for Task 13): a
- * marker above the user's home directory (say `/Users/.git`) must not turn
- * every session into one giant "project".
+ * `dir` and its ancestors, nearest first, up to the filesystem root. No
+ * ceiling: Codex's `discover_project_root` walks every ancestor
+ * (config/src/loader/mod.rs:1490-1526), so a marker above `$HOME` makes it
+ * load that directory's `.codex/rules` too — and predexec must as well.
  */
-function ancestors(dir: string, homeParent: string): string[] {
+function ancestors(dir: string): string[] {
   const out: string[] = [];
   for (let cur = dir; ; cur = dirname(cur)) {
     out.push(cur);
-    if (cur === homeParent || dirname(cur) === cur) return out;
+    if (dirname(cur) === cur) return out;
   }
 }
 
@@ -615,8 +633,8 @@ function hasMarker(dir: string, marker: string): boolean {
  * purpose — here, inheriting trust only LOADS MORE restrictions, so a forged
  * pointer can over-block, never under-block.
  */
-function mainWorktreeRoot(cwd: string, homeParent: string): string | null {
-  for (const dir of ancestors(cwd, homeParent)) {
+function mainWorktreeRoot(cwd: string): string | null {
+  for (const dir of ancestors(cwd)) {
     const dotGit = join(dir, ".git");
     if (!hasMarker(dir, ".git")) continue;
     if (isDirectory(dotGit)) return dir;
@@ -736,16 +754,14 @@ export function readCodexRules(
     return { rules, unreadable, warnings };
   }
 
-  const env = opts.env ?? process.env;
-  const homeParent = dirname(canonicalPath(env.HOME || homedir()));
   const originalCwd = resolve(cwd);
   const canonicalCwd = canonicalPath(cwd);
-  const cwdAncestors = ancestors(canonicalCwd, homeParent);
+  const cwdAncestors = ancestors(canonicalCwd);
   const projectRoot =
     config.markers.length === 0
       ? canonicalCwd
       : (cwdAncestors.find((dir) => config.markers.some((m) => hasMarker(dir, m))) ?? canonicalCwd);
-  const repoRoot = mainWorktreeRoot(canonicalCwd, homeParent);
+  const repoRoot = mainWorktreeRoot(canonicalCwd);
   const codexHomeCanonical = canonicalPath(codexHome);
 
   const layerDirs = cwdAncestors.slice(0, cwdAncestors.indexOf(projectRoot) + 1).reverse();
@@ -876,9 +892,20 @@ export function createCodexPolicyChecker(
               // `["git","push"]` rule on `FOO=1 git push` / `timeout 5 git
               // push`; stripped-only misses a `["timeout"]` rule on the same
               // command (see module header).
-              const tokenForms = rawTokens.length === strippedTokens.length && rawTokens.every((token, i) => token === strippedTokens[i])
+              const baseForms = rawTokens.length === strippedTokens.length && rawTokens.every((token, i) => token === strippedTokens[i])
                 ? [rawTokens]
                 : [rawTokens, strippedTokens];
+              // Codex matches an absolute-path program by its basename
+              // (`/bin/rm x` against `["rm"]`; execpolicy/src/policy.rs:344-370,
+              // enabled via `resolve_host_executables` in
+              // core/src/exec_policy.rs:373,493). It narrows that to the paths a
+              // `host_executable(...)` lists; predexec applies it to every
+              // absolute path, which only over-blocks (review I3).
+              const tokenForms = [...baseForms];
+              for (const toks of baseForms) {
+                const head = toks[0];
+                if (head?.startsWith("/") && basename(head) !== "") tokenForms.push([basename(head), ...toks.slice(1)]);
+              }
               let winner: CodexRule | null = null;
               for (const rule of rules) {
                 const matches = tokenForms.some((toks) => matchesPrefix(rule.pattern, toks));

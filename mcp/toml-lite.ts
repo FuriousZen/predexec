@@ -22,8 +22,9 @@
  *   Recovery restarts on the line after the failing statement's first line,
  *   so a broken multi-line construct cannot swallow a later `[projects]`
  *   section unseen.
- * - a table header defined twice (`[a]` ... `[a]`) always fails: TOML forbids
- *   it and the old reader silently merged it (CX-7).
+ * - a table header defined twice (`[a]` ... `[a]`, or `[a]` and `[[a]]` in
+ *   either order) always fails: TOML forbids it and the old reader silently
+ *   merged it (CX-7).
  * Pure function, no imports.
  */
 
@@ -346,6 +347,8 @@ class Parser {
         this.tableArrays.add(arr);
         node[last] = arr;
       } else if (Array.isArray(existing) && this.tableArrays.has(existing)) existing.push(table);
+      else if (this.isTable(existing) && this.headerDefined.has(existing))
+        throw new TomlError(pos, `table ${header} defined more than once (already a [table])`, true);
       else throw new TomlError(pos, `cannot redefine "${last}" as an array of tables`);
       return table;
     }
@@ -362,6 +365,8 @@ class Parser {
       this.headerDefined.add(existing);
       return existing;
     }
+    if (Array.isArray(existing) && this.tableArrays.has(existing))
+      throw new TomlError(pos, `table ${header} defined more than once (already an [[array of tables]])`, true);
     throw new TomlError(pos, `cannot redefine "${last}" as a table`);
   }
 }
