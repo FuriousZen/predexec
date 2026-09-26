@@ -1138,6 +1138,158 @@ export function checkCodex(opts = {}) {
   return checks;
 }
 
+/** True when `args` contains `--host antigravity` (two-token or `--host=antigravity`). */
+function antigravityArgsHaveHost(args) {
+  if (!Array.isArray(args)) return false;
+  if (args.includes("--host=antigravity")) return true;
+  const idx = args.indexOf("--host");
+  return idx !== -1 && args[idx + 1] === "antigravity";
+}
+
+/**
+ * The predexec plugin directory under `<configDir>/plugins/`, if installed —
+ * agy has no separate `installed_plugins.json` index the way Claude Code does
+ * (measured directly against a live, unmodified `~/.gemini/config/plugins/`:
+ * each subdirectory just carries its own `plugin.json`), so this scans one
+ * level and matches on the directory name OR the manifest's own `name` field.
+ */
+function findAntigravityPlugin(configDir) {
+  let entries;
+  try {
+    entries = readdirSync(join(configDir, "plugins"), { withFileTypes: true });
+  } catch {
+    return null;
+  }
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const dir = join(configDir, "plugins", entry.name);
+    const manifest = readJson(join(dir, "plugin.json"));
+    if (!manifest) continue;
+    if (entry.name === "predexec" || manifest.name === "predexec") return { dirName: entry.name, dir, manifest };
+  }
+  return null;
+}
+
+/**
+ * Antigravity CLI (`agy`): registration lives in one of two independent
+ * places — a global MCP server entry in `~/.gemini/config/mcp_config.json`,
+ * or an installed plugin directory under `~/.gemini/config/plugins/`
+ * (both directly measured against this machine's live, unmodified
+ * `~/.gemini` — see docs/research/antigravity.md and the module header of
+ * mcp/policy-antigravity.ts). Either route is healthy only with `--host
+ * antigravity` in its server args — without it the predexec MCP subprocess
+ * silently falls back to Claude Code policy/stats behavior, the same failure
+ * mode as the Codex check above. A plugin can additionally be turned off:
+ * `config.json`'s `plugins.<dir>.enabled` wins when present (per agy's
+ * plugins.md docs), falling back to the plugin's own `plugin.json` shipping
+ * `"disabled": true`.
+ *
+ * The grant check at the end warns when no `mcp(...)` allow grant covers
+ * predexec, since `readOnlyHint`'s effect on approval prompting is UNVERIFIED
+ * (docs/research/antigravity.md §b) — it does not suppress the warning. It is
+ * skipped entirely under `toolPermission: "always-proceed"`, where nothing
+ * ever prompts regardless of grants. A plugin-installed server is namespaced
+ * `<plugin-dir>_<server>` by agy unconditionally (measured, §e), so the
+ * expected grant for the plugin form differs from the bare global form.
+ */
+export function checkAntigravity(opts = {}) {
+  const env = opts.env ?? process.env;
+  const home = opts.home ?? homedir();
+  const agyBin = opts.agyBin ?? "agy";
+  const installed = opts.installed ?? onPath(agyBin, env);
+  const geminiDir = opts.geminiDir ?? join(home, ".gemini");
+  const configDir = opts.configDir ?? join(geminiDir, "config");
+
+  if (!installed && !existsSync(geminiDir)) {
+    return [{ name: "antigravity not installed", status: "skip", detail: "no agy on PATH and no ~/.gemini" }];
+  }
+
+  const named = (servers) =>
+    servers && typeof servers === "object" ? Object.keys(servers).find((k) => /predexec/.test(k)) : undefined;
+
+  const mcpConfig = readJson(join(configDir, "mcp_config.json"));
+  const globalKey = named(mcpConfig?.mcpServers);
+
+  const plugin = findAntigravityPlugin(configDir);
+  const pluginMcp = plugin ? readJson(join(plugin.dir, "mcp_config.json")) : null;
+  const pluginServerKey = named(pluginMcp?.mcpServers);
+  const namespacedPluginKey = plugin && pluginServerKey ? `${plugin.dirName}_${pluginServerKey}` : null;
+
+  if (!globalKey && !plugin) {
+    return [
+      {
+        name: "antigravity: installed, predexec not registered",
+        status: "info",
+        hint:
+          "run `agy plugin install <path to node_modules/predexec/antigravity-plugin>`, or " +
+          "`agy mcp add predexec npx -- -y --package=predexec predexec-mcp --host antigravity` " +
+          "followed by `npx -y predexec install-skill antigravity`",
+      },
+    ];
+  }
+
+  const checks = [];
+
+  if (globalKey) {
+    checks.push({
+      name: `antigravity mcp registration: "${globalKey}"`,
+      status: "ok",
+      detail: join(configDir, "mcp_config.json"),
+    });
+    if (!antigravityArgsHaveHost(mcpConfig.mcpServers[globalKey]?.args)) {
+      checks.push({
+        name: "antigravity: mcp registration is missing --host antigravity",
+        status: "fail",
+        hint:
+          "append `--host antigravity` to the registered args — without it predexec silently falls back to Claude Code policy/stats behavior",
+      });
+    }
+  }
+
+  if (plugin) {
+    const configJson = readJson(join(configDir, "config.json")) ?? {};
+    const override = configJson.plugins?.[plugin.dirName]?.enabled;
+    const disabled = override === false || (override === undefined && plugin.manifest.disabled === true);
+    if (disabled) {
+      checks.push({
+        name: "antigravity: predexec plugin is disabled",
+        status: "fail",
+        hint: "run `agy plugin enable predexec` (or set plugins.predexec.enabled: true in ~/.gemini/config/config.json)",
+      });
+    } else {
+      checks.push({ name: "antigravity: predexec plugin installed", status: "ok", detail: plugin.dir });
+      if (pluginServerKey && !antigravityArgsHaveHost(pluginMcp.mcpServers[pluginServerKey]?.args)) {
+        checks.push({
+          name: "antigravity: plugin mcp registration is missing --host antigravity",
+          status: "fail",
+          hint: "the plugin's mcp_config.json args must include --host antigravity — reinstall from an up-to-date predexec package",
+        });
+      }
+    }
+  }
+
+  // Grant check: `mcp(...)` allow grants live in agy's settings.json, the
+  // same file mcp/policy-antigravity.ts reads for enforcement.
+  const settings = readJson(opts.settingsPath ?? join(home, ".gemini", "antigravity-cli", "settings.json"));
+  const toolPermission = typeof settings?.toolPermission === "string" ? settings.toolPermission : "request-review";
+  if (toolPermission !== "always-proceed") {
+    const allow = Array.isArray(settings?.permissions?.allow) ? settings.permissions.allow : [];
+    const expectedNames = [globalKey, namespacedPluginKey].filter(Boolean);
+    const covered = (name) => allow.some((g) => typeof g === "string" && (g === `mcp(${name}/*)` || g.startsWith(`mcp(${name}/`)));
+    if (expectedNames.length > 0 && !expectedNames.some(covered)) {
+      checks.push({
+        name: "antigravity: no mcp(...) allow grant found for predexec",
+        status: "info",
+        hint:
+          `under toolPermission "${toolPermission}", every predexec call may prompt for approval — add an allow ` +
+          `grant such as "mcp(${expectedNames[0]}/*)" to ~/.gemini/antigravity-cli/settings.json to skip that`,
+      });
+    }
+  }
+
+  return checks;
+}
+
 /**
  * Live probe: spawn `opencode serve` on a random high port and poll
  * /experimental/tool/ids for "predexec". The gold check for silent loader skips.
@@ -1514,18 +1666,15 @@ export function checkOpencodeSkill(opts = {}, registered = false) {
 }
 
 /**
- * Antigravity has no doctor-tracked MCP-style registration in this codebase
- * yet (Task 19/20/21), so its skill check stands alone: skip when there's no
- * sign of Antigravity at all (`~/.gemini` absent), otherwise the same
- * present/duplicate/conflicting verdict as the other harnesses.
+ * `registered` now comes from checkAntigravity()'s own ok/fail verdicts (see
+ * doctor()), the same convention as checkCodexSkill/checkOpencodeSkill — no
+ * skill-visible harness has anything actionable to say about a missing skill
+ * until predexec is actually wired in, so this no longer stands alone on
+ * `~/.gemini` existing (Task 21; that overall "is antigravity present at
+ * all" verdict now belongs to checkAntigravity's own skip check).
  */
-export function checkAntigravitySkill(opts = {}) {
-  const home = opts.home ?? homedir();
-  const geminiDir = opts.geminiDir ?? join(home, ".gemini");
-  if (!existsSync(geminiDir)) {
-    return [{ name: "antigravity not installed", status: "skip", detail: "no ~/.gemini directory" }];
-  }
-  return skillCheck("antigravity", "antigravity", antigravitySkillRoots(opts), true, opts);
+export function checkAntigravitySkill(opts = {}, registered = false) {
+  return skillCheck("antigravity", "antigravity", antigravitySkillRoots(opts), registered, opts);
 }
 
 /**
@@ -1679,6 +1828,7 @@ async function doctor(args) {
   const opencodeChecks = checkOpencode();
   const claudeChecks = checkClaudeCode();
   const codexChecks = checkCodex();
+  const antigravityChecks = checkAntigravity();
 
   const opencodeRegistered = opencodeChecks.some(
     (c) => c.status === "ok" && c.name.startsWith("opencode config: plugin"),
@@ -1687,6 +1837,9 @@ async function doctor(args) {
     (c) => c.status === "ok" && (c.name.startsWith("claude code mcp (") || c.name === "claude code: predexec plugin installed"),
   );
   const codexRegistered = codexChecks.some((c) => c.status === "ok" && c.name.startsWith("codex mcp registration:"));
+  const antigravityRegistered = antigravityChecks.some(
+    (c) => c.status === "ok" && (c.name.startsWith("antigravity mcp registration:") || c.name === "antigravity: predexec plugin installed"),
+  );
 
   const checks = [
     checkNodeVersion(),
@@ -1697,7 +1850,8 @@ async function doctor(args) {
     ...checkClaudeSkill({}, claudeRegistered),
     ...codexChecks,
     ...checkCodexSkill({}, codexRegistered),
-    ...checkAntigravitySkill(),
+    ...antigravityChecks,
+    ...checkAntigravitySkill({}, antigravityRegistered),
   ];
   if (args.includes("--live")) {
     // Only a silent loader skip counts as a failure — see liveProbe.

@@ -25,6 +25,14 @@
  * top-level `version` field at all (confirmed against every installed
  * marketplace inspected — see docs/research/codex-plugin.md §1), so there is
  * nothing to sync there.
+ *
+ * Antigravity: `antigravity-plugin/plugin.json`'s `version` field, and the npx
+ * pin in its sibling `antigravity-plugin/mcp_config.json` — agy's own
+ * `plugin.json` schema documents only `name` (see
+ * ~/.gemini/antigravity/builtin/skills/agy-customizations/docs/plugins.md,
+ * read-only), but `agy plugin validate antigravity-plugin` accepts the extra
+ * `version`/`description` fields, so keeping them in step with package.json
+ * costs nothing and matches the Claude/Codex manifests' shape.
  */
 import { readFileSync, writeFileSync } from "node:fs";
 
@@ -57,6 +65,17 @@ const codexMcp = JSON.parse(readFileSync(codexMcpPath, "utf8"));
 syncNpxPin(codexMcp.mcpServers?.predexec?.args, version);
 writeFileSync(codexMcpPath, JSON.stringify(codexMcp, null, 2) + "\n", "utf8");
 
+const antigravityPluginPath = "antigravity-plugin/plugin.json";
+const antigravityPlugin = JSON.parse(readFileSync(antigravityPluginPath, "utf8"));
+antigravityPlugin.version = version;
+writeFileSync(antigravityPluginPath, JSON.stringify(antigravityPlugin, null, 2) + "\n", "utf8");
+
+const antigravityMcpPath = "antigravity-plugin/mcp_config.json";
+const antigravityMcp = JSON.parse(readFileSync(antigravityMcpPath, "utf8"));
+syncNpxPin(antigravityMcp.mcpServers?.predexec?.args, version);
+writeFileSync(antigravityMcpPath, JSON.stringify(antigravityMcp, null, 2) + "\n", "utf8");
+
 console.log(
-  `synced ${claudePluginPath}, ${marketplacePath}, ${codexPluginPath}, and ${codexMcpPath} to ${version}`,
+  `synced ${claudePluginPath}, ${marketplacePath}, ${codexPluginPath}, ${codexMcpPath}, ` +
+    `${antigravityPluginPath}, and ${antigravityMcpPath} to ${version}`,
 );

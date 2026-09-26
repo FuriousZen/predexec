@@ -419,6 +419,62 @@ The same stdio MCP server, started with `--host antigravity`. agy passes no host
 subprocess env (measured), so the flag is required. It selects the Antigravity policy reader
 (`mcp/policy-antigravity.ts`) and the `antigravity` stats label.
 
+**Install (recommended): a normal, non-plugin MCP registration.** A non-plugin server's cwd is
+wherever `agy` is launched from (measured — see Session root below), so predexec's root-resolution
+ancestor walk finds your project automatically, with **no extra configuration**:
+
+```bash
+agy mcp add predexec npx -- -y --package=predexec predexec-mcp --host antigravity
+npx -y predexec install-skill antigravity
+```
+
+`agy mcp add` writes `~/.gemini/config/mcp_config.json` (global — every workspace). For a
+per-project registration instead, write the same shape by hand into `.agents/mcp_config.json` at
+your workspace root (agy's `.agents/` customization root also loads a workspace-scoped
+`mcp_config.json` from there, the same mechanism it uses for `.agents/skills/`):
+
+```json
+{
+  "mcpServers": {
+    "predexec": {
+      "command": "npx",
+      "args": ["-y", "--package=predexec", "predexec-mcp", "--host", "antigravity"]
+    }
+  }
+}
+```
+
+**Verify:**
+
+```bash
+npx -y predexec doctor   # shows the mcp_config.json registration and its skill
+```
+
+**Alternative: the plugin form** (`antigravity-plugin/` in this package) bundles the MCP server
+with the routing skill in one step, mirroring the Claude Code / Codex plugin forms:
+
+```bash
+agy plugin install <path to node_modules/predexec/antigravity-plugin>
+```
+
+> **The plugin form needs one extra step you don't need above: `PREDEXEC_ROOT`.** A plugin's MCP
+> server always runs with cwd = the *plugin's own directory* (`PLUGIN_ROOT`), never your
+> workspace (measured). agy's `mcp_config.json` schema has no `${workspaceFolder}`-style variable
+> substitution to work around that — checked directly against agy's own bundled docs
+> (`~/.gemini/antigravity/builtin/skills/agy-customizations/docs/`), which document none for this
+> file. So `--host antigravity` refuses every plan under the plugin form until it's told where the
+> workspace is: export `PREDEXEC_ROOT` in the shell that launches `agy` (agy forwards its full
+> inherited environment to MCP children — measured), e.g. `PREDEXEC_ROOT=$(pwd) agy`, or add
+> `--root <dir>` to the plugin's own copy of `mcp_config.json` after installing it. This is exactly
+> why the non-plugin form above is the recommended install: it needs neither step.
+
+`install-skill antigravity` (needed for the non-plugin form; the plugin form bundles its own copy
+already) copies the routing skill to `~/.gemini/config/skills/predexec/` (global — Ruling R3,
+supported by Task 19's static evidence; pass `--project` for `.agents/skills/predexec/` instead).
+A fallback with no MCP tool at all, the same idea as Codex's `AGENTS.md` fallback, ships at
+`configs/antigravity/AGENTS.md` — paste it into your workspace's `AGENTS.md`/`GEMINI.md` when you
+can't register an MCP server at all.
+
 **Session root.** agy starts a workspace MCP server in the directory `agy` was launched from,
 which may be a subdirectory. It starts a plugin server in the plugin's own directory, with
 `PLUGIN_ROOT` set (both measured). predexec therefore resolves its root in this order:

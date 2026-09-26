@@ -8,6 +8,7 @@ import {
   agentsFileHasRouting,
   ancestorsOf,
   antigravitySkillRoots,
+  checkAntigravity,
   checkAntigravitySkill,
   checkClaudeCode,
   checkClaudeSkill,
@@ -703,6 +704,144 @@ describe("doctor — codex checks", () => {
   });
 });
 
+describe("doctor — antigravity checks", () => {
+  const agOpts = (over: Record<string, unknown> = {}) => ({
+    home: join(tmp, "home"),
+    installed: false,
+    ...over,
+  });
+
+  const GOOD_ARGS = ["-y", "--package=predexec@0.4.1", "predexec-mcp", "--host", "antigravity"];
+
+  const globalMcpConfig = (args: string[] = GOOD_ARGS) =>
+    JSON.stringify({ mcpServers: { predexec: { command: "npx", args } } });
+
+  const writePlugin = (opts: { args?: string[]; disabledInManifest?: boolean } = {}) => {
+    write(
+      "home/.gemini/config/plugins/predexec/plugin.json",
+      JSON.stringify({ name: "predexec", ...(opts.disabledInManifest ? { disabled: true } : {}) }),
+    );
+    write(
+      "home/.gemini/config/plugins/predexec/mcp_config.json",
+      JSON.stringify({ mcpServers: { predexec: { command: "npx", args: opts.args ?? GOOD_ARGS } } }),
+    );
+  };
+
+  it("reports absent when there is no ~/.gemini dir and agy is not on PATH", () => {
+    scratch();
+    expect(checkAntigravity(agOpts())[0]!.status).toBe("skip");
+  });
+
+  it("reports not-wired (info) when ~/.gemini exists but predexec is registered nowhere", () => {
+    scratch();
+    mkdirSync(join(tmp, "home", ".gemini"), { recursive: true });
+    const checks = checkAntigravity(agOpts());
+    expect(checks[0]!.status).toBe("info");
+    expect(checks[0]!.hint).toContain("agy plugin install");
+    expect(checks[0]!.hint).toContain("--host antigravity");
+  });
+
+  it("reports ok for a well-formed global mcp_config.json registration with --host antigravity", () => {
+    scratch();
+    write("home/.gemini/config/mcp_config.json", globalMcpConfig());
+    const checks = checkAntigravity(agOpts());
+    expect(checks.some((c) => c.status === "ok" && /mcp registration/.test(c.name))).toBe(true);
+    expect(checks.every((c) => c.status !== "fail")).toBe(true);
+  });
+
+  it("warns (fail) when the global registration is missing --host antigravity", () => {
+    scratch();
+    write("home/.gemini/config/mcp_config.json", globalMcpConfig(["-y", "--package=predexec", "predexec-mcp"]));
+    const checks = checkAntigravity(agOpts());
+    const fail = checks.find((c) => c.status === "fail" && /--host antigravity/.test(c.name));
+    expect(fail).toBeTruthy();
+  });
+
+  it("reports ok for an enabled plugin under ~/.gemini/config/plugins/", () => {
+    scratch();
+    writePlugin();
+    const checks = checkAntigravity(agOpts());
+    expect(checks.some((c) => c.status === "ok" && /plugin installed/.test(c.name))).toBe(true);
+    expect(checks.every((c) => c.status !== "fail")).toBe(true);
+  });
+
+  it("warns (fail) when the plugin's own mcp_config.json is missing --host antigravity", () => {
+    scratch();
+    writePlugin({ args: ["-y", "--package=predexec", "predexec-mcp"] });
+    const checks = checkAntigravity(agOpts());
+    const fail = checks.find((c) => c.status === "fail" && /--host antigravity/.test(c.name));
+    expect(fail).toBeTruthy();
+  });
+
+  it("warns (fail) when the plugin is disabled via config.json (config.json wins)", () => {
+    scratch();
+    writePlugin();
+    write("home/.gemini/config/config.json", JSON.stringify({ plugins: { predexec: { enabled: false } } }));
+    const checks = checkAntigravity(agOpts());
+    const fail = checks.find((c) => c.status === "fail" && /disabled/.test(c.name));
+    expect(fail).toBeTruthy();
+    expect(checks.some((c) => c.status === "ok" && /plugin installed/.test(c.name))).toBe(false);
+  });
+
+  it("warns (fail) when the plugin ships disabled in its own plugin.json and config.json has no override", () => {
+    scratch();
+    writePlugin({ disabledInManifest: true });
+    const checks = checkAntigravity(agOpts());
+    const fail = checks.find((c) => c.status === "fail" && /disabled/.test(c.name));
+    expect(fail).toBeTruthy();
+  });
+
+  it("a config.json enabled:true override beats a plugin.json that ships disabled", () => {
+    scratch();
+    writePlugin({ disabledInManifest: true });
+    write("home/.gemini/config/config.json", JSON.stringify({ plugins: { predexec: { enabled: true } } }));
+    const checks = checkAntigravity(agOpts());
+    expect(checks.some((c) => c.status === "ok" && /plugin installed/.test(c.name))).toBe(true);
+    expect(checks.every((c) => c.status !== "fail")).toBe(true);
+  });
+
+  it("info: no mcp(...) allow grant found under the default (request-review) toolPermission", () => {
+    scratch();
+    write("home/.gemini/config/mcp_config.json", globalMcpConfig());
+    const checks = checkAntigravity(agOpts());
+    const info = checks.find((c) => c.status === "info" && /allow grant/.test(c.name));
+    expect(info).toBeTruthy();
+    expect(info!.hint).toContain("mcp(predexec/*)");
+  });
+
+  it("no grant warning under toolPermission: always-proceed (nothing ever prompts)", () => {
+    scratch();
+    write("home/.gemini/config/mcp_config.json", globalMcpConfig());
+    write("home/.gemini/antigravity-cli/settings.json", JSON.stringify({ toolPermission: "always-proceed" }));
+    const checks = checkAntigravity(agOpts());
+    expect(checks.some((c) => /allow grant/.test(c.name))).toBe(false);
+  });
+
+  it("no grant warning once a matching mcp(predexec/*) allow grant exists", () => {
+    scratch();
+    write("home/.gemini/config/mcp_config.json", globalMcpConfig());
+    write(
+      "home/.gemini/antigravity-cli/settings.json",
+      JSON.stringify({ permissions: { allow: ["mcp(predexec/*)"] } }),
+    );
+    const checks = checkAntigravity(agOpts());
+    expect(checks.some((c) => /allow grant/.test(c.name))).toBe(false);
+  });
+
+  it("the plugin form needs the namespaced grant, mcp(predexec_predexec/*)", () => {
+    scratch();
+    writePlugin();
+    write(
+      "home/.gemini/antigravity-cli/settings.json",
+      JSON.stringify({ permissions: { allow: ["mcp(predexec/*)"] } }),
+    );
+    const checks = checkAntigravity(agOpts());
+    const info = checks.find((c) => c.status === "info" && /allow grant/.test(c.name));
+    expect(info).toBeTruthy();
+    expect(info!.hint).toContain("mcp(predexec_predexec/*)");
+  });
+});
+
 const skillFrontmatter = (body = "body") => `---\nname: predexec\ndescription: x\n---\n\n${body}\n`;
 
 // A deterministic fixture "package root" so skillCheck's canonical-content
@@ -1113,15 +1252,19 @@ describe("doctor — skill checks (opencode)", () => {
 });
 
 describe("doctor — skill checks (antigravity)", () => {
-  it("skips when there is no sign of antigravity at all", () => {
+  // Task 21: checkAntigravitySkill is now gated on the SAME `registered` flag
+  // convention as checkCodexSkill/checkOpencodeSkill (computed by doctor()
+  // from checkAntigravity()'s own ok/fail checks) rather than merely on
+  // ~/.gemini existing — an unregistered harness has nothing actionable to
+  // say about a missing skill (see skillCheck's own doc comment).
+  it("is silent when unregistered and no skill exists", () => {
     scratch();
-    expect(checkAntigravitySkill({ home: join(tmp, "home") })[0]!.status).toBe("skip");
+    expect(checkAntigravitySkill({ home: join(tmp, "home"), cwd: join(tmp, "proj") }, false)).toEqual([]);
   });
 
-  it("hints install-skill when ~/.gemini exists but no skill is found", () => {
+  it("hints install-skill when registered but no skill is found", () => {
     scratch();
-    mkdirSync(join(tmp, "home", ".gemini"), { recursive: true });
-    const checks = checkAntigravitySkill({ home: join(tmp, "home"), cwd: join(tmp, "proj") });
+    const checks = checkAntigravitySkill({ home: join(tmp, "home"), cwd: join(tmp, "proj") }, true);
     expect(checks[0]!.status).toBe("info");
     expect(checks[0]!.hint).toContain("install-skill antigravity");
   });
@@ -1130,7 +1273,7 @@ describe("doctor — skill checks (antigravity)", () => {
     scratch();
     const pkg = writeCanonicalPackageFixture();
     write("home/.gemini/config/skills/predexec/SKILL.md", canonicalSkill("antigravity"));
-    const checks = checkAntigravitySkill({ home: join(tmp, "home"), cwd: join(tmp, "proj"), packageRoot: pkg });
+    const checks = checkAntigravitySkill({ home: join(tmp, "home"), cwd: join(tmp, "proj"), packageRoot: pkg }, true);
     expect(checks[0]!.status).toBe("ok");
   });
 
@@ -1138,7 +1281,7 @@ describe("doctor — skill checks (antigravity)", () => {
     scratch();
     const pkg = writeCanonicalPackageFixture();
     write("home/.gemini/config/skills/predexec/SKILL.md", skillFrontmatter("hand-edited"));
-    const checks = checkAntigravitySkill({ home: join(tmp, "home"), cwd: join(tmp, "proj"), packageRoot: pkg });
+    const checks = checkAntigravitySkill({ home: join(tmp, "home"), cwd: join(tmp, "proj"), packageRoot: pkg }, true);
     expect(checks[0]!.status).toBe("fail");
     expect(checks[0]!.name).toContain("wrong harness or stale");
   });

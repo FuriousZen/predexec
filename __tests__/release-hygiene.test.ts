@@ -165,6 +165,83 @@ describe("release hygiene", () => {
     }
   });
 
+  it("antigravity-plugin/plugin.json and mcp_config.json parse and stay in step with package.json's version", () => {
+    const pkg = JSON.parse(readFileSync("package.json", "utf8")) as { version: string };
+    const plugin = JSON.parse(readFileSync(join("antigravity-plugin", "plugin.json"), "utf8")) as {
+      name: string;
+      version: string;
+    };
+    // agy's plugin.json schema documents only `name` as meaningful (see
+    // ~/.gemini/antigravity/builtin/skills/agy-customizations/docs/plugins.md,
+    // read-only) — the directory name is what config.json's `plugins.<dir>`
+    // map and the `<plugin>_<server>` MCP namespacing key off, so this must
+    // stay "predexec" to match the shipped directory.
+    expect(plugin.name).toBe("predexec");
+    expect(plugin.version).toBe(pkg.version);
+
+    const mcp = JSON.parse(readFileSync(join("antigravity-plugin", "mcp_config.json"), "utf8")) as {
+      mcpServers: { predexec: { command: string; args: string[] } };
+    };
+    const server = mcp.mcpServers.predexec;
+    expect(server.command).toBe("npx");
+    expect(server.args).toContain(`--package=predexec@${pkg.version}`);
+    // `--host antigravity` selects mcp/policy-antigravity.ts; without it the
+    // server silently falls back to Claude Code policy/stats behavior.
+    expect(server.args).toContain("--host");
+    expect(server.args[server.args.indexOf("--host") + 1]).toBe("antigravity");
+  });
+
+  it("sync-plugin-version.mjs also syncs antigravity-plugin/plugin.json and mcp_config.json's npx pin", () => {
+    const pluginPath = join("antigravity-plugin", "plugin.json");
+    const mcpPath = join("antigravity-plugin", "mcp_config.json");
+    const originalPlugin = readFileSync(pluginPath, "utf8");
+    const originalMcp = readFileSync(mcpPath, "utf8");
+    try {
+      // Deliberately desync both files first, so this proves the script
+      // actually rewrites them rather than observing values that already
+      // happened to match package.json's version.
+      const plugin = JSON.parse(originalPlugin);
+      plugin.version = "0.0.0-stale";
+      writeFileSync(pluginPath, JSON.stringify(plugin, null, 2) + "\n", "utf8");
+      const mcp = JSON.parse(originalMcp);
+      const npxArgs = mcp.mcpServers.predexec.args;
+      npxArgs[npxArgs.findIndex((a: string) => a.startsWith("--package=predexec"))] =
+        "--package=predexec@0.0.0-stale";
+      writeFileSync(mcpPath, JSON.stringify(mcp, null, 2) + "\n", "utf8");
+
+      execFileSync(process.execPath, ["scripts/sync-plugin-version.mjs"], { stdio: "pipe" });
+
+      const pkg = JSON.parse(readFileSync("package.json", "utf8")) as { version: string };
+      const syncedPlugin = JSON.parse(readFileSync(pluginPath, "utf8")) as { version: string };
+      const syncedMcp = JSON.parse(readFileSync(mcpPath, "utf8")) as {
+        mcpServers: { predexec: { args: string[] } };
+      };
+      expect(syncedPlugin.version).toBe(pkg.version);
+      expect(syncedMcp.mcpServers.predexec.args).toContain(`--package=predexec@${pkg.version}`);
+    } finally {
+      writeFileSync(pluginPath, originalPlugin, "utf8");
+      writeFileSync(mcpPath, originalMcp, "utf8");
+    }
+  });
+
+  it("agy plugin validate antigravity-plugin passes, when the agy CLI is on PATH", () => {
+    // Read-only: `agy plugin validate` only inspects the manifest/skills/mcp
+    // config files on disk — it does not touch ~/.gemini or register
+    // anything. Never run `agy plugin install` or `agy mcp add` here.
+    let agyPath: string;
+    try {
+      agyPath = execFileSync(process.platform === "win32" ? "where" : "which", ["agy"], { stdio: "pipe" })
+        .toString()
+        .trim()
+        .split("\n")[0]!;
+    } catch {
+      return; // no agy CLI on PATH — nothing to check
+    }
+    if (!agyPath) return;
+    const output = execFileSync(agyPath, ["plugin", "validate", "antigravity-plugin"], { stdio: "pipe" }).toString();
+    expect(output).toMatch(/\[ok\]/);
+  });
+
   it("claude plugin validate . passes, when the claude CLI is on PATH", () => {
     let claudePath: string;
     try {
