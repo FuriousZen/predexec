@@ -33,10 +33,31 @@
  * read-only), but `agy plugin validate antigravity-plugin` accepts the extra
  * `version`/`description` fields, so keeping them in step with package.json
  * costs nothing and matches the Claude/Codex manifests' shape.
+ *
+ * `--root <dir>` resolves every path below against `<dir>` instead of the
+ * process's cwd, so tests can point this at a throwaway copy of the
+ * manifests instead of the real tracked files (see
+ * __tests__/release-hygiene.test.ts). Omitting it keeps the default
+ * (`process.cwd()`), which is what the `version` npm lifecycle script relies
+ * on — it invokes this script with no args from the repo root.
  */
 import { readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 
-const version = JSON.parse(readFileSync("package.json", "utf8")).version;
+function parseRoot(argv) {
+  const i = argv.indexOf("--root");
+  if (i !== -1) {
+    const dir = argv[i + 1];
+    if (!dir) throw new Error("--root requires a directory argument");
+    return dir;
+  }
+  return process.cwd();
+}
+
+const root = parseRoot(process.argv.slice(2));
+const path = (relative) => join(root, relative);
+
+const version = JSON.parse(readFileSync(path("package.json"), "utf8")).version;
 
 function syncNpxPin(args, version) {
   if (!Array.isArray(args)) return;
@@ -45,37 +66,37 @@ function syncNpxPin(args, version) {
 }
 
 const claudePluginPath = ".claude-plugin/plugin.json";
-const claudePlugin = JSON.parse(readFileSync(claudePluginPath, "utf8"));
+const claudePlugin = JSON.parse(readFileSync(path(claudePluginPath), "utf8"));
 claudePlugin.version = version;
 syncNpxPin(claudePlugin.mcpServers?.predexec?.args, version);
-writeFileSync(claudePluginPath, JSON.stringify(claudePlugin, null, 2) + "\n", "utf8");
+writeFileSync(path(claudePluginPath), JSON.stringify(claudePlugin, null, 2) + "\n", "utf8");
 
 const marketplacePath = ".claude-plugin/marketplace.json";
-const marketplace = JSON.parse(readFileSync(marketplacePath, "utf8"));
+const marketplace = JSON.parse(readFileSync(path(marketplacePath), "utf8"));
 marketplace.version = version;
-writeFileSync(marketplacePath, JSON.stringify(marketplace, null, 2) + "\n", "utf8");
+writeFileSync(path(marketplacePath), JSON.stringify(marketplace, null, 2) + "\n", "utf8");
 
 const codexPluginPath = ".codex-plugin/plugin.json";
-const codexPlugin = JSON.parse(readFileSync(codexPluginPath, "utf8"));
+const codexPlugin = JSON.parse(readFileSync(path(codexPluginPath), "utf8"));
 codexPlugin.version = version;
-writeFileSync(codexPluginPath, JSON.stringify(codexPlugin, null, 2) + "\n", "utf8");
+writeFileSync(path(codexPluginPath), JSON.stringify(codexPlugin, null, 2) + "\n", "utf8");
 
 const codexMcpPath = ".codex-plugin/mcp.json";
-const codexMcp = JSON.parse(readFileSync(codexMcpPath, "utf8"));
+const codexMcp = JSON.parse(readFileSync(path(codexMcpPath), "utf8"));
 syncNpxPin(codexMcp.mcpServers?.predexec?.args, version);
-writeFileSync(codexMcpPath, JSON.stringify(codexMcp, null, 2) + "\n", "utf8");
+writeFileSync(path(codexMcpPath), JSON.stringify(codexMcp, null, 2) + "\n", "utf8");
 
 const antigravityPluginPath = "antigravity-plugin/plugin.json";
-const antigravityPlugin = JSON.parse(readFileSync(antigravityPluginPath, "utf8"));
+const antigravityPlugin = JSON.parse(readFileSync(path(antigravityPluginPath), "utf8"));
 antigravityPlugin.version = version;
-writeFileSync(antigravityPluginPath, JSON.stringify(antigravityPlugin, null, 2) + "\n", "utf8");
+writeFileSync(path(antigravityPluginPath), JSON.stringify(antigravityPlugin, null, 2) + "\n", "utf8");
 
 const antigravityMcpPath = "antigravity-plugin/mcp_config.json";
-const antigravityMcp = JSON.parse(readFileSync(antigravityMcpPath, "utf8"));
+const antigravityMcp = JSON.parse(readFileSync(path(antigravityMcpPath), "utf8"));
 syncNpxPin(antigravityMcp.mcpServers?.predexec?.args, version);
-writeFileSync(antigravityMcpPath, JSON.stringify(antigravityMcp, null, 2) + "\n", "utf8");
+writeFileSync(path(antigravityMcpPath), JSON.stringify(antigravityMcp, null, 2) + "\n", "utf8");
 
 console.log(
   `synced ${claudePluginPath}, ${marketplacePath}, ${codexPluginPath}, ${codexMcpPath}, ` +
-    `${antigravityPluginPath}, and ${antigravityMcpPath} to ${version}`,
+    `${antigravityPluginPath}, and ${antigravityMcpPath} to ${version} (root: ${root})`,
 );

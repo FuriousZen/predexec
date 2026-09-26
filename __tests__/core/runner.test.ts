@@ -5,6 +5,30 @@ import type { ToolOp, RunOptions } from "../../core/types.ts";
 
 const cwd = process.cwd();
 
+/**
+ * Resolves true once `pid` is actually reaped (kill(pid, 0) throws ESRCH),
+ * polling instead of asserting the instant a caller returns. A SIGKILLed
+ * process group member isn't necessarily reaped by the time `runNode`
+ * resolves — especially under load — so an instantaneous check is racy
+ * even though the kill itself was correct.
+ */
+async function waitForProcessGone(
+  pid: number,
+  { timeoutMs = 2_000, intervalMs = 20 }: { timeoutMs?: number; intervalMs?: number } = {},
+): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    try {
+      process.kill(pid, 0);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ESRCH") return true;
+      throw err;
+    }
+    if (Date.now() >= deadline) return false;
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+  }
+}
+
 const mockToolExecutor = async (op: ToolOp) => {
   if (op.tool === "read") return { stdout: `content of ${op.path}`, stderr: "", exitCode: 0 };
   if (op.tool === "grep") return { stdout: `match in ${op.path}`, stderr: "", exitCode: 0 };
@@ -198,7 +222,7 @@ describe("runNode — termination", () => {
     expect(r.stderr).toContain("[predexec] command timed out after 1000ms");
     const childPid = Number(r.stdout.trim());
     expect(childPid).toBeGreaterThan(0);
-    expect(() => process.kill(childPid, 0)).toThrow(expect.objectContaining({ code: "ESRCH" }));
+    expect(await waitForProcessGone(childPid)).toBe(true);
   }, 5_000);
 
   it("keeps the timeout notice when stderr already overflowed OUTPUT_CAP", async () => {

@@ -11,13 +11,67 @@
  *    to a throwaway dir for the whole suite, or every run pollutes live stats
  *    (seen as "double-logged" policyStop rows: one per policy test per run).
  */
-import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { execFileSync, spawn } from "node:child_process";
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
+import { dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
-import { beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { ensureBuild } from "./helpers/ensure-build.ts";
+
+// Every file scripts/sync-plugin-version.mjs writes. Sync tests must never
+// touch these directly — see the "sync-plugin-version.mjs" describe block
+// below, which snapshots them before its tests run and asserts byte-identity
+// after, and only ever exercises the script against a --root'd tmp copy.
+const SYNCED_MANIFESTS = [
+  "package.json",
+  ".claude-plugin/plugin.json",
+  ".claude-plugin/marketplace.json",
+  ".codex-plugin/plugin.json",
+  ".codex-plugin/mcp.json",
+  "antigravity-plugin/plugin.json",
+  "antigravity-plugin/mcp_config.json",
+];
+
+const SYNC_SCRIPT = resolve("scripts/sync-plugin-version.mjs");
+
+function copyManifestsToTmp(): string {
+  const dir = mkdtempSync(join(tmpdir(), "predexec-sync-"));
+  for (const rel of SYNCED_MANIFESTS) {
+    const dest = join(dir, rel);
+    mkdirSync(dirname(dest), { recursive: true });
+    cpSync(rel, dest);
+  }
+  return dir;
+}
+
+/** Sets a JSON file's top-level `version` field to a stale placeholder. */
+function desyncVersion(manifestPath: string) {
+  const json = JSON.parse(readFileSync(manifestPath, "utf8"));
+  json.version = "0.0.0-stale";
+  writeFileSync(manifestPath, JSON.stringify(json, null, 2) + "\n", "utf8");
+}
+
+/** Sets the `--package=predexec@...` npx pin inside an mcpServers.predexec.args array to stale. */
+function desyncNpxPin(manifestPath: string) {
+  const json = JSON.parse(readFileSync(manifestPath, "utf8"));
+  const args = json.mcpServers.predexec.args as string[];
+  const i = args.findIndex((a) => a.startsWith("--package=predexec"));
+  args[i] = "--package=predexec@0.0.0-stale";
+  writeFileSync(manifestPath, JSON.stringify(json, null, 2) + "\n", "utf8");
+}
+
+function runSync(root: string) {
+  execFileSync(process.execPath, [SYNC_SCRIPT, "--root", root], { stdio: "pipe" });
+}
+
+function runSyncAsync(root: string): Promise<number | null> {
+  return new Promise((resolvePromise, reject) => {
+    const child = spawn(process.execPath, [SYNC_SCRIPT, "--root", root], { stdio: "ignore" });
+    child.on("error", reject);
+    child.on("exit", (code) => resolvePromise(code));
+  });
+}
 
 describe("release hygiene", () => {
   it("plugin.json version matches package.json", () => {
@@ -69,21 +123,6 @@ describe("release hygiene", () => {
     expect(entry?.source).toBe("./");
   });
 
-  it("sync-plugin-version.mjs syncs both plugin.json and marketplace.json to package.json's version", () => {
-    execFileSync(process.execPath, ["scripts/sync-plugin-version.mjs"], { stdio: "pipe" });
-    const pkg = JSON.parse(readFileSync("package.json", "utf8")) as { version: string };
-    const plugin = JSON.parse(readFileSync(join(".claude-plugin", "plugin.json"), "utf8")) as {
-      version: string;
-      mcpServers: { predexec: { args: string[] } };
-    };
-    const marketplace = JSON.parse(readFileSync(join(".claude-plugin", "marketplace.json"), "utf8")) as {
-      version: string;
-    };
-    expect(plugin.version).toBe(pkg.version);
-    expect(marketplace.version).toBe(pkg.version);
-    expect(plugin.mcpServers.predexec.args).toContain(`--package=predexec@${pkg.version}`);
-  });
-
   it("there is no root .mcp.json (a live Claude Code project-scope registration)", () => {
     expect(existsSync(join(".mcp.json"))).toBe(false);
   });
@@ -132,39 +171,6 @@ describe("release hygiene", () => {
     expect(entry?.source).toEqual({ source: "local", path: "./" });
   });
 
-  it("sync-plugin-version.mjs also syncs .codex-plugin/plugin.json and mcp.json's npx pin", () => {
-    const pluginPath = join(".codex-plugin", "plugin.json");
-    const mcpPath = join(".codex-plugin", "mcp.json");
-    const originalPlugin = readFileSync(pluginPath, "utf8");
-    const originalMcp = readFileSync(mcpPath, "utf8");
-    try {
-      // Deliberately desync both files first, so this test proves the script
-      // actually rewrites them rather than merely observing values that
-      // already happened to match package.json's version.
-      const plugin = JSON.parse(originalPlugin);
-      plugin.version = "0.0.0-stale";
-      writeFileSync(pluginPath, JSON.stringify(plugin, null, 2) + "\n", "utf8");
-      const mcp = JSON.parse(originalMcp);
-      const npxArgs = mcp.mcpServers.predexec.args;
-      npxArgs[npxArgs.findIndex((a: string) => a.startsWith("--package=predexec"))] =
-        "--package=predexec@0.0.0-stale";
-      writeFileSync(mcpPath, JSON.stringify(mcp, null, 2) + "\n", "utf8");
-
-      execFileSync(process.execPath, ["scripts/sync-plugin-version.mjs"], { stdio: "pipe" });
-
-      const pkg = JSON.parse(readFileSync("package.json", "utf8")) as { version: string };
-      const syncedPlugin = JSON.parse(readFileSync(pluginPath, "utf8")) as { version: string };
-      const syncedMcp = JSON.parse(readFileSync(mcpPath, "utf8")) as {
-        mcpServers: { predexec: { args: string[] } };
-      };
-      expect(syncedPlugin.version).toBe(pkg.version);
-      expect(syncedMcp.mcpServers.predexec.args).toContain(`--package=predexec@${pkg.version}`);
-    } finally {
-      writeFileSync(pluginPath, originalPlugin, "utf8");
-      writeFileSync(mcpPath, originalMcp, "utf8");
-    }
-  });
-
   it("antigravity-plugin/plugin.json and mcp_config.json parse and stay in step with package.json's version", () => {
     const pkg = JSON.parse(readFileSync("package.json", "utf8")) as { version: string };
     const plugin = JSON.parse(readFileSync(join("antigravity-plugin", "plugin.json"), "utf8")) as {
@@ -189,39 +195,6 @@ describe("release hygiene", () => {
     // server silently falls back to Claude Code policy/stats behavior.
     expect(server.args).toContain("--host");
     expect(server.args[server.args.indexOf("--host") + 1]).toBe("antigravity");
-  });
-
-  it("sync-plugin-version.mjs also syncs antigravity-plugin/plugin.json and mcp_config.json's npx pin", () => {
-    const pluginPath = join("antigravity-plugin", "plugin.json");
-    const mcpPath = join("antigravity-plugin", "mcp_config.json");
-    const originalPlugin = readFileSync(pluginPath, "utf8");
-    const originalMcp = readFileSync(mcpPath, "utf8");
-    try {
-      // Deliberately desync both files first, so this proves the script
-      // actually rewrites them rather than observing values that already
-      // happened to match package.json's version.
-      const plugin = JSON.parse(originalPlugin);
-      plugin.version = "0.0.0-stale";
-      writeFileSync(pluginPath, JSON.stringify(plugin, null, 2) + "\n", "utf8");
-      const mcp = JSON.parse(originalMcp);
-      const npxArgs = mcp.mcpServers.predexec.args;
-      npxArgs[npxArgs.findIndex((a: string) => a.startsWith("--package=predexec"))] =
-        "--package=predexec@0.0.0-stale";
-      writeFileSync(mcpPath, JSON.stringify(mcp, null, 2) + "\n", "utf8");
-
-      execFileSync(process.execPath, ["scripts/sync-plugin-version.mjs"], { stdio: "pipe" });
-
-      const pkg = JSON.parse(readFileSync("package.json", "utf8")) as { version: string };
-      const syncedPlugin = JSON.parse(readFileSync(pluginPath, "utf8")) as { version: string };
-      const syncedMcp = JSON.parse(readFileSync(mcpPath, "utf8")) as {
-        mcpServers: { predexec: { args: string[] } };
-      };
-      expect(syncedPlugin.version).toBe(pkg.version);
-      expect(syncedMcp.mcpServers.predexec.args).toContain(`--package=predexec@${pkg.version}`);
-    } finally {
-      writeFileSync(pluginPath, originalPlugin, "utf8");
-      writeFileSync(mcpPath, originalMcp, "utf8");
-    }
   });
 
   it("agy plugin validate antigravity-plugin passes, when the agy CLI is on PATH", () => {
@@ -273,6 +246,118 @@ describe("release hygiene", () => {
     // a clean Node subprocess, the way real hosts load it.
     const script = `const m = await import(${JSON.stringify(url)}); if (typeof m.default?.server !== "function") { console.error("default.server is " + typeof m.default?.server); process.exit(1); }`;
     execFileSync(process.execPath, ["--input-type=module", "-e", script], { stdio: "pipe" });
+  });
+});
+
+describe("sync-plugin-version.mjs", () => {
+  // F2 (docs/superpowers/specs/2026-09-26-escape-hardening.md): the old tests
+  // planted "0.0.0-stale" into the REAL tracked manifests and restored them in
+  // a `finally` block. Two concurrent vitest runs (or even two workers in one
+  // run) racing that same real file corrupt each other's read of it. Every
+  // test below instead runs the script against a --root'd tmp copy, and this
+  // describe block snapshots every tracked manifest before its tests run and
+  // asserts byte-identity afterward, so a regression back to in-place writes
+  // fails loudly here instead of showing up as cross-run flake.
+  let before: Record<string, string>;
+  const tmpDirs: string[] = [];
+
+  beforeAll(() => {
+    before = Object.fromEntries(SYNCED_MANIFESTS.map((rel) => [rel, readFileSync(rel, "utf8")]));
+  });
+
+  afterEach(() => {
+    let dir: string | undefined;
+    while ((dir = tmpDirs.pop())) rmSync(dir, { recursive: true, force: true });
+  });
+
+  afterAll(() => {
+    for (const rel of SYNCED_MANIFESTS) {
+      expect(readFileSync(rel, "utf8"), `${rel} must be untouched by sync-plugin-version.mjs tests`).toBe(
+        before[rel],
+      );
+    }
+  });
+
+  it("syncs .claude-plugin/plugin.json and marketplace.json to package.json's version", () => {
+    const dir = copyManifestsToTmp();
+    tmpDirs.push(dir);
+    // Deliberately desync first, so this proves the script actually rewrites
+    // the file rather than merely observing a value that already matched.
+    desyncVersion(join(dir, ".claude-plugin", "plugin.json"));
+
+    runSync(dir);
+
+    const pkg = JSON.parse(readFileSync(join(dir, "package.json"), "utf8")) as { version: string };
+    const plugin = JSON.parse(readFileSync(join(dir, ".claude-plugin", "plugin.json"), "utf8")) as {
+      version: string;
+      mcpServers: { predexec: { args: string[] } };
+    };
+    const marketplace = JSON.parse(readFileSync(join(dir, ".claude-plugin", "marketplace.json"), "utf8")) as {
+      version: string;
+    };
+    expect(plugin.version).toBe(pkg.version);
+    expect(marketplace.version).toBe(pkg.version);
+    expect(plugin.mcpServers.predexec.args).toContain(`--package=predexec@${pkg.version}`);
+  });
+
+  it("also syncs .codex-plugin/plugin.json and mcp.json's npx pin", () => {
+    const dir = copyManifestsToTmp();
+    tmpDirs.push(dir);
+    const pluginPath = join(dir, ".codex-plugin", "plugin.json");
+    const mcpPath = join(dir, ".codex-plugin", "mcp.json");
+    desyncVersion(pluginPath);
+    desyncNpxPin(mcpPath);
+
+    runSync(dir);
+
+    const pkg = JSON.parse(readFileSync(join(dir, "package.json"), "utf8")) as { version: string };
+    const syncedPlugin = JSON.parse(readFileSync(pluginPath, "utf8")) as { version: string };
+    const syncedMcp = JSON.parse(readFileSync(mcpPath, "utf8")) as {
+      mcpServers: { predexec: { args: string[] } };
+    };
+    expect(syncedPlugin.version).toBe(pkg.version);
+    expect(syncedMcp.mcpServers.predexec.args).toContain(`--package=predexec@${pkg.version}`);
+  });
+
+  it("also syncs antigravity-plugin/plugin.json and mcp_config.json's npx pin", () => {
+    const dir = copyManifestsToTmp();
+    tmpDirs.push(dir);
+    const pluginPath = join(dir, "antigravity-plugin", "plugin.json");
+    const mcpPath = join(dir, "antigravity-plugin", "mcp_config.json");
+    desyncVersion(pluginPath);
+    desyncNpxPin(mcpPath);
+
+    runSync(dir);
+
+    const pkg = JSON.parse(readFileSync(join(dir, "package.json"), "utf8")) as { version: string };
+    const syncedPlugin = JSON.parse(readFileSync(pluginPath, "utf8")) as { version: string };
+    const syncedMcp = JSON.parse(readFileSync(mcpPath, "utf8")) as {
+      mcpServers: { predexec: { args: string[] } };
+    };
+    expect(syncedPlugin.version).toBe(pkg.version);
+    expect(syncedMcp.mcpServers.predexec.args).toContain(`--package=predexec@${pkg.version}`);
+  });
+
+  it("runs safely against two separate --root targets at once, without touching each other or the repo", async () => {
+    const dirA = copyManifestsToTmp();
+    const dirB = copyManifestsToTmp();
+    tmpDirs.push(dirA, dirB);
+    desyncVersion(join(dirA, ".claude-plugin", "plugin.json"));
+    desyncVersion(join(dirB, ".codex-plugin", "plugin.json"));
+
+    const [codeA, codeB] = await Promise.all([runSyncAsync(dirA), runSyncAsync(dirB)]);
+
+    expect(codeA).toBe(0);
+    expect(codeB).toBe(0);
+    const pkg = JSON.parse(readFileSync("package.json", "utf8")) as { version: string };
+    const pluginA = JSON.parse(readFileSync(join(dirA, ".claude-plugin", "plugin.json"), "utf8")) as {
+      version: string;
+    };
+    const pluginB = JSON.parse(readFileSync(join(dirB, ".codex-plugin", "plugin.json"), "utf8")) as {
+      version: string;
+    };
+    expect(pluginA.version).toBe(pkg.version);
+    expect(pluginB.version).toBe(pkg.version);
   });
 });
 

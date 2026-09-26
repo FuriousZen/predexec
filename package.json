@@ -46,6 +46,7 @@
   "scripts": {
     "test": "vitest run",
     "test:watch": "vitest",
+    "test:stress": "node scripts/stress-test.mjs",
     "typecheck": "tsc --noEmit",
     "build": "node scripts/clean-build.mjs",
     "skills": "pnpm run build && node scripts/gen-skills.mjs",
