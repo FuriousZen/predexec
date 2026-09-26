@@ -121,42 +121,32 @@ describe.each(variants)("pi extension ($name) — tool.execute", ({ predexec }) 
     expect(updates.length).toBeGreaterThan(0);
   });
 
-  it("handles coercion error gracefully returning stoppedReason: error", async () => {
+  it("throws on a coercion error instead of returning it as a normal result (pi renders a returned object as success)", async () => {
     const { api, getTool } = createFakeApi();
     predexec(api);
     const tool = getTool();
 
     const cwd = mkdtempSync(join(tmpdir(), "px-pi-"));
-    const result = await tool.execute(
-      "tc2",
-      { bad: "plan" },
-      undefined,
-      () => {},
-      { cwd },
-    );
-
-    expect(result.details.stoppedReason).toBe("error");
-    expect(result.details.fellBack).toBe(true);
-    expect(result.content[0].text).toContain("predexec expected a JSON object with `root`");
+    await expect(
+      tool.execute("tc2", { bad: "plan" }, undefined, () => {}, { cwd }),
+    ).rejects.toThrow("predexec expected a JSON object with `root`");
   });
 
-  it("handles engine unexpected error gracefully returning stoppedReason: error", async () => {
+  it("throws on an unexpected engine error instead of returning it as a normal result", async () => {
     const { api, getTool } = createFakeApi();
     predexec(api);
     const tool = getTool();
 
     const cwd = mkdtempSync(join(tmpdir(), "px-pi-"));
-    const result = await tool.execute(
-      "tc3",
-      { root: "a", nodes: [{ id: "a", commands: ["echo"] }], cwd: 123 },
-      undefined,
-      () => {},
-      { cwd },
-    );
-
-    expect(result.details.stoppedReason).toBe("error");
-    expect(result.details.fellBack).toBe(true);
-    expect(result.content[0].text).toContain("cwd must be a relative directory inside the session root");
+    await expect(
+      tool.execute(
+        "tc3",
+        { root: "a", nodes: [{ id: "a", commands: ["echo"] }], cwd: 123 },
+        undefined,
+        () => {},
+        { cwd },
+      ),
+    ).rejects.toThrow("cwd must be a relative directory inside the session root");
   });
 
   it("constructs native read tools at the effective plan cwd", async () => {
@@ -273,5 +263,39 @@ describe.each(variants)("pi extension ($name) — tool_result nudge hook", ({ pr
     const out = await hook(event);
 
     expect(out).toBeUndefined();
+  });
+
+  it("does not append the nudge after an errored bash result", async () => {
+    const { api, events } = createFakeApi();
+    predexec(api);
+    const hook = events.get("tool_result")!;
+
+    const event = {
+      toolName: "bash",
+      isError: true,
+      input: { command: "cat foo.txt" },
+      content: [{ type: "text", text: "no such file" }],
+    };
+    const out = await hook(event);
+
+    expect(out).toBeUndefined();
+  });
+
+  it("appends the nudge after a read-only powershell command", async () => {
+    const { api, events } = createFakeApi();
+    predexec(api);
+    const hook = events.get("tool_result")!;
+
+    const event = {
+      toolName: "powershell",
+      isError: false,
+      input: { command: "Get-Content foo.txt" },
+      content: [{ type: "text", text: "contents" }],
+    };
+    const out = await hook(event);
+
+    expect(out).toBeDefined();
+    const text = out.content.map((c: any) => c.text).join("");
+    expect(text).toContain("[predexec] Batch read-only commands in one predexec call");
   });
 });

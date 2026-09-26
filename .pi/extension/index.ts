@@ -18,7 +18,7 @@ import {
   createFindTool,
   createLsTool,
 } from "@earendil-works/pi-coding-agent";
-import { isDestructiveCommand, OUTPUT_CAP, validateOperation, type ToolOp } from "../../core/index.ts";
+import { coercePlan, isDestructiveCommand, OUTPUT_CAP, validateOperation, type ToolOp } from "../../core/index.ts";
 import { TRUNCATION_MARKER } from "../../core/runner.ts";
 import type { ProgressEvent } from "../../core/types.ts";
 import { executeAdapterPlan } from "../../adapter-runtime.ts";
@@ -204,13 +204,20 @@ function createToolExecutor(cwd: string, signal?: AbortSignal) {
     return tools;
   };
 
+  // "Never ran" (invalid arg, unknown tool, an underlying tool.execute() throw
+  // — e.g. ENOEXEC from a broken ~/.pi/agent/bin/rg) is exit 2, matching the
+  // MCP and opencode adapters; a search that ran and found nothing stays exit
+  // 1 (see mapToolResult). Exit 1 previously covered BOTH cases here, so a
+  // broken tool binary was indistinguishable from "no matches" (PI-2).
+  const NEVER_RAN = 2;
+
   return async (op: ToolOp, opts: { cwd: string; signal?: AbortSignal }) => {
     const validationError = validateOperation(op);
-    if (validationError) return { stdout: "", stderr: `invalid operation: ${validationError}`, exitCode: 1 };
+    if (validationError) return { stdout: "", stderr: `invalid operation: ${validationError}`, exitCode: NEVER_RAN };
     const tools = toolsFor(opts.cwd ?? cwd);
     const tool = tools[op.tool];
     if (!tool) {
-      return { stdout: "", stderr: `unknown tool: ${op.tool}`, exitCode: 1 };
+      return { stdout: "", stderr: `unknown tool: ${op.tool}`, exitCode: NEVER_RAN };
     }
     try {
       const { tool: _name, ...args } = op;
@@ -221,9 +228,50 @@ function createToolExecutor(cwd: string, signal?: AbortSignal) {
         .join("\n");
       return mapToolResult(op.tool, stdout, result.details);
     } catch (err) {
-      return { stdout: "", stderr: (err as Error).message, exitCode: 1 };
+      return { stdout: "", stderr: (err as Error).message, exitCode: NEVER_RAN };
     }
   };
+}
+
+/**
+ * pi validates a tool call's arguments against `parameters` (a JSON Schema)
+ * BEFORE `execute` ever runs — unlike the MCP and opencode adapters, where our
+ * own `coercePlan` (inside `executeAdapterPlan`) is the first thing that sees
+ * the raw model output. Without this hook, a model that emits a
+ * double-encoded `nodes` string, a whole stringified plan, or the
+ * single-command shorthand `commands:"ls"` (a bare string where the schema
+ * requires an array) gets rejected by pi's own schema check and `execute`
+ * never runs at all — `coercePlan`'s recovery never gets a chance (PI-1).
+ *
+ * Reuses the shared `coercePlan` (still re-run, harmlessly, inside
+ * `executeAdapterPlan`) for the JSON-string recovery instead of reimplementing
+ * it; the one thing it does NOT cover is `commands` arriving as a bare
+ * string per node — pi's schema requires an array, but coercePlan's job is
+ * JSON-string recovery, not shape coercion — so that's normalized here too.
+ *
+ * Must never throw: pi treats a `prepareArguments` throw as an immediate
+ * tool-call error that skips `execute` entirely, forfeiting the friendlier,
+ * engine-produced diagnostic a genuinely malformed plan gets when it reaches
+ * `executeAdapterPlan`'s own `coercePlan` call instead. On failure the raw
+ * args pass through unchanged so pi's schema validation (or `execute`, if
+ * that validation still accepts them) reports the problem.
+ */
+export function prepareArguments(args: unknown): Record<string, unknown> {
+  let plan: unknown;
+  try {
+    plan = coercePlan(args);
+  } catch {
+    return (args && typeof args === "object" ? args : {}) as Record<string, unknown>;
+  }
+  const nodes = (plan as { nodes?: unknown }).nodes;
+  if (Array.isArray(nodes)) {
+    (plan as { nodes: unknown[] }).nodes = nodes.map((node) =>
+      node && typeof node === "object" && typeof (node as { commands?: unknown }).commands === "string"
+        ? { ...node, commands: [(node as { commands: string }).commands] }
+        : node,
+    );
+  }
+  return plan as Record<string, unknown>;
 }
 
 export default function predexec(pi: ExtensionAPI): void {
@@ -234,7 +282,13 @@ export default function predexec(pi: ExtensionAPI): void {
   // wording and broke silently when it changed).
 
   pi.on("tool_result", async (event) => {
-    if (event.toolName === "bash") {
+    // A failed shell result is not "read-only work worth batching" — nudging
+    // toward MORE predexec calls after an error reads as predexec papering
+    // over the failure (PI-4). `powershell` is a separate tool from `bash`
+    // (added post-0.82.1) that runs the same read-only-vs-mutating shell
+    // commands and deserves the identical nudge.
+    if (event.isError) return;
+    if (event.toolName === "bash" || event.toolName === "powershell") {
       const cmd = (event as { input?: { command?: string } }).input?.command ?? "";
       if (!cmd || isDestructiveCommand(cmd)) return;
       return {
@@ -257,6 +311,7 @@ export default function predexec(pi: ExtensionAPI): void {
       "predexec: " + RECOVERY_LINE.trimEnd(),
     ],
     parameters: PlanTreeSchema as any,
+    prepareArguments,
     async execute(_toolCallId, params: Record<string, unknown>, signal, onUpdate, ctx) {
       let lastUpdateAt = 0;
       let pendingTimeout: ReturnType<typeof setTimeout> | undefined;
@@ -321,6 +376,14 @@ export default function predexec(pi: ExtensionAPI): void {
 
       done = true;
       if (pendingTimeout) clearTimeout(pendingTimeout);
+      // pi's own contract (docs/extensions.md: "Throw from execute() to produce
+      // a failed tool result. Returning an object does not mark it as an
+      // error.") — a coercion/engine failure returned as a normal object was
+      // rendered as a SUCCESS by pi (PI-3), hiding it from isError-gated logic
+      // (including this file's own tool_result nudge, above).
+      if (result.stoppedReason === "error") {
+        throw new Error(result.transcript || "predexec: the plan failed for an unknown reason.");
+      }
       return {
         content: [{ type: "text" as const, text: result.transcript || "(no output)" }],
         details: {
