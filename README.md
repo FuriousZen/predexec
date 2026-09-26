@@ -442,7 +442,8 @@ block as shipped rather than padding it.
 > **Every shell command a predexec plan runs bypasses Codex's sandbox entirely**, regardless of
 > `sandbox_mode` / the active permission profile, because those govern Codex's *own* shell tool,
 > not an MCP subprocess. predexec's read-only invariant, the `destructive.ts` heuristic, and the
-> fail-closed execpolicy-rules adapter (reads `~/.codex/config.toml` plus
+> fail-closed execpolicy-rules adapter (reads `~/.codex/config.toml` merged over
+> `/etc/codex/config.toml` for project trust, plus `/etc/codex/rules`,
 > `~/.codex/rules/*.rules` / `<repo>/.codex/rules/`) are the **only** containment — there is no
 > OS-level backstop the way Claude Code's sandboxing docs offer. Session-only CLI flags
 > (`--sandbox`, `-a`/`--ask-for-approval`, `--profile`, `--full-auto`) are a config layer that

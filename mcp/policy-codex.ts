@@ -675,7 +675,23 @@ type TrustLevel = "trusted" | "untrusted";
 interface TrustConfig {
   /** `[projects."<key>"] trust_level`, entries without a trust_level dropped (mod.rs:1285-1288). */
   projects: Array<{ key: string; spellings: Set<string>; level: TrustLevel }>;
-  markers: string[];
+  /** `project_root_markers`, or undefined when this file does not set it. */
+  markers: string[] | undefined;
+}
+
+const DEFAULT_PROJECT_ROOT_MARKERS = [".git"];
+
+/**
+ * Layer `overlay` over `base` the way Codex merges config layers before
+ * deciding trust (config/src/merge.rs merge_toml_values: tables merge per key,
+ * a later scalar or array replaces an earlier one). A project key's trust in
+ * the higher layer replaces the lower one's; an entry with no trust_level was
+ * already dropped, so it leaves the lower layer's trust standing.
+ */
+function mergeTrustConfigs(base: TrustConfig, overlay: TrustConfig): TrustConfig {
+  const byKey = new Map(base.projects.map((p) => [p.key, p] as const));
+  for (const project of overlay.projects) byKey.set(project.key, project);
+  return { projects: [...byKey.values()], markers: overlay.markers ?? base.markers };
 }
 
 /**
@@ -687,7 +703,7 @@ interface TrustConfig {
  * outside those keys come back as debug-only `warnings`.
  */
 function readTrustConfig(configPath: string, warnings: string[]): TrustConfig | null {
-  const empty: TrustConfig = { projects: [], markers: [".git"] };
+  const empty: TrustConfig = { projects: [], markers: undefined };
   if (!existsSync(configPath)) return empty;
   let parsed: ReturnType<typeof parseTomlLite>;
   try {
@@ -735,7 +751,9 @@ function trustFor(config: TrustConfig, key: string): TrustLevel | null {
 /**
  * Read execpolicy rules the way Codex layers them (core/src/exec_policy.rs:
  * 663-681 walks config layers low to high and loads `<layer folder>/rules`):
- *   1. system: `<systemDir>/rules` (default `/etc/codex/rules`)
+ *   1. system: `<systemDir>/rules` (default `/etc/codex/rules`); its
+ *      `<systemDir>/config.toml` is merged under the user config.toml for
+ *      trust and project_root_markers
  *   2. user: `$CODEX_HOME/rules` (env, else `~/.codex`)
  *   3. project: for each directory from the project root down to cwd, its
  *      `.codex/rules` — only when that directory is trusted.
@@ -764,20 +782,29 @@ export function readCodexRules(
   const codexHome = resolveCodexHome(opts);
   collectRulesDir(join(codexHome, "rules"), rules, unreadable);
 
+  // Trust and project_root_markers come from the system config.toml merged
+  // under the user's (config/src/loader/mod.rs load_config_layers_state: the
+  // system layer, then the user layer, merged before project_trust_context).
+  // Either file existing but unreadable fails closed.
+  const systemConfigPath = join(opts.systemDir ?? "/etc/codex", "config.toml");
+  const systemConfig = readTrustConfig(systemConfigPath, warnings);
   const configPath = join(codexHome, "config.toml");
-  const config = readTrustConfig(configPath, warnings);
-  if (config === null) {
-    unreadable.push(configPath);
+  const userConfig = readTrustConfig(configPath, warnings);
+  if (systemConfig === null || userConfig === null) {
+    if (systemConfig === null) unreadable.push(systemConfigPath);
+    if (userConfig === null) unreadable.push(configPath);
     return { rules, unreadable, warnings };
   }
+  const config = mergeTrustConfigs(systemConfig, userConfig);
+  const markers = config.markers ?? DEFAULT_PROJECT_ROOT_MARKERS;
 
   const originalCwd = resolve(cwd);
   const canonicalCwd = canonicalPath(cwd);
   const cwdAncestors = ancestors(canonicalCwd);
   const projectRoot =
-    config.markers.length === 0
+    markers.length === 0
       ? canonicalCwd
-      : (cwdAncestors.find((dir) => config.markers.some((m) => hasMarker(dir, m))) ?? canonicalCwd);
+      : (cwdAncestors.find((dir) => markers.some((m) => hasMarker(dir, m))) ?? canonicalCwd);
   const repoRoot = mainWorktreeRoot(canonicalCwd);
   const codexHomeCanonical = canonicalPath(codexHome);
 

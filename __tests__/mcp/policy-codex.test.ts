@@ -934,3 +934,79 @@ describe("readCodexRules — a triple-quoted literal ends at its FIRST closing d
     expect(unreadable).toEqual([join(codexHome, "rules", "a.rules")]);
   });
 });
+
+// Final review #7: Codex merges `/etc/codex/config.toml` UNDER the user
+// config before deciding trust and project_root_markers
+// (codex-rs/config/src/loader/mod.rs load_config_layers_state: system layer,
+// then user layers, merged with merge_toml_values — tables merge per key, a
+// later scalar/array replaces an earlier one).
+describe("readCodexRules — system config.toml trust layer", () => {
+  const forbidRm = 'prefix_rule(pattern=["rm","-rf"], decision="forbidden")\n';
+
+  it("a project trusted only in the system config loads its .codex/rules", () => {
+    const { projectDir, systemDir, opts } = setupLayers();
+    mkdirSync(systemDir, { recursive: true });
+    writeFileSync(join(systemDir, "config.toml"), trustConfig(projectDir, true));
+    writeRule(join(projectDir, ".codex", "rules"), "p.rules", forbidRm);
+    const { rules, unreadable } = readCodexRules(projectDir, opts);
+    expect(unreadable).toEqual([]);
+    expect(rules).toEqual([{ pattern: ["rm", "-rf"], decision: "forbidden" }]);
+  });
+
+  it("the user config overrides the system config for the same project key", () => {
+    const { codexHome, projectDir, systemDir, opts } = setupLayers();
+    mkdirSync(systemDir, { recursive: true });
+    writeFileSync(join(systemDir, "config.toml"), trustConfig(projectDir, true));
+    writeFileSync(join(codexHome, "config.toml"), trustConfig(projectDir, false));
+    writeRule(join(projectDir, ".codex", "rules"), "p.rules", forbidRm);
+    expect(readCodexRules(projectDir, opts).rules).toEqual([]);
+  });
+
+  it("a user entry without trust_level keeps the system trust (tables merge per key)", () => {
+    const { codexHome, projectDir, systemDir, opts } = setupLayers();
+    mkdirSync(systemDir, { recursive: true });
+    writeFileSync(join(systemDir, "config.toml"), trustConfig(projectDir, true));
+    writeFileSync(join(codexHome, "config.toml"), `[projects."${projectDir}"]\nnote = "x"\n`);
+    writeRule(join(projectDir, ".codex", "rules"), "p.rules", forbidRm);
+    expect(readCodexRules(projectDir, opts).rules).toEqual([{ pattern: ["rm", "-rf"], decision: "forbidden" }]);
+  });
+
+  it("system project_root_markers apply when the user config sets none", () => {
+    const { projectDir, systemDir, opts } = setupLayers();
+    const sub = join(projectDir, "pkg");
+    mkdirSync(sub, { recursive: true });
+    writeFileSync(join(projectDir, "ROOT_MARK"), "");
+    mkdirSync(systemDir, { recursive: true });
+    writeFileSync(join(systemDir, "config.toml"), `project_root_markers = ["ROOT_MARK"]\n${trustConfig(projectDir, true)}`);
+    writeRule(join(projectDir, ".codex", "rules"), "p.rules", forbidRm);
+    expect(readCodexRules(sub, opts).rules).toEqual([{ pattern: ["rm", "-rf"], decision: "forbidden" }]);
+  });
+
+  it("the user's project_root_markers replace the system's", () => {
+    const { codexHome, projectDir, systemDir, opts } = setupLayers();
+    const sub = join(projectDir, "pkg");
+    mkdirSync(sub, { recursive: true });
+    writeFileSync(join(projectDir, "ROOT_MARK"), "");
+    mkdirSync(systemDir, { recursive: true });
+    writeFileSync(join(systemDir, "config.toml"), `project_root_markers = ["ROOT_MARK"]\n${trustConfig(projectDir, true)}`);
+    writeFileSync(join(codexHome, "config.toml"), `project_root_markers = []\n`);
+    writeRule(join(projectDir, ".codex", "rules"), "p.rules", forbidRm);
+    // No markers: the project root is cwd (pkg), which is not trusted.
+    expect(readCodexRules(sub, opts).rules).toEqual([]);
+  });
+
+  it("an unparseable system config.toml fails closed", () => {
+    const { projectDir, systemDir, opts } = setupLayers();
+    mkdirSync(systemDir, { recursive: true });
+    writeFileSync(join(systemDir, "config.toml"), "[projects\ntrust_level = ");
+    const { unreadable } = readCodexRules(projectDir, opts);
+    expect(unreadable).toEqual([join(systemDir, "config.toml")]);
+  });
+
+  it("a system config with a wrong-shaped projects table fails closed", () => {
+    const { projectDir, systemDir, opts } = setupLayers();
+    mkdirSync(systemDir, { recursive: true });
+    writeFileSync(join(systemDir, "config.toml"), 'projects = "nope"\n');
+    expect(readCodexRules(projectDir, opts).unreadable).toEqual([join(systemDir, "config.toml")]);
+  });
+});
