@@ -57,7 +57,17 @@ try {
   mkdirSync(join(symlinkRoot, "node_modules"));
   mkdirSync(join(outside, "pkg"));
   writeFileSync(join(outside, "pkg", "package.json"), '{"name":"outside-package"}\n');
+  // A symlink placed under a REAL node_modules directory pointing outside the
+  // root — this is the removed exemption's attack shape (CC-1): a plan author
+  // could plant `node_modules/<anything>` to escape containment.
   symlinkSync(join(outside, "pkg"), join(symlinkRoot, "node_modules", "pkg"), "junction");
+  // The legitimate case the removed exemption used to (over-broadly) cover:
+  // pnpm's own virtual store layout, `.pnpm/<pkg>/node_modules/<name>` symlinked
+  // relatively to `../../<pkg>` — every hop stays lexically inside node_modules,
+  // so it needs no exemption at all; plain root containment already allows it.
+  mkdirSync(join(symlinkRoot, "node_modules", ".pnpm", "x", "node_modules"), { recursive: true });
+  writeFileSync(join(symlinkRoot, "node_modules", ".pnpm", "x", "package.json"), '{"name":"pnpm-style"}\n');
+  symlinkSync("../../x", join(symlinkRoot, "node_modules", ".pnpm", "x", "node_modules", "pkg"), "junction");
   symlinksAvailable = true;
 } catch {
   // Some platforms require elevated privileges for symlink creation.
@@ -232,11 +242,31 @@ describe("mcp tool-ops — path containment", () => {
     }
   });
 
-  it.skipIf(!symlinksAvailable)("allows dependency symlinks below node_modules", async () => {
-    const r = await runSymlink({ tool: "read", path: "node_modules/pkg/package.json" });
-    expect(r.exitCode).toBe(0);
-    expect(r.stdout).toBe('{"name":"outside-package"}\n');
-  });
+  it.skipIf(!symlinksAvailable)(
+    "refuses a node_modules symlink that resolves outside the root (CC-1: exemption removed)",
+    async () => {
+      // read keeps the plain 0/1 contract; grep/find reserve 2 for "never
+      // searched" (see the SEARCH_ERROR_EXIT comment in mcp/tool-ops.ts).
+      for (const [op, exitCode] of [
+        [{ tool: "read", path: "node_modules/pkg/package.json" }, 1],
+        [{ tool: "grep", pattern: "outside-package", path: "node_modules/pkg" }, 2],
+        [{ tool: "find", pattern: "*.json", path: "node_modules/pkg" }, 2],
+      ] as [ToolOp, number][]) {
+        const r = await runSymlink(op);
+        expect(r.exitCode, op.tool).toBe(exitCode);
+        expect(r.stderr, op.tool).toContain("outside");
+      }
+    },
+  );
+
+  it.skipIf(!symlinksAvailable)(
+    "still reads through a pnpm-style relative symlink that stays inside the root",
+    async () => {
+      const r = await runSymlink({ tool: "read", path: "node_modules/.pnpm/x/node_modules/pkg/package.json" });
+      expect(r.exitCode).toBe(0);
+      expect(r.stdout).toBe('{"name":"pnpm-style"}\n');
+    },
+  );
 
   it.skipIf(!symlinksAvailable)("uses the canonical match file for context after a lexical alias is swapped", async () => {
     const contextRoot = mkdtempSync(join(tmpdir(), "px-context-root-"));

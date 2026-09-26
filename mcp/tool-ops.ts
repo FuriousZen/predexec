@@ -30,7 +30,7 @@
 
 import { execFile } from "node:child_process";
 import type { ChildProcess } from "node:child_process";
-import { accessSync, constants } from "node:fs";
+import { accessSync, constants, realpathSync } from "node:fs";
 import { open, opendir, realpath, stat } from "node:fs/promises";
 import { delimiter, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { StringDecoder } from "node:string_decoder";
@@ -180,6 +180,29 @@ export function findOnPath(bin: string): string | null {
 }
 
 /**
+ * The one directory a session's own `node_modules` may legitimately point
+ * OUTSIDE the session root (CC-1). Some package managers place the WHOLE
+ * `node_modules` entry behind a symlink into an external, shared store
+ * (pnpm's hoisted/shared-store layouts are the measured case) — that single
+ * resolved directory is the only realpath `target()` accepts outside `root`.
+ *
+ * Resolved once, synchronously, at executor construction — not per
+ * operation — the same way `findOnPath`'s rg/fd lookup is. This is
+ * deliberately narrow: an arbitrary symlink placed a few levels under an
+ * otherwise-REAL `node_modules` directory (e.g. a planted `node_modules/evil`)
+ * gets no exemption at all and must resolve inside `root` like anything else.
+ */
+function resolveNodeModulesStore(root: string): string | null {
+  try {
+    const realRoot = realpathSync(root);
+    const store = realpathSync(join(root, "node_modules"));
+    return isWithin(realRoot, store) ? null : store;
+  } catch {
+    return null; // no node_modules, or it could not be resolved — nothing to allow
+  }
+}
+
+/**
  * Translate the glob subset `find` accepts (`*`, `**`, `?`, `[abc]`, `[!abc]`)
  * into a RegExp.
  *
@@ -231,8 +254,11 @@ export function globToRegExp(glob: string): RegExp {
  * Lexical containment precheck: `abs` must BE the root or sit under it.
  *
  * The trailing separator is what stops /repo-evil passing for root /repo. The
- * existing target is then checked again through realpath, with only a lexical
- * `node_modules` segment exempted for package-manager dependency symlinks.
+ * existing target is then checked again through realpath in `target()`, which
+ * additionally allows the single resolved directory a session's own
+ * `node_modules` may itself point at outside the root (see
+ * `resolveNodeModulesStore`) — nothing else resolves outside the session root,
+ * no matter how many `node_modules` segments are lexically in its path.
  */
 function isWithin(root: string, abs: string): boolean {
   return abs === root || abs.startsWith(root.endsWith(sep) ? root : root + sep);
@@ -285,6 +311,12 @@ async function target(
   root: string,
   base: string,
   label: string,
+  /**
+   * The one realpath allowed outside `root` (see `resolveNodeModulesStore`),
+   * or `null` when this session's `node_modules` is not itself a symlink
+   * pointing outside the session root.
+   */
+  nodeModulesStore: string | null,
 ): Promise<
   | { abs: string; lexicalAbs: string; isDir: boolean; err?: undefined }
   | { abs?: undefined; lexicalAbs?: undefined; isDir?: undefined; err: OpResult }
@@ -296,11 +328,14 @@ async function target(
   if (!info) return { err: fail(label, `path not found: ${raw} (resolved against ${base})`) };
   const [realRoot, realTarget] = await Promise.all([realpathOrNull(root), realpathOrNull(found.abs)]);
   if (!realRoot || !realTarget) return { err: fail(label, `path not found: ${raw} (resolved against ${base})`) };
-  // Package managers intentionally place dependency trees behind symlinks. Keep
-  // that one exception lexical and exact: names such as `node_modules-evil` do
-  // not earn permission to leave the session root.
-  const dependencyPath = relative(root, found.abs).split(sep).includes("node_modules");
-  if (!isWithin(realRoot, realTarget) && !dependencyPath) {
+  // CC-1: there is no longer a lexical `node_modules` exemption here. A path
+  // segment named `node_modules` earns nothing on its own — an arbitrary
+  // symlink planted a few levels under an otherwise-real `node_modules`
+  // directory must resolve inside the root exactly like anything else. The
+  // ONLY realpath allowed outside the root is `nodeModulesStore`: the single
+  // directory the session's own top-level `node_modules` resolves to, when
+  // that entry is itself a symlink into an external package-manager store.
+  if (!isWithin(realRoot, realTarget) && !(nodeModulesStore !== null && isWithin(nodeModulesStore, realTarget))) {
     return { err: outsideSymlinkError(label, raw, realTarget, root) };
   }
   return { abs: realTarget, lexicalAbs: found.abs, isDir: info.isDirectory() };
@@ -483,10 +518,16 @@ export async function walkFiles(dir: string, signal?: AbortSignal, limits: WalkL
 
 // ── read ────────────────────────────────────────────────────────────────────
 
-async function readOp(op: ToolOp, root: string, base: string, signal?: AbortSignal): Promise<OpResult> {
+async function readOp(
+  op: ToolOp,
+  root: string,
+  base: string,
+  nodeModulesStore: string | null,
+  signal?: AbortSignal,
+): Promise<OpResult> {
   const raw = String(op.path ?? "");
   if (!raw) return fail("read", "missing required arg `path`");
-  const found = await target(op, root, base, "read");
+  const found = await target(op, root, base, "read", nodeModulesStore);
   if (found.err) return found.err;
   if (found.isDir) return fail("read", `${raw} is a directory — use {tool:"ls"} to list it`);
 
@@ -649,6 +690,7 @@ async function grepOp(
   op: ToolOp,
   root: string,
   base: string,
+  nodeModulesStore: string | null,
   rg: string | null,
   signal?: AbortSignal,
 ): Promise<OpResult> {
@@ -657,7 +699,7 @@ async function grepOp(
   if (pattern.length > MAX_GREP_PATTERN_LENGTH) {
     return fail("grep", `pattern exceeds the maximum length of ${MAX_GREP_PATTERN_LENGTH} characters`);
   }
-  const scope = await target(op, root, base, "grep");
+  const scope = await target(op, root, base, "grep", nodeModulesStore);
   if (scope.err) return scope.err;
 
   const limit = positiveInt(op.limit) ?? DEFAULT_GREP_LIMIT;
@@ -670,7 +712,7 @@ async function grepOp(
   // or the fallback. This closes the ordinary alias-swap window while the
   // local options above are being prepared (the remaining pathname race is
   // documented below).
-  const currentScope = await target(op, root, base, "grep");
+  const currentScope = await target(op, root, base, "grep", nodeModulesStore);
   if (currentScope.err) return currentScope.err;
 
   const notes: string[] = [];
@@ -913,12 +955,13 @@ async function findOp(
   op: ToolOp,
   root: string,
   base: string,
+  nodeModulesStore: string | null,
   fd: string | null,
   signal?: AbortSignal,
 ): Promise<OpResult> {
   const pattern = String(op.pattern ?? "");
   if (!pattern) return fail("find", "missing required arg `pattern`");
-  const scope = await target(op, root, base, "find");
+  const scope = await target(op, root, base, "find", nodeModulesStore);
   if (scope.err) return scope.err;
   if (!scope.isDir) return fail("find", `"${String(op.path)}" is a file — find searches a directory`);
 
@@ -931,7 +974,7 @@ async function findOp(
 
   // Glob compilation is local work between the initial locate and the walk;
   // close that gap with one final realpath check at the operation boundary.
-  const currentScope = await target(op, root, base, "find");
+  const currentScope = await target(op, root, base, "find", nodeModulesStore);
   if (currentScope.err) return currentScope.err;
   if (!currentScope.isDir) return fail("find", `"${String(op.path)}" is a file — find searches a directory`);
 
@@ -1013,6 +1056,8 @@ export interface LsOpOptions {
   maxScanEntries?: number;
   /** Test seam only; production uses node:fs/promises.opendir. */
   opendir?: LsOpendirLike;
+  /** See `target()`'s `nodeModulesStore` parameter. Defaults to `null`. */
+  nodeModulesStore?: string | null;
 }
 
 const compareEntryNames = (a: ListedEntry, b: ListedEntry): number => {
@@ -1047,7 +1092,7 @@ export async function lsOp(
   options: LsOpOptions = {},
 ): Promise<OpResult> {
   if (signal?.aborted) throw new Error("aborted");
-  const scope = await target(op, root, base, "ls");
+  const scope = await target(op, root, base, "ls", options.nodeModulesStore ?? null);
   if (scope.err) return scope.err;
   if (!scope.isDir) return fail("ls", `${String(op.path ?? ".")} is not a directory — use {tool:"read"} for files`);
 
@@ -1132,6 +1177,8 @@ export function createToolExecutor(opts: ToolExecutorOptions): ToolExecutor {
   // null from the caller pins the pure-Node path.
   const rg = opts.rgPath === undefined ? findOnPath("rg") : opts.rgPath;
   const fd = opts.fdPath === undefined ? findOnPath("fd") : opts.fdPath;
+  // Resolved once, not per op — see `target()`'s `nodeModulesStore` parameter.
+  const nodeModulesStore = resolveNodeModulesStore(root);
 
   return async (op: ToolOp, runOpts: { cwd: string; signal?: AbortSignal }): Promise<OpResult> => {
     const label = String(op.tool);
@@ -1152,13 +1199,13 @@ export function createToolExecutor(opts: ToolExecutorOptions): ToolExecutor {
     try {
       switch (op.tool) {
         case "read":
-          return await readOp(op, root, base, runOpts.signal);
+          return await readOp(op, root, base, nodeModulesStore, runOpts.signal);
         case "grep":
-          return await grepOp(op, root, base, rg, runOpts.signal);
+          return await grepOp(op, root, base, nodeModulesStore, rg, runOpts.signal);
         case "find":
-          return await findOp(op, root, base, fd, runOpts.signal);
+          return await findOp(op, root, base, nodeModulesStore, fd, runOpts.signal);
         case "ls":
-          return await lsOp(op, root, base, runOpts.signal, opts.lsOpendir ? { opendir: opts.lsOpendir } : undefined);
+          return await lsOp(op, root, base, runOpts.signal, { ...(opts.lsOpendir ? { opendir: opts.lsOpendir } : {}), nodeModulesStore });
         default:
           return { stdout: "", stderr: `unknown tool: ${op.tool}`, exitCode: 1 };
       }
