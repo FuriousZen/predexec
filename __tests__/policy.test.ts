@@ -801,3 +801,105 @@ describe("readOpencodeRuleset — hostMajor 2: agent/mode markdown files", () =>
     expect(v2(ctx, "echo ,} x")).toBe("deny");
   });
 });
+
+// R44 — certainty or fail closed: every agent file predexec cannot read with
+// certainty makes THAT agent deny-all; it must never come out as an allow
+// where opencode v2 (gray-matter 4.0.3 + js-yaml, full agent schemas) denies.
+describe("readOpencodeRuleset — hostMajor 2: R44 agent files are certain or deny-all", () => {
+  const md = (dir: string, rel: string, text: string) => {
+    mkdirSync(join(dir, rel, ".."), { recursive: true });
+    writeFileSync(join(dir, rel), text);
+  };
+  const buildVerdict = (ctx: ReturnType<typeof setup>, op: Operation = "cat marker.txt") =>
+    evaluateOperation(op, readOpencodeRuleset(ctx.project, ctx.env, { hostMajor: 2, agent: "build" }), { directory: ctx.project, hostMajor: 2 }).action;
+  const DENY = '{bash: {"cat *": deny}}';
+
+  it.each([
+    ["unclosed block (gray-matter reads to EOF)", `---\npermission: ${DENY}\n`],
+    ["`---yaml` opening line", `---yaml\npermission: ${DENY}\n---\n`],
+    ["`---json` opening line", '---json\n{"permission": {"bash": {"cat *": "deny"}}}\n---\n'],
+    ["closed by `----`", `---\npermission: ${DENY}\n----\n`],
+    ["closed by `---x`", `---\npermission: ${DENY}\n---x\n`],
+    ["merge key inside a mapping", `---\npermission: {<<: ${DENY}}\n---\n`],
+    ["top-level merge key", `---\n<<: {permission: ${DENY}}\n---\n`],
+    ["block merge key", `---\npermission:\n  <<: ${DENY}\n---\n`],
+    ["anchor/alias", `---\nbase: &b ${DENY}\npermission: *b\n---\n`],
+    ["tag", `---\npermission: !!map ${DENY}\n---\n`],
+  ])("frontmatter the strict splitter/subset cannot certify ⇒ deny: %s", (_label, text) => {
+    const ctx = setup();
+    md(ctx.project, ".opencode/agent/build.md", text);
+    expect(buildVerdict(ctx)).toBe("deny");
+    expect(buildVerdict(ctx, "ls")).toBe("deny");
+  });
+
+  it("a file that does not start with `---` has no frontmatter (like gray-matter)", () => {
+    const ctx = setup();
+    md(ctx.project, ".opencode/agent/build.md", `text first\n---\npermission: {bash: deny}\n---\n`);
+    expect(buildVerdict(ctx, "ls")).toBe("allow");
+  });
+
+  it.each([
+    ["temperature: hot", "temperature: hot"],
+    ["model: 5", "model: 5"],
+    ["variant: 5", "variant: 5"],
+    ["top_p: x", "top_p: x"],
+    ["options: 3", "options: 3"],
+    ["maxSteps: 0", "maxSteps: 0"],
+    ["steps: 1.5", "steps: 1.5"],
+    ["color: pink", "color: pink"],
+    ["description: (null)", "description:"],
+    ["prompt: 3", "prompt: 3"],
+    ["tools: {bash: maybe}", "tools: {bash: maybe}"],
+    ["disable: yes-ish", "disable: sometimes"],
+    ["mode: boss", "mode: boss"],
+    ["permission.question as object", "permission: {question: {x: allow}}"],
+  ])("legacy agent file v2 would SKIP (%s) ⇒ deny-all, never apply its allow", (_label, line) => {
+    const ctx = setup();
+    ctx.globalConfig({ permission: { bash: { "cat *": "deny" } } });
+    md(ctx.project, ".opencode/agent/build.md", `---\n${line}\npermission: {bash: allow}\n---\n`.replace("permission: {bash: allow}\n", line.startsWith("permission") ? "" : "permission: {bash: allow}\n"));
+    expect(buildVerdict(ctx)).toBe("deny");
+  });
+
+  it.each([
+    ["model without provider", 'model: "noslash"'],
+    ["request.headers non-string", "request: {headers: {a: 1}}"],
+    ["hidden: 1", "hidden: 1"],
+    ["color: primary (legacy-only theme name)", "color: primary"],
+    ["permissions entry malformed", "permissions: [{action: shell}]"],
+  ])("native agent file v2 would SKIP (%s) ⇒ deny-all", (_label, line) => {
+    const ctx = setup();
+    md(ctx.project, ".opencode/agent/build.md", `---\n${line}\n---\n`);
+    expect(buildVerdict(ctx, "ls")).toBe("deny");
+  });
+
+  it("valid full-schema legacy and native files still apply", () => {
+    const ctx = setup();
+    md(
+      ctx.project,
+      ".opencode/agent/build.md",
+      '---\nmodel: anthropic/claude\nvariant: fast\ntemperature: 0.2\ntop_p: 1\noptions: {a: 1}\nmaxSteps: 3\ncolor: accent\ndescription: B\ntools: {write: false}\nname: whatever\npermission: {bash: {"cat *": deny}}\n---\nbody',
+    );
+    expect(buildVerdict(ctx)).toBe("deny");
+    expect(buildVerdict(ctx, "ls")).toBe("allow");
+    md(ctx.project, ".opencode/agent/nat.md", "---\nmodel: {providerID: p, model: m}\nrequest: {headers: {x: y}, body: {k: [1]}}\ncolor: \"#aabbcc\"\nsteps: 2\n---\n");
+    expect(evaluateOperation("ls", readOpencodeRuleset(ctx.project, ctx.env, { hostMajor: 2, agent: "nat" }), { directory: ctx.project, hostMajor: 2 }).action).toBe("allow");
+  });
+
+  it("an empty agent file is skipped like v2 (does not resurrect a disabled agent)", () => {
+    const ctx = setup();
+    ctx.projectConfig({ agents: { build: { disabled: true } } });
+    md(ctx.project, ".opencode/agent/build.md", "");
+    expect(buildVerdict(ctx, "ls")).toBe("deny");
+  });
+
+  it("a 200k-char colon-less line is rejected in < 50ms (deny-all), and a > 256 KiB file is deny-all", () => {
+    const ctx = setup();
+    md(ctx.project, ".opencode/agent/build.md", `---\n${"a ".repeat(100_000)}b\n---\n`);
+    const t0 = performance.now();
+    const verdict = buildVerdict(ctx, "ls");
+    expect(performance.now() - t0).toBeLessThan(50);
+    expect(verdict).toBe("deny");
+    md(ctx.project, ".opencode/agent/build.md", `---\ndescription: x\n---\n${"x".repeat(300 * 1024)}`);
+    expect(buildVerdict(ctx, "ls")).toBe("deny");
+  });
+});

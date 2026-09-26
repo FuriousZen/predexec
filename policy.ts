@@ -43,7 +43,7 @@ import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { inspectCommandSubstitutionTree, lexShellWords, splitCommandSegments } from "./core/index.ts";
 import type { HostPolicyDenial, Operation, PolicyCheckContext, PolicyVerdict } from "./core/types.ts";
-import { parseFrontmatter } from "./yaml-frontmatter.ts";
+import { MAX_FRONTMATTER_FILE_BYTES, parseFrontmatter } from "./yaml-frontmatter.ts";
 
 export type PolicyAction = "allow" | "ask" | "deny";
 
@@ -632,17 +632,96 @@ interface V2Document {
 }
 
 const V2_AGENT_MODES = new Set(["subagent", "primary", "all"]);
+const V1_THEME_COLORS = new Set(["primary", "secondary", "accent", "success", "warning", "error", "info"]);
+const HEX_COLOR = /^#[0-9a-fA-F]{6}$/;
 
-/** Field checks v2's agent schemas make on the fields predexec relies on (schema `config/agent.ts:11-22`, core `v1/config/agent.ts:8-41`). */
-function v2CheckAgentFields(value: Json, where: string, disabledKey: "disable" | "disabled"): void {
-  if (value.mode !== undefined && !V2_AGENT_MODES.has(value.mode as string)) throw new Error(`${where}: mode must be subagent|primary|all`);
-  for (const key of ["hidden", disabledKey] as const) {
-    if (value[key] !== undefined && typeof value[key] !== "boolean") throw new Error(`${where}: ${key} must be a boolean`);
+/**
+ * Full-schema field checks (R44). v2 DROPS an agent whose decode fails
+ * (core `config/plugin/agent.ts:193-209` for files; `config/normalize.ts:131-166`
+ * decodeMap for config entries), so applying such an agent's rules could allow
+ * what the surviving rules deny. predexec instead throws, which makes that
+ * agent deny-all (files) or the whole config unreadable (config documents).
+ * Every declared field is checked; `optionalKey` fields reject `null`
+ * (schema `schema.ts:12-16`).
+ */
+type FieldCheck = (v: unknown) => boolean;
+const isStr: FieldCheck = (v) => typeof v === "string";
+const isBool: FieldCheck = (v) => typeof v === "boolean";
+const isFinite_: FieldCheck = (v) => typeof v === "number" && Number.isFinite(v);
+const isPosInt: FieldCheck = (v) => typeof v === "number" && Number.isInteger(v) && v > 0; // schema `schema.ts:3`
+const isMode: FieldCheck = (v) => typeof v === "string" && V2_AGENT_MODES.has(v);
+const isRecordOf = (check: FieldCheck): FieldCheck => (v) => isPlainObject(v) && Object.values(v).every(check);
+const isJson: FieldCheck = (v) =>
+  v === null || ["string", "boolean"].includes(typeof v) || isFinite_(v) || (Array.isArray(v) && v.every(isJson)) || isRecordOf(isJson)(v);
+
+/** ConfigPermissionV1.Info (core `v1/config/permission.ts:5-48`): an action, or keys → action | {pattern: action}; `question`/`websearch`/`doom_loop` take an action only. */
+const isV1Permission: FieldCheck = (v) =>
+  isAction(v) ||
+  (isPlainObject(v) &&
+    Object.entries(v).every(([key, rule]) =>
+      ["question", "websearch", "doom_loop"].includes(key) ? isAction(rule) : isAction(rule) || isRecordOf(isAction)(rule),
+    ));
+
+/** Native model selection (schema `config/model.ts:8-28`): `provider/model[#variant]` or `{providerID, model, variant?}`. */
+const isModelSelection: FieldCheck = (v) => {
+  if (typeof v === "string") return /^[^/#]+\/[^#]+(?:#[^#]+)?$/.test(v);
+  if (!isPlainObject(v)) return false;
+  return (
+    typeof v.providerID === "string" && /^[^/#]+$/.test(v.providerID) &&
+    typeof v.model === "string" && /^[^#]+$/.test(v.model) &&
+    (v.variant === undefined || (typeof v.variant === "string" && /^[^#]+$/.test(v.variant)))
+  );
+};
+
+/** ConfigProvider.Request (schema `config/provider.ts:30-45`). */
+const isRequest: FieldCheck = (v) =>
+  isPlainObject(v) &&
+  (v.headers === undefined || isRecordOf(isStr)(v.headers)) &&
+  (v.body === undefined || isRecordOf(isJson)(v.body));
+
+const isNativeRuleset: FieldCheck = (v) =>
+  Array.isArray(v) &&
+  v.every((r) => isPlainObject(r) && typeof r.action === "string" && typeof r.resource === "string" && isAction(r.effect));
+
+/** Legacy agent schema, core `v1/config/agent.ts:12-39`; unknown keys are allowed (StructWithRest of Any). */
+const V1_AGENT_FIELDS: Record<string, FieldCheck> = {
+  model: isStr,
+  variant: isStr,
+  temperature: isFinite_,
+  top_p: isFinite_,
+  prompt: isStr,
+  tools: isRecordOf(isBool),
+  disable: isBool,
+  description: isStr,
+  mode: isMode,
+  hidden: isBool,
+  options: isPlainObject,
+  color: (v) => typeof v === "string" && (HEX_COLOR.test(v) || V1_THEME_COLORS.has(v)),
+  steps: isPosInt,
+  maxSteps: isPosInt,
+  permission: isV1Permission,
+};
+
+/** Native agent schema, schema `config/agent.ts:11-22`; excess keys are ignored by the decode. */
+const NATIVE_AGENT_FIELDS: Record<string, FieldCheck> = {
+  model: isModelSelection,
+  request: isRequest,
+  system: isStr,
+  description: isStr,
+  mode: isMode,
+  hidden: isBool,
+  color: (v) => typeof v === "string" && HEX_COLOR.test(v),
+  steps: isPosInt,
+  disabled: isBool,
+  permissions: isNativeRuleset,
+};
+
+function v2CheckFields(value: Json, fields: Record<string, FieldCheck>, where: string): void {
+  for (const [key, check] of Object.entries(fields)) {
+    if (Object.prototype.hasOwnProperty.call(value, key) && !check(value[key])) {
+      throw new Error(`${where}: \`${key}\` does not match opencode v2's agent schema`);
+    }
   }
-  for (const key of ["description", "system", "prompt"] as const) {
-    if (value[key] !== undefined && value[key] !== null && typeof value[key] !== "string") throw new Error(`${where}: ${key} must be a string`);
-  }
-  if (value.steps !== undefined && !(Number.isInteger(value.steps) && (value.steps as number) > 0)) throw new Error(`${where}: steps must be a positive integer`);
 }
 
 const v2AgentShape = (value: Json, disabled: boolean, rules: PolicyRule[]): V2Agent | null =>
@@ -661,29 +740,20 @@ const v2AgentShape = (value: Json, disabled: boolean, rules: PolicyRule[]): V2Ag
  * (`v1/config/migrate.ts:140-161`, `normalizeAction`).
  */
 function v2LegacyAgent(value: Json, where: string): V2Agent | null {
-  v2CheckAgentFields(value, where, "disable");
+  v2CheckFields(value, V1_AGENT_FIELDS, where);
   const permission: Json = {};
-  if (value.tools !== undefined) {
-    if (!isPlainObject(value.tools)) throw new Error(`${where}: tools must be an object`);
-    for (const [tool, enabled] of Object.entries(value.tools)) {
-      if (typeof enabled !== "boolean") throw new Error(`${where}: tools.${tool} must be a boolean`);
-      permission[tool === "write" || tool === "edit" || tool === "patch" ? "edit" : tool] = enabled ? "allow" : "deny";
-    }
+  for (const [tool, enabled] of Object.entries((value.tools as Record<string, boolean> | undefined) ?? {})) {
+    permission[tool === "write" || tool === "edit" || tool === "patch" ? "edit" : tool] = enabled ? "allow" : "deny";
   }
   if (value.permission !== undefined) {
-    const own = isAction(value.permission) ? { "*": value.permission } : value.permission;
-    if (!isPlainObject(own)) throw new Error(`${where}: permission must be an action or an object`);
-    Object.assign(permission, own);
+    Object.assign(permission, isAction(value.permission) ? { "*": value.permission } : value.permission);
   }
   return v2AgentShape(value, value.disable === true, v2MigratePermission(permission, where));
 }
 
 /** A native `agents.<name>` value (schema `config/agent.ts:11-22`). */
 function v2NativeAgent(value: Json, where: string): V2Agent | null {
-  v2CheckAgentFields(value, where, "disabled");
-  if (value.color !== undefined && !(typeof value.color === "string" && /^#[0-9a-fA-F]{6}$/.test(value.color))) {
-    throw new Error(`${where}: color must be #rrggbb`);
-  }
+  v2CheckFields(value, NATIVE_AGENT_FIELDS, where);
   return v2AgentShape(value, value.disabled === true, v2NativePermissions(value.permissions, where));
 }
 
@@ -791,16 +861,26 @@ function v2AgentFiles(directory: string): Array<{ file: string; primary: boolean
  * non-native key is decoded as a legacy agent. v2 silently skips a file it
  * cannot decode; predexec fails closed for THAT agent instead.
  */
-function v2MarkdownAgentDocument(directory: string, file: string, primary: boolean): V2Document {
+function v2MarkdownAgentDocument(directory: string, file: string, primary: boolean): V2Document | null {
   const name = relative(directory, file)
     .replaceAll("\\", "/")
     .replace(/^(agent|agents|mode|modes)\//, "")
     .replace(/\.md$/, "");
   const agents = new Map<string, V2AgentEntry>();
   try {
-    const { data } = parseFrontmatter(readFileSync(file, "utf8"));
+    // Size cap before reading: the parse is synchronous on the policy path.
+    if (statSync(file).size > MAX_FRONTMATTER_FILE_BYTES) throw new Error("agent file too large");
+    const content = readFileSync(file, "utf8");
+    // v2 skips an empty file outright (`content ? decode(...) : undefined`, agent.ts:44).
+    if (content === "") return null;
+    const { data } = parseFrontmatter(content);
     const legacy = Object.keys(data).some((key) => !V2_NATIVE_AGENT_KEYS.has(key));
-    const agent = legacy ? v2LegacyAgent(data, file) : v2NativeAgent(data, file);
+    // Native files join a string model with a string variant before decode (agent.ts:190-196).
+    const native =
+      typeof data.model === "string" && !data.model.includes("#") && typeof data.variant === "string" && /^[^#]+$/.test(data.variant)
+        ? { ...data, model: `${data.model}#${data.variant}` }
+        : data;
+    const agent = legacy ? v2LegacyAgent(data, file) : v2NativeAgent(native, file);
     agents.set(name, agent && primary ? { ...agent, mode: "primary" } : agent);
   } catch (err) {
     agents.set(name, { error: `${file} could not be read as an opencode agent (${err instanceof Error ? err.message : String(err)})` });
@@ -951,7 +1031,8 @@ function readOpencodeV2Ruleset(directory: string, env: NodeJS.ProcessEnv, agent?
   for (const source of v2ConfigSources(directory, env, paths)) {
     if ("agentDir" in source) {
       for (const { file, primary } of v2AgentFiles(source.agentDir)) {
-        documents.push(v2MarkdownAgentDocument(source.agentDir, file, primary));
+        const document = v2MarkdownAgentDocument(source.agentDir, file, primary);
+        if (document) documents.push(document);
       }
       continue;
     }

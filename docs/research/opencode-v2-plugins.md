@@ -145,11 +145,26 @@ parses the packaged `skills/opencode/predexec/SKILL.md` the way v2's directory l
       Its `tools` become permissions (`write`/`edit`/`patch` → `edit`), with `permission` assigned
       over them (`v1/config/agent.ts:44-61`). Otherwise it is a native agent, and its `permissions`
       are taken verbatim (`agent.ts:177-211`).
-    - v2 parses frontmatter with gray-matter/js-yaml, retrying top-level `a: b: c` values as
-      strings (`config/markdown.ts:3-38`). predexec uses a small subset parser
-      (`yaml-frontmatter.ts`). Where v2 would silently skip a file, and for anything outside that
-      subset (anchors, aliases, tags, ...), predexec **fails closed for that agent only**; other
-      agents are unaffected.
+    - **Certainty or fail closed (R44, fix round 3).** v2 parses frontmatter with gray-matter 4.0.3
+      and js-yaml, retrying top-level `a: b: c` values as strings (`config/markdown.ts:3-38`).
+      predexec does not chase parity with them. It accepts only what it can read with certainty,
+      and any other agent file makes **that agent deny-all**:
+      - A file that does not start with `---` has no frontmatter, as in gray-matter.
+      - A file that does must have an opening line exactly `---` and a closing line exactly `---`.
+        gray-matter also accepts `---yaml`/`---json`, a closing line that merely starts with `---`,
+        and an unclosed block read to EOF. predexec refuses all of these.
+      - The frontmatter must lie within the subset parsed by `yaml-frontmatter.ts`. Merge keys
+        `<<`, anchors, aliases, tags and multi-line flow are refused.
+      - Every declared field must match v2's full agent schema: legacy (`v1/config/agent.ts:12-39`,
+        `v1/config/permission.ts:5-48`) or native (schema `config/agent.ts:11-22`,
+        `config/model.ts:8-28`, `config/provider.ts:30-45`). v2 would silently **skip** a
+        schema-invalid file. Applying its rules could allow what the surviving rules deny, and
+        ignoring it would be a parity bet, so predexec denies instead.
+      - Caps: a line over 4 KiB or a file over 256 KiB makes that agent deny-all. The key scan is
+        linear, because the read runs synchronously on the policy path over every agent file.
+      - An empty file is skipped, as v2 does.
+      - Agent entries in JSON config documents get the same full-schema check. A mismatch there
+        makes the whole config unreadable, so every operation stops.
     - **Default agent.** Without an explicit agent, the default is `default_agent` if it is
       selectable (not a subagent, not hidden), else `build`, else the first selectable agent
       (`agent.ts:94-104`).

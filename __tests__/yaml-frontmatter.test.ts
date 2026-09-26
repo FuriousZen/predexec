@@ -40,7 +40,27 @@ describe("yaml-frontmatter — the subset opencode v2 agent files use", () => {
     ["duplicate key", "a: 1\na: 2"],
     ["bad indentation", "a:\n    b: 1\n  c: 2"],
     ["multi-document", "a: 1\n---\nb: 2"],
+    ["block merge key", "<<: {a: 1}"],
+    ["flow merge key", "a: {<<: {b: 1}}"],
+    ["line over 4 KiB", `a: ${"x".repeat(5000)}`],
   ])("throws on unsupported/invalid input: %s", (_label, yaml) => {
     expect(() => parseYamlSubset(yaml)).toThrow();
+  });
+
+  it.each([
+    ["unclosed", "---\na: 1\n"],
+    ["language tag", "---yaml\na: 1\n---\n"],
+    ["closing ----", "---\na: 1\n----\n"],
+    ["closing ---x", "---\na: 1\n---x\n"],
+    ["opening with trailing text", "--- a\na: 1\n---\n"],
+  ])("strict split throws on shapes gray-matter would still read: %s", (_label, text) => {
+    expect(() => parseFrontmatter(text)).toThrow();
+  });
+
+  it("the key scan is linear: a 200k-char colon-less line fails fast", () => {
+    const t0 = performance.now();
+    expect(() => parseYamlSubset(`${"a ".repeat(100_000)}b`)).toThrow();
+    expect(() => parseFrontmatter(`---\n${"a ".repeat(100_000)}b\n---\n`)).toThrow();
+    expect(performance.now() - t0).toBeLessThan(50);
   });
 });

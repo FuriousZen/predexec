@@ -16,15 +16,72 @@ export interface Frontmatter {
   body: string;
 }
 
-/** gray-matter's split: a leading `---` line, the YAML, a closing `---` line. */
+/** Hard caps: past these the caller treats the file as unreadable (fail closed), never as partial. */
+export const MAX_FRONTMATTER_FILE_BYTES = 256 * 1024;
+export const MAX_FRONTMATTER_LINE_CHARS = 4096;
+
+/**
+ * Strict split — certainty or throw (R44). A file that does not start with
+ * `---` has no frontmatter (as in gray-matter 4.0.3). One that does must be
+ * exactly: an opening line `---`, YAML, a closing line `---`. gray-matter also
+ * accepts shapes this refuses — a language tag (`---yaml`, `---json`), a
+ * closing line that merely STARTS with `---` (`----`, `---x`), an unclosed
+ * block read to EOF — so each of those throws instead of guessing.
+ */
 export function parseFrontmatter(content: string): Frontmatter {
   const text = content.replace(/^﻿/, "");
-  const m = /^---[ \t]*\r?\n([\s\S]*?)\r?\n---[ \t]*(?:\r?\n|$)/.exec(text) ?? /^---[ \t]*\r?\n()---[ \t]*(?:\r?\n|$)/.exec(text);
-  if (!m) return { data: {}, body: text };
-  const yaml = m[1] ?? "";
+  if (!text.startsWith("---")) return { data: {}, body: text };
+  if (text.length > MAX_FRONTMATTER_FILE_BYTES) throw new Error("agent file too large");
+  const lines = text.split("\n");
+  const bare = (i: number) => (lines[i] ?? "").replace(/\r$/, "");
+  if (bare(0) !== "---") throw new Error("frontmatter opening line must be exactly ---");
+  let close = -1;
+  for (let i = 1; i < lines.length; i++) {
+    if (!bare(i).startsWith("---")) continue;
+    if (bare(i) !== "---") throw new Error("frontmatter closing line must be exactly ---");
+    close = i;
+    break;
+  }
+  if (close < 0) throw new Error("unclosed frontmatter");
+  const yaml = lines.slice(1, close).map((_, i) => bare(i + 1)).join("\n");
   const data = yaml.trim() === "" ? {} : parseYamlSubset(yaml);
   if (data === null || typeof data !== "object" || Array.isArray(data)) throw new Error("frontmatter is not a mapping");
-  return { data: data as Json, body: text.slice(m[0].length) };
+  return { data: data as Json, body: lines.slice(close + 1).join("\n") };
+}
+
+/**
+ * Linear split of a block-mapping line into key and the text after `:` —
+ * no regex over the unbounded line. `null` when the line is not a
+ * `key: value` entry. Throws on the YAML merge key `<<`, which js-yaml
+ * resolves and this reader does not.
+ */
+function splitKey(t: string): { key: string; rest: string } | null {
+  let key: string;
+  let after: string;
+  if (t.startsWith('"') || t.startsWith("'")) {
+    const { value, rest } = unquote(t);
+    let i = 0;
+    while (i < rest.length && (rest[i] === " " || rest[i] === "\t")) i++;
+    if (rest[i] !== ":") return null;
+    after = rest.slice(i + 1);
+    if (after !== "" && after[0] !== " " && after[0] !== "\t") return null;
+    key = value;
+  } else {
+    if (t === "" || "\"'#{}[],&*!|>%@`?".includes(t[0]!)) return null;
+    if (t[0] === "-" && (t.length === 1 || t[1] === " " || t[1] === "\t")) return null;
+    let i = 0;
+    for (; i < t.length; i++) {
+      const c = t[i]!;
+      if (c === "#" && (t[i - 1] === " " || t[i - 1] === "\t")) return null;
+      if (c === ":" && (i + 1 === t.length || t[i + 1] === " " || t[i + 1] === "\t")) break;
+    }
+    if (i === t.length) return null;
+    key = t.slice(0, i).trimEnd();
+    after = t.slice(i + 1);
+    if (key === "") return null;
+  }
+  if (key === "<<") throw new Error("YAML merge keys are not supported");
+  return { key, rest: after };
 }
 
 interface Line {
@@ -145,6 +202,7 @@ class FlowParser {
         return out;
       }
       const key = this.value();
+      if (key === "<<") throw new Error("YAML merge keys are not supported");
       this.ws();
       if (this.s[this.i] !== ":") throw new Error("expected ':' in flow mapping");
       this.i++;
@@ -175,7 +233,8 @@ class FlowParser {
 export function parseYamlSubset(yaml: string): unknown {
   const lines: Line[] = [];
   for (const raw of yaml.split(/\r?\n/)) {
-    if (raw.includes("\t") && /^\s*\t/.test(raw)) throw new Error("tab indentation");
+    if (raw.length > MAX_FRONTMATTER_LINE_CHARS) throw new Error("frontmatter line too long");
+    if (/^ *\t/.test(raw)) throw new Error("tab indentation");
     const text = raw.trimEnd();
     if (text.trim() === "" || text.trim().startsWith("#")) {
       lines.push({ indent: -1, text: "" }); // kept for block scalars
@@ -188,12 +247,6 @@ export function parseYamlSubset(yaml: string): unknown {
   const skipBlank = () => {
     while (pos < lines.length && lines[pos]!.indent < 0) pos++;
   };
-
-  const KEY = /^("(?:[^"\\]|\\.)*"|'(?:[^']|'')*'|[^\s"'#{}[\],&*!|>%@`-][^:#]*?|-[^\s:#][^:#]*?)\s*:(?:\s+(.*))?$/;
-
-  function parseKey(k: string): string {
-    return k.startsWith('"') || k.startsWith("'") ? unquote(k).value : k.trim();
-  }
 
   function blockScalar(indicator: string, parentIndent: number): string {
     const keep = indicator.endsWith("+");
@@ -242,12 +295,11 @@ export function parseYamlSubset(yaml: string): unknown {
       if (!l || l.indent < indent) return out;
       if (l.indent > indent) throw new Error(`unexpected indentation: ${l.text}`);
       if (l.text.startsWith("- ") || l.text === "-") return out; // sibling sequence belongs to the parent
-      const m = KEY.exec(l.text);
-      if (!m) throw new Error(`not a mapping entry: ${l.text}`);
+      const m = splitKey(l.text);
+      if (!m) throw new Error("not a mapping entry");
       pos++;
-      const key = parseKey(m[1]!);
-      if (Object.prototype.hasOwnProperty.call(out, key)) throw new Error(`duplicate key: ${key}`);
-      out[key] = valueAfter(m[2], indent, indent === 0);
+      if (Object.prototype.hasOwnProperty.call(out, m.key)) throw new Error(`duplicate key: ${m.key}`);
+      out[m.key] = valueAfter(m.rest, indent, indent === 0);
     }
   }
 
@@ -264,7 +316,7 @@ export function parseYamlSubset(yaml: string): unknown {
         out.push(valueAfter("", indent + 1, false));
         continue;
       }
-      if (KEY.test(item.trim()) && !item.trim().startsWith("{") && !item.trim().startsWith("[")) {
+      if (splitKey(item.trim()) !== null) {
         // `- key: value` starts a mapping whose later keys sit at itemIndent.
         lines[pos] = { indent: itemIndent, text: item.trim() };
         out.push(mapping(itemIndent));
