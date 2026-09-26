@@ -158,7 +158,19 @@ export interface RunOptions {
    * cannot prompt mid-walk → policyStop hard-stop before running), null to run.
    */
   checkOperationPolicy?: OperationPolicyChecker;
+  /**
+   * Wall-clock bound for each shell command, clamped to
+   * [1_000, MAX_COMMAND_TIMEOUT_MS]; defaults to DEFAULT_COMMAND_TIMEOUT_MS.
+   * A timed-out command's process group is SIGKILLed and it reports exitCode 124.
+   */
+  commandTimeoutMs?: number;
 }
+
+/** Default per-shell-command wall-clock bound (ms). */
+export const DEFAULT_COMMAND_TIMEOUT_MS = 60_000;
+
+/** Upper clamp for RunOptions.commandTimeoutMs (ms). */
+export const MAX_COMMAND_TIMEOUT_MS = 600_000;
 
 /** Engine-level backstop when a plan omits maxDepth. */
 export const DEFAULT_MAX_DEPTH = 8;

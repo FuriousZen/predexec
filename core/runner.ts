@@ -7,22 +7,59 @@
  */
 
 import { spawn } from "node:child_process";
-import { MAX_PARALLEL_CONCURRENCY } from "./types.ts";
+import { DEFAULT_COMMAND_TIMEOUT_MS, MAX_COMMAND_TIMEOUT_MS, MAX_PARALLEL_CONCURRENCY } from "./types.ts";
 import type { NodeOutput, Operation, PlanNode, RunOptions, ToolOp } from "./types.ts";
 
 /** Per-stream capture cap (chars). Keeps the transcript bounded on noisy commands. */
 export const OUTPUT_CAP = 8192;
 
-/** Marker prefix for truncated output; engine.ts checks for `${TRUNCATION_MARKER}]`. */
+/**
+ * Marker prefix for truncated output. Rendered as `${TRUNCATION_MARKER}]` (count
+ * unknown) or `${TRUNCATION_MARKER}: N more chars]`; conditions.ts strips both
+ * forms before matching, and the pi adapter renders its own.
+ */
 export const TRUNCATION_MARKER = "…[truncated" as const;
 
+/** GNU `timeout` convention for a command killed for exceeding its time bound. */
+const TIMEOUT_EXIT_CODE = 124;
+
+/** How long to wait for pipes to close after killing a timed-out group before giving up on them. */
+const KILL_GRACE_MS = 2_000;
+
+/**
+ * One command's captured output. `stdout`/`stderr` hold the KEPT text with no
+ * marker; the marker is rendered once, by `cap()`, from `*Total` (every char the
+ * command produced), so the reported dropped count is the true one rather than
+ * a count of an already-marked, already-capped string.
+ */
 interface CommandResult {
   command: string;
   stdout: string;
   stderr: string;
+  stdoutTotal: number;
+  stderrTotal: number;
   exitCode: number;
   stdoutTruncated: boolean;
   stderrTruncated: boolean;
+}
+
+/** A result paired with its command's position in the node, so labels survive gaps. */
+interface IndexedResult {
+  index: number;
+  result: CommandResult;
+}
+
+function failedResult(command: string, stderr: string): CommandResult {
+  return {
+    command,
+    stdout: "",
+    stderr,
+    stdoutTotal: 0,
+    stderrTotal: stderr.length,
+    exitCode: 1,
+    stdoutTruncated: false,
+    stderrTruncated: false,
+  };
 }
 
 export function isToolOp(op: Operation): op is ToolOp {
@@ -34,26 +71,26 @@ export async function runNode(node: PlanNode, opts: RunOptions): Promise<NodeOut
     return { stdout: "", stderr: "", exitCode: 0, stdoutTruncated: false, stderrTruncated: false };
   }
 
-  const results: CommandResult[] = node.parallel
+  const results: IndexedResult[] = node.parallel
     ? await runParallel(node.commands, opts)
     : await runSequential(node.commands, opts);
 
   return aggregate(results);
 }
 
-async function runSequential(commands: Operation[], opts: RunOptions): Promise<CommandResult[]> {
-  const results: CommandResult[] = [];
-  for (const command of commands) {
+async function runSequential(commands: Operation[], opts: RunOptions): Promise<IndexedResult[]> {
+  const results: IndexedResult[] = [];
+  for (const [index, command] of commands.entries()) {
     if (opts.signal?.aborted) break;
-    const res = await runOneOp(command, opts);
-    results.push(res);
-    if (res.exitCode !== 0) break;
+    const result = await runOneOp(command, opts);
+    results.push({ index, result });
+    if (result.exitCode !== 0) break;
   }
   return results;
 }
 
-async function runParallel(commands: Operation[], opts: RunOptions): Promise<CommandResult[]> {
-  const results = new Array<CommandResult>(commands.length);
+async function runParallel(commands: Operation[], opts: RunOptions): Promise<IndexedResult[]> {
+  const results = new Array<CommandResult | undefined>(commands.length);
   let next = 0;
   async function worker(): Promise<void> {
     while (!opts.signal?.aborted && next < commands.length) {
@@ -64,46 +101,48 @@ async function runParallel(commands: Operation[], opts: RunOptions): Promise<Com
   await Promise.all(
     Array.from({ length: Math.min(MAX_PARALLEL_CONCURRENCY, commands.length) }, () => worker()),
   );
-  return results.filter((result): result is CommandResult => result !== undefined);
+  // Keep each command's original index: filtering unstarted slots out of a bare
+  // array would renumber every later `[i]` label onto the wrong command.
+  const indexed: IndexedResult[] = [];
+  results.forEach((result, index) => {
+    if (result) indexed.push({ index, result });
+  });
+  return indexed;
 }
 
 async function runOneOp(op: Operation, opts: RunOptions): Promise<CommandResult> {
   if (typeof op === "string") return runShell(op, opts);
   if (isToolOp(op)) return runToolOp(op, opts);
-  return {
-    command: "unknown",
-    stdout: "",
-    stderr: "invalid operation: expected string or {tool, ...}",
-    exitCode: 1,
-    stdoutTruncated: false,
-    stderrTruncated: false,
-  };
+  return failedResult("unknown", "invalid operation: expected string or {tool, ...}");
 }
 
 async function runToolOp(op: ToolOp, opts: RunOptions): Promise<CommandResult> {
   const label = formatToolOpLabel(op);
   if (!opts.executeToolOp) {
-    return {
-      command: label,
-      stdout: "",
-      stderr: "no tool executor provided for tool operations",
-      exitCode: 1,
-      stdoutTruncated: false,
-      stderrTruncated: false,
-    };
+    return failedResult(label, "no tool executor provided for tool operations");
   }
   try {
     const result = await opts.executeToolOp(op, { cwd: opts.cwd, signal: opts.signal });
     const stdoutTruncated = result.stdoutTruncated === true || result.stdout.length > OUTPUT_CAP;
     const stderrTruncated = result.stderrTruncated === true || result.stderr.length > OUTPUT_CAP;
-    const stdout = stdoutTruncated ? `${result.stdout.slice(0, OUTPUT_CAP)}\n${TRUNCATION_MARKER}]` : result.stdout;
-    const stderr = stderrTruncated ? `${result.stderr.slice(0, OUTPUT_CAP)}\n${TRUNCATION_MARKER}]` : result.stderr;
+    const res: CommandResult = {
+      command: label,
+      stdout: result.stdout.slice(0, OUTPUT_CAP),
+      stderr: result.stderr.slice(0, OUTPUT_CAP),
+      stdoutTotal: result.stdout.length,
+      stderrTotal: result.stderr.length,
+      exitCode: result.exitCode,
+      stdoutTruncated,
+      stderrTruncated,
+    };
+    const stdout = render(res, "stdout", OUTPUT_CAP).text;
+    const stderr = render(res, "stderr", OUTPUT_CAP).text;
     if (stdout) opts.onCommandOutput?.(stdout);
     if (stderr) opts.onCommandOutput?.(stderr);
-    return { command: label, stdout, stderr, exitCode: result.exitCode, stdoutTruncated, stderrTruncated };
+    return res;
   } catch (err) {
     const msg = (err as Error).message ?? String(err);
-    return { command: label, stdout: "", stderr: msg, exitCode: 1, stdoutTruncated: false, stderrTruncated: false };
+    return failedResult(label, msg);
   }
 }
 
@@ -113,54 +152,116 @@ export function formatToolOpLabel(op: ToolOp): string {
   return primary ? `${op.tool}:${primary}` : op.tool;
 }
 
+function clampTimeout(ms: number | undefined): number {
+  if (typeof ms !== "number" || Number.isNaN(ms)) return DEFAULT_COMMAND_TIMEOUT_MS;
+  return Math.min(MAX_COMMAND_TIMEOUT_MS, Math.max(1_000, ms));
+}
+
+/**
+ * Run one shell command with a closed stdin, a wall-clock bound, and abort
+ * support. The child leads its own process group (`detached`), so a timeout or
+ * abort SIGKILLs the whole group — `sh -c 'sleep 30 & sleep 30'` would otherwise
+ * leave the backgrounded child holding the pipes open and the promise pending.
+ */
 function runShell(command: string, opts: RunOptions): Promise<CommandResult> {
   return new Promise<CommandResult>((resolvePromise) => {
+    const timeoutMs = clampTimeout(opts.commandTimeoutMs);
     let stdout = "";
     let stderr = "";
-    let stdoutTruncated = false;
-    let stderrTruncated = false;
+    let stdoutTotal = 0;
+    let stderrTotal = 0;
     let settled = false;
+    let timedOut = false;
+    let aborted = false;
+    let graceTimer: ReturnType<typeof setTimeout> | undefined;
+
+    const appendStderr = (s: string) => {
+      stderrTotal += s.length;
+      const remaining = OUTPUT_CAP - stderr.length;
+      if (remaining > 0) stderr += s.slice(0, remaining);
+    };
 
     const child = spawn(command, {
       cwd: opts.cwd,
       shell: true,
-      signal: opts.signal,
+      detached: true,
+      windowsHide: true,
+      stdio: ["ignore", "pipe", "pipe"],
     });
+
+    const killGroup = () => {
+      if (child.pid === undefined) return;
+      try {
+        if (process.platform !== "win32") process.kill(-child.pid, "SIGKILL");
+        else child.kill("SIGKILL");
+      } catch {
+        // The group may already be gone.
+      }
+      // A process that escaped the group (setsid) can still hold the pipes open;
+      // stop waiting on them after a grace period rather than hanging the walk.
+      graceTimer ??= setTimeout(() => {
+        child.stdout?.destroy();
+        child.stderr?.destroy();
+        finish(1);
+      }, KILL_GRACE_MS);
+      graceTimer.unref?.();
+    };
+
+    const onAbort = () => {
+      aborted = true;
+      killGroup();
+    };
+
+    const timer = setTimeout(() => {
+      timedOut = true;
+      killGroup();
+    }, timeoutMs);
 
     const finish = (exitCode: number) => {
       if (settled) return;
       settled = true;
+      clearTimeout(timer);
+      if (graceTimer) clearTimeout(graceTimer);
+      opts.signal?.removeEventListener("abort", onAbort);
+      if (timedOut) {
+        appendStderr(`${stderr && !stderr.endsWith("\n") ? "\n" : ""}[predexec] command timed out after ${timeoutMs}ms\n`);
+        exitCode = TIMEOUT_EXIT_CODE;
+      } else if (aborted) {
+        appendStderr(`${stderr && !stderr.endsWith("\n") ? "\n" : ""}[predexec] command aborted\n`);
+        if (exitCode === 0) exitCode = 1;
+      }
       resolvePromise({
         command,
-        stdout: stdoutTruncated ? `${stdout}\n${TRUNCATION_MARKER}]` : stdout,
-        stderr: stderrTruncated ? `${stderr}\n${TRUNCATION_MARKER}]` : stderr,
+        stdout,
+        stderr,
+        stdoutTotal,
+        stderrTotal,
         exitCode,
-        stdoutTruncated,
-        stderrTruncated,
+        stdoutTruncated: stdoutTotal > OUTPUT_CAP,
+        stderrTruncated: stderrTotal > OUTPUT_CAP,
       });
     };
 
-    child.stdout?.on("data", (d: Buffer) => {
-      const s = d.toString();
+    if (opts.signal?.aborted) onAbort();
+    else opts.signal?.addEventListener("abort", onAbort, { once: true });
+
+    // setEncoding keeps a multi-byte UTF-8 character split across two chunks intact.
+    child.stdout?.setEncoding("utf8");
+    child.stderr?.setEncoding("utf8");
+    child.stdout?.on("data", (s: string) => {
+      stdoutTotal += s.length;
       const remaining = OUTPUT_CAP - stdout.length;
       if (remaining > 0) stdout += s.slice(0, remaining);
-      if (s.length > remaining) stdoutTruncated = true;
       opts.onCommandOutput?.(s);
     });
-    child.stderr?.on("data", (d: Buffer) => {
-      const s = d.toString();
-      const remaining = OUTPUT_CAP - stderr.length;
-      if (remaining > 0) stderr += s.slice(0, remaining);
-      if (s.length > remaining) stderrTruncated = true;
+    child.stderr?.on("data", (s: string) => {
+      appendStderr(s);
       opts.onCommandOutput?.(s);
     });
 
     child.on("error", (err: NodeJS.ErrnoException) => {
-      // Spawn failure or abort kill. Surface as a non-zero exit so edges can react.
-      const message = `${err.message}\n`;
-      const remaining = OUTPUT_CAP - stderr.length;
-      if (remaining > 0) stderr += message.slice(0, remaining);
-      if (message.length > remaining) stderrTruncated = true;
+      // Spawn failure. Surface as a non-zero exit so edges can react.
+      appendStderr(`${err.message}\n`);
       finish(typeof err.errno === "number" ? err.errno : 1);
     });
 
@@ -170,23 +271,19 @@ function runShell(command: string, opts: RunOptions): Promise<CommandResult> {
   });
 }
 
-function aggregate(results: CommandResult[]): NodeOutput {
-  const joinedStdout = joinLabeled(results, (r) => r.stdout);
-  const joinedStderr = joinLabeled(results, (r) => r.stderr);
-  const cappedStdout = cap(joinedStdout.text);
-  const cappedStderr = cap(joinedStderr.text);
+function aggregate(results: IndexedResult[]): NodeOutput {
+  const stdout = joinLabeled(results, "stdout");
+  const stderr = joinLabeled(results, "stderr");
   // exitCode = the failing command's code (stop-on-first-error left it last) or the last command's.
-  const failed = results.find((r) => r.exitCode !== 0);
+  const failed = results.find(({ result }) => result.exitCode !== 0);
   const last = results[results.length - 1];
-  const exitCode = failed ? failed.exitCode : (last?.exitCode ?? 0);
-  // joinLabeled already budgets per command; the outer cap is a final backstop
-  // for the (rare) case where the per-command floor sums above OUTPUT_CAP.
+  const exitCode = failed ? failed.result.exitCode : (last?.result.exitCode ?? 0);
   return {
-    stdout: cappedStdout.text,
-    stderr: cappedStderr.text,
+    stdout: stdout.text,
+    stderr: stderr.text,
     exitCode,
-    stdoutTruncated: joinedStdout.truncated || cappedStdout.truncated || results.some((r) => r.stdoutTruncated),
-    stderrTruncated: joinedStderr.truncated || cappedStderr.truncated || results.some((r) => r.stderrTruncated),
+    stdoutTruncated: stdout.truncated || results.some(({ result }) => result.stdoutTruncated),
+    stderrTruncated: stderr.truncated || results.some(({ result }) => result.stderrTruncated),
   };
 }
 
@@ -204,30 +301,54 @@ function aggregate(results: CommandResult[]): NodeOutput {
  * Per-command budgets keep every command represented, and an explicit marker
  * tells the model which ones were shortened rather than leaving it to infer.
  */
-function joinLabeled(results: CommandResult[], pick: (r: CommandResult) => string): { text: string; truncated: boolean } {
-  if (results.length === 1) return { text: cap(pick(results[0]!)).text, truncated: false };
+function joinLabeled(results: IndexedResult[], stream: Stream): { text: string; truncated: boolean } {
+  if (results.length === 1) return render(results[0]!.result, stream, OUTPUT_CAP);
 
   const budget = Math.max(256, Math.floor(OUTPUT_CAP / results.length));
   let truncated = false;
   const text = results
-    .map((r, i) => {
-      const text = pick(r);
-      if (!text) return "";
+    .map(({ index, result }) => {
+      if (!result[stream]) return "";
       // Index label, not the full command: the command is already in the plan
       // (tool-call args), so echoing it back double-counts it in context.
-      const capped = cap(text, budget);
+      const capped = render(result, stream, budget);
       truncated ||= capped.truncated;
-      return `[${i + 1}]\n${capped.text}`;
+      return `[${index + 1}]\n${capped.text}`;
     })
     .filter(Boolean)
     .join("\n");
+  // Final backstop for the (rare) case where the per-command floor sums above
+  // OUTPUT_CAP. Applied only then: re-capping an already-marked join would
+  // clip the last command's marker and misreport its dropped count.
+  if (budget * results.length > OUTPUT_CAP) {
+    const backstop = cap(text);
+    return { text: backstop.text, truncated: truncated || backstop.truncated };
+  }
   return { text, truncated };
 }
 
-function cap(text: string, limit = OUTPUT_CAP): { text: string; truncated: boolean } {
-  if (text.length <= limit) return { text, truncated: false };
+type Stream = "stdout" | "stderr";
+
+/**
+ * Render one command's stream under `limit`, marking it once. The dropped count
+ * comes from the command's true total, not from the kept text. A result the
+ * adapter itself truncated with no known total gets the count-less marker.
+ */
+function render(r: CommandResult, stream: Stream, limit: number): { text: string; truncated: boolean } {
+  const text = r[stream];
+  const total = stream === "stdout" ? r.stdoutTotal : r.stderrTotal;
+  const flagged = stream === "stdout" ? r.stdoutTruncated : r.stderrTruncated;
+  if (total > limit || text.length > limit) return cap(text, limit, total);
+  if (flagged) return { text: `${text}\n${TRUNCATION_MARKER}]`, truncated: true };
+  return { text, truncated: false };
+}
+
+function cap(text: string, limit = OUTPUT_CAP, originalLength = text.length): { text: string; truncated: boolean } {
+  const total = Math.max(originalLength, text.length);
+  if (total <= limit) return { text, truncated: false };
+  const kept = text.slice(0, limit);
   return {
-    text: `${text.slice(0, limit)}\n${TRUNCATION_MARKER}: ${text.length - limit} more chars]`,
+    text: `${kept}\n${TRUNCATION_MARKER}: ${total - kept.length} more chars]`,
     truncated: true,
   };
 }

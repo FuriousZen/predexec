@@ -176,3 +176,63 @@ describe("runNode", () => {
     expect(r.stderrTruncated).toBe(false);
   });
 });
+
+describe("runNode — termination", () => {
+  it("gives shell commands a closed stdin", async () => {
+    const r = await runNode({ id: "n", commands: ["cat"] }, { cwd });
+    expect(r.exitCode).toBe(0); // EOF immediately, no hang
+  }, 5_000);
+
+  it("kills a command that exceeds commandTimeoutMs, including its children", async () => {
+    const r = await runNode({ id: "n", commands: ["sh -c 'sleep 30 & sleep 30'"] }, { cwd, commandTimeoutMs: 1_000 });
+    expect(r.exitCode).toBe(124);
+    expect(r.stderr).toContain("[predexec] command timed out after 1000ms");
+  }, 5_000);
+
+  it("clamps commandTimeoutMs up to the 1s floor", async () => {
+    const r = await runNode({ id: "n", commands: ["sleep 30"] }, { cwd, commandTimeoutMs: 1 });
+    expect(r.exitCode).toBe(124);
+    expect(r.stderr).toContain("[predexec] command timed out after 1000ms");
+  }, 5_000);
+
+  it("reports the true number of dropped chars", async () => {
+    const r = await runNode({ id: "n", commands: ["seq 1 100000"] }, { cwd });
+    const m = r.stdout.match(/…\[truncated: (\d+) more chars\]/);
+    expect(Number(m?.[1])).toBeGreaterThan(500_000);
+  });
+
+  it("keeps every per-command marker and its true count in a multi-command batch", async () => {
+    const r = await runNode({ id: "n", commands: ["seq 1 100000", "seq 1 100000"] }, { cwd });
+    const counts = [...r.stdout.matchAll(/…\[truncated: (\d+) more chars\]/g)].map((m) => Number(m[1]));
+    expect(counts).toHaveLength(2);
+    for (const count of counts) expect(count).toBeGreaterThan(500_000);
+  });
+
+  it("decodes multi-byte UTF-8 split across chunks", async () => {
+    const q = String.fromCharCode(39);
+    const script = 'const b=Buffer.from("é");process.stdout.write(b.subarray(0,1));setTimeout(()=>process.stdout.write(b.subarray(1)),30)';
+    const r = await runNode({ id: "n", commands: [`node -e ${q}${script}${q}`] }, { cwd });
+    expect(r.stdout).toContain("é");
+  });
+
+  it("keeps [i] labels aligned with command indices when a parallel batch is aborted", async () => {
+    const controller = new AbortController();
+    const commands = ["echo out1", "sleep 2; echo out2", "sleep 2; echo out3"];
+    const r = await runNode(
+      { id: "n", commands, parallel: true },
+      {
+        cwd,
+        signal: controller.signal,
+        onCommandOutput: (chunk) => {
+          if (chunk.includes("out1")) controller.abort();
+        },
+      },
+    );
+    const labels = [...r.stdout.matchAll(/\[(\d+)\]\n(\S+)/g)];
+    expect(labels.length).toBeGreaterThan(0);
+    for (const [, index, text] of labels) {
+      expect(text).toBe(`out${index}`);
+    }
+    expect(r.stdout).not.toContain("out2");
+  }, 5_000);
+});
