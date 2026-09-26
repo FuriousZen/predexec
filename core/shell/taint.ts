@@ -18,9 +18,11 @@
  * (any operator form except the `${!c[@]}` key list), `[[ -v $c ]]`,
  * `printf -v "$c"`, `read "$c"` (and `-a`), `getopts o "$c"`,
  * `declare|typeset|local|export|readonly "$c=…"`, bare `export|readonly "$c"`,
- * `declare -p "$c"`, and (sh only) `unset -f "$c"`. These do not: namerefs
- * (`declare -n`, bash >= 4.3 only), `test -v`/`[ -v`, plain `unset "$c"`, and
- * bare `declare|local "$c"`.
+ * `declare -p "$c"`, and (sh only) `unset -f "$c"`. These do not: `test -v`/
+ * `[ -v`, and bare `declare|local "$c"`. Namerefs (`declare -n r=$c`, which
+ * bash 3.2 rejects) and plain `unset "$c"` did not evaluate on 3.2 either, but
+ * are flagged fail-closed for bash >= 4.3 semantics (the Linux default), where
+ * array subscripts in them are evaluated — unverifiable on this 3.2 host.
  *
  * The analysis is deliberately flow-insensitive and over-approximating: order
  * is ignored, quoting is ignored for context detection, and any identifier in
@@ -352,22 +354,31 @@ function recordNameOperands(flow: Flow, segment: string, command: string, args: 
       name(args[1]);
       break;
     case "unset":
-      if (options.some((option) => /^-[A-Za-z]*f/.test(option))) args.forEach(name);
+      // `-f` evaluates on /bin/sh 3.2; plain and `-v` operands are flagged for
+      // bash >= 4.3 semantics, which evaluates their array subscripts.
+      args.forEach(name);
       break;
     case "declare":
     case "typeset":
     case "local":
     case "export":
     case "readonly": {
-      // A bare name is only parsed as one by export/readonly and `-p`.
-      const bareIsName = command === "export" || command === "readonly" ||
+      // A bare name is only parsed as one by export/readonly and `-p`, and a
+      // nameref (`-n`) also resolves its value as a name. Namerefs are flagged
+      // for bash >= 4.3 semantics (bash 3.2 has no `-n`).
+      const nameref = options.some((option) => /^-[A-Za-z]*n/.test(option));
+      const bareIsName = nameref || command === "export" || command === "readonly" ||
         options.some((option) => /^-[A-Za-z]*p/.test(option));
       for (const word of args) {
         if (/^[-+]/.test(word.value)) continue;
         const raw = rawWord(segment, word);
         const equals = raw.indexOf("=");
-        if (equals !== -1) flow.nameReferences.push(...variableReferences(raw.slice(0, equals)));
-        else if (bareIsName) flow.nameReferences.push(...variableReferences(raw));
+        if (equals === -1) {
+          if (bareIsName) flow.nameReferences.push(...variableReferences(raw));
+          continue;
+        }
+        flow.nameReferences.push(...variableReferences(raw.slice(0, equals)));
+        if (nameref) flow.nameReferences.push(...variableReferences(raw.slice(equals + 1)));
       }
       break;
     }

@@ -99,14 +99,17 @@ const TAINTED_NAMES = [
   "c=$(cat f); f(){ local \"$c=1\"; }; f", "c=$(cat f); export \"$c\"", "c=$(cat f); readonly \"$c\"",
   "c=$(cat f); declare -p \"$c\"", "c=$(cat f); unset -f \"$c\"",
   "for c in *; do echo ${!c}; done",
+  // R6: bash >= 4.3 semantics, unverifiable on bash 3.2 — flagged fail-closed.
+  "c=$(cat f); declare -n r=$c", "c=$(cat f); f(){ local -n r=\"$c\"; }; f", "c=$(cat f); typeset -n r=$c",
+  "c=$(cat f); declare -n \"$c\"", "c=$(cat f); unset \"$c\"", "c=$(cat f); unset -v \"$c\"",
 ];
 
-// Measured NOT to evaluate on bash 3.2 / sh (namerefs need bash >= 4.3,
-// `test -v` is unsupported there), or no data-derived name is involved.
+// Measured NOT to evaluate on bash 3.2 / sh (`test -v` is unsupported there),
+// or no data-derived name is involved.
 const CLEAN_NAMES = [
   "c=$(cat f); echo \"$c\"", "echo ${!prefix*}", "echo ${!prefix@}", "declare -n r=literal",
   "c=$(cat f); echo ${!c[@]}", "c=$(cat f); declare \"$c\"", "c=$(cat f); f(){ local \"$c\"; }; f",
-  "c=$(cat f); unset \"$c\"", "c=$(cat f); test -v \"$c\"", "c=$(cat f); read -p \"$c\" x",
+  "c=$(cat f); test -v \"$c\"", "c=$(cat f); read -p \"$c\" x",
   "c=lit; echo ${!c}", "c=lit; printf -v \"$c\" x",
 ];
 

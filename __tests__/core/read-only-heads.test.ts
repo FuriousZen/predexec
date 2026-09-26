@@ -153,6 +153,8 @@ describe("arithmetic over data-derived variables (E-A)", () => {
 const TAINTED_NAMES = [
   "c=$(cat f); echo ${!c}", "c=$(cat f); [[ -v $c ]]", "c=$(cat f); printf -v \"$c\" x", "c=$(cat f); read \"$c\" <<< x",
   "c=$(cat f); declare \"$c=1\"", "c=$(cat f); export \"$c=1\"", "c=$(cat f); f(){ local \"$c=1\"; }; f",
+  // R6: flagged for bash >= 4.3 semantics
+  "c=$(cat f); declare -n r=$c", "c=$(cat f); unset \"$c\"",
 ];
 const UNTAINTED_NAMES = ["c=$(cat f); echo \"$c\"", "echo ${!prefix*}", "declare -n r=literal"];
 
