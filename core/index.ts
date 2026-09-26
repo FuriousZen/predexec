@@ -20,9 +20,11 @@ export { escapeRegExp, isSafeRegex } from "./conditions.ts";
 export { validateOperation } from "./validation.ts";
 export {
   inspectCommandSubstitutionTree,
+  lexShellWords,
   splitCommandSegments,
   stripLeadingAssignmentsAndWrappers,
   tokenizeShellWords,
+  type ShellWord,
   type WrapperInspectionOptions,
 } from "./shell/inspection.ts";
 export {

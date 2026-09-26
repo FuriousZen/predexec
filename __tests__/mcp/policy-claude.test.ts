@@ -763,6 +763,18 @@ describe("Claude Read rules — tool ops and shell readers", () => {
     ["jq . .env"],
     ["jq --arg k v . -- .env"],
     ["yq eval . .env"],
+    // Quoted/escaped braces are literal in bash; the expander must not
+    // misread them as syntax (each of these once reached leaf).
+    ["cat {.env,\\}}"],
+    ["cat {.env,'}'}"],
+    ["cat {.env,\"}\"}"],
+    ["cat {\\{,.env}"],
+    // An unclosed `{` is literal, but bash still expands later groups.
+    ["cat a{/../{.env,x}"],
+    ["cat {a,}{.env,x}"],
+    // jq's --rawfile/--slurpfile FILE is read even though a filter follows.
+    ["jq --rawfile x .env -n 1"],
+    ["jq --slurpfile x .env -n 1"],
   ])("Read(./.env) deny hard-stops the shell read `%s`", async (command) => {
     const { repo, check } = setup({ deny: ["Read(./.env)"] });
     const r = await run(repo, check, [command]);
@@ -787,6 +799,27 @@ describe("Claude Read rules — tool ops and shell readers", () => {
     const { repo, check } = setup({ deny: ["Read(./.env)"] });
     const r = await run(repo, check, ["F=.env; cat $F"]);
     expect(r.stoppedReason).toBe("policyStop");
+  });
+
+  it("expands every brace group in sequence", async () => {
+    const { repo, check } = setup({ deny: ["Read(./b.env)"] });
+    expect((await run(repo, check, ["cat {a,b}{.env,x}"])).stoppedReason).toBe("policyStop");
+  });
+
+  it("zero-pads brace sequences the way bash 4+ does", async () => {
+    const { repo, check } = setup({ deny: ["Read(./secret01)"] });
+    expect((await run(repo, check, ["cat secret{01..02}"])).stoppedReason).toBe("policyStop");
+    expect((await run(repo, check, ["cat secret{1..2} 2>/dev/null || true"])).stoppedReason).toBe("leaf");
+  });
+
+  it("stops rather than match a path too long to check in bounded time", () => {
+    const { check, ctx } = setup({ deny: ["Read(./.env)", "Read(**/secrets/**)"] });
+    const deep = Array(600).fill("a").join("/");
+    const start = performance.now();
+    expect(check({ tool: "read", path: deep }, ctx)).toMatch(/too long/);
+    expect(check(`cat ${deep}`, ctx)).toMatch(/too long/);
+    expect(check({ tool: "read", path: "x".repeat(5000) }, ctx)).toMatch(/too long/);
+    expect(performance.now() - start).toBeLessThan(500);
   });
 
   it("stops a brace expansion too large to check", async () => {

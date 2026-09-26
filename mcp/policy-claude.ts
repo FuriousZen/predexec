@@ -46,9 +46,9 @@ import { basename, dirname, isAbsolute, join, parse as parsePath, relative, reso
 import {
   escapeRegExp,
   inspectCommandSubstitutionTree,
+  lexShellWords,
   splitCommandSegments,
   stripLeadingAssignmentsAndWrappers,
-  tokenizeShellWords,
   type Operation,
   type PolicyCheckContext,
   type PolicyVerdict,
@@ -705,6 +705,11 @@ function matchTargets(rules: readonly CompiledReadRule[], kind: OpKind, targets:
   for (const target of targets) {
     const { paths, isDir } = pathSpellings(target.path);
     for (const path of paths) {
+      // The path is model-chosen and gitignore matching is polynomial in its
+      // segment count; past a sane bound, stop instead of matching.
+      if (path.length > MAX_CHECKED_PATH_LENGTH || path.split(sep).length > MAX_CHECKED_PATH_SEGMENTS) {
+        return `path too long to check against Read rules (${path.length} chars) — use a shorter path`;
+      }
       for (const rule of applicable) {
         const hit = rule.test(path, isDir) ??
           // A searched directory is a read of its contents: "Claude Code
@@ -715,6 +720,16 @@ function matchTargets(rules: readonly CompiledReadRule[], kind: OpKind, targets:
     }
   }
   return null;
+}
+
+/** Longest path (chars / segments) the Read matcher is asked to check; longer stops. */
+const MAX_CHECKED_PATH_LENGTH = 4096;
+const MAX_CHECKED_PATH_SEGMENTS = 512;
+
+/** A shell word: its dequoted value and its source spelling. */
+interface RawWord {
+  value: string;
+  raw: string;
 }
 
 /** Shell file readers whose operands are read-rule targets (CC-3). */
@@ -793,29 +808,37 @@ const OUTPUT_REDIRECT_RE = /^(?:\d*|&)>/;
  * relative operands unresolvable (the host prompts on "a relative path that
  * follows a `cd` in the same command").
  */
-function shellReadOperands(command: string): { operands: string[]; afterCd: boolean; complete: boolean } {
+function shellReadOperands(command: string): { operands: RawWord[]; afterCd: boolean; complete: boolean } {
   const inspected = inspectCommandSubstitutionTree(command);
-  const operands: string[] = [];
+  const operands: RawWord[] = [];
   let afterCd = false;
   for (const text of inspected.commands) {
     for (const line of text.split("\n")) {
       for (const segment of splitCommandSegments(line)) {
-        const tokens = tokenizeShellWords(segment);
-        const words: string[] = [];
+        // Keep each word's source spelling: brace expansion must know which
+        // braces were quoted or escaped (literal) — the value has lost that.
+        const tokens: RawWord[] = lexShellWords(segment).words.map((w) => ({ value: w.value, raw: segment.slice(w.start, w.end) }));
+        const words: RawWord[] = [];
         for (let i = 0; i < tokens.length; i++) {
           const token = tokens[i]!;
-          const input = INPUT_REDIRECT_RE.exec(token);
+          const input = INPUT_REDIRECT_RE.exec(token.value);
           if (input) {
-            const target = input[1] || tokens[++i];
+            const target = input[1] ? { value: input[1], raw: token.raw } : tokens[++i];
             if (target !== undefined) operands.push(target);
-          } else if (SKIP_NEXT_REDIRECT_RE.test(token)) {
+          } else if (SKIP_NEXT_REDIRECT_RE.test(token.value)) {
             i++; // heredoc delimiter, here-string word, or output target
-          } else if (!OUTPUT_REDIRECT_RE.test(token) && !/^\d*<[<&(]/.test(token)) {
+          } else if (!OUTPUT_REDIRECT_RE.test(token.value) && !/^\d*<[<&(]/.test(token.value)) {
             words.push(token);
           }
         }
-        const argv = stripLeadingAssignmentsAndWrappers(words, WRAPPER_OPTIONS);
-        const head = argv[0] === undefined ? "" : basename(argv[0]);
+        const values = words.map((w) => w.value);
+        const stripped = stripLeadingAssignmentsAndWrappers(values, WRAPPER_OPTIONS);
+        // Stripping removes a prefix; map back to the raw words by offset.
+        const offset = values.length - stripped.length;
+        const argv: RawWord[] = stripped.every((v, i) => v === values[offset + i])
+          ? words.slice(offset)
+          : stripped.map((value) => ({ value, raw: "\\" })); // unmappable: mark as quoted (fail closed on braces)
+        const head = argv[0] === undefined ? "" : basename(argv[0].value);
         if (head === "cd" || head === "pushd") afterCd = true;
         if (SHELL_READERS.has(head)) operands.push(...readerOperands(head, argv.slice(1)));
       }
@@ -824,12 +847,16 @@ function shellReadOperands(command: string): { operands: string[]; afterCd: bool
   return { operands, afterCd, complete: inspected.complete };
 }
 
-function readerOperands(head: string, args: readonly string[]): string[] {
-  const out: string[] = [];
+function readerOperands(head: string, args: readonly RawWord[]): RawWord[] {
+  const out: RawWord[] = [];
+  // Files named by option (`jq --rawfile NAME FILE`, `grep -f FILE`) are kept
+  // apart from positionals so the script/filter shift below never drops one.
+  const optionFiles: RawWord[] = [];
   let scriptGiven = false;
   let endOfOptions = false;
   for (let i = 0; i < args.length; i++) {
-    const arg = args[i]!;
+    const word = args[i]!;
+    const arg = word.value;
     if (!endOfOptions && arg === "--") {
       endOfOptions = true;
     } else if (!endOfOptions && arg.startsWith("-") && arg !== "-") {
@@ -838,28 +865,28 @@ function readerOperands(head: string, args: readonly string[]): string[] {
       if (pair) {
         const value = args[i + 2];
         i += 2;
-        if (pair.file && value !== undefined) out.push(value);
+        if (pair.file && value !== undefined) optionFiles.push(value);
       } else if (SCRIPT_OPTIONS[head]?.has(name)) {
         scriptGiven = true;
         if (inline === undefined) i++;
       } else if (FILE_OPTIONS[head]?.has(name)) {
         scriptGiven = true;
-        const value = inline ?? args[++i];
-        if (value !== undefined) out.push(value);
+        const value = inline !== undefined ? { value: inline, raw: word.raw } : args[++i];
+        if (value !== undefined) optionFiles.push(value);
       } else if (VALUE_OPTIONS[head]?.has(name) && inline === undefined) {
         i++;
       } else if (SCRIPT_FIRST.has(head) && /^-[ef]./.test(arg) && !arg.startsWith("--")) {
         // Attached short forms: `-eexpr`, `-f.env`.
         scriptGiven = true;
-        if (arg[1] === "f") out.push(arg.slice(2));
+        if (arg[1] === "f") optionFiles.push({ value: arg.slice(2), raw: word.raw });
       }
     } else {
-      out.push(arg);
+      out.push(word);
     }
   }
-  if (head === "yq" && YQ_SUBCOMMANDS.has(out[0] ?? "")) out.shift();
+  if (head === "yq" && YQ_SUBCOMMANDS.has(out[0]?.value ?? "")) out.shift();
   if (SCRIPT_FIRST.has(head) && !scriptGiven) out.shift();
-  return out;
+  return [...optionFiles, ...out];
 }
 
 /** Most words one operand's brace expansion may produce before it counts as unresolvable. */
@@ -888,10 +915,11 @@ function expandBraces(word: string, depth = 0): string[] | null {
         break;
       } else if (ch === "," && nesting === 1) commas.push(i);
     }
-    if (close === -1) return [word];
+    if (close === -1) continue; // an unclosed `{` is literal; later groups still expand (bash)
     const inner = word.slice(open + 1, close);
     let alternatives: string[] | null = null;
     if (commas.length > 0) {
+      // Commas inside a nested group belong to it; only depth-1 commas split.
       alternatives = [];
       let start = open + 1;
       for (const comma of [...commas, close]) {
@@ -919,6 +947,12 @@ function expandBraces(word: string, depth = 0): string[] | null {
   return [word];
 }
 
+/**
+ * `{a..b[..step]}`. Numeric endpoints written with a leading zero pad every
+ * term to the wider endpoint's width, as bash 4+ does (`{01..02}` →
+ * `01 02`); a shell that does not pad (bash 3.2) only makes the padded
+ * spelling an extra check.
+ */
 function braceSequence(from: string, to: string, stepText: string | undefined): string[] | null {
   const numeric = /^-?\d+$/.test(from) && /^-?\d+$/.test(to);
   if (!numeric && (/\d/.test(from) || /\d/.test(to))) return null;
@@ -926,24 +960,38 @@ function braceSequence(from: string, to: string, stepText: string | undefined): 
   const b = numeric ? Number(to) : to.charCodeAt(0);
   const step = Math.abs(Number(stepText ?? 1)) || 1;
   if (Math.abs(b - a) / step + 1 > MAX_BRACE_WORDS) return null;
+  const padded = numeric && [from, to].some((end) => /^-?0\d/.test(end));
+  const width = Math.max(from.length, to.length);
+  const format = (v: number): string => {
+    if (!numeric) return String.fromCharCode(v);
+    if (!padded) return String(v);
+    const digits = String(Math.abs(v)).padStart(width - (v < 0 ? 1 : 0), "0");
+    return v < 0 ? `-${digits}` : digits;
+  };
   const out: string[] = [];
-  for (let v = a; a <= b ? v <= b : v >= b; v += a <= b ? step : -step) {
-    out.push(numeric ? String(v) : String.fromCharCode(v));
-  }
+  for (let v = a; a <= b ? v <= b : v >= b; v += a <= b ? step : -step) out.push(format(v));
   return out;
 }
 
-/** Resolve one shell operand to absolute paths, or a reason it cannot be resolved. */
-function resolveShellOperand(operand: string, cwd: string, home: string, afterCd: boolean): string[] | { unresolved: string } {
+/**
+ * Resolve one shell operand to absolute paths, or a reason it cannot be
+ * resolved. Brace expansion runs only when the word's source spelling has no
+ * quoting or escaping: a quoted/escaped brace is literal in bash, and once the
+ * tokenizer has removed the quotes the two are indistinguishable — so a word
+ * with braces AND quoting is unresolvable (fail closed) rather than guessed.
+ */
+function resolveShellOperand(word: RawWord, cwd: string, home: string, afterCd: boolean): string[] | { unresolved: string } {
+  const operand = word.value;
   if (operand === "-" || operand === "") return [];
   if (/[$`]/.test(operand)) return { unresolved: operand };
-  if (operand.includes("{")) {
+  if (/[{}]/.test(operand)) {
+    if (/['"\\]/.test(word.raw)) return { unresolved: word.raw };
     const words = expandBraces(operand);
     if (words === null) return { unresolved: operand };
     if (words.length > 1 || words[0] !== operand) {
       const out: string[] = [];
-      for (const word of words) {
-        const resolved = resolveShellOperand(word, cwd, home, afterCd);
+      for (const expanded of words) {
+        const resolved = resolveShellOperand({ value: expanded, raw: expanded }, cwd, home, afterCd);
         if (!Array.isArray(resolved)) return { unresolved: operand };
         out.push(...resolved);
       }

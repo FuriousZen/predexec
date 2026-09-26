@@ -13,6 +13,7 @@ export {
   inspectCommandSubstitutions,
   inspectCommandSubstitutionTree,
   inspectShellCommandClauses,
+  lexShellWords,
   splitCommandSegments,
   stripLeadingAssignmentsAndWrappers,
   tokenizeShellWords,
@@ -20,5 +21,6 @@ export {
   type CommandSubstitutionTree,
   type ExecutableBodyTreeOptions,
   type ShellClauseInspection,
+  type ShellWord,
   type WrapperInspectionOptions,
 } from "./lexer.ts";
