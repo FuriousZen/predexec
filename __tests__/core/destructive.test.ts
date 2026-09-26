@@ -1860,3 +1860,41 @@ describe("versioned interpreter heads and dangerous environment (task 7)", () =>
     `python -W ignore::x.Y script.py`,
   ])("dangerous environment/warning category: %s", (c) => expect(isDestructiveCommand(c)).toBe(true));
 });
+
+// Task 7 review round 1 (C1-pre, I2, R22 M1): shell argv grammar, alias
+// interpreter argument rescan, and shells that read their script from stdin.
+describe("shell invocation grammar and stdin-fed shells (task 7 review)", () => {
+  it.each([
+    `bash -c -- 'echo hi > out.txt'`,
+    `sh -c -- 'echo hi > out.txt'`,
+    `bash -lc -- 'echo hi > out.txt'`,
+    `bash --norc -c 'echo hi > out.txt'`,
+    `bash --rcfile /dev/null -c 'echo hi > out.txt'`,
+    `bash -c -- 'r\\m -f x'`,
+    `bash -o pipefail -c 'rm x'`,
+    `bash -eo pipefail -c 'rm x'`,
+    `bash +O extglob -c 'rm x'`,
+    `bash --unknown-option -c 'ls'`,
+    `echo 'cat .env' | bash`,
+    `bash <<< 'x'`,
+    `bash < script.sh`,
+    `ls | sh -s`,
+    `bash script.sh`,
+    `sh`,
+    `python3.12 setup.py install`,
+    `python3.12 -m pip download x`,
+    `pypy3 -m pip download x`,
+  ])("mutating: %s", (c) => expect(isDestructiveCommand(c)).toBe(true));
+
+  it.each([
+    `bash -c -- 'ls'`,
+    `bash -lc -- 'cat f'`,
+    `bash --norc --noprofile -c 'ls'`,
+    `bash --rcfile /dev/null -c 'ls'`,
+    `bash -o pipefail -c 'cat f | head'`,
+    `zsh -o pipefail -c 'ls'`,
+    `bash -xc 'ls'`,
+    `bash --version`,
+    `python3.12 -m json.tool f`,
+  ])("read-only: %s", (c) => expect(isDestructiveCommand(c)).toBe(false));
+});

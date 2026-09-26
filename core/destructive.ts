@@ -165,7 +165,8 @@ const WORD_RE = new RegExp(
     // package managers — install/remove plus the lockfile/link/upgrade verbs
     /\b(npm|pnpm|yarn|bun|pip|pip3|apt|apt-get|brew|cargo|go|gem|poetry|composer)\s+(install|add|i|ci|remove|uninstall|rm|update|upgrade|link|dlx|prune)\b/,
     /\bnpx\b/,
-    /\bpython3?\s+(-m\s*pip|setup\.py)\b/,
+    // Any python/pypy alias (`python3.12`, `pypy3`), not just the canonical heads.
+    /\b(?:python|pypy)[\d.]*[a-z]?(?:-dbg)?\s+(-m\s*pip|setup\.py)\b/,
     /\bmake\s+install\b/,
     // history-mutating git verbs. Option tokens may sit between `git` and the
     // verb (`git -C /repo reset --hard`, `git -c k=v commit`), so allow them.
@@ -491,15 +492,28 @@ function findDestructiveTokenInternal(cmd: string, depth: number): string | null
   // to it. Rescan each segment's unquoted argv; interpreter and shell program
   // text stays with the language scanners below.
   const argvText = wordScanSegments.map((segment) => {
-    const normalized = normalizeEnvInvocation(tokenizeShellWords(stripShellControlPrefix(segment), ARGV));
+    const clause = stripShellControlPrefix(segment);
+    const normalized = normalizeEnvInvocation(tokenizeShellWords(clause, ARGV));
     if (!normalized.complete || normalized.argv.length === 0) return "";
     const head = normalized.argv[0]!.replace(/^.*\//, "");
     const family = interpreterFamily(head);
-    if (EVAL_INTERPRETERS.has(family) || EVAL_SHELLS.has(head)) return family;
+    // Program text stays with the language scanners; a non-eval interpreter
+    // invocation (`python3.12 setup.py install`) keeps its arguments, under
+    // the canonical head the blocklist is spelled with.
+    if (EVAL_SHELLS.has(head)) return head;
+    if (EVAL_INTERPRETERS.has(family)) {
+      return isEvalInvocation(family, clause) ? family : [family, ...normalized.argv.slice(1)].join(" ");
+    }
     return [head, ...normalized.argv.slice(1)].join(" ");
   }).join(" | ");
   const argvWord = WORD_RE.exec(argvText);
   if (argvWord) return argvWord[0].trim();
+
+  // A shell with no `-c` runs a script file or reads its commands from stdin
+  // (`echo x | bash`, `bash <<< x`, `bash < f`): code we cannot see.
+  for (const segment of segments) {
+    if (shellEvalPayload(stripShellControlPrefix(segment))?.runsScript) return "shell script";
+  }
 
   // Interpreter eval payloads: scan the RAW segment — writer APIs live inside
   // the quotes the sanitizer deliberately preserves words in.

@@ -988,13 +988,73 @@ describe("runPlanTree — async policy checkers and inner shell commands", () =>
     ["timeout 5 /bin/cat .env", ["cat .env"]],
     ["/bin/bash -c 'cat .env'", ["cat .env"]],
     ["/cat .env", ["cat .env"]],
+    ["bash -lc -- 'cat .env'", ["cat .env"]],
+    ["bash -c -- 'cat .env'", ["cat .env"]],
+    ["bash --norc -c 'cat .env'", ["cat .env"]],
+    ["bash --rcfile F -c 'cat .env'", ["cat .env"]],
+    ["/usr/bin/env cat .env", ["cat .env"]],
+    ["env cat .env", ["cat .env"]],
+    ["'/bin/cat' .env", ["cat .env"]],
+    ["\"/bin/cat\" .env", ["cat .env"]],
+    ["\\/bin/cat .env", ["cat .env"]],
     ["FOO=1 /usr/local/bin/cat .env", ["cat .env"]],
   ])("expands %s for the checker", async (command, expected) => {
     const seen: string[] = [];
-    await runPlanTree({ root: "a", nodes: [{ id: "a", commands: [command] }] },
-      { cwd, checkOperationPolicy: (op) => { if (typeof op === "string") seen.push(op); return "stop"; } });
+    // Every variant of `command` is allowed, so all are checked; the trailing
+    // gate operation is denied, so nothing is executed.
+    const r = await runPlanTree({ root: "a", nodes: [{ id: "a", commands: [command, "echo gate"] }] },
+      { cwd, checkOperationPolicy: (op) => { if (typeof op === "string") seen.push(op); return op === "echo gate" ? "gate" : null; } });
+    expect(r.stoppedReason).toBe("policyStop");
     expect(seen[0]).toBe(command);
     for (const inner of expected) expect(seen).toContain(inner);
+  });
+
+  it.each(["bash -lc -- 'cat .env'", "bash -c -- 'cat .env'", "bash --norc -c 'cat .env'", "bash --rcfile F -c 'cat .env'"])(
+    "never hands the checker an option word as the script: %s", async (command) => {
+      const seen: string[] = [];
+      const r = await runPlanTree({ root: "a", nodes: [{ id: "a", commands: [command] }] },
+        { cwd, checkOperationPolicy: (op) => { if (typeof op === "string") seen.push(op); return op === "cat .env" ? "deny" : null; } });
+      expect(seen).not.toContain("--");
+      expect(seen).not.toContain("-c");
+      expect(seen).not.toContain("F");
+      expect(r.stoppedReason).toBe("policyStop");
+    });
+
+  it("passes the abort signal to the checker and races a pending check against it", async () => {
+    const controller = new AbortController();
+    let received: AbortSignal | undefined;
+    let calls = 0;
+    const pending = runPlanTree({ root: "a", nodes: [{ id: "a", commands: ["echo one", "echo two"] }] },
+      {
+        cwd,
+        signal: controller.signal,
+        checkOperationPolicy: (_op, ctx) => {
+          calls++;
+          received = ctx?.signal;
+          return new Promise<null>(() => {});
+        },
+      });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    controller.abort();
+    const r = await pending;
+    expect(r.stoppedReason).toBe("aborted");
+    expect(received).toBe(controller.signal);
+    expect(calls).toBe(1);
+  });
+
+  it("passes cwd and sessionRoot to the checker", async () => {
+    const contexts: unknown[] = [];
+    await runPlanTree({ root: "a", nodes: [{ id: "a", commands: ["echo hi"] }] },
+      { cwd, checkOperationPolicy: (_op, ctx) => (contexts.push({ cwd: ctx?.cwd, sessionRoot: ctx?.sessionRoot }), null) });
+    expect(contexts).toEqual([{ cwd, sessionRoot: cwd }]);
+  });
+
+  it("stops checking an operation's variants after its first verdict, but still checks every operation", async () => {
+    const seen: unknown[] = [];
+    const r = await runPlanTree({ root: "a", nodes: [{ id: "a", commands: ["sh -c 'ls; cat .env'", "echo later"] }] },
+      { cwd, checkOperationPolicy: (op) => { seen.push(op); return op === "sh -c 'ls; cat .env'" ? "deny" : null; } });
+    expect(r.stoppedReason).toBe("policyStop");
+    expect(seen).toEqual(["sh -c 'ls; cat .env'", "echo later"]);
   });
 
   it("expands the command of a bash tool op for the checker", async () => {

@@ -49,6 +49,7 @@ export {
   type Operation,
   type OperationPolicyChecker,
   type PolicyVerdict,
+  type PolicyCheckContext,
   type PlanTree,
   type CoreResult,
   type ToolExecutor,

@@ -20,7 +20,7 @@ import { isAbsolute, relative, resolve, sep } from "node:path";
 import { conditionStringBudget, evaluateConditionWithDetail, isInsideRoot } from "./conditions.ts";
 import { READ_ONLY_TOOLS, MUTATING_TOOLS, findDestructiveToken } from "./destructive.ts";
 import { runNode, isToolOp, formatToolOpLabel } from "./runner.ts";
-import { extractShellCommandClauses, splitCommandSegments, stripLeadingAssignmentsAndWrappers } from "./shell/lexer.ts";
+import { ARGV, extractShellCommandClauses, normalizeEnvInvocation, splitCommandSegments, tokenizeShellWords } from "./shell/lexer.ts";
 import { shellEvalPayload } from "./shell/interpreters.ts";
 import { validateOperation } from "./validation.ts";
 import {
@@ -36,6 +36,8 @@ import {
   type NodeOutput,
   type Operation,
   type OperationPolicyChecker,
+  type PolicyCheckContext,
+  type PolicyVerdict,
   type PlanNode,
   type PlanTree,
   type RunOptions,
@@ -282,20 +284,26 @@ async function findPolicyViolation(
   effectiveCwd: string,
   signal: AbortSignal | undefined,
 ): Promise<{ index: number; command: string; rule: string } | "aborted" | null> {
+  const context: PolicyCheckContext = { cwd: effectiveCwd, sessionRoot, ...(signal ? { signal } : {}) };
   let violation: { index: number; command: string; rule: string } | null = null;
   for (let i = 0; i < node.commands.length; i++) {
     const op = node.commands[i]!;
     const command = isToolOp(op) ? formatToolOpLabel(op) : op;
-    let rule: string | null;
+    let rule: string | null = null;
     try {
       const shell = typeof op === "string" ? op : op.tool === "bash" && typeof op.command === "string" ? op.command : null;
       const checked: Operation[] = [normalizePolicyOperation(op, sessionRoot, effectiveCwd)];
       if (shell !== null) checked.push(...policyShellVariants(shell));
-      rule = null;
       for (const operation of checked) {
         if (signal?.aborted) return "aborted";
-        const verdict = await check(operation);
-        if (verdict && rule === null) rule = verdict;
+        const verdict = await raceAbort(check(operation, context), signal);
+        if (verdict === "aborted") return "aborted";
+        // One verdict decides this operation; further variants would only add
+        // host prompts. Later operations are still checked.
+        if (verdict) {
+          rule = verdict;
+          break;
+        }
       }
     } catch (err) {
       rule = `policy check failed: ${err instanceof Error ? err.message : String(err)}`;
@@ -305,16 +313,42 @@ async function findPolicyViolation(
   return violation;
 }
 
+/** Settle a (possibly async) verdict, or "aborted" as soon as `signal` fires. */
+function raceAbort(verdict: PolicyVerdict | Promise<PolicyVerdict>, signal: AbortSignal | undefined): Promise<PolicyVerdict | "aborted"> {
+  if (!signal) return Promise.resolve(verdict);
+  return new Promise((resolve, reject) => {
+    const onAbort = (): void => resolve("aborted");
+    if (signal.aborted) {
+      // The abandoned check may still reject; that is not this walk's error.
+      Promise.resolve(verdict).catch(() => {});
+      onAbort();
+      return;
+    }
+    signal.addEventListener("abort", onAbort, { once: true });
+    Promise.resolve(verdict).then(
+      (value) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(value);
+      },
+      (err: unknown) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(err);
+      },
+    );
+  });
+}
+
 /** Nesting bound for `sh -c "bash -c '...'"` expansion in policyShellVariants. */
 const MAX_POLICY_SHELL_DEPTH = 8;
 
 /**
  * The extra spellings of one shell command a host policy must also see, so a
  * rule on `cat .env` cannot be sidestepped by wrapping it: every inner clause
- * of a `sh|bash|zsh|dash -c '<script>'` (recursively), and every clause whose
- * effective head is an absolute path, rewritten to the head's basename
- * (`/bin/cat .env` → `cat .env`). The command itself is not included, and
- * nothing is returned for a command with neither form.
+ * of a `sh|bash|zsh|dash -c '<script>'` (recursively), and every clause's
+ * decoded argv form — quotes/escapes removed, leading assignments, `env` and
+ * wrappers dropped, head reduced to its basename (`/usr/bin/env '/bin/cat'
+ * .env` → `cat .env`). The command itself is not included, and nothing is
+ * returned for a command with neither form.
  */
 function policyShellVariants(command: string): string[] {
   const variants: string[] = [];
@@ -329,8 +363,8 @@ function policyShellVariants(command: string): string[] {
   const visit = (text: string, depth: number): void => {
     for (const segment of splitCommandSegments(text)) {
       for (const clause of new Set([segment, ...extractShellCommandClauses(segment)])) {
-        const basenameForm = absoluteHeadAsBasename(clause);
-        if (basenameForm !== null) add(basenameForm);
+        const argvForm = decodedArgvForm(clause);
+        if (argvForm !== null) add(argvForm);
         const shell = shellEvalPayload(clause);
         if (shell?.payload == null || depth >= MAX_POLICY_SHELL_DEPTH) continue;
         for (const inner of splitCommandSegments(shell.payload)) {
@@ -344,12 +378,25 @@ function policyShellVariants(command: string): string[] {
   return variants;
 }
 
-/** `[wrappers] /abs/path/head args` → `head args`; null when the head is not an unquoted absolute path. */
-function absoluteHeadAsBasename(clause: string): string | null {
-  const stripped = stripLeadingAssignmentsAndWrappers(clause.trim());
-  const head = /^\/[^\s'"\\]*(?=\s|$)/.exec(stripped)?.[0];
-  const base = head?.slice(head.lastIndexOf("/") + 1);
-  return head && base ? base + stripped.slice(head.length) : null;
+/** Quote an argv word for a host policy's shell-text matcher. */
+function quotePolicyWord(word: string): string {
+  return /^[A-Za-z0-9_@%+=:,./{}-]+$/.test(word) ? word : `'${word.replace(/'/g, `'\\''`)}'`;
+}
+
+/**
+ * The clause as its effective command, `head args` with the head's basename,
+ * when that differs from how it is spelled (an absolute, quoted or escaped
+ * head, or leading assignments/`env`/wrappers); null otherwise.
+ */
+function decodedArgvForm(clause: string): string | null {
+  const trimmed = clause.trim();
+  const normalized = normalizeEnvInvocation(tokenizeShellWords(trimmed, ARGV));
+  if (!normalized.complete || normalized.argv.length === 0) return null;
+  const head = normalized.argv[0]!;
+  const base = head.replace(/^.*\//, "");
+  if (!base) return null;
+  if (head === base && trimmed.split(/\s/, 1)[0] === base) return null;
+  return [base, ...normalized.argv.slice(1)].map(quotePolicyWord).join(" ");
 }
 
 /** Map native relative targets to the session-root namespace used by hosts. */

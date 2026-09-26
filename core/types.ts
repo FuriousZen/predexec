@@ -20,11 +20,23 @@ export interface ToolOp {
 export type Operation = string | ToolOp;
 /** A host-policy verdict: the matched rule/pattern when the host would deny or prompt, null to run. */
 export type PolicyVerdict = string | null;
+/** What the engine tells a policy checker about the walk it is checking for. */
+export interface PolicyCheckContext {
+  /** The node's effective working directory (plan `cwd` resolved against the session root). */
+  cwd: string;
+  /** The session root (`RunOptions.cwd`). */
+  sessionRoot: string;
+  /** The run's abort signal; the engine also races a pending check against it. */
+  signal?: AbortSignal;
+}
 /**
  * Adapter-provided host-policy check for every operation in a node batch. It
  * may answer asynchronously (a host permission bridge); the engine awaits it.
  */
-export type OperationPolicyChecker = (operation: Operation) => PolicyVerdict | Promise<PolicyVerdict>;
+export type OperationPolicyChecker = (
+  operation: Operation,
+  context: PolicyCheckContext,
+) => PolicyVerdict | Promise<PolicyVerdict>;
 
 export interface PlanNode {
   id: NodeId;

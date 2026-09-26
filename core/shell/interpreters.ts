@@ -551,46 +551,93 @@ export function languageWordScanSegment(head: string, segment: string): string {
   return view === null ? segment : `${head} ${view}`;
 }
 interface ShellEvalPayload {
+  /** The static `-c` script, or null when there is none or it cannot be known. */
   payload: string | null;
+  /** The invocation could not be parsed with confidence (fail closed). */
   ambiguous: boolean;
+  /** No `-c`: the shell runs a script file or reads commands from stdin. */
+  runsScript: boolean;
 }
 
-/** Extract a static `-c` payload from an actual shell invocation, through wrappers. */
+interface ShellArgvWord {
+  value: string;
+  dynamic: boolean;
+}
+
+/** Shell long options that take no argument (bash's documented set). */
+const SHELL_LONG_OPTIONS: ReadonlySet<string> = new Set([
+  "--norc", "--noprofile", "--login", "--posix", "--noediting", "--restricted", "--verbose", "--protected", "--debugger",
+]);
+/** Shell long options whose argument is the next word (or attached with `=`). */
+const SHELL_LONG_OPTIONS_WITH_ARGUMENT: ReadonlySet<string> = new Set(["--rcfile", "--init-file"]);
+/** Options that print and exit without running any commands. */
+const SHELL_INFO_OPTIONS: ReadonlySet<string> = new Set(["--version", "--help"]);
+
+const AMBIGUOUS_SHELL: ShellEvalPayload = { payload: null, ambiguous: true, runsScript: false };
+
+/**
+ * Parse a shell's argv (after the head) the way sh/bash/zsh/dash do: option
+ * words until `--`, `-`, or the first operand. Short clusters (`-lc`, `-eo`,
+ * `+O`) set `c` (command mode) and consume one following word per `o`/`O`;
+ * `--rcfile`/`--init-file` consume theirs. In command mode the first operand
+ * is the script; `bash -c -- 'x'` runs `x`. Any other long or malformed option
+ * is ambiguous: guessing its arity is how a script hid behind `--norc`.
+ */
+function parseShellArgv(words: readonly ShellArgvWord[]): ShellEvalPayload | null {
+  let command = false;
+  let i = 0;
+  for (; i < words.length; i++) {
+    const { value, dynamic } = words[i]!;
+    if (dynamic) return AMBIGUOUS_SHELL;
+    if (value === "--" || value === "-") {
+      i++;
+      break;
+    }
+    if (SHELL_INFO_OPTIONS.has(value)) return null;
+    if (value.startsWith("--")) {
+      if (SHELL_LONG_OPTIONS.has(value)) continue;
+      const attached = value.indexOf("=");
+      if (SHELL_LONG_OPTIONS_WITH_ARGUMENT.has(attached === -1 ? value : value.slice(0, attached))) {
+        if (attached === -1) i++;
+        continue;
+      }
+      return AMBIGUOUS_SHELL;
+    }
+    if (/^[-+][A-Za-z]+$/.test(value)) {
+      for (const letter of value.slice(1)) {
+        if (letter === "c") command = true;
+        else if (letter === "o" || letter === "O") i++;
+      }
+      continue;
+    }
+    if (/^[-+]/.test(value)) return AMBIGUOUS_SHELL;
+    break;
+  }
+  if (!command) return { payload: null, ambiguous: false, runsScript: true };
+  const operand = words[i];
+  if (!operand || operand.dynamic || operand.value.length > MAX_LANGUAGE_ARGUMENT_LENGTH) return AMBIGUOUS_SHELL;
+  return { payload: operand.value, ambiguous: false, runsScript: false };
+}
+
+/**
+ * Parse an actual shell invocation, through wrappers: its static `-c` script,
+ * or whether it runs a script file / stdin. Null when the segment is not a
+ * shell invocation or only prints information (`bash --version`).
+ */
 export function shellEvalPayload(segment: string): ShellEvalPayload | null {
   const parsed = lexShellWords(segment);
   if (!parsed.complete) return null;
   const tokens = parsed.words.map((word) => word.value);
   const normalized = normalizeEnvInvocation(tokens);
-  if (!normalized.complete) return { payload: null, ambiguous: true };
+  if (!normalized.complete) return AMBIGUOUS_SHELL;
   if (normalized.argv.length === 0) return null;
-  const index = 0;
-  const head = normalized.argv[index]!.replace(/^.*\//, "");
+  const head = normalized.argv[0]!.replace(/^.*\//, "");
   if (!EVAL_SHELLS.has(head)) return null;
 
+  // Prefer the raw words: they carry whether each one is dynamic.
   const rawHeadIndex = tokens.findIndex((token) => token.replace(/^.*\//, "") === head);
-  if (rawHeadIndex >= 0) {
-    for (let i = rawHeadIndex + 1; i < tokens.length; i++) {
-      const token = tokens[i]!;
-      if (token === "--") break;
-      if (token !== "-c" && !/^-[-\w]*c[^-]*$/.test(token)) continue;
-      const argument = parsed.words[i + 1];
-      if (!argument || argument.dynamic) return { payload: null, ambiguous: true };
-      if (argument.value.length > MAX_LANGUAGE_ARGUMENT_LENGTH) return { payload: null, ambiguous: true };
-      return { payload: argument.value, ambiguous: false };
-    }
-    return null;
-  }
-
-  for (let i = index + 1; i < normalized.argv.length; i++) {
-    const token = normalized.argv[i]!;
-    if (token === "--") break;
-    if (token !== "-c" && !/^-[^-]*c[^-]*$/.test(token)) continue;
-    const argument = normalized.argv[i + 1];
-    if (!argument || /[$`]/.test(argument)) return { payload: null, ambiguous: true };
-    if (argument.length > MAX_LANGUAGE_ARGUMENT_LENGTH) return { payload: null, ambiguous: true };
-    return { payload: argument, ambiguous: false };
-  }
-  return null;
+  if (rawHeadIndex >= 0) return parseShellArgv(parsed.words.slice(rawHeadIndex + 1));
+  return parseShellArgv(normalized.argv.slice(1).map((value) => ({ value, dynamic: /[$`]/.test(value) })));
 }
 
 /**
