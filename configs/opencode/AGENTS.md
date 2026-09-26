@@ -1,4 +1,16 @@
-# predexec routing
+# predexec routing (manual fallback)
+
+**Most installs don't need this file.** The predexec opencode plugin registers its
+packaged skill automatically, via opencode's `config` hook appending to
+`skills.paths` — `predexec` shows up in the model's skill list with no manual step.
+
+Use this drop-in block only when:
+- an agent's `tools.skill:false` or a `permission.skill` deny rule hides skills from it
+  entirely (the plugin's guarded system-prompt fallback covers this case too, but this
+  file gives you the exact wording under your own control), or
+- your opencode version/host doesn't pick up the config-hook registration (see
+  `docs/research/opencode-skills.md` for what was actually measured), or
+- you want the routing text without installing the plugin at all.
 
 Drop this block into your project's `AGENTS.md` (or `CLAUDE.md`) so opencode loads the
 predexec routing rule natively. When present, the predexec plugin detects it (a quorum

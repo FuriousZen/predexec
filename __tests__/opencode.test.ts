@@ -1,6 +1,7 @@
 import { mkdirSync, mkdtempSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 // `server` is accessed through the default export (`plugin.server`), not as a
 // named import: that mirrors what current opencode loaders (readV1Plugin)
@@ -19,7 +20,7 @@ import {
   type ToolOp,
 } from "../core/index.ts";
 import { PLAN_SHAPE_DESCRIPTION } from "../plan-language.ts";
-import { STEERING_LINE } from "../steering.ts";
+import { renderSkill, STEERING_LINE } from "../steering.ts";
 
 // read/ls pre-check path existence against the cwd, so mocked-client tests
 // need a real directory with the paths their ops name.
@@ -72,6 +73,47 @@ describe.each(variants)("opencode plugin ($name) — loader contract", ({ plugin
     expect(def.args.plan._zod?.def).toBeDefined();
     expect(typeof (hooks as any)["experimental.chat.system.transform"]).toBe("function");
     expect(typeof (hooks as any)["tool.execute.after"]).toBe("function");
+    expect(typeof (hooks as any).config).toBe("function");
+  });
+});
+
+describe.each(variants)("opencode plugin ($name) — packaged skill registration via config hook", ({ plugin }) => {
+  // Repo root, computed independently of the plugin's own import.meta.url
+  // walk (which locates package.json by name rather than a fixed `..`
+  // count) — the test asserts on the RESULT the hook produces, not by
+  // mirroring that resolution logic.
+  const repoRoot = fileURLToPath(new URL("..", import.meta.url));
+  const packagedSkillDir = join(repoRoot, "skills", "opencode");
+
+  it("appends the packaged skills/opencode absolute path to cfg.skills.paths", async () => {
+    const hooks = await plugin.server({ client: {} } as any);
+    const cfg: any = {};
+    await (hooks as any).config(cfg);
+    expect(cfg.skills?.paths).toContain(packagedSkillDir);
+  });
+
+  it("preserves pre-existing skills.paths entries", async () => {
+    const hooks = await plugin.server({ client: {} } as any);
+    const cfg: any = { skills: { paths: ["/existing/one"] } };
+    await (hooks as any).config(cfg);
+    expect(cfg.skills.paths).toEqual(["/existing/one", packagedSkillDir]);
+  });
+
+  it("is idempotent — calling config twice does not duplicate the entry", async () => {
+    const hooks = await plugin.server({ client: {} } as any);
+    const cfg: any = {};
+    await (hooks as any).config(cfg);
+    await (hooks as any).config(cfg);
+    expect(cfg.skills.paths.filter((p: string) => p === packagedSkillDir)).toHaveLength(1);
+  });
+
+  it("does not disturb unrelated cfg fields", async () => {
+    const hooks = await plugin.server({ client: {} } as any);
+    const cfg: any = { plugin: ["predexec"], skills: { urls: ["https://example.invalid"] } };
+    await (hooks as any).config(cfg);
+    expect(cfg.plugin).toEqual(["predexec"]);
+    expect(cfg.skills.urls).toEqual(["https://example.invalid"]);
+    expect(cfg.skills.paths).toContain(packagedSkillDir);
   });
 });
 
@@ -849,5 +891,40 @@ describe.each(variants)("opencode plugin ($name) — system.transform no-op for 
   it("treats an empty-string sessionID the same as absent", async () => {
     const output = await transform({ sessionID: "", model: { id: "m" } });
     expect(output.system).toEqual(["existing system prompt"]);
+  });
+});
+
+describe.each(variants)("opencode plugin ($name) — system.transform defers to the packaged skill", ({ plugin }) => {
+  // Simulates the real <available_skills> block opencode's own system prompt
+  // builder renders once the config-hook-registered skill is discovered
+  // (skill/index.ts fmt(), verbose mode: name + description + location only —
+  // see session/system.ts:107-118). The quorum check must recognize predexec's
+  // OWN generated skill description as routing instructions already present,
+  // not just a hand-written AGENTS.md block.
+  const skillDescription = (() => {
+    const match = renderSkill("opencode").match(/^description: (.+)$/m);
+    if (!match) throw new Error("opencode SKILL.md is missing a description frontmatter line");
+    return match[1];
+  })();
+
+  it("skips injection when the system prompt already carries the generated <available_skills> description", async () => {
+    const hooks = await plugin.server({ client: {} } as any);
+    const output = {
+      system: [
+        "<available_skills>\n" +
+          "  <skill>\n" +
+          "    <name>predexec</name>\n" +
+          `    <description>${skillDescription}</description>\n` +
+          "    <location>/wherever/skills/opencode/predexec/SKILL.md</location>\n" +
+          "  </skill>\n" +
+          "</available_skills>",
+      ],
+    };
+    await (hooks as any)["experimental.chat.system.transform"]({ sessionID: "ses_1", model: { id: "m" } }, output);
+    // SKILL_DESCRIPTION is built FROM STEERING_LINE (it's a literal prefix of
+    // it), so asserting on substring absence would be trivially wrong here —
+    // the array staying at length 1 (nothing pushed) is the real assertion
+    // that injection was skipped.
+    expect(output.system).toHaveLength(1);
   });
 });

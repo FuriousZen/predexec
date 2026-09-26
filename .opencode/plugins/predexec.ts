@@ -18,6 +18,14 @@
  * host does not provide that package at import time) — the `Plugin`/`ToolContext`
  * shapes this file needs are declared locally below.
  *
+ * Skill delivery: the `config` hook registers the packaged
+ * `skills/opencode/predexec/SKILL.md` with the host by appending its absolute
+ * directory to `cfg.skills.paths` (see registerPackagedSkill below) — no
+ * manual `install-skill opencode` step needed. The `experimental.chat.system.
+ * transform` injection stays as a fallback for agents that can't see skills at
+ * all (`tools.skill:false` / a `permission.skill` deny rule) or hosts where
+ * the config hook doesn't take effect.
+ *
  * Permissions (opencode-only behavior change): when opencode hands the tool
  * `context.ask` — its real permission service (`@opencode-ai/plugin@1.18.32`
  * `src/tool.ts:19`, bridged in opencode `tool/registry.ts:143-153`) — every
@@ -31,8 +39,9 @@
  * cannot prompt mid-walk and keep hard-stopping on ask.
  */
 
-import { existsSync, realpathSync, statSync } from "node:fs";
-import { isAbsolute, relative, resolve, sep } from "node:path";
+import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import {
   isDestructiveCommand,
@@ -96,7 +105,19 @@ type PluginHooks = {
     input: { tool: string; args?: { command?: string } },
     output: { output: string },
   ) => Promise<void>;
+  /**
+   * opencode calls every hook's `config(cfg)` with the SAME live config
+   * object skill discovery later reads (not a copy) — see the
+   * `registerPackagedSkill` doc comment below for the file:line evidence.
+   * Loosely typed to the one field this hook touches; `Record<string,
+   * unknown>` covers the rest of the real (much larger) Config shape this
+   * file has no reason to model.
+   */
+  config: (cfg: OpencodeConfigLike) => Promise<void> | void;
 };
+
+/** The slice of opencode's Config shape `registerPackagedSkill` reads/writes. */
+type OpencodeConfigLike = { skills?: { paths?: string[] } } & Record<string, unknown>;
 
 type Plugin = (input: { client: unknown }) => Promise<PluginHooks>;
 
@@ -152,6 +173,76 @@ function realpathOrNull(p: string): string | null {
 
 const errText = (e: unknown): string =>
   typeof e === "string" ? e : e instanceof Error ? e.message : JSON.stringify(e);
+
+/**
+ * Walks up from `startDir` to the nearest ancestor directory whose
+ * `package.json` declares `"name": "predexec"`, rather than counting a fixed
+ * number of `..` segments. This file lives at `.opencode/plugins/predexec.ts`
+ * in a source checkout (package root two levels up) but at
+ * `dist/.opencode/plugins/predexec.js` in an npm install (package root three
+ * levels up) — a fixed-depth relative path silently breaks the moment either
+ * layout changes; resolving by content is layout-independent.
+ */
+function findPackageRoot(startDir: string): string | null {
+  let dir = startDir;
+  for (;;) {
+    try {
+      const pkg = JSON.parse(readFileSync(join(dir, "package.json"), "utf8"));
+      if (pkg && pkg.name === "predexec") return dir;
+    } catch {
+      // No package.json at this level, or it's unreadable/malformed — keep walking up.
+    }
+    const parent = dirname(dir);
+    if (parent === dir) return null; // reached the filesystem root without a match
+    dir = parent;
+  }
+}
+
+/**
+ * Absolute path to the packaged opencode skill directory (`skills/opencode`,
+ * containing `predexec/SKILL.md`), or null if the package root couldn't be
+ * located or the directory doesn't exist on disk. Computed once at module
+ * load — this file's own location never changes at runtime.
+ */
+const PACKAGED_OPENCODE_SKILL_DIR: string | null = (() => {
+  const root = findPackageRoot(dirname(fileURLToPath(import.meta.url)));
+  if (!root) return null;
+  const dir = join(root, "skills", "opencode");
+  return existsSync(dir) ? dir : null;
+})();
+
+/**
+ * Registers the packaged opencode skill (`skills/opencode/predexec/SKILL.md`)
+ * with the host by appending its absolute directory to `cfg.skills.paths`,
+ * which opencode scans as a bare `**\/SKILL.md` glob — no `.opencode`/`.claude`
+ * scoping applies to `skills.paths` entries (opencode 1.18.32
+ * `packages/opencode/src/skill/index.ts:211-219`: `SKILL_PATTERN = "**\/SKILL.md"`
+ * applied to each `cfg.skills?.paths` entry, absolute or relative-to-directory).
+ *
+ * This is safe to call from the `config` hook specifically because opencode's
+ * plugin loader hands every hook's `config(cfg)` the SAME config object
+ * (`packages/opencode/src/plugin/index.ts:152,245-253`: one `cfg =
+ * yield* config.get()` is captured once and reused for every `hook.config?.(cfg)`
+ * call) that lazy skill discovery reads later via its own `config.get()`
+ * (`skill/index.ts:210-220`) — both resolve through `Config.Service`'s single
+ * per-instance `InstanceState`, which memoizes `s.config` rather than
+ * recomputing it, so the two calls return the identical object. Mutating it
+ * here is the host's own documented mechanism: `project/bootstrap.ts:36-38`
+ * runs `plugin.init()` (which triggers this hook) BEFORE any other service —
+ * skill discovery included, which is itself lazy and materializes even later,
+ * on first use — initializes, with the comment "Plugin can mutate config so
+ * it has to be initialized before anything else."
+ *
+ * Idempotent (checked by identity of the computed path) and additive: a
+ * project's own `skills.paths` entries, and any array a plugin loaded earlier
+ * already added, are preserved rather than replaced.
+ */
+function registerPackagedSkill(cfg: OpencodeConfigLike): void {
+  if (!PACKAGED_OPENCODE_SKILL_DIR) return;
+  const skills = (cfg.skills ??= {});
+  const paths = (skills.paths ??= []);
+  if (!paths.includes(PACKAGED_OPENCODE_SKILL_DIR)) paths.push(PACKAGED_OPENCODE_SKILL_DIR);
+}
 
 /**
  * Maps a predexec tool op to an opencode SDK call, normalizing the response to
@@ -486,10 +577,27 @@ const server: Plugin = async ({ client }) => ({
     },
   },
 
-  // opencode has no native plugin-skill loader (unlike pi's `pi.skills`), so we
-  // inject the routing line here — but only as a guarded fallback. When the host
-  // already carries the rule (e.g. a project AGENTS.md/CLAUDE.md with the same
-  // block — see configs/opencode/AGENTS.md), we stay silent to avoid duplication.
+  // Ships the packaged opencode skill (skills/opencode/predexec/SKILL.md) by
+  // registering it with the host directly, rather than relying solely on a
+  // manual `install-skill opencode` copy or a hand-authored AGENTS.md block —
+  // see registerPackagedSkill's doc comment for how and why this is safe.
+  config: (cfg) => {
+    registerPackagedSkill(cfg);
+  },
+
+  // Unlike pi's `pi.skills`, a config-hook-registered skill is not a GUARANTEE
+  // the model ever sees it: an agent with `tools.skill:false` or a
+  // `permission.skill` deny rule gets no skill text in its system prompt at
+  // all (session/system.ts:107-108 in opencode 1.18.32 — the whole `skills`
+  // section returns early on `Permission.disabled(["skill"], ...)`). This
+  // system-prompt injection is the fallback for exactly that case (and for
+  // hosts where the config hook doesn't take effect at all — see
+  // docs/research/opencode-skills.md). When the host already carries the rule
+  // — either via the registered skill's own `<available_skills>` description
+  // (systemHasRoutingInstructions' quorum hits on OUR OWN generated
+  // SKILL_DESCRIPTION text just as it would on a hand-written AGENTS.md/
+  // CLAUDE.md block — see configs/opencode/AGENTS.md) — we stay silent to
+  // avoid duplication.
   //
   // opencode 1.18.32 fires this hook from exactly two call sites, and their
   // payloads are the only signal available to tell them apart:

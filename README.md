@@ -175,8 +175,16 @@ If `predexec` is missing from the list, the plugin was **silently skipped** — 
 plugin load failures only as internal session events, so this curl is the reliable check.
 Then, in a session, try the prompt under [A prompt to see it work](#a-prompt-to-see-it-work).
 
-The plugin injects a one-line routing rule into the system prompt as a **guarded fallback**.
-To steer declaratively instead, copy the routing block into your project's `AGENTS.md`:
+The plugin ships its own routing skill (`skills/opencode/predexec/SKILL.md`) automatically:
+its `config` hook appends the packaged skill directory's absolute path to `skills.paths`
+on opencode's live config object, so `predexec` shows up in the model's skill list with no
+`install-skill` step. It also injects a one-line routing rule into the system prompt as a
+**guarded fallback**, for an agent whose `tools.skill:false` or a `permission.skill` deny
+rule hides skills entirely, or for a host/version where the config hook doesn't take effect
+(see `docs/research/opencode-skills.md`).
+
+To steer declaratively instead — or as a fallback for either case above — copy the routing
+block into your project's `AGENTS.md`:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/FuriousZen/predexec/main/configs/opencode/AGENTS.md -o AGENTS.md
@@ -416,7 +424,9 @@ installed skill are both active (harmless — the routing text just loads twice)
 duplicate copies of the same skill across two discovery roots are `info`, not `[!]`.
 
 `install-skill` copies the packaged skill for one harness into that host's own skill directory
-(pi needs no such step — it loads the skill straight out of the installed package):
+(pi needs no such step — it loads the skill straight out of the installed package; opencode
+needs no such step either — its plugin registers the packaged skill itself via a `config`
+hook, so `install-skill opencode` is a manual fallback for hosts where that doesn't apply):
 
 | harness | `--project` off (global) | `--project` |
 | :-- | :-- | :-- |
