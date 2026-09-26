@@ -1898,3 +1898,33 @@ describe("shell invocation grammar and stdin-fed shells (task 7 review)", () => 
     `python3.12 -m json.tool f`,
   ])("read-only: %s", (c) => expect(isDestructiveCommand(c)).toBe(false));
 });
+
+// Task 7 fix round 2 (R24): every POSIX-ish and non-POSIX shell, and the
+// busybox/toybox multicall forms, parse their -c script like sh/bash.
+describe("extended shell family and multicall binaries (task 7 R24)", () => {
+  const shells = [
+    "ksh", "ksh93", "mksh", "pdksh", "oksh", "yash", "posh", "ash", "csh", "tcsh", "fish", "rbash",
+    "busybox sh", "busybox ash", "busybox hush", "toybox sh", "/bin/busybox sh",
+  ];
+  it.each(shells.flatMap((shell) => [
+    `${shell} -c 'echo hi > out.txt'`,
+    `${shell} -c 'rm x'`,
+    `${shell}`,
+    `echo ls | ${shell}`,
+    `${shell} script.sh`,
+  ]))("mutating: %s", (c) => expect(isDestructiveCommand(c)).toBe(true));
+
+  it.each(shells.map((shell) => `${shell} -c 'ls'`))("read-only: %s", (c) => expect(isDestructiveCommand(c)).toBe(false));
+
+  it.each([
+    `fish --command='echo hi > out.txt'`,
+    `fish --command 'echo hi > out.txt'`,
+    `busybox rm x`,
+    `busybox r\\m x`,
+    `toybox rm x`,
+    `busybox sh -c -- 'echo hi > out.txt'`,
+  ])("mutating: %s", (c) => expect(isDestructiveCommand(c)).toBe(true));
+
+  it.each([`fish --command='ls'`, `fish --command 'ls'`, `busybox cat f`, `busybox ls`])(
+    "read-only: %s", (c) => expect(isDestructiveCommand(c)).toBe(false));
+});

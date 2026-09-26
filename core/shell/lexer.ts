@@ -1540,6 +1540,9 @@ export function parenthesizedBodies(command: string): string[] {
  */
 export const WRAPPERS: ReadonlySet<string> = new Set([
   "time", "nice", "nohup", "command", "builtin", "xargs", "env", "timeout", "stdbuf", "noglob",
+  // Multicall binaries: `busybox rm x` runs the `rm` applet, so the applet
+  // word is the effective head.
+  "busybox", "toybox",
 ]);
 
 /** Wrappers that take one positional argument (a duration) before the command. */

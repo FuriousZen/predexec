@@ -25,7 +25,16 @@ import {
 
 /** Interpreters whose `-e`/`-c`/`--eval` payload is executable code, not data. */
 export const EVAL_INTERPRETERS = new Set(["node", "deno", "bun", "python", "python3", "ruby", "perl", "php"]);
-export const EVAL_SHELLS = new Set(["sh", "bash", "zsh", "dash"]);
+/**
+ * Shells whose `-c` argument is a script and which otherwise run a script file
+ * or stdin. Not just sh/bash/zsh/dash: `ksh -c 'echo x > f'` hid its write
+ * from every screen. Multicall `busybox`/`toybox` is a wrapper (lexer.ts), so
+ * `busybox sh` resolves to `sh` here.
+ */
+export const EVAL_SHELLS = new Set([
+  "sh", "bash", "rbash", "zsh", "dash", "ash", "hush", "ksh", "ksh93", "mksh", "pdksh", "oksh", "yash", "posh",
+  "csh", "tcsh", "fish",
+]);
 
 /**
  * Versioned and distro-alias interpreter executables (`python3.12`,
@@ -596,6 +605,12 @@ function parseShellArgv(words: readonly ShellArgvWord[]): ShellEvalPayload | nul
     if (SHELL_INFO_OPTIONS.has(value)) return null;
     if (value.startsWith("--")) {
       if (SHELL_LONG_OPTIONS.has(value)) continue;
+      // fish spells -c as `--command SCRIPT` / `--command=SCRIPT`.
+      if (value === "--command" || value.startsWith("--command=")) {
+        const script = value === "--command" ? words[i + 1] : { value: value.slice("--command=".length), dynamic: false };
+        if (!script || script.dynamic || script.value.length > MAX_LANGUAGE_ARGUMENT_LENGTH) return AMBIGUOUS_SHELL;
+        return { payload: script.value, ambiguous: false, runsScript: false };
+      }
       const attached = value.indexOf("=");
       if (SHELL_LONG_OPTIONS_WITH_ARGUMENT.has(attached === -1 ? value : value.slice(0, attached))) {
         if (attached === -1) i++;

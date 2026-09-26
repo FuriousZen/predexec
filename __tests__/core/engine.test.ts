@@ -1020,6 +1020,15 @@ describe("runPlanTree — async policy checkers and inner shell commands", () =>
       expect(r.stoppedReason).toBe("policyStop");
     });
 
+  it.each(["ksh -c 'cat .env'", "busybox sh -c 'cat .env'", "fish --command='cat .env'", "tcsh -c 'cat .env'", "busybox cat .env"])(
+    "a denied inner command stops under %s", async (command) => {
+      const seen: string[] = [];
+      const r = await runPlanTree({ root: "a", nodes: [{ id: "a", commands: [command] }] },
+        { cwd, checkOperationPolicy: (op) => { if (typeof op === "string") seen.push(op); return op === "cat .env" ? "deny" : null; } });
+      expect(seen).toContain("cat .env");
+      expect(r.stoppedReason).toBe("policyStop");
+    });
+
   it("passes the abort signal to the checker and races a pending check against it", async () => {
     const controller = new AbortController();
     let received: AbortSignal | undefined;
