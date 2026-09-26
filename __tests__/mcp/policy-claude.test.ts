@@ -775,6 +775,19 @@ describe("Claude Read rules — tool ops and shell readers", () => {
     // jq's --rawfile/--slurpfile FILE is read even though a filter follows.
     ["jq --rawfile x .env -n 1"],
     ["jq --slurpfile x .env -n 1"],
+    // Final review minor #5: more readers that print a named file.
+    ["paste .env"],
+    ["paste -d, README.md .env"],
+    ["comm .env README.md"],
+    ["join -t, README.md .env"],
+    ["look TOKEN .env"],
+    ["pr .env"],
+    ["pr -h title .env"],
+    ["iconv -f utf-8 -t ascii .env"],
+    ["perl -ne print .env"],
+    ["perl -pe 1 .env"],
+    ["perl -lane 'print $F[0]' .env"],
+    ["perl -n -e print .env"],
   ])("Read(./.env) deny hard-stops the shell read `%s`", async (command) => {
     const { repo, check } = setup({ deny: ["Read(./.env)"] });
     const r = await run(repo, check, [command]);
@@ -789,6 +802,9 @@ describe("Claude Read rules — tool ops and shell readers", () => {
     ["awk '{print $1}' README.md"],
     ["cat {README,x}.md 2>/dev/null || true"],
     ["jq .env README.md 2>/dev/null || true"],
+    ["look .env README.md 2>/dev/null || true"],
+    ["paste -d .env README.md"],
+    ["perl -ne print README.md"],
   ])("a Read(./.env) deny still runs the unrelated shell read `%s`", async (command) => {
     const { repo, check } = setup({ deny: ["Read(./.env)"] });
     const r = await run(repo, check, [command]);

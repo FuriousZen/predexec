@@ -740,9 +740,10 @@ const SHELL_READERS = new Set([
   // file. `tee` is deliberately absent — it reads stdin; its FILE args are
   // written, which is Edit's business (and a mutation stop here).
   "diff", "cmp", "base64", "strings", "hexdump", "bat", "jq", "yq",
+  "paste", "comm", "join", "look", "pr", "iconv",
 ]);
 /** Readers whose first operand is a script/pattern/filter unless one is given by option. */
-const SCRIPT_FIRST = new Set(["sed", "awk", "grep", "rg", "jq", "yq"]);
+const SCRIPT_FIRST = new Set(["sed", "awk", "grep", "rg", "jq", "yq", "look"]);
 /** yq v4 subcommands that may precede the expression. */
 const YQ_SUBCOMMANDS = new Set(["eval", "e", "eval-all", "ea"]);
 /** Options taking TWO values; `file` says whether the second is a file the command reads. */
@@ -791,6 +792,12 @@ const VALUE_OPTIONS: Record<string, ReadonlySet<string>> = {
   bat: new Set(["-l", "-r", "-H", "-m", "--language", "--line-range", "--highlight-line", "--map-syntax", "--theme", "--style"]),
   jq: new Set(["--indent", "--tab-width"]),
   yq: new Set(["-p", "-o", "-I", "--input-format", "--output-format", "--indent"]),
+  paste: new Set(["-d", "--delimiters"]),
+  join: new Set(["-t", "-1", "-2", "-j", "-o", "-e", "-a", "-v"]),
+  comm: new Set(["--output-delimiter"]),
+  look: new Set(["-t"]),
+  pr: new Set(["-h", "--header", "-o", "-w", "-W", "-l", "-N"]),
+  iconv: new Set(["-f", "-t", "-o", "--from-code", "--to-code", "--output"]),
 };
 
 const INPUT_REDIRECT_RE = /^\d*<(?!<|&|\()>?(.*)$/s;
@@ -841,6 +848,7 @@ function shellReadOperands(command: string): { operands: RawWord[]; afterCd: boo
         const head = argv[0] === undefined ? "" : basename(argv[0].value);
         if (head === "cd" || head === "pushd") afterCd = true;
         if (SHELL_READERS.has(head)) operands.push(...readerOperands(head, argv.slice(1)));
+        else if (head === "perl") operands.push(...perlLoopOperands(argv.slice(1)));
       }
     }
   }
@@ -887,6 +895,41 @@ function readerOperands(head: string, args: readonly RawWord[]): RawWord[] {
   if (head === "yq" && YQ_SUBCOMMANDS.has(out[0]?.value ?? "")) out.shift();
   if (SCRIPT_FIRST.has(head) && !scriptGiven) out.shift();
   return [...optionFiles, ...out];
+}
+
+/** perl switches whose value is the rest of the cluster (`-Mmod`, `-Idir`, `-i.bak`, `-F:`). */
+const PERL_ATTACHED_VALUE = new Set(["M", "m", "I", "i", "x", "d", "D", "C", "F"]);
+
+/**
+ * File operands of `perl -n`/`-p` (and `-a`/`-F`, which imply `-n`): the
+ * implicit `while (<>)` loop reads every operand. Without `-e`/`-E` the first
+ * operand is the program file, which perl also reads. Other perl invocations
+ * are not treated as readers.
+ */
+function perlLoopOperands(args: readonly RawWord[]): RawWord[] {
+  let loop = false;
+  let i = 0;
+  for (; i < args.length; i++) {
+    const arg = args[i]!.value;
+    if (arg === "--") { i++; break; }
+    if (!arg.startsWith("-") || arg === "-") break;
+    for (let j = 1; j < arg.length; j++) {
+      const letter = arg[j]!;
+      if (letter === "n" || letter === "p" || letter === "a") loop = true;
+      if (letter === "e" || letter === "E") {
+        if (j === arg.length - 1) i++; // the program is the next word
+        break;
+      }
+      if (letter === "F") loop = true;
+      if (PERL_ATTACHED_VALUE.has(letter)) break;
+      // `-l[octal]` and `-0[octal|xHEX]` take only digits; switches may follow (`-lane`).
+      if (letter === "l" || letter === "0") {
+        const digits = /^(?:x[0-9A-Fa-f]*|[0-7]*)/.exec(arg.slice(j + 1))![0];
+        j += letter === "l" && digits.startsWith("x") ? 0 : digits.length;
+      }
+    }
+  }
+  return loop ? args.slice(i) : [];
 }
 
 /** Most words one operand's brace expansion may produce before it counts as unresolvable. */

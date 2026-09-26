@@ -85,3 +85,43 @@ describe("read-only heads that write or exec (CORE-1)", () => {
   it.each(SAFE)("read-only: %s", (c) => expect(isDestructiveCommand(c)).toBe(false));
   it.each(MORE_SAFE)("read-only: %s", (c) => expect(isDestructiveCommand(c)).toBe(false));
 });
+
+// Final review minor #4: ordinary writers the blocklist missed. Each extracts,
+// creates, rewrites or records a file; their list/test/stdout modes only read.
+const WRITER_ESCAPES = [
+  // tar: create/extract/update/append modes, old-style bundles and long forms
+  "tar xf a.tar", "tar xvf a.tar", "tar -xf a.tar", "tar -xzf a.tgz", "tar cf out.tar dir", "tar -czf out.tgz dir",
+  "tar uf a.tar f", "tar rf a.tar f", "tar --extract -f a.tar", "tar --create -f o.tar d", "tar --get -f a.tar",
+  "tar -tf a.tar --to-command=sh", "tar -I 'sh -c id' -tf a.tar", "tar --use-compress-program=x -tf a.tar",
+  "tar -tf a.tar --remove-files", "tar --ext -f a.tar", "bsdtar -xf a.tar",
+  // unzip: anything but list/test/pipe/comment/zipinfo extracts
+  "unzip a.zip", "unzip -o a.zip", "unzip a.zip -d out", "unzip -q a.zip",
+  // compressors: in-place by default
+  "gzip f", "gzip -9 f", "gunzip f.gz", "gzip -d f.gz", "bzip2 f", "bunzip2 f.bz2", "xz f", "unxz f.xz",
+  "zstd f", "zstd -d f.zst", "zstd -c f -o out.zst", "zstd --rm -c f",
+  // uniq writes its second operand
+  "uniq in.txt out.txt", "uniq -c in.txt out.txt", "uniq -f 1 in.txt out.txt",
+  // patch applies unless --dry-run
+  "patch < p.diff", "patch -p1 < p.diff", "patch f p.diff", "patch -p1 -i p.diff",
+  // sqlite3 and script always may write
+  "sqlite3 db.sqlite 'drop table t'", "sqlite3 db.sqlite .tables", "script -q out.txt ls", "script",
+  // watch runs its command (sh -c on the joined words, or exec with -x)
+  "watch 'echo > x'", "watch -n 1 rm -rf zz", "watch -x rm zz", "watch -n1 'touch x'", "watch --shotsdir=d ls",
+  "watch -s d ls", "watch --bogus ls",
+];
+
+const WRITER_SAFE = [
+  "tar tf a.tar", "tar -tf a.tar", "tar -tvf a.tar", "tar --list -f a.tar", "tar -tzf a.tgz",
+  "unzip -l a.zip", "unzip -t a.zip", "unzip -v a.zip", "unzip -p a.zip f", "unzip -qql a.zip", "unzip -Z a.zip",
+  "gzip -c f", "gzip -dc f.gz", "gzip -t f.gz", "gzip -l f.gz", "gunzip -c f.gz", "gzip --stdout f",
+  "bzip2 -dc f.bz2", "xz -dc f.xz", "xz -l f.xz", "zstd -dc f.zst", "zstd -t f.zst", "zstd --list f.zst",
+  "cat f | gzip | wc -c", "zstd --test f.zst", "bunzip2 -c f.bz2", "unxz --stdout f.xz",
+  "uniq in.txt", "uniq -c in.txt", "uniq -f 1 in.txt", "sort f | uniq -c",
+  "patch --dry-run -p1 < p.diff", "patch --dry-run f p.diff",
+  "watch ls", "watch -n 2 'git status'", "watch -x ls -la", "watch -d -n 1 cat f",
+];
+
+describe("ordinary writers (final review minor #4)", () => {
+  it.each(WRITER_ESCAPES)("mutating: %s", (c) => expect(isDestructiveCommand(c)).toBe(true));
+  it.each(WRITER_SAFE)("read-only: %s", (c) => expect(isDestructiveCommand(c)).toBe(false));
+});

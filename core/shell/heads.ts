@@ -38,6 +38,8 @@ export const READ_ONLY_HEADS = new Set([
  */
 interface ReadOnlyHeadContext {
   inspect: (argv: string[]) => string | null;
+  /** Classify shell TEXT (a `watch 'cmd'` body that `sh -c` will parse). */
+  inspectText: (text: string) => string | null;
   followingText: string | null;
   /** Leading `NAME=value` assignments (shell prefix or `env`) for this head. */
   assignments: readonly string[];
@@ -510,6 +512,7 @@ export const READ_ONLY_HEAD_WRITES: Record<string, ReadOnlyHeadWriteCheck> = {
     }
     return lessArgvWrite(args);
   },
+  uniq: uniqWrite,
   // -i/--inplace rewrites the file; --split-exp writes one file per document.
   yq: (args) => {
     for (const arg of args) {
@@ -525,3 +528,144 @@ export const READ_ONLY_HEAD_WRITES: Record<string, ReadOnlyHeadWriteCheck> = {
     return null;
   },
 };
+
+const UNIQ_GETOPT: GetoptSpec = {
+  short: { c: "flag", d: "flag", D: "flag", f: "value", i: "flag", s: "value", u: "flag", w: "value", z: "flag" },
+  long: {
+    count: "flag", repeated: "flag", "all-repeated": "optional", "skip-fields": "value", group: "optional",
+    "ignore-case": "flag", "skip-chars": "value", unique: "flag", "zero-terminated": "flag", "check-chars": "value",
+    help: "flag", version: "flag",
+  },
+};
+
+/** procps-ng watch. `-s/--shotsdir` writes screenshots; `-x` execs argv instead of `sh -c`. */
+const WATCH_GETOPT: GetoptSpec = {
+  short: {
+    b: "flag", c: "flag", C: "flag", d: "optional", e: "flag", g: "flag", n: "value", p: "flag", q: "value",
+    r: "flag", s: "value", t: "flag", w: "flag", x: "flag", h: "flag", v: "flag",
+  },
+  long: {
+    beep: "flag", color: "flag", "no-color": "flag", differences: "optional", errexit: "flag", chgexit: "flag",
+    interval: "value", precise: "flag", equexit: "value", "no-rerun": "flag", shotsdir: "value", "no-title": "flag",
+    "no-wrap": "flag", exec: "flag", help: "flag", version: "flag",
+  },
+  stopAtOperand: true,
+};
+
+/**
+ * GNU/bsd tar modes and options that write, delete or run a program. Long
+ * options may be abbreviated, so any unambiguous-or-not prefix of one of these
+ * names counts (over-blocking an ambiguous abbreviation tar would reject).
+ */
+const TAR_WRITE_LONG = [
+  "create", "extract", "get", "update", "append", "concatenate", "catenate", "delete", "remove-files",
+  "to-command", "use-compress-program", "info-script", "new-volume-script", "checkpoint-action",
+];
+/** Short/bundled letters: c/x/u/r/A modes, -I compress program, -F info script. */
+const TAR_WRITE_LETTERS = /[cxurAIF]/;
+
+function tarWrite(args: string[]): string | null {
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i]!;
+    if (arg === "--") break;
+    if (arg.startsWith("--")) {
+      const name = arg.slice(2).split("=")[0]!;
+      if (name.length > 0 && TAR_WRITE_LONG.some((long) => long.startsWith(name))) return `tar --${name}`;
+      continue;
+    }
+    // Old-style bundled first word (`tar xvf a.tar`), or a dash cluster. A
+    // letter taking a value (`f`, `C`, `T`, `X`, `b`, `N`, `K`, `L`, `V`, `g`)
+    // ends the cluster's option letters in dash form (`-fx.tar` names a file).
+    const cluster = i === 0 && !arg.startsWith("-") ? arg : arg.startsWith("-") && arg !== "-" ? arg.slice(1) : null;
+    if (cluster === null) continue;
+    for (const letter of cluster) {
+      if (TAR_WRITE_LETTERS.test(letter)) return `tar -${letter}`;
+      if (arg.startsWith("-") && "fCTXbNKLVg".includes(letter)) break;
+    }
+  }
+  return null;
+}
+
+/** unzip extracts unless a list/test/pipe/comment/zipinfo mode is given. */
+function unzipWrite(args: string[]): string | null {
+  for (const arg of args) {
+    if (arg === "--") break;
+    if (/^-[^-]/.test(arg) && /[ltvpzZ]/.test(arg.slice(1))) return null;
+  }
+  return "unzip";
+}
+
+/**
+ * gzip-family compressors replace their file operands in place unless writing
+ * to stdout, testing or listing. With no file operand they filter stdin to
+ * stdout. zstd's `-o FILE` writes and `--rm` deletes the source either way.
+ */
+function compressorWrite(head: string, args: string[]): string | null {
+  let readOnlyMode = false;
+  let operands = 0;
+  let endOfOptions = false;
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i]!;
+    if (!endOfOptions && arg === "--") { endOfOptions = true; continue; }
+    if (!endOfOptions && arg.startsWith("--")) {
+      const name = arg.slice(2).split("=")[0]!;
+      if (head === "zstd" && (name === "rm" || name === "output")) return `zstd --${name}`;
+      if (["stdout", "to-stdout", "test", "list", "help", "version"].includes(name)) readOnlyMode = true;
+      continue;
+    }
+    if (!endOfOptions && arg.startsWith("-") && arg !== "-") {
+      if (head === "zstd" && arg.slice(1).includes("o")) return "zstd -o";
+      // Short clusters: -c stdout, -t test, -l list, -h/-V help/version. A
+      // level or thread count (`-9`, `-T0`) holds no mode letter.
+      if (/[ctlhV]/.test(arg.slice(1))) readOnlyMode = true;
+      continue;
+    }
+    if (arg !== "-") operands++;
+  }
+  return readOnlyMode || operands === 0 ? null : head;
+}
+
+/**
+ * Heads outside READ_ONLY_HEADS whose writes the word scan cannot see: each
+ * returns the offending token, or null for its read-only modes. Unlike
+ * READ_ONLY_HEAD_WRITES, a null here does not skip the word scan.
+ */
+export const WRITER_HEAD_MODES: Record<string, ReadOnlyHeadWriteCheck> = {
+  tar: tarWrite,
+  bsdtar: tarWrite,
+  gtar: tarWrite,
+  unzip: unzipWrite,
+  gzip: (args) => compressorWrite("gzip", args),
+  gunzip: (args) => compressorWrite("gunzip", args),
+  bzip2: (args) => compressorWrite("bzip2", args),
+  bunzip2: (args) => compressorWrite("bunzip2", args),
+  xz: (args) => compressorWrite("xz", args),
+  unxz: (args) => compressorWrite("unxz", args),
+  zstd: (args) => compressorWrite("zstd", args),
+  unzstd: (args) => compressorWrite("unzstd", args),
+  // `patch` applies to files (from stdin or -i) unless it is a dry run.
+  patch: (args) => (args.includes("--dry-run") ? null : "patch"),
+  // A database shell: any statement or dot-command may write the database or
+  // a file (`.output`, `.backup`), and statements can come from stdin.
+  sqlite3: () => "sqlite3",
+  // `script` records the session to a typescript file (default ./typescript).
+  script: () => "script",
+  // watch runs its command repeatedly: `sh -c` on the joined words, or the
+  // argv itself with -x. That command is classified in turn.
+  watch: (args, { inspect, inspectText }) => {
+    const items = getopt(args, WATCH_GETOPT);
+    if (items === null) return "watch option";
+    if (optionNamed(items, ["s", "shotsdir"])) return "watch --shotsdir";
+    const command = items.filter((item) => item.kind === "operand").map((item) => item.value);
+    if (command.length === 0) return null;
+    const nested = optionNamed(items, ["x", "exec"]) ? inspect(command) : inspectText(command.join(" "));
+    return nested ? `watch ${nested}` : null;
+  },
+};
+
+/** uniq writes its second operand: `uniq [OPTION]... [INPUT [OUTPUT]]`. */
+function uniqWrite(args: string[]): string | null {
+  const items = getopt(args, UNIQ_GETOPT);
+  if (items === null) return "uniq option";
+  return items.filter((item) => item.kind === "operand").length > 1 ? "uniq outfile" : null;
+}

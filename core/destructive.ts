@@ -16,14 +16,15 @@
  *      is a known reader (READER_ALLOWLISTS).
  *
  * This module is the pipeline; the tables and per-concern scanners live in
- * core/shell/: heads.ts (READ_ONLY_HEADS + per-head argv predicates), git.ts,
+ * core/shell/: heads.ts (READ_ONLY_HEADS + per-head argv predicates, and
+ * WRITER_HEAD_MODES for mode-sensitive writers such as tar/unzip/gzip), git.ts,
  * env.ts (command-bearing environment variables), interpreters.ts (eval-flag
  * grammars, preflight, shell eval payloads), language-scan.ts (inline program
  * scanning), and reader-allowlists.ts.
  *
  * Deliberately out of scope: allowlist-only inversion for commands in general
- * (the adapters' `mutates` guidance wants tests/builds speculating), rsync/tar
- * -x (mode-sensitive parsing).
+ * (the adapters' `mutates` guidance wants tests/builds speculating), and
+ * rsync (mode-sensitive parsing).
  */
 
 import {
@@ -56,6 +57,7 @@ import {
 import {
   READ_ONLY_HEADS,
   READ_ONLY_HEAD_WRITES,
+  WRITER_HEAD_MODES,
 } from "./shell/heads.ts";
 import {
   commandBearingEnvironmentSetting,
@@ -276,15 +278,21 @@ function findInterpreterWriter(head: string, segment: string): string | null {
   });
 }
 
-/** Run the segment's READ_ONLY_HEAD_WRITES predicate, if its effective head has one. */
+/**
+ * Run the segment's READ_ONLY_HEAD_WRITES predicate, or its WRITER_HEAD_MODES
+ * one, if its effective head has one.
+ */
 function readOnlyHeadWrite(segment: string, depth: number, followingText: string | null): string | null {
   const normalized = normalizeEnvInvocation(tokenizeShellWords(segment, ARGV));
   if (!normalized.complete || normalized.argv.length === 0) return null;
   const head = normalized.argv[0]!.replace(/^.*\//, "");
-  const check = Object.hasOwn(READ_ONLY_HEAD_WRITES, head) ? READ_ONLY_HEAD_WRITES[head]! : undefined;
+  const check = Object.hasOwn(READ_ONLY_HEAD_WRITES, head)
+    ? READ_ONLY_HEAD_WRITES[head]!
+    : Object.hasOwn(WRITER_HEAD_MODES, head) ? WRITER_HEAD_MODES[head]! : undefined;
   if (!check) return null;
   return check(normalized.argv.slice(1), {
     inspect: (argv) => findDestructiveTokenInternal(argv.map(shellQuoteWord).join(" "), depth + 1),
+    inspectText: (text) => findDestructiveTokenInternal(text, depth + 1),
     followingText,
     assignments: normalized.assignments,
   });
