@@ -4,7 +4,7 @@
       "command": "npx",
       "args": [
         "-y",
-        "--package=predexec@0.4.1",
+        "--package=predexec@0.5.0",
         "predexec-mcp",
         "--host",
         "codex"
