@@ -1,802 +1,827 @@
-# Predexec Audit Remediation Implementation Plan
+# predexec Harness Refresh Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Correct predexec's audited safety, accuracy, and resource-bound defects, then simplify the affected policy and plan-language modules without weakening harness-specific behavior.
+**Goal:** Fix the audited safety and compatibility defects in predexec 0.4.1, restructure the shell-classification core, make every harness (pi, opencode, Claude Code, Codex, Antigravity) load its routing prompt as a shipped `SKILL.md`, and add Antigravity as a fifth host.
 
-**Architecture:** Implement narrow, independently reviewed vertical changes in risk-adjusted order. Represent output completeness and operation policy as explicit core data, enforce one cwd and resource-budget contract, harden MCP fallbacks, then consolidate only mechanics proven identical by tests.
+**Architecture:** Fix the confirmed read-only and termination bugs in core first, test-first. Then consolidate the three shell lexers into one `core/shell/` module tree, which the refactor must keep behavior-identical (the whole suite is the oracle). After that, fix each adapter's policy and tool-op defects. Next, generate all harness skills from one source in `steering.ts` and wire each harness's native skill-shipping mechanism. Last, add `--host antigravity` on the shared MCP server, based on live measurements.
 
 **Tech Stack:** Node.js 22+, TypeScript 5.9, Vitest 4, pnpm 11, `@modelcontextprotocol/server` v2, zod 4.
 
-**Spec:** `docs/superpowers/specs/2026-08-29-audit-remediation-design.md`
+**Spec:** `docs/superpowers/specs/2026-09-25-harness-refresh-audit.md`. Finding IDs such as `CORE-1` and `CX-2` refer to it. Read the finding before starting a task that cites it.
+
+**Project context:** `/Users/williamwo/Development/personal/predexec/CLAUDE.md` sits in the parent directory, outside this git repo. Its "Invariants" and "Hard-won details" sections are binding: do not undo any hard-won detail unless a task below explicitly changes it.
 
 ## Global Constraints
 
-- `core/` stays pure TypeScript with zero harness imports and zero third-party runtime dependencies.
-- Add no production dependency.
-- Mutating nodes hard-stop before execution; mutation execution remains out of scope.
-- Preserve opencode last-match-wins and Codex most-restrictive-wins policy semantics.
-- Preserve packed-install, ESM, stdio-protocol, and fail-closed policy behavior.
-- Every production behavior change starts with a focused failing test whose expected failure is observed.
-- Use `./node_modules/.bin/vitest run <test files>` for focused tests and `./node_modules/.bin/tsc --noEmit` for typechecking.
-- Run the full 621-test-or-greater suite, build, and packed-artifact verification before completion.
-- Do not stage or modify `PLAN.post-0.3.1-archive.md` or `CODEX-RESEARCH.md`; they are pre-existing user-owned untracked files.
-- Use explicit `git add` paths; never `git add -A`.
+- `core/` stays pure TypeScript with zero harness imports and zero third-party runtime dependencies. After Task 5, `core/` imports nothing outside `core/`.
+- Add no production dependency. The production closure stays `@modelcontextprotocol/server`, `@modelcontextprotocol/core` and `zod`.
+- Mutating nodes hard-stop before execution. Mutation execution stays out of scope.
+- Preserve the host policy semantics:
+  - opencode: last-match-wins over the flattened ruleset.
+  - Claude Code: deny → ask → allow.
+  - Codex: most-restrictive-wins.
+  - Antigravity: Deny > Ask > Allow.
+- Every policy reader fails closed on anything it cannot parse, *except* the explicitly tolerated constructs named in Task 13.
+- `mcp/server.ts` never writes to stdout. The tool DESCRIPTION stays host-neutral.
+- No root `.mcp.json` in the repo. It would register a live Claude Code project-scope server.
+- Every production behavior change starts with a focused failing test, and you must see it fail for the expected reason.
+- Focused tests: `./node_modules/.bin/vitest run <files>`. Typecheck: `./node_modules/.bin/tsc --noEmit`. Full gate: `pnpm run build && ./node_modules/.bin/vitest run`.
+- The baseline is 1592 passing and 1 skipped. The suite count only goes up.
+- Stage with explicit `git add <paths>` and never `git add -A`. Use conventional-commit messages (`fix:`, `feat:`, `refactor:`, `docs:`, `chore:`, `test:`).
+- Work on branch `harness-refresh`, never on `main`. Do not publish to npm and do not push.
+- Skill frontmatter: `name` matches `^[a-z0-9]+(-[a-z0-9]+)*$` and is at most 64 chars. `description` is 1–1024 chars and carries the full routing rule, because most hosts keep only name and description resident.
+
+## Review Focus
+
+1. **A policy reader meeting host-written config it has never seen.** Examples: Codex `network_rule(...)`, `[[skills.config]]`, an opencode agent override. It should keep enforcing the rules it *can* read, not silently allow and not refuse everything. Tests: Task 10 and Task 13.
+2. **A plan run from a subdirectory or a symlinked path of a repo.** Policy, trust, containment and skill discovery must resolve to the same project root the host uses. Tests: Task 8, Task 13 and Task 20.
+3. **A model-authored plan that blocks forever.** Causes include stdin reads, `tail -f`, a slow regex, or a hung tool op. The walk must return a bounded, explicitly-marked failure. Tests: Task 1 and Task 2.
+4. **The same skill loaded twice, or a skill naming the wrong tool.** Cases: plugin plus manual install, a Claude skill picked up by opencode's `.claude/skills` scan, or the plugin-namespaced tool name. Doctor must flag it, and skill text must not hardcode a tool id that varies by install. Tests: Task 14 and Task 15.
+5. **Tool-op failure versus an empty result.** On every host, "never ran" (exit 2) must differ from "ran, found nothing" (exit 1). Tests: Task 11 and Task 12.
 
 ---
 
-### Task 1: Make output completeness structural
+## Phase 0 — Workspace
+
+### Task 0: Host-runnable toolchain, build-independent tests, repo hygiene
+
+Covers ENV-1, BLD-1, DOC-1 (the hygiene part).
 
 **Files:**
-- Modify: `core/types.ts`
-- Modify: `core/runner.ts`
+- Modify: `pnpm-workspace.yaml` (gitignored, local only). Add `supportedArchitectures` and resolve the placeholder `allowBuilds`.
+- Create: `__tests__/helpers/global-setup.ts`
+- Modify: `vitest.config.ts`
+- Move: `PLAN.md` from HEAD → `docs/superpowers/plans/2026-08-29-audit-remediation.md` (the previous plan is closed; this file already replaced it in the working tree, so recover it with `git show HEAD:PLAN.md`)
+- Remove from index: `.superpowers/sdd/PLAN/task-*-report.md`. Add `.superpowers/` to `.gitignore`.
+
+- [ ] **Step 1:** Create the branch: `git switch -c harness-refresh`.
+- [ ] **Step 2:** Make `node_modules` work on both macOS and the Linux devcontainer. In `pnpm-workspace.yaml` set:
+
+  ```yaml
+  supportedArchitectures:
+    os: [current, linux]
+    cpu: [current]
+    libc: [current, glibc]
+  ```
+
+  Set every `allowBuilds` placeholder to `false`. Delete the stale `minimumReleaseAgeExclude` entries for `@opencode-ai/*@1.18.14`. Then run `pnpm install --frozen-lockfile`. If pnpm complains about the `/workspaces/.pnpm-store` store path, run `pnpm install --frozen-lockfile --store-dir ../.pnpm-store`.
+
+  Verify with `ls node_modules/.pnpm | grep rolldown+binding`. Both `darwin-arm64` and `linux-arm64-gnu` must be present.
+- [ ] **Step 3:** Confirm BLD-1 reproduces. Run `rm -rf dist && ./node_modules/.bin/vitest run __tests__/pi.test.ts`. Expected: FAIL resolving `../dist/.pi/extension/index.js`.
+- [ ] **Step 4:** Add a global setup that builds once:
+
+  ```ts
+  // __tests__/helpers/global-setup.ts
+  import { ensureBuild } from "./ensure-build.ts";
+  export default function setup(): void { ensureBuild(); }
+  ```
+
+  In `vitest.config.ts`, add `globalSetup: ["__tests__/helpers/global-setup.ts"]` under `test`. Check the actual export name in `__tests__/helpers/ensure-build.ts` and use it.
+- [ ] **Step 5:** Run `rm -rf dist && ./node_modules/.bin/vitest run`. Expected: all pass (1592 + 1 skipped).
+- [ ] **Step 6:** Archive the old plan and clean up the scratch files:
+
+  ```bash
+  git show HEAD:PLAN.md > docs/superpowers/plans/2026-08-29-audit-remediation.md
+  git rm --cached -r .superpowers
+  echo ".superpowers/" >> .gitignore
+  ```
+- [ ] **Step 7:** Commit. `git add vitest.config.ts __tests__/helpers/global-setup.ts .gitignore docs/superpowers PLAN.md` then `git commit -m "chore: build dist in vitest globalSetup; archive previous plan"`.
+
+---
+
+## Phase 1 — Core safety (HIGH)
+
+### Task 1: Runner termination, stdin, and output fidelity
+
+Covers CORE-3, CORE-6, CORE-8, and CORE-10 (the UTF-8 part and the stale comment).
+
+**Files:**
+- Modify: `core/runner.ts`, `core/types.ts`
+- Test: `__tests__/core/runner.test.ts`
+
+**Interfaces:**
+- Produces:
+  - `RunOptions.commandTimeoutMs?: number`, clamped to `[1_000, MAX_COMMAND_TIMEOUT_MS]`.
+  - `DEFAULT_COMMAND_TIMEOUT_MS = 60_000` and `MAX_COMMAND_TIMEOUT_MS = 600_000`, exported from `core/types.ts`.
+  - Timed-out commands report `exitCode: 124` (the GNU `timeout` convention) and a stderr line `[predexec] command timed out after <ms>ms`.
+
+- [ ] **Step 1: Write the failing tests.**
+
+  ```ts
+  describe("runNode — termination", () => {
+    it("gives shell commands a closed stdin", async () => {
+      const r = await runNode({ id: "n", commands: ["cat"] }, { cwd });
+      expect(r.exitCode).toBe(0);           // EOF immediately, no hang
+    }, 5_000);
+
+    it("kills a command that exceeds commandTimeoutMs, including its children", async () => {
+      const r = await runNode({ id: "n", commands: ["sh -c 'sleep 30 & sleep 30'"] }, { cwd, commandTimeoutMs: 1_000 });
+      expect(r.exitCode).toBe(124);
+      expect(r.stderr).toContain("[predexec] command timed out after 1000ms");
+    }, 5_000);
+
+    it("reports the true number of dropped chars", async () => {
+      const r = await runNode({ id: "n", commands: ["seq 1 100000"] }, { cwd });
+      const m = r.stdout.match(/…\[truncated: (\d+) more chars\]/);
+      expect(Number(m?.[1])).toBeGreaterThan(500_000);
+    });
+
+    it("decodes multi-byte UTF-8 split across chunks", async () => {
+      const q = String.fromCharCode(39);
+      const script = 'const b=Buffer.from("é");process.stdout.write(b.subarray(0,1));setTimeout(()=>process.stdout.write(b.subarray(1)),30)';
+      const r = await runNode({ id: "n", commands: [`node -e ${q}${script}${q}`] }, { cwd });
+      expect(r.stdout).toContain("é");
+    });
+  });
+  ```
+
+  Also add a parallel-abort test. Use a node with 3 commands, `parallel:true`, and an `AbortController` fired after the first command completes. Assert that every `[i]` label in the output matches the command at index `i-1`.
+- [ ] **Step 2:** Run `./node_modules/.bin/vitest run __tests__/core/runner.test.ts`. Expected: the `cat` test times out, the timeout test times out, the truncated count is about 28, `é` is mangled, and the labels are wrong.
+- [ ] **Step 3: Implement.**
+  - `spawn(command, { cwd, shell: true, detached: true, stdio: ["ignore", "pipe", "pipe"] })`.
+  - `child.stdout.setEncoding("utf8")`, and the same for stderr.
+  - A timer that calls `process.kill(-child.pid, "SIGKILL")` (the process group). Wrap it in try/catch, because the group may already be gone.
+  - Replace `signal:` with a manual `abort` listener that kills the group the same way, and remove the listener in `finish`.
+  - Track `totalChars` in `runShell`, and pass it to `cap()` as the original length instead of re-capping text that is already marked.
+  - In `runParallel`, keep the original index with each result, so `joinLabeled` gets `(index, output)` pairs rather than a filtered array.
+  - Fix the `runner.ts:16` comment so it names the file that actually reads `TRUNCATION_MARKER`, or delete the claim.
+- [ ] **Step 4:** Run the runner, engine and adapter-runtime tests. Expected: PASS.
+- [ ] **Step 5:** Commit: `fix(core): close stdin, bound command runtime, kill process groups, fix truncation counts`.
+
+### Task 2: Regex termination and condition-path confinement
+
+Covers CORE-2 and CORE-9.
+
+**Files:**
 - Modify: `core/conditions.ts`
-- Modify: `core/engine.ts`
-- Modify: `__tests__/core/runner.test.ts`
-- Modify: `__tests__/core/conditions.test.ts`
-- Modify: `__tests__/core/engine.test.ts`
+- Test: `__tests__/core/conditions.test.ts`
 
-**Interfaces:**
-- Produces: `NodeOutput.stdoutTruncated: boolean` and `NodeOutput.stderrTruncated: boolean`.
-- Produces: completeness-aware `evaluateConditionWithDetail` behavior.
-- Preserves: `OUTPUT_CAP = 8192` and the visible `TRUNCATION_MARKER` prefix.
+- [ ] **Step 1: Write the failing tests.**
 
-- [ ] **Step 1: Add failing shell-capture and transcript tests**
+  ```ts
+  const CATASTROPHIC = ["((a+))+$", "(a+b?)+$", "(\\w+\\s?)+$", "(a+){12}$", "((?:a|b)+c?)*$", "(x+x+)+y"];
+  const SAFE = ["(?:\\d+\\.)+\\d+", "^v\\d+(?:\\.\\d+){2}$", "(ab)+", "(a|b){3}", "\\w+", "(foo\\s)+bar"];
+  it.each(CATASTROPHIC)("rejects %s", (p) => expect(isSafeRegex(p)).toBe(false));
+  it.each(SAFE)("accepts %s", (p) => expect(isSafeRegex(p)).toBe(true));
 
-Add to `__tests__/core/runner.test.ts`:
+  it("every accepted pattern runs in bounded time on adversarial input", () => {
+    const gen = ["a", "b?", "\\w", "\\s?", "a+", "(a+)", "(?:a|b)", "\\d+"];
+    for (const x of gen) for (const y of gen) for (const q of ["+", "*", "{2,}", "{5}"]) {
+      const p = `(${x}${y})${q}$`;
+      if (!isSafeRegex(p)) continue;
+      const t0 = performance.now();
+      new RegExp(p).test("a".repeat(28) + "!");
+      expect(performance.now() - t0, p).toBeLessThan(50);
+    }
+  });
 
-```ts
-it("marks truncation when a later chunk arrives after an exact OUTPUT_CAP prefix", async () => {
-  const q = String.fromCharCode(39);
-  const script = 'process.stdout.write("x".repeat(8192)); setTimeout(() => process.stdout.write("TAIL"), 30)';
-  const r = await runNode({ id: "n", commands: [`node -e ${q}${script}${q}`] }, { cwd });
-  expect(r.stdout).toContain("…[truncated");
-  expect(r.stdout).not.toContain("TAIL");
-  expect(r.stdoutTruncated).toBe(true);
-  expect(r.stderrTruncated).toBe(false);
-});
-```
+  it("fileExists refuses paths outside the session root", () => {
+    expect(evaluateConditionWithDetail({ kind: "fileExists", path: "../../etc/hosts" }, out, { cwd }).matched).toBe(false);
+    expect(evaluateConditionWithDetail({ kind: "fileExists", path: "/etc/hosts" }, out, { cwd }).matched).toBe(false);
+  });
+  ```
 
-Add a tool-executor case returning `"x".repeat(OUTPUT_CAP + 1)` and assert the same boolean/marker contract. Add an engine test asserting the transcript warning is driven by `stdoutTruncated`, not by marker substring detection.
+  Check the actual `evaluateConditionWithDetail` signature at `core/conditions.ts:542` and adapt the call. The result must carry a detail reason that mentions "outside session root".
+- [ ] **Step 2:** Run the tests and watch them fail.
+- [ ] **Step 3: Implement.**
+  - Classify a quantified group (`+`, `*`, `{n,}`, or `{n,m}` with `m ≥ 2`) as unsafe when its body *can end open-ended*. That holds when the last **non-optional** atom is open-ended, meaning a `+`/`*`/`{n,}`-quantified atom or a nested group whose own body can end open-ended. It also holds when the body has two adjacent open-ended atoms over overlapping classes (`x+x+`).
+  - Reuse the existing `parseSequence` / `nestedEndsOpenEnded` helpers. Do not add a second parser.
+  - For `fileExists`, resolve the path against `cwd` and refuse when the resolved path is not inside the session root, using the containment rule `resolvePlanCwd` uses (`core/engine.ts:157`).
+- [ ] **Step 4:** Run the conditions and engine tests, plus `__tests__/plan-language.test.ts`. Expected: PASS. The property test must also pass, with no pattern over 50 ms.
+- [ ] **Step 5:** Commit: `fix(core): close isSafeRegex bypasses; confine fileExists to session root`.
 
-- [ ] **Step 2: Run the focused runner/engine tests and verify RED**
+### Task 3: Read-only heads that write or exec
 
-Run:
+Covers CORE-1.
 
-```bash
-./node_modules/.bin/vitest run __tests__/core/runner.test.ts __tests__/core/engine.test.ts
-```
+**Files:**
+- Modify: `core/destructive.ts` (`READ_ONLY_HEADS`, `HEAD_EXCEPTIONS`, `AWK_WRITE_RE` around `:220-247` and `:1557`)
+- Create: `__tests__/core/read-only-heads.test.ts`
 
-Expected: FAIL because `NodeOutput` has no completeness fields and exact-cap shell capture omits the marker.
+- [ ] **Step 1:** Write a table-driven escape suite. Every row must be classified mutating:
 
-- [ ] **Step 3: Add failing completeness-aware condition tests**
+  ```ts
+  import { isDestructiveCommand } from "../../core/index.ts";
+  const ESCAPES = [
+    "sed -n 'w SED_W.txt' in.txt", "sed -n 'W out' f", "sed '1e touch x' f", "sed --in-place s/a/b/ f",
+    "sed -Ei s/a/b/ f", "sed -ni.bak p f", "sort --output=o.txt f", "sort -oo.txt f", "sort -o o.txt f",
+    "sort --compress-program=sh f", "awk 'BEGIN{print \"x\" | \"sh\"}'", "awk 'BEGIN{\"touch x\" | getline}'",
+    "awk '{print > \"f\"}' in", "gawk -i inplace '{print}' f", "xxd in.txt out.txt", "xxd -r a b",
+    "rg --pre ./x.sh hello f", "rg --pre=./x.sh hello f", "tree -o out.txt", "find . -fprint out",
+    "find . -fls out", "find . -fprintf out %p", "find . -okdir rm {} ;", "find . -delete",
+    "less -o log f", "less --log-file=log f", "yq -i .a=1 f.yaml", "jq -n 'input' --rawfile x /dev/stdin",
+  ];
+  const SAFE = ["sed -n 1,5p f", "sort -r f", "awk '{print $1}' f", "xxd f", "rg hello", "tree -L 2", "find . -name '*.ts'", "less f", "yq .a f.yaml"];
+  it.each(ESCAPES)("mutating: %s", (c) => expect(isDestructiveCommand(c)).toBe(true));
+  it.each(SAFE)("read-only: %s", (c) => expect(isDestructiveCommand(c)).toBe(false));
+  ```
 
-Add to `__tests__/core/conditions.test.ts` using an output helper that defaults both flags to false:
+  Drop the `jq` row if `--rawfile` is genuinely read-only after checking. It is there to force the question, not as a fixed requirement.
+- [ ] **Step 2:** Run the suite and watch the ESCAPES rows fail.
+- [ ] **Step 3: Implement.** Change `HEAD_EXCEPTIONS` from one regex per head to an **argv predicate** per head, built on the existing tokenizer. `(argv: string[]) => boolean` returns true when the invocation writes or execs.
+  - **sed:** any `-i`/`--in-place` in a short-flag cluster or long form, any script containing `w`/`W`/`e` commands, or an `s///w` / `s///e` flag.
+  - **sort:** `-o`, `-o<file>`, `--output`, `--compress-program`.
+  - **awk / gawk / mawk:** `-i inplace`, and any program containing `>`/`>>`, `|` followed by a string, `| getline`, or `system(`.
+  - **xxd:** more than one positional argument, or `-r`.
+  - **rg:** `--pre`, `--pre=`.
+  - **tree:** `-o`.
+  - **find:** `-delete`, `-exec*`, `-ok*`, `-fprint*`, `-fls`.
+  - **less:** `-o`, `-O`, `--log-file`, `--LOG-FILE`.
+  - **yq:** `-i`, `--inplace`.
 
-```ts
-it("does not establish absence or a number from truncated output", () => {
-  const incomplete = {
-    stdout: "all good\n…[truncated]",
-    stderr: "",
-    exitCode: 0,
-    stdoutTruncated: true,
-    stderrTruncated: false,
-  };
-  expect(evaluateConditionWithDetail(
-    incomplete,
-    { kind: "match", source: "stdout", regex: "ERROR", negate: true },
-    "/",
-  )).toMatchObject({ result: false });
-  expect(evaluateConditionWithDetail(
-    incomplete,
-    { kind: "numeric", source: "stdout", extract: "(\\d+)", op: "eq", value: 0 },
-    "/",
-  )).toMatchObject({ result: false });
-});
+  Remove a head from `READ_ONLY_HEADS` entirely if its predicate cannot be written confidently.
+- [ ] **Step 4:** Run `./node_modules/.bin/vitest run __tests__/core` and `__tests__/command-inspection.test.ts`. Expected: PASS.
+- [ ] **Step 5:** Commit: `fix(core): classify write/exec flags of read-only heads by argv`.
 
-it("allows a positive match observed before truncation", () => {
-  const incomplete = {
-    stdout: "READY\n…[truncated]",
-    stderr: "",
-    exitCode: 0,
-    stdoutTruncated: true,
-    stderrTruncated: false,
-  };
-  expect(evaluateConditionWithDetail(
-    incomplete,
-    { kind: "match", source: "stdout", regex: "READY" },
-    "/",
-  ).result).toBe(true);
-});
-```
+### Task 4: Wrapper parity and interpreter-eval inversion
 
-Also assert `jsonPath` reports `stdout was truncated` rather than generic invalid JSON.
+Covers CORE-4 and CORE-5.
 
-- [ ] **Step 4: Run condition tests and verify RED**
+**Files:**
+- Modify: `core/destructive.ts` (`WRAPPERS` `:1609`; interpreter scan `:258-267`)
+- Test: `__tests__/core/destructive.test.ts` (or whichever existing file holds the destructive tests; find it with `grep -l isDestructiveCommand __tests__/core`)
 
-Run:
+- [ ] **Step 1: Write the failing tests.**
 
-```bash
-./node_modules/.bin/vitest run __tests__/core/conditions.test.ts
-```
+  ```ts
+  it.each([
+    `timeout 5 node -e "require('fs').writeFileSync('x','y')"`,
+    `stdbuf -o0 python3 -c "open('x','w').write('y')"`,
+    `noglob python3 -c "open('x','w').write('y')"`,
+    `python3 -c "import os; os.replace('a','b')"`,
+    `python3 -c "__import__('os').system('touch x')"`,
+    `ruby -e 'IO.write("x","y")'`,
+    `perl -e 'unlink "x"'`,
+    `node -e "require('child_process').execSync('touch x')"`,
+  ])("mutating: %s", (c) => expect(isDestructiveCommand(c)).toBe(true));
 
-Expected: FAIL because conditions ignore completeness.
+  it.each([
+    `python3 -c "import json,sys; print(json.load(open('p.json'))['version'])"`,
+    `node -e "console.log(require('./package.json').version)"`,
+    `python3 --version`,
+  ])("read-only: %s", (c) => expect(isDestructiveCommand(c)).toBe(false));
 
-- [ ] **Step 5: Implement completeness propagation**
+  it("core WRAPPERS is a superset of command-inspection DEFAULT_WRAPPERS", () => { /* import both sets, assert ⊇ */ });
+  ```
 
-Change `NodeOutput` in `core/types.ts` to:
+  Export whatever you need for the parity test. Task 5 deletes the duplication, so this test is temporary scaffolding. It becomes trivially true in Task 5, and you should keep it there anyway.
+- [ ] **Step 2:** Run the tests and watch them fail.
+- [ ] **Step 3: Implement.**
+  - Add `timeout`, `stdbuf` and `noglob` to the core `WRAPPERS`, including their option-and-duration argument skipping. Copy that from `command-inspection.ts`.
+  - Invert the interpreter rule. An inline `-c`/`-e`/`--eval`/`-p` payload counts as **mutating unless** every call it makes matches a small reader allowlist.
+    - Python: `print`, `open(<path>)` with no mode or an `'r'`/`'rb'` mode, `json.load(s)`, `sys.*`, `os.path.*`, `os.listdir`, `os.getcwd`, `os.environ.get`.
+    - Node: `console.log`, `require('<relative json>')`, `JSON.*`, `process.version*`, `fs.readFileSync`, `fs.existsSync`, `fs.readdirSync`, `fs.statSync`.
+    - Ruby and Perl: `puts`, `print`, `File.read`, `JSON.parse`.
 
-```ts
-export interface NodeOutput {
-  stdout: string;
-  stderr: string;
-  exitCode: number;
-  stdoutTruncated: boolean;
-  stderrTruncated: boolean;
-}
-```
-
-Give `CommandResult` the same booleans. In `runShell`, track raw receipt independently from retained length:
-
-```ts
-let stdoutTruncated = false;
-let stderrTruncated = false;
-
-child.stdout?.on("data", (d: Buffer) => {
-  const s = d.toString();
-  const remaining = OUTPUT_CAP - stdout.length;
-  if (remaining > 0) stdout += s.slice(0, remaining);
-  if (s.length > remaining) stdoutTruncated = true;
-  opts.onCommandOutput?.(s);
-});
-```
-
-Apply the symmetric stderr logic. At `finish`, append one explicit marker when the corresponding flag is true. For tool operations, set flags before slicing. Refactor aggregation so it ORs per-command flags and never infers completeness by searching text.
-
-In `conditions.ts`, determine the selected stream's flag. Return false with explicit detail for negated matches on incomplete streams, all numeric conditions on incomplete stdout, and all JSON-path conditions on incomplete stdout. Positive matches continue evaluating the retained prefix.
-
-In `engine.ts`, render the continuation warning when either flag is true.
-
-- [ ] **Step 6: Verify GREEN and commit**
-
-Run:
-
-```bash
-./node_modules/.bin/vitest run __tests__/core/runner.test.ts __tests__/core/conditions.test.ts __tests__/core/engine.test.ts
-./node_modules/.bin/tsc --noEmit
-```
-
-Expected: all pass.
-
-Commit:
-
-```bash
-git add core/types.ts core/runner.ts core/conditions.ts core/engine.ts __tests__/core/runner.test.ts __tests__/core/conditions.test.ts __tests__/core/engine.test.ts
-git commit -m "fix: make output completeness explicit"
-```
+  Keep the existing obfuscation screens. Payloads that call nothing (`python3 --version`) stay read-only.
+- [ ] **Step 4:** Run `./node_modules/.bin/vitest run __tests__/core __tests__/command-inspection.test.ts`. Expected: PASS. If some existing read-only expectations now flip to mutating, review each one: keep the flip when the old expectation was an escape, and widen the allowlist when it was a genuine reader.
+- [ ] **Step 5:** Commit: `fix(core): wrapper parity and allowlist-based interpreter eval classification`.
 
 ---
 
-### Task 2: Close obvious mutation-classifier bypasses
+## Phase 2 — Core architecture (behavior-preserving)
+
+### Task 5: `core/shell/` — one tokenizer, one wrapper vocabulary, shared constants
+
+Covers ARCH-1, ARCH-2, ARCH-4, and CORE-7.
 
 **Files:**
-- Modify: `core/destructive.ts`
-- Modify: `__tests__/core/destructive.test.ts`
-- Modify: `__tests__/core/engine.test.ts`
+- Create: `core/shell/lexer.ts`. It holds the one tokenizer, clause splitter, parenthesized-body and substitution walker, and wrapper and assignment stripping, all merged from `command-inspection.ts` and `destructive.ts`.
+- Move: `command-inspection.ts` → `core/shell/inspection.ts` (a thin layer over `lexer.ts`).
+- Modify: `core/destructive.ts`, `core/index.ts`, `core/types.ts`, `core/coerce.ts`, `core/validation.ts`, `plan-language.ts`, `core/engine.ts`, and every importer of `command-inspection.ts` (`grep -rl command-inspection --include=*.ts .`).
+- Move: `__tests__/command-inspection.test.ts` → `__tests__/core/shell/inspection.test.ts`.
 
 **Interfaces:**
-- Consumes: `findDestructiveToken(command)` and mutation hard-stop behavior.
-- Produces: conservative classification for ordinary `cp` and Git verb invocations.
+- Produces:
+  - `core/shell/lexer.ts` exports `tokenizeShellWords`, `splitCommandSegments` (now backslash-aware), `extractShellCommandClauses`, `stripLeadingAssignmentsAndWrappers`, and `WRAPPERS: ReadonlySet<string>`, the single source.
+  - `core/types.ts` exports `CONDITION_KINDS` (readonly tuple), `TOOL_NAMES` (readonly tuple `["read","grep","find","ls"]`) and `JSON_PATH_SINGLE_OP_MESSAGE`. `HIGH_CONFIDENCE_KINDS`, coerce's `VALID_KINDS`, validation's and plan-language's tool lists, and engine/plan-language's jsonPath message are all derived from these.
+- Preserves: every existing export name reachable from `core/index.ts` (including `inspectCommandSubstitutionTree` and `splitCommandSegments`).
 
-- [ ] **Step 1: Add failing table-driven classifier tests**
+- [ ] **Step 1: Failing tests.** Add an invariant test:
 
-Add blocked cases:
+  ```ts
+  // __tests__/core/purity.test.ts
+  import { readdirSync, readFileSync } from "node:fs"; import { join, resolve, relative } from "node:path";
+  it("core/ imports nothing outside core/", () => {
+    const root = resolve("core"); const bad: string[] = [];
+    const walk = (d: string) => { for (const e of readdirSync(d, { withFileTypes: true })) {
+      const p = join(d, e.name); if (e.isDirectory()) walk(p);
+      else if (p.endsWith(".ts")) for (const m of readFileSync(p, "utf8").matchAll(/from\s+["']([^"']+)["']/g)) {
+        const spec = m[1]; if (!spec.startsWith(".")) { if (!spec.startsWith("node:")) bad.push(`${p}: ${spec}`); continue; }
+        if (relative(root, resolve(d, spec)).startsWith("..")) bad.push(`${p}: ${spec}`);
+      } } };
+    walk(root); expect(bad).toEqual([]);
+  });
+  ```
 
-```ts
-it.each([
-  "cp source.txt destination.txt",
-  "cp -- source.txt destination.txt",
-  "git add file.txt",
-  "git clone https://example.invalid/repo target",
-  "git fetch origin",
-  "git pull --ff-only",
-  "git init scratch",
-])("blocks mutating command: %s", (command) => {
-  expect(findDestructiveToken(command)).not.toBeNull();
-});
-```
+  Add a backslash-escape test (CORE-7). In `echo \"; touch X; echo \"` the quotes are escaped, so the `;` separators are live: `expect(splitCommandSegments('echo \\"; touch X; echo \\"')).toEqual(['echo \\"', 'touch X', 'echo \\"'])`. Today it returns 1 segment.
+- [ ] **Step 2:** Run the tests and watch them fail. The purity test lists `destructive.ts` and `index.ts`.
+- [ ] **Step 3:** Move and merge. Where the two lexers disagree, keep the stricter behavior (the one that yields more clauses or more mutating verdicts) and add a test pinning it. Delete `shellWords`, `shellArguments`, `parenthesizedGroups`, `normalizeEnvInvocation` and `effectiveHead` from `destructive.ts` once their callers use `lexer.ts`. Also delete the Task 4 parity scaffolding once only one `WRAPPERS` set exists; keep a test that asserts `WRAPPERS.has("timeout")`.
+- [ ] **Step 4:** Run the full gate: `pnpm run build && ./node_modules/.bin/vitest run`. Expected: every pre-existing test passes, unmodified apart from import paths.
+- [ ] **Step 5:** Commit: `refactor(core): consolidate shell lexing into core/shell; single-source constants`.
 
-Add allowed cases:
+### Task 6: Split `destructive.ts` by concern
 
-```ts
-it.each([
-  "git status --short",
-  "git diff --stat",
-  "git log -5 --oneline",
-  "git show HEAD:README.md",
-  "git rev-parse --show-toplevel",
-  "git branch --list",
-  "git tag --list",
-  "git remote -v",
-  "git config --get user.name",
-])("allows read-only git command: %s", (command) => {
-  expect(findDestructiveToken(command)).toBeNull();
-});
-```
+Covers ARCH-3.
 
-Add one engine regression proving `cp source destination` stops before `runNode` creates the destination.
+**Files:**
+- Create:
+  - `core/shell/interpreters.ts`: language-payload scanning, currently about `destructive.ts:282-1560`.
+  - `core/shell/git.ts`: git read-only and config-key classification.
+- Modify: `core/destructive.ts`. It becomes a short pipeline of segments → clauses → per-clause argv classification, with a redirect check, privilege stop, head policy, interpreter scan and git check. Remove the double `extractShellCommandClauses` recursion at `:2385-2394`.
 
-- [ ] **Step 2: Verify RED**
+- [ ] **Step 1:** Record a baseline. Add `__tests__/core/destructive-corpus.test.ts`. It collects every command string used across `__tests__/**` (grep them into a JSON fixture `__tests__/fixtures/command-corpus.json`, committed) and snapshots `isDestructiveCommand` over the corpus with `toMatchSnapshot()`. Run it and commit the snapshot *before* refactoring.
+- [ ] **Step 2:** Split the file. No behavior changes.
+- [ ] **Step 3:** Run the corpus snapshot and the full gate. Expected: the snapshot is unchanged and everything passes. `wc -l core/destructive.ts` should be under 700.
+- [ ] **Step 4:** Commit in two parts: `test(core): snapshot destructive classification corpus`, then `refactor(core): split destructive.ts into interpreters and git modules`.
 
-Run:
+### Task 7: Async-capable policy hook, inner-shell policy expansion, small core cleanups
 
-```bash
-./node_modules/.bin/vitest run __tests__/core/destructive.test.ts __tests__/core/engine.test.ts
-```
+Covers ARCH-5, CX-5 (the core part), and CORE-10 (stats and coerce).
 
-Expected: FAIL for ordinary `cp` and omitted Git verbs.
+**Files:**
+- Modify: `core/types.ts` (`OperationPolicyChecker` return type), `core/engine.ts` (`findPolicyViolation`), `stats.ts:87`, `core/coerce.ts`
+- Test: `__tests__/core/engine.test.ts`, `__tests__/stats.test.ts`, `__tests__/core/coerce.test.ts`
 
-- [ ] **Step 3: Implement conservative Git verb inspection**
+**Interfaces:**
+- Produces:
+  - `type OperationPolicyChecker = (op: Operation, ctx: { cwd: string; sessionRoot: string; signal?: AbortSignal }) => PolicyVerdict | Promise<PolicyVerdict>`. Keep the existing parameter shape if it differs, and only widen the return type.
+  - The engine now calls the checker for each shell operation **and** for each inner command of `sh|bash|zsh|dash -c|-lc|-ic '<script>'` (split into clauses by `core/shell/lexer.ts`), and it also calls the checker with an absolute-path head basename-normalized (`/bin/cat .env` → `cat .env`). Adapters get this for free.
 
-Replace the `cp\s+-` branch with `\bcp\b`. Add a Git verb scanner before the generic word scan:
+- [ ] **Step 1: Failing tests.**
 
-```ts
-const READ_ONLY_GIT_VERBS = new Set([
-  "status", "diff", "log", "show", "rev-parse", "ls-files", "ls-tree",
-  "grep", "blame", "describe", "shortlog", "name-rev", "for-each-ref",
-]);
-```
+  ```ts
+  it("awaits an async policy checker", async () => {
+    const r = await runPlanTree({ root: "a", nodes: [{ id: "a", commands: ["ls"] }] },
+      { cwd, checkOperationPolicy: async () => "denied by host" });
+    expect(r.stoppedReason).toBe("policyStop");
+  });
+  it.each(["bash -lc 'cat .env'", "sh -c \"cat .env\"", "/bin/cat .env"])("policy sees inner command of %s", async (c) => {
+    const seen: string[] = [];
+    await runPlanTree({ root: "a", nodes: [{ id: "a", commands: [c] }] },
+      { cwd, checkOperationPolicy: (op) => { if (typeof op === "string") seen.push(op); return typeof op === "string" && op.startsWith("cat .env") ? "deny" : null; } });
+    expect(seen).toContain("cat .env");
+  });
+  it("coercePlan does not mutate its input", () => { const p = { root: "a", nodes: '[{"id":"a","commands":["ls"]}]' }; const c = structuredClone(p); coercePlan(p); expect(p).toEqual(c); });
+  ```
 
-Continue honoring the existing explicitly read-only subforms of `branch`, `tag`, `stash`, `config`, and `remote`. Skip documented global options and their values before locating the verb. If a segment's effective head is `git` and its verb is absent from the read-only set/subforms, return `git <verb>` as the destructive token. Do not merge this with host policy matching.
-
-- [ ] **Step 4: Verify GREEN and commit**
-
-Run:
-
-```bash
-./node_modules/.bin/vitest run __tests__/core/destructive.test.ts __tests__/core/engine.test.ts
-./node_modules/.bin/tsc --noEmit
-```
-
-Commit:
-
-```bash
-git add core/destructive.ts __tests__/core/destructive.test.ts __tests__/core/engine.test.ts
-git commit -m "fix: close copy and git mutation bypasses"
-```
+  Add a stats test asserting `stats.ts` uses `estimateRequestsSaved`: spy on it, or compare outputs on a fixture where the duplicate would drift.
+- [ ] **Step 2:** Run the tests and watch them fail.
+- [ ] **Step 3:** Implement. `runPlanTree` is already async, so `await` the checker. Check `opts.signal` between checks.
+- [ ] **Step 4:** Run the full gate. Expected: PASS.
+- [ ] **Step 5:** Commit: `feat(core): async policy checkers; policy sees inner shell scripts and absolute heads`.
 
 ---
 
-### Task 3: Enforce one effective working directory
+## Phase 3 — Adapter defects
+
+### Task 8: Claude Code / Codex tool-op containment
+
+Covers CC-1.
 
 **Files:**
-- Modify: `core/engine.ts`
-- Modify: `core/types.ts`
-- Modify: `.pi/extension/index.ts`
-- Modify: `__tests__/core/engine.test.ts`
-- Modify: `__tests__/pi.test.ts`
-- Modify: `__tests__/mcp/tool-ops.test.ts`
+- Modify: `mcp/tool-ops.ts:~302` (the `node_modules` realpath exemption)
+- Test: `__tests__/mcp/tool-ops.test.ts`
+
+- [ ] **Step 1: Failing test.** In a tmp root, create `node_modules/evil -> <tmp outside dir containing secret.txt>`. Then check that:
+  - `{tool:"read",path:"node_modules/evil/secret.txt"}` returns exit 2 with stderr mentioning "outside".
+  - `grep` and `find` rooted at `node_modules/evil` also refuse.
+  - A pnpm-style `node_modules/.pnpm/x/node_modules/pkg -> ../../x` link that stays inside the root *still reads fine*.
+- [ ] **Step 2:** Run the test and watch it fail.
+- [ ] **Step 3:** Delete the exemption. Containment = `realpath(target)` is inside `realpath(sessionRoot)`. If a legitimate case needs a pnpm store outside the root, allow only `realpath(<root>/node_modules)`'s *own* resolved store dir, found once at startup, and document it inline.
+- [ ] **Step 4:** Run `./node_modules/.bin/vitest run __tests__/mcp`. Expected: PASS.
+- [ ] **Step 5:** Commit: `fix(mcp): remove node_modules containment exemption`.
+
+### Task 9: Claude Code permission fidelity
+
+Covers CC-2, CC-3, and CC-4.
+
+**Files:**
+- Create: `mcp/gitignore-match.ts`. A pure gitignore-pattern → matcher for absolute paths, no deps.
+- Modify: `mcp/policy-claude.ts`, `mcp/server.ts` (checker wiring)
+- Test: `__tests__/mcp/policy-claude.test.ts`, `__tests__/mcp/gitignore-match.test.ts`
 
 **Interfaces:**
-- Produces: `resolvePlanCwd(sessionRoot: string, planCwd?: string): { cwd: string } | { error: string }` exported from `core/engine.ts` for focused tests.
-- Preserves: tool executors receive the engine-computed `RunOptions.cwd`.
+- Produces:
+  - `compileClaudePathRule(rule: string, anchor: { projectDir: string; settingsDir: string; home: string }): (absPath: string) => boolean`.
+  - The anchor forms (per https://code.claude.com/docs/en/permissions, "Read and Edit"): `//abs` → filesystem absolute, `~/x` → home, `/x` → relative to the settings file's source root, `./x` or a bare `x` → project-relative, `**/x` → any depth. A bare name with no slash matches at any depth, following gitignore.
 
-- [ ] **Step 1: Add failing central validation tests**
+- [ ] **Step 1: Failing tests.** Table test over `(rule, path, expected)`:
+  - `Read(.env)` vs `config/.env` → deny
+  - `Read(secrets/**)` vs `lib/secrets/x` → deny
+  - `Read(//etc/**)` vs `/etc/hosts` → deny
+  - `Read(~/.ssh/**)` vs `$HOME/.ssh/id_rsa` → deny
+  - `Read(./.env)` vs `a/../.env` → deny (normalized)
+  - symlink `link -> .env`, read `link` → deny (target checked)
+  - `Read(secrets/**)` with `{tool:"grep", path:"secrets"}` and `{tool:"find", pattern:"*.pem", path:"secrets"}` → deny
+  - with `deny: ["Read(./.env)"]`: shell `cat .env`, `head .env`, `cat < .env`, `tail -n1 ./.env` → policyStop
+  - a rule placed only in `~/.claude/remote-settings.json` is honored
 
-Add engine cases asserting no command runs for `cwd: "/tmp"`, `cwd: ".."`, and non-string cwd. Assert `stoppedReason === "error"` and transcript contains `cwd must be a relative directory inside the session root`.
+  Also check that `CLAUDE_CONFIG_DIR` relocates the user-level settings path.
+- [ ] **Step 2:** Run the tests and watch them fail.
+- [ ] **Step 3: Implement.**
+  - The gitignore matcher supports `*`, `**`, `?`, character classes, leading `/` anchoring, trailing `/` (directory), and `!` negation (applied in order within a rule list).
+  - Apply Read rules to `read`/`grep`/`find`/`ls` ops, checking both the canonical path and its realpath.
+  - For shell commands, extract file operands of known readers (`cat head tail less more sed awk grep rg wc sort uniq cut tr nl od xxd file stat`) and `<` redirect targets, using `core/shell/lexer.ts` exported through `core/index.ts`. Run them through the Read rules.
+  - Add `~/.claude/remote-settings.json` (and `$CLAUDE_CONFIG_DIR/...`) to `claudeSettingsPaths`.
+  - macOS MDM (`/Library/Managed Preferences/com.anthropic.claudecode.plist`, a binary plist) and the Windows registry: **detect presence only**. If the file or key exists, fail closed with a policyStop reason that says managed MDM policy cannot be read by predexec. Reading them properly would add a plist parser, which is out of scope.
+- [ ] **Step 4:** Run `./node_modules/.bin/vitest run __tests__/mcp`. Expected: PASS.
+- [ ] **Step 5:** Commit: `fix(mcp): gitignore-semantics Read rules for tool ops and shell readers; managed settings sources`.
 
-Add a positive nested-directory test using a temporary `sub/` directory.
+### Task 10: opencode permission fidelity, plus host `context.ask` bridge
 
-- [ ] **Step 2: Add a failing Pi effective-cwd test**
-
-Extend the Pi tool-factory mock so it records the cwd passed to `createReadTool`. Execute a plan with `cwd: "sub"` and `{tool:"read", path:"inside.txt"}`. Assert the factory receives the resolved `sub` directory rather than the session root.
-
-- [ ] **Step 3: Verify RED**
-
-Run:
-
-```bash
-./node_modules/.bin/vitest run __tests__/core/engine.test.ts __tests__/pi.test.ts
-```
-
-Expected: absolute/escaping shell cwd runs today, and Pi remains root-bound.
-
-- [ ] **Step 4: Implement central cwd resolution**
-
-Use `isAbsolute`, `relative`, and `resolve`:
-
-```ts
-export function resolvePlanCwd(sessionRoot: string, planCwd?: string): { cwd: string } | { error: string } {
-  if (planCwd === undefined) return { cwd: sessionRoot };
-  if (typeof planCwd !== "string" || planCwd === "" || isAbsolute(planCwd)) {
-    return { error: "cwd must be a relative directory inside the session root" };
-  }
-  const cwd = resolve(sessionRoot, planCwd);
-  const rel = relative(sessionRoot, cwd);
-  if (rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
-    return { error: "cwd must be a relative directory inside the session root" };
-  }
-  return { cwd };
-}
-```
-
-Call this after structural plan validation and before `runNode`. Return an error `CoreResult` before execution on failure.
-
-In Pi, replace one fixed tool map with a `Map<string, tool-map>` keyed by `opts.cwd`; construct native tools for the effective cwd on first use. Preserve the incoming abort signal.
-
-- [ ] **Step 5: Verify GREEN, retain MCP defense, and commit**
-
-Run:
-
-```bash
-./node_modules/.bin/vitest run __tests__/core/engine.test.ts __tests__/pi.test.ts __tests__/mcp/tool-ops.test.ts
-./node_modules/.bin/tsc --noEmit
-```
-
-Commit:
-
-```bash
-git add core/engine.ts core/types.ts .pi/extension/index.ts __tests__/core/engine.test.ts __tests__/pi.test.ts __tests__/mcp/tool-ops.test.ts
-git commit -m "fix: enforce one contained plan cwd"
-```
-
----
-
-### Task 4: Bound parallel execution and Pi progress memory
+Covers OC-1, OC-2, OC-3, and OC-4.
 
 **Files:**
-- Modify: `core/types.ts`
-- Modify: `core/engine.ts`
-- Modify: `core/runner.ts`
-- Modify: `.pi/extension/index.ts`
-- Modify: `__tests__/core/engine.test.ts`
-- Modify: `__tests__/core/runner.test.ts`
-- Modify: `__tests__/pi.test.ts`
+- Modify: `policy.ts`, `.opencode/plugins/predexec.ts`
+- Test: `__tests__/policy.test.ts`, `__tests__/opencode.test.ts`
 
 **Interfaces:**
-- Produces: `MAX_OPERATIONS_PER_NODE = 64` and `MAX_PARALLEL_CONCURRENCY = 8` from `core/types.ts`.
-- Produces: `appendProgressText(current: string, data: string): string` from the Pi adapter for direct testing.
+- Consumes: the async `OperationPolicyChecker` from Task 7.
+- Produces:
+  - `readOpencodeRuleset(projectDir, env): PolicyRule[] | { error: string }`. It returns the ruleset **flattened across all permission keys** in opencode's order, after mergeDeep of the config layers.
+  - `createPolicyChecker` evaluates `permission` key = `bash` for shell, and `read`/`grep`/`glob`/`list` for tool ops, both through wildcard key matching. It evaluates last-match-wins over the flattened list.
 
-- [ ] **Step 1: Add failing plan-size and concurrency tests**
+- [ ] **Step 1: Failing tests** (verdicts shown are opencode's):
 
-Add an engine validation test with 65 `true` commands expecting an error naming the 64-operation ceiling.
+  ```ts
+  it.each([
+    [{ bash: "allow", "*": "deny" }, "ls", "deny"],
+    [{ bash: { "git *": "allow" }, "*": "deny" }, "git status", "deny"],
+    [{ "b*": "deny" }, "ls", "deny"],
+    [{ bash: { "git log *": "deny" } }, "git log", "deny"],
+    [{ read: { "~/secret/*": "deny" } }, { tool: "read", path: `${homedir()}/secret/a` }, "deny"],
+  ])("opencode parity %#", /* build checker from a single config, assert verdict */);
+  it("mergeDeep across global then project keeps first-appearance key order", () => {
+    // global {bash:{"*":"allow","cat *":"deny"}} + project {bash:{"*":"allow"}} → `cat secret.pem` denied
+  });
+  it("honors agent.<name>.permission, OPENCODE_CONFIG_CONTENT, OPENCODE_DISABLE_PROJECT_CONFIG, and built-in external_directory ask for paths outside the project", ...);
+  ```
 
-Add a runner test whose tool executor increments an active counter, waits on a short timer, and records the maximum. Execute 24 operations with `parallel:true`; expect `maxActive <= 8`, all 24 results present, and result order equal to command order.
+  Read opencode 1.18.32's `permission/index.ts`, `config/config.ts:42-47, 414-423` and `util/wildcard.ts`. Fetch them with `npm pack @opencode-ai/opencode@1.18.32` or from GitHub tag `v1.18.32`. Mirror their order exactly, and cite file:line in comments.
+- [ ] **Step 2:** Run the tests and watch them fail.
+- [ ] **Step 3: Implement the static reader fixes.** Then, in the plugin, **prefer** the host bridge when `context.ask` exists on the tool context:
+  - For each operation, await `context.ask({ permission: "bash", patterns: [cmd], always: [], metadata: { source: "predexec" } })`.
+  - Resolved means run. A rejection is a `policyStop` whose reason says "opencode permission denied".
+  - When the static reader says `ask`, the bridge lets opencode prompt the user instead of hard-stopping. This is an intentional behavior change on opencode only: document it in the README and in the skill text generated in Task 14.
+  - Keep the static reader as the fallback when `context.ask` is absent. Also keep it as a *pre-check* that turns static `deny` into an immediate stop, without prompting.
+- [ ] **Step 4:** Run `./node_modules/.bin/vitest run __tests__/policy.test.ts __tests__/opencode.test.ts`. Expected: PASS.
+- [ ] **Step 5:** Commit: `fix(opencode): flattened mergeDeep ruleset parity; bridge to host permission service`.
 
-- [ ] **Step 2: Add failing Pi progress-buffer tests**
+### Task 11: opencode tool-op fidelity
 
-Export and test this contract:
-
-```ts
-expect(appendProgressText("", "x".repeat(100_000)).length).toBeLessThanOrEqual(OUTPUT_CAP + 64);
-expect(appendProgressText("", "x".repeat(100_000))).toContain("…[truncated");
-```
-
-In the adapter integration test, omit `onUpdate`, stream a large command result, and assert no progress accumulator helper is invoked.
-
-- [ ] **Step 3: Verify RED**
-
-Run:
-
-```bash
-./node_modules/.bin/vitest run __tests__/core/runner.test.ts __tests__/core/engine.test.ts __tests__/pi.test.ts
-```
-
-- [ ] **Step 4: Implement validation, worker pool, and bounded progress**
-
-Export exact constants:
-
-```ts
-export const MAX_OPERATIONS_PER_NODE = 64;
-export const MAX_PARALLEL_CONCURRENCY = 8;
-```
-
-Reject oversized nodes in `validatePlan`. Replace `Promise.all(commands.map(...))` with indexed workers:
-
-```ts
-const results = new Array<CommandResult>(commands.length);
-let next = 0;
-async function worker(): Promise<void> {
-  while (next < commands.length) {
-    const index = next++;
-    results[index] = await runOneOp(commands[index]!, opts);
-  }
-}
-await Promise.all(Array.from(
-  { length: Math.min(MAX_PARALLEL_CONCURRENCY, commands.length) },
-  () => worker(),
-));
-return results;
-```
-
-In Pi, import `OUTPUT_CAP` from the owning core module or export it through the public core interface. `appendProgressText` retains the prefix up to `OUTPUT_CAP` and appends one marker. Only pass `onCommandOutput` when `onUpdate` exists.
-
-- [ ] **Step 5: Verify GREEN and commit**
-
-Run focused tests plus typecheck, then commit:
-
-```bash
-git add core/types.ts core/engine.ts core/runner.ts core/index.ts .pi/extension/index.ts __tests__/core/engine.test.ts __tests__/core/runner.test.ts __tests__/pi.test.ts
-git commit -m "fix: bound plan parallelism and progress output"
-```
-
----
-
-### Task 5: Correct cycle stats and JSON-path authoring
+Covers OC-5, OC-6, OC-7, and OC-8, plus exit-2 parity.
 
 **Files:**
-- Modify: `stats.ts`
-- Modify: `core/engine.ts`
-- Modify: `steering.ts`
-- Modify: `.pi/extension/index.ts`
-- Modify: `mcp/server.ts`
 - Modify: `.opencode/plugins/predexec.ts`
-- Modify: `__tests__/stats.test.ts`
-- Modify: `__tests__/core/engine.test.ts`
-- Modify: `__tests__/index.test.ts`
+- Test: `__tests__/opencode.test.ts`
+
+- [ ] **Step 1: Failing tests,** using the mocked v1 client:
+  - `find` with `limit: 500` sends `limit ≤ 200`. It requests `min(limit,200)+1` and flags `truncated` when the extra row returns, and the stderr says so explicitly.
+  - Every client call passes `directory: sessionRoot`, never a subdirectory. Subdirectory scoping is applied client-side by path prefix.
+  - A `file.read` response `{type:"binary"}` gives exit 2 with stderr `binary file`.
+  - Every "never ran" path (invalid op, unknown tool, client throw) gives exit 2, while an empty result gives exit 1.
+  - `experimental.chat.system.transform` is a no-op when the request is a title, summary or small-model prompt. Detect that from `input` per opencode 1.18.32 `session/llm/request.ts:56-72` and `agent/agent.ts:381`, and cite them.
+- [ ] **Step 2:** Run the tests and watch them fail.
+- [ ] **Step 3:** Implement.
+- [ ] **Step 4:** Run the tests. Expected: PASS.
+- [ ] **Step 5:** Commit: `fix(opencode): bounded find with explicit truncation, single-instance directory, exit-2 failures`.
+
+### Task 12: pi adapter fixes and version bump
+
+Covers PI-1 through PI-6.
+
+**Files:**
+- Modify: `.pi/extension/index.ts`, `package.json` (`devDependencies` → `@earendil-works/pi-coding-agent: ^0.87.1`; add `peerDependencies: {"@earendil-works/pi-coding-agent": "*"}` and `peerDependenciesMeta: {..., optional: true}`, because Claude, Codex and opencode users do not have pi), `pnpm-lock.yaml`
+- Create: `__tests__/pi-host.test.ts`, which uses pi's real `loadExtensions()` and `validateToolArguments` from the installed package
+
+- [ ] **Step 1:** Run `pnpm add -D @earendil-works/pi-coding-agent@^0.87.1`, then run the typecheck.
+- [ ] **Step 2: Failing tests** in `pi-host.test.ts`:
+  - The real loader loads `dist/.pi/extension/index.js` and registers `predexec`.
+  - `prepareArguments` followed by `validateToolArguments` accepts `nodes` as a JSON string, a whole-plan string, and `commands:"ls"`.
+  - `execute` with an engine `stoppedReason:"error"` **throws**.
+  - The tool_result nudge is not appended when `event.isError`, and *is* appended for `powershell`.
+  - A tool-op executor throw gives exit 2.
+- [ ] **Step 3:** Run the tests and watch them fail.
+- [ ] **Step 4: Implement.**
+  - Add `prepareArguments: (args) => coercePlan-derived normalization`. Reuse the adapter-runtime coercion so it isn't reimplemented.
+  - Throw on error.
+  - Add `isError` and `powershell` handling.
+  - Use exit 2 for never-ran.
+  - Update the matching CLAUDE.md hard-won bullet in Task 23: exit 2 is now uniform across all hosts.
+- [ ] **Step 5:** Run `./node_modules/.bin/vitest run __tests__/pi.test.ts __tests__/pi-host.test.ts`. Expected: PASS.
+- [ ] **Step 6:** Commit: `fix(pi): coerce via prepareArguments, throw on error, exit-2 failures; bump pi to 0.87`.
+
+### Task 13: Codex policy fidelity
+
+Covers CX-1, CX-2, CX-3, CX-4, CX-6, and CX-7 (the code part).
+
+**Files:**
+- Modify: `mcp/policy-codex.ts`, `mcp/toml-lite.ts`
+- Test: `__tests__/mcp/policy-codex.test.ts`, `__tests__/mcp/toml-lite.test.ts`
 
 **Interfaces:**
-- Produces: repeated-path operation counting.
-- Produces: validation rule that a node with a `jsonPath` edge has exactly one operation.
-- Produces: model-facing sentence `jsonPath edges require a one-operation source node.`
+- Produces: `readCodexRules(cwd, opts)` resolves the Codex layers in this order:
+  1. system `/etc/codex/rules`
+  2. `$CODEX_HOME` (env, else `~/.codex`) `rules/`
+  3. for trusted projects, the `.codex/rules/` of every directory from the project root down to cwd
 
-- [ ] **Step 1: Add failing cycle-stat test**
+  The project root comes from `project_root_markers` (default `[".git"]`) on canonical realpaths, using the main worktree root when `.git` is a file. Trust is looked up per cwd, then project root, then main worktree root. Use `codex-rs/config/src/loader/mod.rs:1041-1080, 1249-1340, 1378` as the reference and cite it.
 
-```ts
-it("counts operations on every visit through a legal cycle", () => {
-  const p = plan([{ id: "a", commands: ["c1", "c2"] }]);
-  const r = result({ pathTaken: ["a", "a", "a"], depthReached: 2 });
-  expect(estimateRequestsSaved(p, r)).toBe(5);
-});
-```
-
-- [ ] **Step 2: Add failing JSON-path validation test**
-
-Create a node with `commands: ["true", "printf '{\"ok\":true}'"]` and a `jsonPath` edge. Assert `validatePlan` returns `jsonPath edges require a one-operation source node` and `runPlanTree` executes no command.
-
-Add a one-command JSON node case that remains valid.
-
-- [ ] **Step 3: Verify RED**
-
-Run stats and engine tests. Expected: cycle test reports 1 rather than 5; multi-command JSON plan validates.
-
-- [ ] **Step 4: Implement occurrence-based counting and validation**
-
-Build `Map<NodeId, PlanNode>` once in `countVisitedOps`, then reduce `result.pathTaken`:
-
-```ts
-return result.pathTaken.reduce((ops, id) => ops + (byId.get(id)?.commands.length ?? 0), 0);
-```
-
-During the engine's edge validation, reject a node with `commands.length !== 1` when any outgoing edge has `when.kind === "jsonPath"`.
-
-Add `JSON_PATH_SINGLE_OP_LINE` to `steering.ts` and compose it into all three adapter plan descriptions/schema descriptions. Task 9 will consolidate the remaining shape prose; do not redesign schemas here.
-
-- [ ] **Step 5: Verify GREEN and commit**
-
-Run focused tests and typecheck. Commit explicit files:
-
-```bash
-git add stats.ts core/engine.ts steering.ts .pi/extension/index.ts mcp/server.ts .opencode/plugins/predexec.ts __tests__/stats.test.ts __tests__/core/engine.test.ts __tests__/index.test.ts
-git commit -m "fix: count cyclic runs and validate json paths"
-```
+- [ ] **Step 1: Failing tests.**
+  - A `default.rules` containing `network_rule(...)` and `host_executable(...)` alongside `prefix_rule(pattern=["rm"], decision="forbidden")` → `ls` allowed and `rm x` stopped. Before the fix, both are stopped.
+  - A `config.toml` with `[[skills.config]]`, inline tables, `"""` strings, dotted keys, `é`, `1_000`, `1e5`, plus a valid `[projects."/p"] trust_level="trusted"` → trust read correctly.
+  - The same file with a *malformed* `[projects.*]` section → fail closed.
+  - A duplicate `[a]` header → fail closed.
+  - A session in `<trusted repo>/sub/dir`, and one via a symlink to the repo → the repo's `.codex/rules` forbidden rule applies.
+  - `/etc/codex/rules/x.rules` forbidding `cat` → stops. Parametrize the system dir through `CodexPolicyOptions.systemDir` for tests.
+  - `CODEX_HOME=/tmp/ch` with rules there → honored.
+  - Patterns: `[["rm","rmdir"],"-rf"]` matches `rmdir -rf x` but not `ls`, `"a\\b"` matches `a\b`, and `"*"` matches only a literal `*`.
+- [ ] **Step 2:** Run the tests and watch them fail.
+- [ ] **Step 3: Implement.**
+  - **toml-lite:** full parsing for strings, numbers, inline tables, arrays of tables and dotted keys. A parse error *outside* `projects` is tolerated (logged into the result as `warnings`). A parse error that touches `projects` fails closed. Duplicate table headers fail closed.
+  - **execpolicy extractor:** skip `network_rule(...)` and `host_executable(...)` call statements, balanced-paren aware. Unknown top-level calls still fail closed.
+- [ ] **Step 4:** Run `./node_modules/.bin/vitest run __tests__/mcp`. Expected: PASS.
+- [ ] **Step 5:** Commit: `fix(codex): tolerate host-written rules/config, layered trust and rules resolution, CODEX_HOME`.
 
 ---
 
-### Task 6: Make MCP fallback search termination-safe and bounded
+## Phase 4 — Skills everywhere
+
+### Task 14: Single-source skill generation
+
+Covers the SKILL.md requirement, PI (steering), and CC-5.
 
 **Files:**
-- Modify: `core/index.ts`
-- Modify: `mcp/tool-ops.ts`
-- Modify: `__tests__/mcp/tool-ops.test.ts`
+- Modify: `steering.ts`. Add `SKILL_HARNESSES` and `renderSkill(harness)`.
+- Create: `scripts/gen-skills.mjs` (it imports the compiled `dist/steering.js`), and `package.json` script `"skills": "pnpm run build && node scripts/gen-skills.mjs"`
+- Generate:
+  - `.pi/skills/predexec/SKILL.md` (pi discovers it through `pi.skills`)
+  - `skills/claude/predexec/SKILL.md`
+  - `skills/codex/predexec/SKILL.md`
+  - `skills/opencode/predexec/SKILL.md`
+  - `skills/antigravity/predexec/SKILL.md`
+- Delete: `skills/predexec-claude/` (replaced by `skills/claude/predexec/`)
+- Modify: `.pi/extension/index.ts`. Trim `promptGuidelines` to a pointer ("see the predexec skill") and keep the one-line `promptSnippet`, which pi needs to list the tool. The tool-op syntax moves into the skill.
+- Create: `__tests__/skills.test.ts`
 
 **Interfaces:**
-- Produces: public `isSafeRegex(pattern: string): boolean` export through `core/index.ts`.
-- Changes internal MCP signatures: `grepViaNode(..., limit, signal)` receives the result limit.
-- Preserves: grep/find exit codes 0=result, 1=no result, 2=search did not run.
+- Produces:
+  - `type SkillHarness = "pi" | "claude" | "codex" | "opencode" | "antigravity"`
+  - `renderSkill(h: SkillHarness): string`, which returns the full file with frontmatter
+  - `SKILL_PATHS: Record<SkillHarness, string>`, repo-relative
 
-- [ ] **Step 1: Add failing unsafe-regex fallback test**
+**Content rules:**
+- Every skill has `name: predexec`.
+- The `description` is the full routing rule: `STEERING_LINE` plus when to use it.
+- The body is composed from the `steering.ts` constants: `USAGE_LINE`, `VERIFY_FIRST_LINE`, `RECOVERY_LINE`, `WHEN_SYNTAX_LINE`, the tool-op syntax, and a per-harness policy paragraph (Claude deny/ask → stop; opencode prompts via host; Codex rules; Antigravity grants). pi omits `policyStop`.
+- **Never hardcode an `mcp__…` tool id.** Say "the `predexec` tool (its full id varies by install, e.g. `mcp__predexec__predexec` or a plugin-namespaced id)".
+- Skills live in per-harness subtrees so opencode's and Codex's recursive `**/SKILL.md` scans of a plugin's skills dir never pick up another harness's skill.
 
-Force `{ rgPath: null }`, create a text file, run grep with `(a+)+$`, and assert exit code 2 with stderr containing `unsafe pattern`. The test must complete normally without timing assertions.
+- [ ] **Step 1: Failing tests** in `skills.test.ts`:
+  - For each harness, `readFileSync(SKILL_PATHS[h])` equals `renderSkill(h)`. This is the drift guard. On failure the message should say "run pnpm skills".
+  - The frontmatter parses, `name` matches the regex, and `description` is ≤1024 chars and contains the `STEERING_MARKERS` quorum.
+  - No skill body contains `mcp__predexec__predexec` except inside the "varies by install" sentence.
+  - `package.json.files` includes `skills` and `.pi/skills`.
+  - `npm pack --dry-run --json` lists all five `SKILL.md` files. Reuse the pack helper if one exists.
+- [ ] **Step 2:** Run the tests and watch them fail.
+- [ ] **Step 3:** Implement `renderSkill`, then run `pnpm skills` to generate the files.
+- [ ] **Step 4:** Run `./node_modules/.bin/vitest run __tests__/skills.test.ts __tests__/steering.test.ts __tests__/pi.test.ts`. Expected: PASS.
+- [ ] **Step 5:** Commit: `feat: generate every harness's routing SKILL.md from steering.ts`.
 
-- [ ] **Step 2: Add failing bounded-scan and large-read tests**
+### Task 15: `predexec install-skill` and doctor skill checks
 
-Create lexically sorted files containing more matches than `limit: 3`. Instrument filesystem reads through a narrow test seam or exported internal helper and assert fallback grep stops after establishing the fourth match, returns the first three path/line results, and emits the existing limit warning.
+**Files:**
+- Modify: `bin/predexec.mjs`, `README.md`
+- Test: `__tests__/doctor.test.ts`, `__tests__/install-skill.test.ts` (new)
 
-Create a large text fixture with requested `{offset: 2, limit: 2}` and assert output/continuation text remains byte-identical while the implementation's retained-line high-water mark stays bounded through an exported test-only-independent helper result. Do not assert process RSS or timing.
+**Interfaces:**
+- CLI: `predexec install-skill <claude|codex|opencode|antigravity|pi> [--project] [--dry-run]`. It copies the packaged `skills/<h>/predexec/` (or `.pi/skills/predexec`) into the target. It refuses to overwrite a differing existing file unless `--force` is given, and it prints the destination.
 
-- [ ] **Step 3: Verify RED**
+| Harness | Global | `--project` |
+|---|---|---|
+| claude | `${CLAUDE_CONFIG_DIR:-~/.claude}/skills/predexec/` | `.claude/skills/predexec/` |
+| codex | `~/.agents/skills/predexec/` | `.agents/skills/predexec/` |
+| opencode | `~/.config/opencode/skills/predexec/` | `.opencode/skills/predexec/` |
+| antigravity | the path measured in Task 19 | `.agents/skills/predexec/` |
+| pi | no-op with a message: pi loads it from the package | — |
 
-Run:
+- **Doctor:**
+  - Per harness, `[x] skill` when a predexec `SKILL.md` exists in any discovery root for that host, or the host's plugin form ships it.
+  - `[ ] skill` when the server is registered but no skill is found, with a hint to run `install-skill`.
+  - `[!]` when two different predexec skills are visible to one host. Example: opencode sees both `.claude/skills/predexec` and its own.
+  - `info` when a Codex/opencode `AGENTS.md` block *and* a skill are both active (the routing text loads twice).
+  - Honor `CLAUDE_CONFIG_DIR`.
+  - For local-scope Claude registrations, walk up from cwd through its ancestors in `~/.claude.json` `projects` (CC-6).
 
-```bash
-./node_modules/.bin/vitest run __tests__/mcp/tool-ops.test.ts
-```
+- [ ] **Step 1:** Write failing tests. Point `HOME` at a tmp dir, run `install-skill` for each harness with and without `--project`, and assert the files. Assert the doctor lines for present, missing and duplicate skills.
+- [ ] **Step 2:** Run the tests and watch them fail. **Step 3:** Implement. **Step 4:** Tests pass.
+- [ ] **Step 5:** Commit: `feat(cli): install-skill command; doctor verifies skills per harness`.
 
-- [ ] **Step 4: Screen regex and stream reads**
+### Task 16: Claude Code plugin packaging
 
-Export `isSafeRegex` from `core/index.ts`. Before `new RegExp` in fallback grep:
+Covers CC-5 (packaging) and CC-6.
 
-```ts
-if (!flags.literal && !isSafeRegex(pattern)) {
-  return { err: fail("grep", "unsafe pattern: nested quantifier may not terminate") };
-}
-```
+**Files:**
+- Modify: `.claude-plugin/plugin.json`
+- Create: `.claude-plugin/marketplace.json`
+- Modify: `scripts/sync-plugin-version.mjs`, `README.md`
+- Test: `__tests__/release-hygiene.test.ts`
 
-Implement a line iterator over `createReadStream` plus `node:readline` for text reads. Detect NUL bytes while consuming chunks. Retain only requested lines and a total-line counter; preserve one-based offset and final-newline semantics.
+- [ ] **Step 1:** Verify the current plugin schema, especially the custom `skills` path field and marketplace `source` forms, against https://code.claude.com/docs/en/plugins-reference and https://code.claude.com/docs/en/plugin-marketplaces. Record the URLs in the commit body.
+- [ ] **Step 2: Failing tests:**
+  - `plugin.json` has `author`, and `skills: "./skills/claude/"` (or the documented equivalent).
+  - Its npx args pin `--package=predexec@<package.json version>`.
+  - `marketplace.json` lists the `predexec` plugin with `source: "./"`.
+  - After `node scripts/sync-plugin-version.mjs`, both files carry the package version.
+  - If the `claude` CLI is on PATH, `claude plugin validate .` exits 0. Otherwise skip that check.
+- [ ] **Step 3:** Implement. Document this in the README:
 
-Sort candidate paths before scanning fallback grep. Iterate files and lines in final output order, stop at `limit + 1` matches, and pass only the first `limit` to context formatting. Retain line arrays only for files contributing returned matches, capped by the requested limit.
+  ```
+  /plugin marketplace add FuriousZen/predexec
+  /plugin install predexec@predexec
+  ```
 
-- [ ] **Step 5: Verify GREEN and commit**
+  Keep `claude mcp add` as the alternative, followed by `npx -y predexec install-skill claude`. Warn not to do both.
+- [ ] **Step 4:** Tests pass. **Step 5:** Commit: `feat(claude): installable plugin marketplace with version-pinned server and skill`.
 
-Run tool-op tests and typecheck. Commit:
+### Task 17: opencode ships its skill via the plugin
 
-```bash
-git add core/index.ts mcp/tool-ops.ts __tests__/mcp/tool-ops.test.ts
-git commit -m "fix: bound MCP fallback reads and regex search"
-```
+**Files:**
+- Modify: `.opencode/plugins/predexec.ts`, `configs/opencode/AGENTS.md` (it becomes a manual-install note), `README.md`
+- Test: `__tests__/opencode.test.ts`
+
+- [ ] **Step 1: Failing tests:**
+  - The plugin's `config` hook appends the absolute path of the packaged `skills/opencode` to `cfg.skills.paths`. It is idempotent and preserves existing paths.
+  - The system-transform guard skips injection when the system prompt already lists the predexec skill description. The quorum must hit on the generated description.
+- [ ] **Step 2:** Implement. Keep the guarded `system.transform` as a fallback for agents with `tools.skill:false` or `permission.skill` set to deny.
+- [ ] **Step 3: Live measurement.** If `opencode` is on PATH, run it in a scratch project that has the plugin installed from `npm pack`, and check that:
+  - `opencode debug skill`, or the `<available_skills>` block in a debug-logged prompt, lists `predexec`;
+  - the `config` hook runs before skill discovery.
+
+  Record the result in `docs/research/opencode-skills.md`. If the hook ordering fails, fall back to documenting `install-skill opencode`, and have doctor report `[ ] skill`.
+- [ ] **Step 4:** Tests pass. **Step 5:** Commit: `feat(opencode): register packaged skill via config hook; system-transform fallback`.
+
+### Task 18: Codex plugin + skill packaging
+
+Covers CX-4 (registration) and CX-7 (docs).
+
+**Files:**
+- Create:
+  - `.codex-plugin/plugin.json`: `{ name, version, description, "mcpServers": "./.codex-plugin/mcp.json", "skills": "./skills/codex/" }`
+  - `.codex-plugin/mcp.json`: `{ "mcpServers": { "predexec": { "command": "npx", "args": ["-y","--package=predexec@<ver>","predexec-mcp","--host","codex"], "env_vars": ["CODEX_HOME"] } } }`
+  - `.agents/plugins/marketplace.json`
+- Modify: `scripts/sync-plugin-version.mjs` (sync these too), `package.json` `files` (add `.codex-plugin`), `configs/codex/AGENTS.md` (strip the preamble into README prose so the file is paste-ready), `README.md` (replace the `curl -o AGENTS.md` clobber with plugin install, `install-skill codex`, and an *append* fallback), `bin/predexec.mjs` doctor (warn when the Codex registration lacks `env_vars=["CODEX_HOME"]` while `CODEX_HOME` is set in the user's shell)
+- Modify: `mcp/policy-codex.ts:6,17,133` and `bin/predexec.mjs:684`. Replace the dangling `CODEX-RESEARCH.md` citations with Codex source paths and URLs.
+
+- [ ] **Step 1:** Verify the manifest schema against the installed codex-cli (`codex plugin --help`, and an installed plugin under `~/.codex/plugins` or wherever `codex plugin list` points). Match the key names exactly, especially `mcpServers` path-vs-inline and `env_vars`.
+- [ ] **Step 2: Failing tests** in `release-hygiene`:
+  - The manifests parse, versions are synced, and `--host codex` and `env_vars` are present.
+  - There is no root `.mcp.json`.
+  - `npm pack` includes `.codex-plugin/` and `skills/codex/`.
+- [ ] **Step 3: Implement.** Then, if `codex` is on PATH, run a live check in a scratch dir:
+
+  ```
+  codex plugin marketplace add <repo path>
+  codex plugin add predexec
+  codex mcp list
+  ```
+
+  Record the result in `docs/research/codex-plugin.md`.
+- [ ] **Step 4:** Tests pass. **Step 5:** Commit: `feat(codex): plugin with skill and CODEX_HOME forwarding; AGENTS.md becomes fallback`.
 
 ---
 
-### Task 7: Enforce truthful MCP symlink containment
+## Phase 5 — Antigravity
+
+### Task 19: Antigravity live measurements
+
+This is a research task with no production code.
 
 **Files:**
-- Modify: `mcp/tool-ops.ts`
-- Modify: `mcp/server.ts`
-- Modify: `__tests__/mcp/tool-ops.test.ts`
-- Modify: `__tests__/mcp/server.test.ts`
-- Modify: `README.md`
+- Create: `docs/research/antigravity.md`, and the probe script `scripts/probes/mcp-env-probe.mjs`, excluded from `files`
+
+- [ ] **Step 1:** Write a stdio MCP probe server with `@modelcontextprotocol/server` and one tool, `probe`, annotated `readOnlyHint:true`. On start it appends a JSON line to `$TMPDIR/predexec-probe.log` recording:
+  - `process.cwd()`
+  - all env var **names**, plus the values of any `ANTIGRAVITY_*`/`GEMINI_*` vars
+  - `process.ppid`
+  - whether writing `~/predexec-probe-write-test` succeeds (then delete it)
+
+  Also send one line to stderr.
+- [ ] **Step 2:** Register it with `agy mcp add --env PROBE=1 predexec-probe node -- <abs path>/scripts/probes/mcp-env-probe.mjs`. Run `agy` non-interactively in a scratch git repo, using `agy --help` to find the headless/prompt flag, with a prompt that asks it to call the `probe` tool. Then answer and record:
+  - (a) the cwd, and whether it equals the workspace root when started from a subdir;
+  - (b) whether the call prompted for approval under the default `toolPermission`;
+  - (c) whether the write succeeded, which shows whether MCP children run outside the sandbox (also test with `enableTerminalSandbox:true`);
+  - (d) which global skills dir is loaded: place a trivial skill in each of `~/.gemini/config/skills/` and `~/.gemini/antigravity-cli/skills/` and ask agy to list its skills;
+  - (e) after `agy plugin install` of a scratch plugin wrapping the probe, the namespaced tool name, and whether `mcp(predexec-probe/*)` grants match it.
+- [ ] **Step 3:** If a step can't run headless, mark it **UNVERIFIED** with the exact blocker. Do not guess. Afterwards remove the probe registration (`agy mcp remove predexec-probe`) and the scratch skills.
+- [ ] **Step 4:** Commit: `docs(research): measure Antigravity MCP spawn, approval, sandbox, skills, plugin namespacing`.
+
+### Task 20: `--host antigravity` + `mcp/policy-antigravity.ts`
+
+**Files:**
+- Create: `mcp/policy-antigravity.ts`, `__tests__/mcp/policy-antigravity.test.ts`
+- Modify: `bin/predexec-mcp.mjs` (accept `antigravity` in `--host`), `mcp/server.ts` (select the checker and the stats label `antigravity`; the description stays host-neutral), `stats.ts` / `bin/predexec.mjs stats` (the label), tool-op containment root (per the Task 19 cwd finding; if the cwd is not the workspace, add `--root <dir>` / `PREDEXEC_ROOT` and document it)
 
 **Interfaces:**
-- Produces: realpath containment for existing MCP tool targets.
-- Preserves: dependency symlinks whose lexical path contains a `node_modules` segment.
+- Produces:
+  - `createAntigravityPolicyChecker(opts: { home?: string; cwd: string; env?: NodeJS.ProcessEnv }): OperationPolicyChecker`
+  - `parseAntigravityGrant(s: string): { action: string; target: { kind: "prefix" | "regex" | "any"; value: string } } | null`
 
-- [ ] **Step 1: Add failing symlink escape tests**
+**Semantics** (https://antigravity.google/docs/permissions; cite in comments):
+- Source: `~/.gemini/antigravity-cli/settings.json` `permissions.{deny,ask,allow}`, plus `toolPermission` and `allowNonWorkspaceAccess`.
+- Shell operation → `command(...)` grants:
+  - `prefix` matches on a word boundary;
+  - `regex:` is compiled only if `isSafeRegex`, otherwise fail closed;
+  - a command containing `$(`, a backtick or `<(` needs an exact full-line match (per the docs).
+- Tool ops `read`/`grep`/`find`/`ls` → `read_file(...)` grants.
+- Order is Deny > Ask > Allow. A deny or ask match is a `policyStop`.
+- `toolPermission: "strict"` → stop unless an allow matches. `allowNonWorkspaceAccess: false` → stop any op whose path resolves outside the workspace.
+- A missing file means no rules. An unparseable file, or an unknown grant syntax in deny/ask, fails closed. Unknown syntax in allow is ignored, because ignoring an allow can only add stops.
+- App/IDE UI grants are unreadable: document that as a known gap.
 
-Create a root directory and a separate outside directory with `secret.txt`. Add `root/link -> outside`. Assert `read link/secret.txt`, `grep` scoped to the link, and `ls link` fail with text containing `symlink resolves outside the predexec root`.
+- [ ] **Step 1: Failing tests.**
+  - Deny beats allow, ask stops, and a prefix word boundary means `command(git)` matches `git status` but not `gitk`.
+  - An unsafe `regex:` fails closed. A substitution construct requires an exact match.
+  - `read_file` deny applies to tool ops.
+  - `strict` behaves as specified, and so does `allowNonWorkspaceAccess:false`.
+  - Unparseable JSON fails closed. A missing file allows.
+  - `--host antigravity` selects the checker, as seen in stdio server tests. Mirror the existing `--host codex` test.
+  - An invalid `--host` still errors to stderr.
+- [ ] **Step 2:** Run the tests and watch them fail. **Step 3:** Implement. **Step 4:** `./node_modules/.bin/vitest run __tests__/mcp` passes.
+- [ ] **Step 5:** Commit: `feat(antigravity): --host antigravity with Deny>Ask>Allow grant policy`.
 
-Create `root/node_modules/pkg -> outside/pkg` and assert reading `node_modules/pkg/package.json` succeeds. Skip only on platforms where symlink creation itself is unavailable.
+### Task 21: Antigravity plugin, skill install, and doctor
 
-- [ ] **Step 2: Verify RED**
+**Files:**
+- Create:
+  - `antigravity-plugin/plugin.json`: `{"name":"predexec", ...}`, per the Task 19 findings and `agy plugin validate`
+  - `antigravity-plugin/mcp_config.json`: `{"mcpServers":{"predexec":{"command":"npx","args":["-y","--package=predexec@<ver>","predexec-mcp","--host","antigravity"]}}}`
+  - `antigravity-plugin/skills/predexec/SKILL.md`. Generate this from `renderSkill("antigravity")`: extend `SKILL_PATHS` so the antigravity skill is written here instead of `skills/antigravity/`, and delete that dir.
+  - `configs/antigravity/AGENTS.md` (paste-ready fallback)
+- Modify: `scripts/sync-plugin-version.mjs`, `package.json` `files`, `bin/predexec.mjs` (doctor + `install-skill antigravity`), `README.md`
 
-Run MCP tool-op tests. Expected: ordinary symlink escape succeeds today.
+**Doctor checks:**
+- `[-]` when neither `agy` nor `~/.gemini` exists.
+- `[x]` when predexec is registered, either in `~/.gemini/config/mcp_config.json` with `--host antigravity` or as an enabled plugin under `~/.gemini/config/plugins/`.
+- `[!]` when it is registered without `--host antigravity`.
+- `[!]` when the plugin is disabled in `~/.gemini/config/config.json`.
+- The skill is present in a Task 19-verified path.
+- `info` when there is no `mcp(predexec/*)` allow grant (every call will prompt), unless Task 19 showed `readOnlyHint` suppresses prompting.
 
-- [ ] **Step 3: Implement realpath-aware target checks**
+- [ ] **Step 1:** Write failing tests covering doctor fixtures for each state above, the manifest and version sync, and that `npm pack` includes `antigravity-plugin/`.
+- [ ] **Step 2:** Implement. If `agy` is on PATH, run `agy plugin validate antigravity-plugin`. It must exit 0.
+- [ ] **Step 3:** Document the install in the README:
 
-After lexical `locate` and existence checks, resolve both root and target using `realpath`. Reject an outside resolved target unless the lexical relative path has a path segment exactly equal to `node_modules`:
+  ```
+  npx -y --package=predexec@<ver> predexec … # or
+  agy plugin install <path to node_modules/predexec/antigravity-plugin>
+  ```
 
-```ts
-const dependencyPath = relative(root, lexicalAbs).split(sep).includes("node_modules");
-if (!isWithin(realRoot, realTarget) && !dependencyPath) return outsideSymlinkError(...);
-```
-
-Use the real target for the operation after validation. Keep recursive walks from following directory symlinks.
-
-Update MCP plan-description prose and README containment documentation to say dependency symlinks below `node_modules` are the sole exception.
-
-- [ ] **Step 4: Verify GREEN and commit**
-
-Run tool-op/server tests, typecheck, and commit:
-
-```bash
-git add mcp/tool-ops.ts mcp/server.ts README.md __tests__/mcp/tool-ops.test.ts __tests__/mcp/server.test.ts
-git commit -m "fix: reject MCP symlink escapes"
-```
+  Also document the manual fallback, `agy mcp add predexec npx -- -y --package=predexec predexec-mcp --host antigravity`, followed by `npx -y predexec install-skill antigravity`.
+- [ ] **Step 4:** Tests pass. **Step 5:** Commit: `feat(antigravity): plugin bundle with skill; doctor and install-skill support`.
 
 ---
 
-### Task 8: Deepen policy from shell commands to operations
+## Phase 6 — Dependencies and docs
 
-**Files:**
-- Modify: `core/types.ts`
-- Modify: `core/engine.ts`
-- Modify: `policy.ts`
-- Modify: `mcp/policy-claude.ts`
-- Modify: `mcp/server.ts`
-- Modify: `.opencode/plugins/predexec.ts`
-- Modify: `__tests__/core/engine.test.ts`
-- Modify: `__tests__/policy.test.ts`
-- Modify: `__tests__/mcp/policy-claude.test.ts`
-- Modify: `__tests__/mcp/server.test.ts`
+### Task 22: Dependency refresh
 
-**Interfaces:**
-- Replaces: `RunOptions.checkCommandPolicy?: (cmd: string) => string | null`.
-- Produces: `OperationPolicyChecker = (operation: Operation) => string | null` and `RunOptions.checkOperationPolicy?: OperationPolicyChecker`.
-- Preserves: all existing Bash checker behavior and verdict strings.
+Covers DEP-1.
 
-- [ ] **Step 1: Add failing engine policy tests for every operation**
+**Files:** `package.json`, `pnpm-lock.yaml`
 
-Pass a checker that records operations and denies `{tool:"read", path:".env"}`. Assert the read executor is never called, `stoppedReason === "policyStop"`, and the transcript names the operation and rule. Assert shell strings and `{tool:"bash"}` still reach the checker.
+- [ ] **Step 1:** Run `pnpm update @modelcontextprotocol/server zod` within their existing ranges. The lock should reach MCP server 2.1.x (for the id-0 cancellation fix) and the latest zod 4.x.
+- [ ] **Step 2:** Add a test in `__tests__/mcp/server.test.ts`. A `notifications/cancelled` for request id `0` must abort the running plan, observed as `stoppedReason` "aborted" or equivalent in the result.
+- [ ] **Step 3:** Run the full gate, and `pnpm audit --prod`. Expected: PASS and no vulnerabilities. `pnpm ls --prod --depth Infinity` must still list only the 3 packages.
+- [ ] **Step 4:** Commit: `chore(deps): MCP server 2.1, zod 4.x refresh`.
 
-- [ ] **Step 2: Add failing Claude and opencode fixture tests**
+Deferred, not in this plan: TypeScript 7 and Vitest 5 (major bumps; each needs its own plan), and the opencode v2 plugin API (not wired into the host session path as of 1.18.32; watch item).
 
-Claude settings fixture:
+### Task 23: Documentation truth pass
 
-```json
-{
-  "permissions": {
-    "deny": ["Read(./.env)", "Grep(./secrets/**)"],
-    "ask": ["Glob(./private/**)"]
-  }
-}
-```
+Covers DOC-1 and the stale claims.
 
-Assert mapped `read`, `grep`, `find`, and `ls` operations stop on matching static rules while unrelated paths pass. Preserve Bash precedence tests.
+**Files:** `/Users/williamwo/Development/personal/predexec/CLAUDE.md` (outside the repo; edit in place, not committed), `README.md`, `steering.ts` header comment
 
-Opencode config fixture:
-
-```json
-{
-  "permission": {
-    "read": {".env": "deny", "*": "allow"},
-    "grep": {"secrets/**": "ask", "*": "allow"},
-    "list": {"private/**": "deny", "*": "allow"}
-  }
-}
-```
-
-Assert last matching rule wins independently within each tool's entries.
-
-- [ ] **Step 3: Verify RED**
-
-Run engine, policy, Claude policy, and MCP server tests. Expected: non-bash operations skip policy.
-
-- [ ] **Step 4: Implement normalized operation checking**
-
-Add:
-
-```ts
-export type OperationPolicyChecker = (operation: Operation) => string | null;
-```
-
-The engine calls it for every item before any item in the node runs. A shell string remains a string; `{tool:"bash"}` remains the full object so adapters can inspect `command`; native tool operations remain objects. Update policy-block formatting through `formatToolOpLabel`.
-
-Extend host policy readers with operation-aware wrapper functions while keeping their existing parsing and precedence private. Claude maps `read`/`ls` to `Read`, `grep` to `Grep`, and `find` to `Glob`; opencode maps to `read`/`grep`/`list`. Codex wraps only shell operations because no persisted file-operation rule source exists. Pi supplies no extra checker and continues through native adapters.
-
-Unreadable configured policy files return a denial for every governed operation. Do not claim Codex execpolicy governs file reads.
-
-- [ ] **Step 5: Verify GREEN and commit**
-
-Run all policy, engine, MCP server, opencode, and Pi tests plus typecheck. Commit explicit files:
-
-```bash
-git add core/types.ts core/engine.ts policy.ts mcp/policy-claude.ts mcp/server.ts .opencode/plugins/predexec.ts __tests__/core/engine.test.ts __tests__/policy.test.ts __tests__/mcp/policy-claude.test.ts __tests__/mcp/server.test.ts
-git commit -m "fix: enforce host policy for tool operations"
-```
+- [ ] **Step 1:** Update CLAUDE.md:
+  - Layout: add `core/shell/*`, `plan-language.ts`, `core/validation.ts`, `mcp/toml-lite.ts`, `mcp/gitignore-match.ts`, `mcp/policy-antigravity.ts`, `skills/<h>/predexec/`, `.codex-plugin/`, `antigravity-plugin/`, `docs/`, `scripts/gen-skills.mjs`.
+  - Test count: the actual number from the final run.
+  - Five adapters.
+  - Replace "exit 2 only on CC" with "exit 2 for never-ran on every host".
+  - Replace the CODEX_HOME env claim with the `env_vars` finding.
+  - Rewrite the zod-skew rationale: host pnpm re-resolves; narrowing can't match opencode's 4.1.8; the MCP SDK carries its own copy.
+  - Update "Tool ops bypass non-bash permissions" to its post-Task 9/10/20 state per host.
+  - Add a "skills are generated — run `pnpm skills`" hard-won bullet.
+  - Add the opencode `context.ask` behavior.
+  - Add the Antigravity gaps measured in Task 19.
+- [ ] **Step 2:** README: a per-harness install matrix (plugin path / manual path / skill step) for all five hosts, and the `install-skill` and `doctor` usage.
+- [ ] **Step 3:** Run the full gate, `npm pack --dry-run`, and `node bin/predexec.mjs doctor`, and paste the summary into the final report.
+- [ ] **Step 4:** Commit (repo files only): `docs: five-harness install matrix and skill workflow`.
 
 ---
 
-### Task 9: Consolidate command inspection and plan-language teaching
+## Execution order and dependencies
 
-**Files:**
-- Create: `command-inspection.ts`
-- Create: `plan-language.ts`
-- Modify: `policy.ts`
-- Modify: `mcp/policy-claude.ts`
-- Modify: `mcp/policy-codex.ts`
-- Modify: `mcp/server.ts`
-- Modify: `.opencode/plugins/predexec.ts`
-- Modify: `.pi/extension/index.ts`
-- Modify: `steering.ts`
-- Create: `__tests__/command-inspection.test.ts`
-- Create: `__tests__/plan-language.test.ts`
-- Modify: `__tests__/policy.test.ts`
-- Modify: `__tests__/mcp/policy-claude.test.ts`
-- Modify: `__tests__/mcp/policy-codex.test.ts`
-- Modify: `__tests__/mcp/server.test.ts`
-- Modify: `__tests__/opencode.test.ts`
-- Modify: `__tests__/pi.test.ts`
-
-**Interfaces:**
-- Produces from `command-inspection.ts`: `extractCommandSubstitutions`, `tokenizeShellWords`, and `stripLeadingAssignmentsAndWrappers`.
-- Produces from `plan-language.ts`: canonical field/tool/limit constants and `PLAN_SHAPE_DESCRIPTION`.
-- Preserves: separate host policy parsing, matching, precedence, and verdict selection.
-
-- [ ] **Step 1: Write parity tests before extraction**
-
-Create table-driven tests covering newline joins, `$()`, backticks, process substitution, quoted tokens, environment assignments, and wrapper chains. Assert the new mechanical functions' desired outputs.
-
-Create plan-language tests asserting the canonical description contains all condition kinds, tool names, `MAX_OPERATIONS_PER_NODE`, `MAX_PARALLEL_CONCURRENCY`, relative cwd rule, and the single-operation JSON-path rule. Assert MCP and opencode descriptions contain the canonical description and Pi's schema represents the same field names and numeric ceilings.
-
-- [ ] **Step 2: Verify RED**
-
-Run the two new test files. Expected: module-not-found failures for the not-yet-created modules.
-
-- [ ] **Step 3: Extract only identical command mechanics**
-
-Move mechanically identical logic into `command-inspection.ts`. Each policy adapter imports it but keeps its own wrapper sets when those sets differ; pass the wrapper set as an argument rather than hiding host semantics globally. Do not move pattern parsing, rule ordering, or verdict calculation.
-
-- [ ] **Step 4: Centralize plan-language facts**
-
-Export immutable arrays/constants for condition kinds and tool operation names plus a composed description. MCP and opencode concatenate the canonical description with their adapter-only parity notes. Pi uses the constants to build enum values, descriptions, and `maxItems: 64`; retain its intentional wording differences.
-
-Remove only duplication covered by the new parity tests. Apply the deletion test: if an extracted wrapper merely renames one call without hiding mechanics, inline it.
-
-- [ ] **Step 5: Verify GREEN and commit**
-
-Run new tests, all policy/adapter tests, and typecheck. Commit:
-
-```bash
-git add command-inspection.ts plan-language.ts policy.ts steering.ts mcp/policy-claude.ts mcp/policy-codex.ts mcp/server.ts .opencode/plugins/predexec.ts .pi/extension/index.ts __tests__/command-inspection.test.ts __tests__/plan-language.test.ts __tests__/policy.test.ts __tests__/mcp/policy-claude.test.ts __tests__/mcp/policy-codex.test.ts __tests__/mcp/server.test.ts __tests__/opencode.test.ts __tests__/pi.test.ts
-git commit -m "refactor: centralize command and plan language mechanics"
-```
-
----
-
-### Task 10: Cross-adapter release verification
-
-**Files:**
-- Modify only if verification exposes a regression: the smallest owning source/test files.
-- Verify: `README.md`, `CLAUDE.md` invariants, package contents, compiled `dist/` output.
-
-**Interfaces:**
-- Consumes all prior tasks.
-- Produces a release-ready local branch; no publish, push, merge, or version bump.
-
-- [ ] **Step 1: Run focused invariant suites**
-
-```bash
-./node_modules/.bin/vitest run \
-  __tests__/core \
-  __tests__/policy.test.ts \
-  __tests__/mcp/policy-claude.test.ts \
-  __tests__/mcp/policy-codex.test.ts \
-  __tests__/mcp/tool-ops.test.ts \
-  __tests__/mcp/server.test.ts \
-  __tests__/pi.test.ts \
-  __tests__/opencode.test.ts \
-  __tests__/stats.test.ts
-```
-
-Expected: all pass with no skipped regression tests except platform-specific symlink skips.
-
-- [ ] **Step 2: Run full static and runtime verification**
-
-```bash
-./node_modules/.bin/tsc --noEmit
-./node_modules/.bin/vitest run
-pnpm run build
-./node_modules/.bin/vitest run __tests__/release-hygiene.test.ts __tests__/pack.test.ts
-```
-
-Expected: typecheck passes, every test passes, build succeeds, packed tarball installs real production dependencies and loads all declared entries.
-
-- [ ] **Step 3: Inspect scope and documentation truthfulness**
-
-```bash
-git diff --check
-git status --short
-git log --oneline --decorate -15
-```
-
-Confirm:
-
-- no runtime dependency was added;
-- no harness import entered `core/`;
-- `dist/` is not staged;
-- user-owned `PLAN.post-0.3.1-archive.md` and `CODEX-RESEARCH.md` remain untracked and unchanged;
-- README/description claims match cwd, policy, truncation, and symlink behavior.
-
-- [ ] **Step 4: Commit verification-only corrections if required**
-
-If verification required source or documentation corrections, first add a focused regression test, observe it fail, implement the minimum correction, rerun its owning suite, and commit explicit paths with:
-
-```bash
-git commit -m "fix: close audit integration regressions"
-```
-
-If no correction is needed, create no empty commit.
-
-- [ ] **Step 5: Request final whole-branch review**
-
-Generate the SDD review package from the branch merge-base through HEAD. The final Luna reviewer must assess spec compliance, correctness, security, performance, test quality, and whether deferred findings block integration.
-
-## Definition of Done
-
-- [x] Tasks 1-10 have completion entries in the SDD ledger.
-- [x] Every production behavior change has recorded RED and GREEN evidence.
-- [x] Every task received independent spec-compliance and code-quality approval.
-- [x] Every audit concern is implemented or has an explicit reviewed ruling in the ledger.
-- [x] Full tests, typecheck, build, and packed-install verification pass.
-- [x] Final whole-branch review is clean or residual findings are explicitly adjudicated.
-- [x] Nothing was pushed, published, merged, or version-bumped.
+`0 → 1 → 2 → 3 → 4 → 5 → 6 → 7`, then `8, 9, 10, 11, 12, 13`, which are independent of each other but depend on 5 and 7. Then `14 → 15 → 16, 17, 18`, then `19 → 20 → 21`, then `22 → 23`. Run tasks one at a time, because every task touches shared files (`core/index.ts`, `bin/predexec.mjs`, `package.json`).

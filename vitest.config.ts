@@ -7,6 +7,7 @@ export default defineConfig({
   test: {
     include: ["__tests__/**/*.test.ts"],
     environment: "node",
+    globalSetup: ["__tests__/helpers/global-setup.ts"],
     env: {
       // Tests execute real plans through executeAdapterPlan, whose stats
       // recorder appends to the live ~/.local/state/predexec/stats.jsonl
