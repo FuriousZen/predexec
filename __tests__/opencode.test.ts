@@ -115,6 +115,55 @@ describe.each(variants)("opencode plugin ($name) — packaged skill registration
     expect(cfg.skills.urls).toEqual(["https://example.invalid"]);
     expect(cfg.skills.paths).toContain(packagedSkillDir);
   });
+
+  // Task 17 review, Critical #1: a throw from the config hook could abort
+  // opencode's plugin.init() for every plugin, not just this one's skill
+  // registration — so a malformed cfg.skills / cfg.skills.paths must never
+  // throw, and the hook must never silently corrupt a shape it doesn't
+  // recognize. The hook itself is synchronous (it returns void, not a
+  // Promise), so these assert with a plain `expect(() => ...).not.toThrow()`
+  // rather than `.resolves`, which requires an actual thenable.
+  const callConfig = (hooks: unknown, cfg: unknown): unknown => (hooks as any).config(cfg);
+
+  it("cfg.skills.paths as a bare string is normalized to an array (opencode's own scan would otherwise iterate it character-by-character)", async () => {
+    const hooks = await plugin.server({ client: {} } as any);
+    const cfg: any = { skills: { paths: "/some/existing/path" } };
+    expect(() => callConfig(hooks, cfg)).not.toThrow();
+    expect(cfg.skills.paths).toEqual(["/some/existing/path", packagedSkillDir]);
+  });
+
+  it("cfg.skills.paths as null is treated the same as absent", async () => {
+    const hooks = await plugin.server({ client: {} } as any);
+    const cfg: any = { skills: { paths: null } };
+    expect(() => callConfig(hooks, cfg)).not.toThrow();
+    expect(cfg.skills.paths).toEqual([packagedSkillDir]);
+  });
+
+  it.each([
+    ["a number", 42],
+    ["a plain object", { not: "an array" }],
+  ])("cfg.skills.paths as %s is left untouched and registration is skipped, without throwing", async (_label, badPaths) => {
+    const hooks = await plugin.server({ client: {} } as any);
+    const cfg: any = { skills: { paths: badPaths } };
+    expect(() => callConfig(hooks, cfg)).not.toThrow();
+    expect(cfg.skills.paths).toBe(badPaths);
+  });
+
+  it.each([
+    ["a string", "not-an-object"],
+    ["an array", ["not", "an", "object"]],
+  ])("cfg.skills as %s is left untouched and registration is skipped, without throwing", async (_label, badSkills) => {
+    const hooks = await plugin.server({ client: {} } as any);
+    const cfg: any = { skills: badSkills };
+    expect(() => callConfig(hooks, cfg)).not.toThrow();
+    expect(cfg.skills).toBe(badSkills);
+  });
+
+  it("cfg itself being a non-object never throws", async () => {
+    const hooks = await plugin.server({ client: {} } as any);
+    expect(() => callConfig(hooks, "not-an-object")).not.toThrow();
+    expect(() => callConfig(hooks, null)).not.toThrow();
+  });
 });
 
 describe.each(variants)("opencode createToolExecutor ($name) — SDK response mapping", ({ createToolExecutor }) => {

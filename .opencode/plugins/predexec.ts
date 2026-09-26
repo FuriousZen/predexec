@@ -236,11 +236,58 @@ const PACKAGED_OPENCODE_SKILL_DIR: string | null = (() => {
  * Idempotent (checked by identity of the computed path) and additive: a
  * project's own `skills.paths` entries, and any array a plugin loaded earlier
  * already added, are preserved rather than replaced.
+ *
+ * Defensive against a malformed `cfg.skills` / `cfg.skills.paths` (a typo in
+ * hand-edited JSON, or a shape some OTHER plugin's own `config` hook already
+ * set): this must never throw. opencode calls every loaded plugin's
+ * `config(cfg)` from one `Effect.tryPromise` per hook inside `plugin.init()`
+ * (`packages/opencode/src/plugin/index.ts:245-253` — logged and `Effect.ignore`d
+ * on failure), so a thrown error here is swallowed at the framework level and
+ * would "only" cost this plugin's own registration; but the caller (the
+ * exported `config` hook below) wraps this in its own try/catch anyway rather
+ * than depend on that host behavior, since it's cheap insurance and the
+ * consequence of being wrong (aborting `plugin.init()`, i.e. opencode startup
+ * — the risk this was written against) is severe. `cfg.skills.paths` set to a
+ * bare string is treated as a one-entry shorthand and normalized to an array
+ * IN PLACE: opencode's own scan (`skill/index.ts:211`) does
+ * `for (const item of cfg.skills?.paths ?? [])`, which would otherwise iterate
+ * a string CHARACTER BY CHARACTER — normalizing here fixes what would
+ * otherwise be a silently-broken user config, rather than leaving it broken.
+ * Any other unrecognized shape on either field (a number, a plain object where
+ * an array was expected, `skills` itself being an array, ...) is left
+ * completely untouched and registration is skipped for that call — never
+ * guessed at, never overwritten.
  */
 function registerPackagedSkill(cfg: OpencodeConfigLike): void {
   if (!PACKAGED_OPENCODE_SKILL_DIR) return;
-  const skills = (cfg.skills ??= {});
-  const paths = (skills.paths ??= []);
+  if (cfg === null || typeof cfg !== "object") return;
+  const bag = cfg as unknown as Record<string, unknown>;
+
+  const rawSkills = bag.skills;
+  let skills: Record<string, unknown>;
+  if (rawSkills === undefined || rawSkills === null) {
+    skills = {};
+    bag.skills = skills;
+  } else if (typeof rawSkills === "object" && !Array.isArray(rawSkills)) {
+    skills = rawSkills as Record<string, unknown>;
+  } else {
+    return; // cfg.skills is some non-object shape (string/number/array/...) — leave it alone.
+  }
+
+  const rawPaths = skills.paths;
+  let paths: unknown[];
+  if (rawPaths === undefined || rawPaths === null) {
+    paths = [];
+    skills.paths = paths;
+  } else if (Array.isArray(rawPaths)) {
+    paths = rawPaths;
+  } else if (typeof rawPaths === "string") {
+    paths = [rawPaths];
+    skills.paths = paths;
+  } else {
+    return; // cfg.skills.paths is some other non-array shape — leave it alone.
+  }
+
   if (!paths.includes(PACKAGED_OPENCODE_SKILL_DIR)) paths.push(PACKAGED_OPENCODE_SKILL_DIR);
 }
 
@@ -581,8 +628,18 @@ const server: Plugin = async ({ client }) => ({
   // registering it with the host directly, rather than relying solely on a
   // manual `install-skill opencode` copy or a hand-authored AGENTS.md block —
   // see registerPackagedSkill's doc comment for how and why this is safe.
+  // Belt-and-braces try/catch: registerPackagedSkill is itself defensive and
+  // shouldn't throw, but a config hook that throws could abort opencode's own
+  // plugin.init() (and therefore startup) for every plugin, not just this
+  // one's skill registration, so nothing here is allowed to propagate.
+  // Logged to stderr only — never stdout — matching every other adapter's
+  // rule against writing to the host's own output stream.
   config: (cfg) => {
-    registerPackagedSkill(cfg);
+    try {
+      registerPackagedSkill(cfg);
+    } catch (err) {
+      console.error(`[predexec] config hook failed to register packaged skill: ${errText(err)}`);
+    }
   },
 
   // Unlike pi's `pi.skills`, a config-hook-registered skill is not a GUARANTEE
