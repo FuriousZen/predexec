@@ -28,6 +28,8 @@ import {
   parseTomlLite,
   piPackageSource,
   projectDirsFromRootToCwd,
+  readCanonicalSkillText,
+  SKILL_SOURCE_PATHS,
   skillCheck,
   stripJsonComments,
   summarizeStats,
@@ -664,6 +666,26 @@ describe("doctor — codex checks", () => {
 
 const skillFrontmatter = (body = "body") => `---\nname: predexec\ndescription: x\n---\n\n${body}\n`;
 
+// A deterministic fixture "package root" so skillCheck's canonical-content
+// comparison (I1 fix — bin/predexec.mjs:1366) has something to compare
+// against that doesn't depend on this repo's own real packaged SKILL.md
+// text. Each harness gets distinct, recognizable wording.
+const CANONICAL_BODY: Record<string, string> = {
+  claude: "canonical claude wording",
+  codex: "canonical codex wording",
+  opencode: "canonical opencode wording",
+  antigravity: "canonical antigravity wording",
+};
+const canonicalSkill = (harness: keyof typeof CANONICAL_BODY) => skillFrontmatter(CANONICAL_BODY[harness]);
+
+/** Writes every harness's canonical SKILL.md under a fresh `pkg/` fixture root, at the exact repo-relative paths SKILL_SOURCE_PATHS declares. Returns the fixture root's absolute path. */
+function writeCanonicalPackageFixture() {
+  for (const harness of Object.keys(CANONICAL_BODY) as (keyof typeof CANONICAL_BODY)[]) {
+    write(join("pkg", SKILL_SOURCE_PATHS[harness]), canonicalSkill(harness));
+  }
+  return join(tmp, "pkg");
+}
+
 describe("skill discovery: findPredexecSkills", () => {
   it("finds a SKILL.md one level under a discovery root", () => {
     scratch();
@@ -710,13 +732,17 @@ describe("skillCheck", () => {
     expect(checks[0]!.hint).toContain("install-skill claude");
   });
 
-  it("reports ok for exactly one skill", () => {
+  // installName "x" has no SKILL_SOURCE_PATHS entry, so readCanonicalSkillText
+  // returns null and skillCheck falls back to comparing found copies against
+  // each other — these three deliberately exercise that fallback path (the
+  // pre-I1-fix behavior, kept for when a real install is corrupted).
+  it("reports ok for exactly one skill (fallback path, unknown harness)", () => {
     scratch();
     write("root/predexec/SKILL.md", skillFrontmatter());
     expect(skillCheck("x", "x", [join(tmp, "root")], true)[0]!.status).toBe("ok");
   });
 
-  it("reports info for identical duplicates visible from two roots", () => {
+  it("reports info for identical duplicates visible from two roots (fallback path)", () => {
     scratch();
     write("a/predexec/SKILL.md", skillFrontmatter("same"));
     write("b/predexec/SKILL.md", skillFrontmatter("same"));
@@ -725,13 +751,78 @@ describe("skillCheck", () => {
     expect(checks[0]!.name).toContain("duplicate copies");
   });
 
-  it("reports fail (`[!]`) for two DIFFERENT skills visible to the same host", () => {
+  it("reports fail (`[!]`) for two DIFFERENT skills visible to the same host (fallback path)", () => {
     scratch();
     write("a/predexec/SKILL.md", skillFrontmatter("claude wording"));
     write("b/predexec/SKILL.md", skillFrontmatter("opencode wording"));
-    const checks = skillCheck("opencode", "opencode", [join(tmp, "a"), join(tmp, "b")], true);
+    const checks = skillCheck("x", "x", [join(tmp, "a"), join(tmp, "b")], true);
     expect(checks[0]!.status).toBe("fail");
     expect(checks[0]!.name).toContain("multiple different predexec skills visible");
+  });
+});
+
+describe("skillCheck — canonical-content comparison (I1 fix)", () => {
+  it("a lone skill matching this harness's packaged canonical content ⇒ ok", () => {
+    scratch();
+    const pkg = writeCanonicalPackageFixture();
+    write("root/predexec/SKILL.md", canonicalSkill("opencode"));
+    const checks = skillCheck("opencode", "opencode", [join(tmp, "root")], true, { packageRoot: pkg });
+    expect(checks[0]!.status).toBe("ok");
+  });
+
+  it("two copies both matching canonical ⇒ info duplicate, not fail", () => {
+    scratch();
+    const pkg = writeCanonicalPackageFixture();
+    write("a/predexec/SKILL.md", canonicalSkill("opencode"));
+    write("b/predexec/SKILL.md", canonicalSkill("opencode"));
+    const checks = skillCheck("opencode", "opencode", [join(tmp, "a"), join(tmp, "b")], true, { packageRoot: pkg });
+    expect(checks[0]!.status).toBe("info");
+    expect(checks[0]!.name).toContain("duplicate copies");
+  });
+
+  it("a LONE skill that does NOT match this harness's canonical content is fail, never ok (the reported gap)", () => {
+    scratch();
+    const pkg = writeCanonicalPackageFixture();
+    write("root/predexec/SKILL.md", canonicalSkill("codex")); // wrong harness's wording, alone in the root
+    const checks = skillCheck("opencode", "opencode", [join(tmp, "root")], true, { packageRoot: pkg });
+    expect(checks[0]!.status).toBe("fail");
+    expect(checks[0]!.name).toContain("wrong harness or stale");
+    expect(checks[0]!.hint).toContain("install-skill opencode");
+    expect(checks[0]!.hint).toContain("--force");
+  });
+
+  it("a stale, hand-edited copy of the harness's own skill ⇒ fail", () => {
+    scratch();
+    const pkg = writeCanonicalPackageFixture();
+    write("root/predexec/SKILL.md", skillFrontmatter("hand-edited, out of date"));
+    const checks = skillCheck("opencode", "opencode", [join(tmp, "root")], true, { packageRoot: pkg });
+    expect(checks[0]!.status).toBe("fail");
+    expect(checks[0]!.name).toContain("wrong harness or stale");
+  });
+
+  it("falls back to pairwise comparison when the canonical file can't be read (corrupted install)", () => {
+    scratch();
+    write("root/predexec/SKILL.md", skillFrontmatter());
+    // "opencode" IS a real harness key, but packageRoot points nowhere, so
+    // readCanonicalSkillText can't load the packaged file for it.
+    const checks = skillCheck("opencode", "opencode", [join(tmp, "root")], true, {
+      packageRoot: join(tmp, "does-not-exist"),
+    });
+    expect(checks[0]!.status).toBe("ok");
+  });
+});
+
+describe("readCanonicalSkillText", () => {
+  it("reads a harness's packaged canonical text from a given package root", () => {
+    scratch();
+    const pkg = writeCanonicalPackageFixture();
+    expect(readCanonicalSkillText("opencode", { packageRoot: pkg })).toBe(canonicalSkill("opencode"));
+  });
+
+  it("returns null for an unknown harness or an unreadable package root", () => {
+    scratch();
+    expect(readCanonicalSkillText("not-a-harness", { packageRoot: join(tmp, "pkg") })).toBeNull();
+    expect(readCanonicalSkillText("opencode", { packageRoot: join(tmp, "does-not-exist") })).toBeNull();
   });
 });
 
@@ -801,6 +892,7 @@ describe("doctor — skill checks (claude)", () => {
     home: join(tmp, "home"),
     cwd: join(tmp, "proj"),
     configDir: join(tmp, "home", ".claude"),
+    packageRoot: writeCanonicalPackageFixture(),
     ...over,
   });
 
@@ -818,8 +910,18 @@ describe("doctor — skill checks (claude)", () => {
 
   it("reports ok once the packaged skill is installed at the global root", () => {
     scratch();
-    write("home/.claude/skills/predexec/SKILL.md", skillFrontmatter());
-    expect(checkClaudeSkill(skOpts(), true)[0]!.status).toBe("ok");
+    const opts = skOpts();
+    write("home/.claude/skills/predexec/SKILL.md", canonicalSkill("claude"));
+    expect(checkClaudeSkill(opts, true)[0]!.status).toBe("ok");
+  });
+
+  it("flags a stale, hand-edited copy of the claude skill (I1 fix)", () => {
+    scratch();
+    const opts = skOpts();
+    write("home/.claude/skills/predexec/SKILL.md", skillFrontmatter("hand-edited"));
+    const checks = checkClaudeSkill(opts, true);
+    expect(checks[0]!.status).toBe("fail");
+    expect(checks[0]!.name).toContain("wrong harness or stale");
   });
 
   it("short-circuits to ok when the plugin form bundles its own skill", () => {
@@ -832,43 +934,80 @@ describe("doctor — skill checks (claude)", () => {
 });
 
 describe("doctor — skill checks (codex)", () => {
+  const cxSkOpts = (over: Record<string, unknown> = {}) => ({
+    home: join(tmp, "home"),
+    cwd: join(tmp, "proj"),
+    codexHome: join(tmp, "codex-home"),
+    packageRoot: writeCanonicalPackageFixture(),
+    ...over,
+  });
+
   it("flags an AGENTS.md routing block and a skill both being active", () => {
     scratch();
+    const opts = cxSkOpts();
     write("proj/AGENTS.md", "Use predexec for read-only shell operations. mutationStop recovers.");
-    write("home/.agents/skills/predexec/SKILL.md", skillFrontmatter());
-    const checks = checkCodexSkill(
-      { home: join(tmp, "home"), cwd: join(tmp, "proj"), codexHome: join(tmp, "codex-home") },
-      true,
-    );
+    write("home/.agents/skills/predexec/SKILL.md", canonicalSkill("codex"));
+    const checks = checkCodexSkill(opts, true);
     expect(checks.some((c) => c.status === "ok")).toBe(true);
     expect(checks.some((c) => c.status === "info" && /AGENTS\.md/.test(c.name))).toBe(true);
   });
 
   it("does not mention AGENTS.md when there is no skill at all", () => {
     scratch();
+    const opts = cxSkOpts();
     write("proj/AGENTS.md", "Use predexec for read-only shell operations. mutationStop recovers.");
-    const checks = checkCodexSkill(
-      { home: join(tmp, "home"), cwd: join(tmp, "proj"), codexHome: join(tmp, "codex-home") },
-      true,
-    );
+    const checks = checkCodexSkill(opts, true);
     expect(checks.some((c) => /AGENTS\.md/.test(c.name))).toBe(false);
+  });
+
+  // I1 fix: a lone WRONG-harness skill sitting in a root codex shares with
+  // opencode (`~/.agents/skills`) must not be silently reported ok.
+  it("a lone opencode-worded skill in a root codex also scans is [!], not ok", () => {
+    scratch();
+    const opts = cxSkOpts();
+    write("home/.agents/skills/predexec/SKILL.md", canonicalSkill("opencode"));
+    const checks = checkCodexSkill(opts, true);
+    expect(checks[0]!.status).toBe("fail");
+    expect(checks[0]!.name).toContain("wrong harness or stale");
   });
 });
 
 describe("doctor — skill checks (opencode)", () => {
+  const ocSkOpts = (over: Record<string, unknown> = {}) => ({
+    home: join(tmp, "home"),
+    cwd: join(tmp, "proj"),
+    packageRoot: writeCanonicalPackageFixture(),
+    ...over,
+  });
+
   it("flags a stale claude-flavored skill visible alongside opencode's own (cross-host duplicate)", () => {
     scratch();
-    write("proj/.claude/skills/predexec/SKILL.md", skillFrontmatter("claude wording"));
-    write("proj/.opencode/skills/predexec/SKILL.md", skillFrontmatter("opencode wording"));
-    const checks = checkOpencodeSkill({ home: join(tmp, "home"), cwd: join(tmp, "proj") }, true);
+    const opts = ocSkOpts();
+    write("proj/.claude/skills/predexec/SKILL.md", canonicalSkill("claude"));
+    write("proj/.opencode/skills/predexec/SKILL.md", canonicalSkill("opencode"));
+    const checks = checkOpencodeSkill(opts, true);
     expect(checks[0]!.status).toBe("fail");
+    expect(checks[0]!.name).toContain("wrong harness or stale");
   });
 
   it("reports ok for a single opencode skill with no cross-host overlap", () => {
     scratch();
-    write("proj/.opencode/skills/predexec/SKILL.md", skillFrontmatter());
-    const checks = checkOpencodeSkill({ home: join(tmp, "home"), cwd: join(tmp, "proj") }, true);
+    const opts = ocSkOpts();
+    write("proj/.opencode/skills/predexec/SKILL.md", canonicalSkill("opencode"));
+    const checks = checkOpencodeSkill(opts, true);
     expect(checks[0]!.status).toBe("ok");
+  });
+
+  // I1 fix: a lone WRONG-harness skill sitting in a root opencode shares with
+  // codex (`~/.agents/skills`) must not be silently reported ok just because
+  // only one copy was found there.
+  it("a lone codex-worded skill in a root opencode also scans is [!], not ok", () => {
+    scratch();
+    const opts = ocSkOpts();
+    write("home/.agents/skills/predexec/SKILL.md", canonicalSkill("codex"));
+    const checks = checkOpencodeSkill(opts, true);
+    expect(checks[0]!.status).toBe("fail");
+    expect(checks[0]!.name).toContain("wrong harness or stale");
   });
 });
 
@@ -888,9 +1027,19 @@ describe("doctor — skill checks (antigravity)", () => {
 
   it("reports ok once the skill is installed", () => {
     scratch();
-    write("home/.gemini/config/skills/predexec/SKILL.md", skillFrontmatter());
-    const checks = checkAntigravitySkill({ home: join(tmp, "home"), cwd: join(tmp, "proj") });
+    const pkg = writeCanonicalPackageFixture();
+    write("home/.gemini/config/skills/predexec/SKILL.md", canonicalSkill("antigravity"));
+    const checks = checkAntigravitySkill({ home: join(tmp, "home"), cwd: join(tmp, "proj"), packageRoot: pkg });
     expect(checks[0]!.status).toBe("ok");
+  });
+
+  it("flags a stale, hand-edited copy of the antigravity skill (I1 fix)", () => {
+    scratch();
+    const pkg = writeCanonicalPackageFixture();
+    write("home/.gemini/config/skills/predexec/SKILL.md", skillFrontmatter("hand-edited"));
+    const checks = checkAntigravitySkill({ home: join(tmp, "home"), cwd: join(tmp, "proj"), packageRoot: pkg });
+    expect(checks[0]!.status).toBe("fail");
+    expect(checks[0]!.name).toContain("wrong harness or stale");
   });
 });
 

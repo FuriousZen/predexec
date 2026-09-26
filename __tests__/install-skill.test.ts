@@ -74,6 +74,14 @@ describe("installSkill", () => {
     expect(result.message).toContain("unknown harness");
   });
 
+  it("returns {ok:false, message} rather than throwing when the packaged source dir is missing (R40)", () => {
+    scratch();
+    const result = installSkill("claude", opts({ packageRoot: join(tmp, "corrupted-install") }));
+    expect(result.ok).toBe(false);
+    expect(result.message).toMatch(/packaged skill source not found/);
+    expect(result.message).toContain("claude");
+  });
+
   it("lists every real harness (except pi) as installable", () => {
     expect(SKILL_HARNESSES).toEqual(["claude", "codex", "opencode", "antigravity", "pi"]);
   });

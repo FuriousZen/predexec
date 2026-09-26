@@ -1352,18 +1352,45 @@ export function agentsFileHasRouting(cwd) {
   return markers.filter(hit).length >= 2;
 }
 
+/** The packaged, canonical SKILL.md text for `harness`, or null if it can't be read. */
+export function readCanonicalSkillText(harness, opts = {}) {
+  const sourcePath = SKILL_SOURCE_PATHS[harness];
+  if (!sourcePath) return null;
+  try {
+    return readFileSync(join(opts.packageRoot ?? packageRoot(), sourcePath), "utf8");
+  } catch {
+    return null;
+  }
+}
+
+function duplicateOrOkChecks(label, skills) {
+  return skills.length > 1
+    ? [
+        {
+          name: `${label}: skill (duplicate copies, identical content)`,
+          status: "info",
+          detail: skills.map((s) => s.path).join(", "),
+          hint: "harmless — the same skill is visible from more than one location",
+        },
+      ]
+    : [{ name: `${label}: skill`, status: "ok", detail: skills[0].path }];
+}
+
 /**
  * The shared doctor verdict for one harness's skill visibility:
  *   - nothing found: `info` (with an install-skill hint) only when the
  *     harness is otherwise registered — an unregistered harness has nothing
  *     actionable to say about a missing skill.
- *   - one or more copies, all byte-identical: `ok` (or `info` when there is
- *     more than one, since that's a harmless duplicate worth naming) — a
- *     harness-specific skill installed into a root another host also scans
- *     (e.g. `.claude/skills/predexec` visible to opencode too) lands here.
- *   - two or more DIFFERENT skills visible to the same host: `fail` (`[!]`).
+ *   - every found copy is byte-identical to `installName`'s OWN packaged
+ *     SKILL.md: `ok` for one copy, `info` "duplicate copies" for more than
+ *     one (harmless — the same correct skill visible from two roots).
+ *   - any found copy does NOT match the packaged canonical content — wrong
+ *     harness (e.g. a codex-worded skill sitting in a root opencode also
+ *     scans) or a stale, hand-edited copy of the harness's own skill: `fail`
+ *     (`[!]`), one entry per mismatched file. A found copy is never assumed
+ *     correct just because it's alone — see task-15-review Important #1.
  */
-export function skillCheck(label, installName, roots, registered) {
+export function skillCheck(label, installName, roots, registered, opts = {}) {
   const skills = findPredexecSkills(roots);
   if (skills.length === 0) {
     return registered
@@ -1377,28 +1404,35 @@ export function skillCheck(label, installName, roots, registered) {
       : [];
   }
 
-  const distinct = new Set(skills.map((s) => s.text));
-  if (distinct.size > 1) {
-    return [
-      {
-        name: `${label}: multiple different predexec skills visible`,
-        status: "fail",
-        detail: skills.map((s) => s.path).join(", "),
-        hint: "remove the stale copy, or reinstall with `--force` so only one predexec skill is visible to this host",
-      },
-    ];
+  const canonical = readCanonicalSkillText(installName, opts);
+  if (canonical === null) {
+    // Can't load this harness's own packaged skill to compare against (a
+    // corrupted install) — fall back to comparing found copies against each
+    // other rather than silently skipping the check.
+    const distinct = new Set(skills.map((s) => s.text));
+    if (distinct.size > 1) {
+      return [
+        {
+          name: `${label}: multiple different predexec skills visible`,
+          status: "fail",
+          detail: skills.map((s) => s.path).join(", "),
+          hint: "remove the stale copy, or reinstall with `--force` so only one predexec skill is visible to this host",
+        },
+      ];
+    }
+    return duplicateOrOkChecks(label, skills);
   }
-  if (skills.length > 1) {
-    return [
-      {
-        name: `${label}: skill (duplicate copies, identical content)`,
-        status: "info",
-        detail: skills.map((s) => s.path).join(", "),
-        hint: "harmless — the same skill is visible from more than one location",
-      },
-    ];
+
+  const mismatched = skills.filter((s) => s.text !== canonical);
+  if (mismatched.length > 0) {
+    return mismatched.map((s) => ({
+      name: `${label}: skill at ${s.path} is not the ${label} skill (wrong harness or stale)`,
+      status: "fail",
+      detail: s.path,
+      hint: `run \`predexec install-skill ${installName} [--project] --force\``,
+    }));
   }
-  return [{ name: `${label}: skill`, status: "ok", detail: skills[0].path }];
+  return duplicateOrOkChecks(label, skills);
 }
 
 export function checkClaudeSkill(opts = {}, registered = false) {
@@ -1409,13 +1443,13 @@ export function checkClaudeSkill(opts = {}, registered = false) {
   if (plugin?.installPath && existsSync(join(plugin.installPath, "skills", "claude", "predexec", "SKILL.md"))) {
     return [{ name: "claude code: skill (bundled with plugin)", status: "ok", detail: plugin.installPath }];
   }
-  return skillCheck("claude code", "claude", claudeSkillRoots({ home, cwd, configDir }), registered);
+  return skillCheck("claude code", "claude", claudeSkillRoots({ home, cwd, configDir }), registered, opts);
 }
 
 export function checkCodexSkill(opts = {}, registered = false) {
   const cwd = opts.cwd ?? process.cwd();
   const roots = codexSkillRoots(opts);
-  const checks = skillCheck("codex", "codex", roots, registered);
+  const checks = skillCheck("codex", "codex", roots, registered, opts);
   if (findPredexecSkills(roots).length > 0 && agentsFileHasRouting(cwd)) {
     checks.push({
       name: "codex: AGENTS.md routing block and skill are both active",
@@ -1429,7 +1463,7 @@ export function checkCodexSkill(opts = {}, registered = false) {
 export function checkOpencodeSkill(opts = {}, registered = false) {
   const cwd = opts.cwd ?? process.cwd();
   const roots = opencodeSkillRoots(opts);
-  const checks = skillCheck("opencode", "opencode", roots, registered);
+  const checks = skillCheck("opencode", "opencode", roots, registered, opts);
   if (findPredexecSkills(roots).length > 0 && agentsFileHasRouting(cwd)) {
     checks.push({
       name: "opencode: AGENTS.md routing block and skill are both active",
@@ -1452,7 +1486,7 @@ export function checkAntigravitySkill(opts = {}) {
   if (!existsSync(geminiDir)) {
     return [{ name: "antigravity not installed", status: "skip", detail: "no ~/.gemini directory" }];
   }
-  return skillCheck("antigravity", "antigravity", antigravitySkillRoots(opts), true);
+  return skillCheck("antigravity", "antigravity", antigravitySkillRoots(opts), true, opts);
 }
 
 /**
@@ -1511,8 +1545,18 @@ export function installSkill(harness, opts = {}) {
   const dryRun = Boolean(opts.dryRun);
   const force = Boolean(opts.force);
 
+  let sourceFiles;
+  try {
+    sourceFiles = readdirSync(sourceDir);
+  } catch {
+    // A corrupted or partial install (the packaged skill directory itself is
+    // missing) — report it the same way every other failure mode here does,
+    // rather than letting an uncaught ENOENT surface a raw stack trace.
+    return { ok: false, message: `packaged skill source not found for "${harness}": ${sourceDir}` };
+  }
+
   const results = [];
-  for (const file of readdirSync(sourceDir)) {
+  for (const file of sourceFiles) {
     const srcPath = join(sourceDir, file);
     const destPath = join(target, file);
     const content = readFileSync(srcPath, "utf8");
