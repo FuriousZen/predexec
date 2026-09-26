@@ -42,7 +42,7 @@ import { existsSync, readFileSync, statSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { inspectCommandSubstitutionTree, lexShellWords, splitCommandSegments } from "./core/index.ts";
-import type { Operation, PolicyCheckContext, PolicyVerdict } from "./core/types.ts";
+import type { HostPolicyDenial, Operation, PolicyCheckContext, PolicyVerdict } from "./core/types.ts";
 
 export type PolicyAction = "allow" | "ask" | "deny";
 
@@ -741,16 +741,21 @@ export type OpencodeAsk = (input: {
  * prompting. Otherwise each request goes to `context.ask`, which evaluates the
  * host's live ruleset (`permission/index.ts:67-107`): an allow resolves
  * silently, an ask prompts the user, a deny or a rejection rejects. Any
- * resolution — once or always — runs; any rejection is a policyStop naming
- * opencode's reason. `always` is sent empty so predexec never widens the
- * host's standing approvals.
+ * resolution (once or always) runs; any rejection is a policyStop carrying
+ * opencode's reason as a `HostPolicyDenial`. `always` is sent empty so
+ * predexec never widens the host's standing approvals.
  *
- * One bridge serves one walk. Each request is sent once with its not-yet
- * approved patterns (one prompt per request, as opencode's own tools do);
- * patterns already approved in this walk are not asked again, so the engine's
- * variant and inner-command expansion does not multiply host prompts. After
- * the first rejection nothing further is asked, and an aborted signal stops
- * asking.
+ * One bridge serves one walk, and it keeps host prompts to what opencode's
+ * own tools would ask:
+ * - Each request is sent once with its not-yet-approved patterns (one prompt
+ *   per request); an approved permission+pattern is never asked again.
+ * - A variant spelling (`context.variant`: an inner `sh -c` clause or decoded
+ *   argv form of an operation whose primary spelling passed) is judged
+ *   statically. A deny stops; an ask reaches the host only when it is stricter
+ *   than the primary's static verdict; otherwise the primary's approval covers it.
+ * - After ANY stop (static or host) the rest of the walk is static-only: the
+ *   node will not run, so prompting for its later operations is pointless.
+ * - An aborted signal stops asking.
  */
 export function createOpencodeAskBridge(
   ask: OpencodeAsk,
@@ -758,20 +763,34 @@ export function createOpencodeAskBridge(
   options: PolicyCheckerOptions & { signal?: AbortSignal } = {},
 ): (operation: Operation, context?: PolicyCheckContext) => Promise<PolicyVerdict> {
   const approved = new Set<string>();
-  let rejected: string | null = null;
+  const primaryAction = new Map<number, PolicyAction>();
+  const strictness: Record<PolicyAction, number> = { allow: 0, ask: 1, deny: 2 };
+  let stopped = false;
+  const stop = (verdict: string | HostPolicyDenial): string | HostPolicyDenial => {
+    stopped = true;
+    return verdict;
+  };
 
   return async (operation, context) => {
     const pre = evaluateOperation(operation, ruleset, options, context);
-    if (pre.action === "deny") return pre.rule ?? "*";
+    if (stopped) return pre.action === "allow" ? null : pre.rule ?? "*";
+    if (pre.action === "deny") return stop(pre.rule ?? "*");
+    const index = context?.operationIndex;
+    if (context?.variant) {
+      if (pre.action === "allow") return null;
+      const primary = index === undefined ? undefined : primaryAction.get(index);
+      if (primary !== undefined && strictness[pre.action] <= strictness[primary]) return null;
+    } else if (index !== undefined) {
+      primaryAction.set(index, pre.action);
+    }
     const requests = opencodeAsksFor(operation, resolveContext(options, context), options.inspectCommand);
-    if (requests === null) return INCOMPLETE;
+    if (requests === null) return stop(INCOMPLETE);
     const signal = context?.signal ?? options.signal;
     for (const request of requests) {
       const key = (pattern: string) => `${request.permission}\u0000${pattern}`;
       const pending = request.patterns.filter((pattern) => !approved.has(key(pattern)));
       if (pending.length === 0) continue;
-      if (rejected) return `${rejected} (an earlier request in this plan was rejected; not asking again)`;
-      if (signal?.aborted) return "aborted before asking opencode for permission";
+      if (signal?.aborted) return stop("aborted before asking opencode for permission");
       try {
         await ask({
           permission: request.permission,
@@ -781,8 +800,7 @@ export function createOpencodeAskBridge(
         });
       } catch (err) {
         const reason = err instanceof Error && err.message ? err.message : String(err);
-        rejected = `opencode permission denied: ${reason}`;
-        return rejected;
+        return stop({ hostDenied: `opencode denied permission: ${reason}` });
       }
       for (const pattern of pending) approved.add(key(pattern));
     }

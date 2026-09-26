@@ -38,6 +38,7 @@ import {
   type OperationPolicyChecker,
   type PolicyCheckContext,
   type PolicyVerdict,
+  type HostPolicyDenial,
   type PlanNode,
   type PlanTree,
   type RunOptions,
@@ -86,8 +87,9 @@ export async function runPlanTree(plan: PlanTree, opts: RunOptions): Promise<Cor
     }
 
     // Host-policy hard-stop: check every operation before running any item in
-    // this node. Predexec cannot prompt mid-walk, so it never runs a node with
-    // a deny/ask match.
+    // this node. A static checker cannot prompt mid-walk, so it stops on a
+    // deny/ask match; a host with a live permission bridge (opencode's
+    // `context.ask`) may prompt inside the check and stop only on refusal.
     const checkOperationPolicy: OperationPolicyChecker | undefined = opts.checkOperationPolicy;
     if (checkOperationPolicy) {
       const violation = await findPolicyViolation(current, checkOperationPolicy, opts.cwd, effectiveCwd, opts.signal);
@@ -283,19 +285,21 @@ async function findPolicyViolation(
   sessionRoot: string,
   effectiveCwd: string,
   signal: AbortSignal | undefined,
-): Promise<{ index: number; command: string; rule: string } | "aborted" | null> {
-  const context: PolicyCheckContext = { cwd: effectiveCwd, sessionRoot, ...(signal ? { signal } : {}) };
-  let violation: { index: number; command: string; rule: string } | null = null;
+): Promise<PolicyViolation | "aborted" | null> {
+  const base: PolicyCheckContext = { cwd: effectiveCwd, sessionRoot, ...(signal ? { signal } : {}) };
+  let violation: PolicyViolation | null = null;
   for (let i = 0; i < node.commands.length; i++) {
     const op = node.commands[i]!;
     const command = isToolOp(op) ? formatToolOpLabel(op) : op;
-    let rule: string | null = null;
+    let rule: string | HostPolicyDenial | null = null;
     try {
       const shell = typeof op === "string" ? op : op.tool === "bash" && typeof op.command === "string" ? op.command : null;
       const checked: Operation[] = [normalizePolicyOperation(op, sessionRoot, effectiveCwd)];
       if (shell !== null) checked.push(...policyShellVariants(shell));
-      for (const operation of checked) {
+      for (let v = 0; v < checked.length; v++) {
+        const operation = checked[v]!;
         if (signal?.aborted) return "aborted";
+        const context: PolicyCheckContext = { ...base, operationIndex: i, ...(v > 0 ? { variant: true } : {}) };
         const verdict = await raceAbort(check(operation, context), signal);
         if (verdict === "aborted") return "aborted";
         // One verdict decides this operation; further variants would only add
@@ -464,15 +468,21 @@ function mutationBlock(
   return lines.join("\n");
 }
 
-function policyBlock(
-  node: PlanNode,
-  violation: { index: number; command: string; rule: string },
-): string {
+interface PolicyViolation {
+  index: number;
+  command: string;
+  rule: string | HostPolicyDenial;
+}
+
+function policyBlock(node: PlanNode, violation: PolicyViolation): string {
   const native = violation.command.startsWith("read:") || violation.command.startsWith("grep:") ||
     violation.command.startsWith("find:") || violation.command.startsWith("ls:");
+  const why = typeof violation.rule === "string"
+    ? `Blocked by host permission rule '${violation.rule}'`
+    : `Blocked — ${violation.rule.hostDenied} —`;
   return [
     `## node ${node.id} — POLICY HARD-STOP (not run)`,
-    `Blocked by host permission rule '${violation.rule}' on operation ${violation.index + 1}: ${violation.command}`,
+    `${why} on operation ${violation.index + 1}: ${violation.command}`,
     native
       ? "Use the host's native file/search tool instead — it enforces/prompts per the host's permission config."
       : "Run this via the host bash tool instead — it enforces/prompts per the host's permission config.",

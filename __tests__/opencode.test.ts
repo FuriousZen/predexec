@@ -1,7 +1,7 @@
 import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 // `server` is accessed through the default export (`plugin.server`), not as a
 // named import: that mirrors what current opencode loaders (readV1Plugin)
 // actually read, and `server` is deliberately not a named export (see the
@@ -26,6 +26,26 @@ const repo = mkdtempSync(join(tmpdir(), "px-opencode-"));
 writeFileSync(join(repo, "a.ts"), "x");
 mkdirSync(join(repo, "src"));
 writeFileSync(join(repo, "src", "a.ts"), "x");
+
+// The plugin reads process.env for opencode config discovery. Policy e2e tests
+// isolate it: every OPENCODE_* source cleared, and global/data/home/managed
+// config pointed at an empty tmp dir, so a developer's real opencode config
+// cannot change a verdict.
+const isolateOpencodeEnv = () => {
+  beforeEach(() => {
+    const scratch = mkdtempSync(join(tmpdir(), "px-oc-env-"));
+    vi.stubEnv("XDG_CONFIG_HOME", join(scratch, "config"));
+    vi.stubEnv("XDG_DATA_HOME", join(scratch, "data"));
+    vi.stubEnv("OPENCODE_TEST_HOME", join(scratch, "home"));
+    vi.stubEnv("OPENCODE_TEST_MANAGED_CONFIG_DIR", join(scratch, "managed"));
+    for (const name of ["OPENCODE_CONFIG", "OPENCODE_CONFIG_DIR", "OPENCODE_CONFIG_CONTENT", "OPENCODE_DISABLE_PROJECT_CONFIG", "OPENCODE_PERMISSION"]) {
+      vi.stubEnv(name, undefined);
+    }
+  });
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+};
 
 const variants = [
   { name: "source (.opencode/plugins/predexec.ts)", plugin: pluginSource, createToolExecutor: createToolExecutorSource },
@@ -320,6 +340,7 @@ describe.each(variants)("opencode createToolExecutor ($name) — missing-path pr
 });
 
 describe.each(variants)("opencode plugin ($name) — host permission policy e2e", ({ plugin }) => {
+  isolateOpencodeEnv();
   const execute = async (directory: string, plan: unknown) => {
     const hooks = await plugin.server({ client: {} } as any);
     return (hooks as any).tool.predexec.execute(
@@ -423,6 +444,7 @@ describe.each(variants)("opencode plugin ($name) — host permission policy e2e"
 });
 
 describe.each(variants)("opencode plugin ($name) — host context.ask bridge", ({ plugin }) => {
+  isolateOpencodeEnv();
   const execute = async (directory: string, plan: unknown, ask?: (input: any) => Promise<void>) => {
     const hooks = await plugin.server({ client: {} } as any);
     return (hooks as any).tool.predexec.execute(
@@ -456,7 +478,8 @@ describe.each(variants)("opencode plugin ($name) — host context.ask bridge", (
       throw new Error("The user rejected permission to use this specific tool call.");
     });
     expect(out).toContain("POLICY HARD-STOP (not run)");
-    expect(out).toContain("opencode permission denied: The user rejected permission");
+    expect(out).toContain("opencode denied permission: The user rejected permission");
+    expect(out).not.toContain("host permission rule");
     expect(out).not.toContain("node a (exit");
   });
 

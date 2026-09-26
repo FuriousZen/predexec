@@ -400,10 +400,12 @@ describe("createOpencodeAskBridge — host permission service", () => {
       throw new Error("The user rejected permission to use this specific tool call.");
     });
     const check = createOpencodeAskBridge(ask, ruleset, { directory: ctx.project });
-    expect(await check("git fetch origin")).toBe(
-      "opencode permission denied: The user rejected permission to use this specific tool call.",
-    );
-    expect(await check("git status")).toContain("not asking again");
+    expect(await check("git fetch origin")).toEqual({
+      hostDenied: "opencode denied permission: The user rejected permission to use this specific tool call.",
+    });
+    // After a stop the walk is static-only: the default-allowed `git status`
+    // is not prompted for.
+    expect(await check("git status")).toBeNull();
     expect(ask).toHaveBeenCalledTimes(1);
   });
 
@@ -447,7 +449,7 @@ describe("createOpencodeAskBridge — host permission service", () => {
     expect(ask).not.toHaveBeenCalled();
   });
 
-  it("through the engine: variants and repeats do not multiply prompts", async () => {
+  it("through the engine: a repeated operation is asked once", async () => {
     const { ctx, ruleset } = rules({});
     const ask = vi.fn<OpencodeAsk>(async () => {});
     const plan: PlanTree = { root: "a", nodes: [{ id: "a", commands: ["echo hi", "echo hi"] }] };
@@ -457,6 +459,65 @@ describe("createOpencodeAskBridge — host permission service", () => {
     });
     expect(r.stoppedReason).toBe("leaf");
     expect(ask).toHaveBeenCalledTimes(1);
+  });
+
+  const walk = async (ctx: ReturnType<typeof setup>, ruleset: ReturnType<typeof readOpencodeRuleset>, commands: string[], ask: OpencodeAsk, signal?: AbortSignal) =>
+    runPlanTree({ root: "a", nodes: [{ id: "a", commands }] }, {
+      cwd: ctx.project,
+      ...(signal ? { signal } : {}),
+      checkOperationPolicy: createOpencodeAskBridge(ask, ruleset, { directory: ctx.project, worktree: ctx.project }),
+    });
+
+  it.each(["sh -c 'cat x'", "/usr/bin/env cat x", "'/bin/cat' x"])(
+    "through the engine: variant spellings of %s cost exactly one host prompt",
+    async (command) => {
+      const { ctx, ruleset } = rules({ bash: { "*": "ask" } });
+      writeFileSync(join(ctx.project, "x"), "x");
+      const ask = vi.fn<OpencodeAsk>(async () => {});
+      const r = await walk(ctx, ruleset, [command], ask);
+      expect(ask).toHaveBeenCalledTimes(1);
+      expect(ask.mock.calls[0]![0].patterns).toEqual([command]);
+      expect(r.stoppedReason).toBe("leaf");
+    },
+  );
+
+  it("through the engine: a variant stricter than its primary still reaches the host", async () => {
+    // `/bin/cat x` is allowed statically; its decoded `cat x` hits `cat *: ask`.
+    const { ctx, ruleset } = rules({ bash: { "cat *": "ask" } });
+    const ask = vi.fn<OpencodeAsk>(async () => {});
+    await walk(ctx, ruleset, ["/bin/cat x"], ask);
+    expect(ask.mock.calls.map((c) => c[0].patterns)).toEqual([["/bin/cat x"], ["cat x"]]);
+  });
+
+  it("through the engine: a variant's static deny stops without another prompt", async () => {
+    const { ctx, ruleset } = rules({ bash: { "cat *": "deny" } });
+    const ask = vi.fn<OpencodeAsk>(async () => {});
+    const r = await walk(ctx, ruleset, ["/bin/cat x"], ask);
+    expect(r.stoppedReason).toBe("policyStop");
+    expect(r.transcript).toContain("host permission rule 'cat *'");
+    expect(ask).toHaveBeenCalledTimes(1);
+  });
+
+  it("through the engine: once a node is stopped, later operations are never prompted for", async () => {
+    const { ctx, ruleset } = rules({ bash: { "*": "ask", "cat *": "deny" } });
+    const ask = vi.fn<OpencodeAsk>(async () => {});
+    const r = await walk(ctx, ruleset, ["cat x", "ls"], ask);
+    expect(r.stoppedReason).toBe("policyStop");
+    expect(ask).not.toHaveBeenCalled();
+  });
+
+  it("through the engine: an abort while a prompt is pending stops without running", async () => {
+    const { ctx, ruleset } = rules({});
+    const controller = new AbortController();
+    const ask = vi.fn<OpencodeAsk>(() => {
+      queueMicrotask(() => controller.abort());
+      return new Promise<void>(() => {});
+    });
+    const r = await walk(ctx, ruleset, ["echo SHOULD_NOT_RUN"], ask, controller.signal);
+    expect(ask).toHaveBeenCalledTimes(1);
+    expect(r.stoppedReason).toBe("aborted");
+    expect(r.pathTaken).toEqual([]);
+    expect(r.transcript).not.toContain("node a (exit");
   });
 
   it("through the engine: a rejection hard-stops before running", async () => {
@@ -470,7 +531,9 @@ describe("createOpencodeAskBridge — host permission service", () => {
       checkOperationPolicy: createOpencodeAskBridge(ask, ruleset, { directory: ctx.project }),
     });
     expect(r.stoppedReason).toBe("policyStop");
-    expect(r.transcript).toContain("opencode permission denied: nope");
+    // A live host rejection reads as the host's answer, not as a static rule.
+    expect(r.transcript).toContain("opencode denied permission: nope");
+    expect(r.transcript).not.toContain("host permission rule");
     expect(r.transcript).not.toContain("node a (exit");
   });
 });

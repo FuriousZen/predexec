@@ -52,6 +52,7 @@ export {
   type OperationPolicyChecker,
   type PolicyVerdict,
   type PolicyCheckContext,
+  type HostPolicyDenial,
   type PlanTree,
   type CoreResult,
   type ToolExecutor,

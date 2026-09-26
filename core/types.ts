@@ -18,8 +18,20 @@ export interface ToolOp {
 
 /** A single step in a node's batch: a shell command (string) or a tool call (object). */
 export type Operation = string | ToolOp;
-/** A host-policy verdict: the matched rule/pattern when the host would deny or prompt, null to run. */
-export type PolicyVerdict = string | null;
+/**
+ * A live host refusal, as opposed to a matched static rule: the host's own
+ * permission service (e.g. an opencode prompt the user rejected) said no.
+ * `hostDenied` is a complete sentence naming the host and its reason.
+ */
+export interface HostPolicyDenial {
+  hostDenied: string;
+}
+/**
+ * A host-policy verdict: the matched rule/pattern when the host would deny or
+ * prompt, a `HostPolicyDenial` when a live host permission service refused,
+ * null to run.
+ */
+export type PolicyVerdict = string | HostPolicyDenial | null;
 /** What the engine tells a policy checker about the walk it is checking for. */
 export interface PolicyCheckContext {
   /** The node's effective working directory (plan `cwd` resolved against the session root). */
@@ -28,6 +40,15 @@ export interface PolicyCheckContext {
   sessionRoot: string;
   /** The run's abort signal; the engine also races a pending check against it. */
   signal?: AbortSignal;
+  /** Index of the operation within its node's `commands`. */
+  operationIndex?: number;
+  /**
+   * True for an extra spelling of operation `operationIndex` (an inner `sh -c`
+   * clause or decoded argv form) checked after its primary spelling passed. A
+   * checker that prompts can treat it as covered by the primary's approval
+   * unless its own verdict is stricter.
+   */
+  variant?: boolean;
 }
 /**
  * Adapter-provided host-policy check for every operation in a node batch. It
