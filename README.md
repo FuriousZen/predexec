@@ -56,7 +56,7 @@ design wants to get natively.
 | Integration | in-process extension | in-process plugin (v1 `{id,server}` and v2 `{id,setup}`) | out-of-process **stdio MCP** | out-of-process **stdio MCP** (same server as Claude Code) | out-of-process **stdio MCP** (same server as Claude Code) |
 | Tool registration | native (`pi.extensions`) | native (`plugin` array) | MCP tool — the only route CC offers a third party | MCP tool — the only route Codex offers a third party | MCP tool — the only route agy offers a third party |
 | `read`/`grep`/`find`/`ls` | the host's **own tool factories** — exact parity | v1: host SDK, with real caps. v2: no file API at all, so it shares Claude Code's `mcp/tool-ops.ts` | **own implementation** over `node:fs` (`rg`/`fd` accelerate) | same implementation as Claude Code (`mcp/tool-ops.ts` is shared) | same implementation as Claude Code (`mcp/tool-ops.ts` is shared) |
-| Steering | skill auto-loaded via `pi.skills` | guarded system-prompt push, `AGENTS.md`, or (v1) an auto-registered packaged skill | skill via plugin wrapper + tool description | `AGENTS.md` native (no plugin wrapper needed) + tool description, or a plugin-bundled skill | plugin-bundled skill, `install-skill`, or `AGENTS.md`/`GEMINI.md` fallback + tool description |
+| Steering | skill auto-loaded via `pi.skills` | guarded system-prompt push, `AGENTS.md`, or (v1) an auto-registered packaged skill | skill via plugin wrapper + tool description | `AGENTS.md` native (no plugin wrapper needed) + tool description, or a plugin-bundled skill | plugin-bundled skill, `install-skill`, or `AGENTS.md` fallback + tool description |
 | Streaming progress | yes (`onUpdate`) | no | no | no | no |
 | Host permission rules | n/a — pi has no per-command rules (project-trust only) | **self-checked** from `permission.bash` plus supported native `read`/`grep`/`glob` rules (with local `list` compatibility), last-match-wins; v1 can bridge an `ask` rule to a real host prompt via `context.ask`, v2 cannot | **self-enforced** from `settings.json`, including mapped native read/search operations via supported `Read`/`Grep`/`Glob` rules (host rules don't reach a subprocess) | **self-enforced** from persisted `config.toml` + execpolicy rules for shell/Bash only — no persisted native file-operation source and **no OS sandbox backstop** (MCP servers run outside it entirely, measured) | **self-enforced** from `~/.gemini/antigravity-cli/settings.json` grants (Deny>Ask>Allow), covering both shell and `read_file` tool ops — and **no OS sandbox backstop** (MCP servers run outside it too, measured) |
 | Published format | compiled ESM (`dist/`) | compiled ESM (`dist/`) | compiled ESM (`dist/`) | compiled ESM (`dist/`) | compiled ESM (`dist/`) |
@@ -128,7 +128,7 @@ plugin), and a **skill step** (only needed on the manual path, or as a fallback)
 | opencode | — (opencode has no plugin-bundle concept; `"plugin": ["predexec"]` in `opencode.json` IS the whole install) | same `"plugin": ["predexec"]` step | none needed — v1's `config` hook / v2's `ctx.skill.transform` auto-register the packaged skill; `install-skill opencode` is a manual fallback |
 | Claude Code | `/plugin marketplace add FuriousZen/predexec` + `/plugin install predexec@predexec` (bundles the skill) | `claude mcp add predexec -- npx -y --package=predexec predexec-mcp` | `npx -y predexec install-skill claude` (manual path only) |
 | Codex | `codex plugin marketplace add FuriousZen/predexec` + `codex plugin add predexec@predexec` (bundles the skill, forwards `CODEX_HOME`) | `codex mcp add predexec -- npx -y --package=predexec predexec-mcp --host codex` | `npx -y predexec install-skill codex` (manual path only); or the no-MCP `AGENTS.md` fallback |
-| Antigravity | `agy plugin install <path to node_modules/predexec/antigravity-plugin>` (bundles the skill; needs `PREDEXEC_ROOT`, see below) | `agy mcp add predexec npx -- -y --package=predexec predexec-mcp --host antigravity` (**recommended** — no extra config needed) | `npx -y predexec install-skill antigravity` (manual path only); or the no-MCP `AGENTS.md`/`GEMINI.md` fallback |
+| Antigravity | **no marketplace** — installs from the package directory: `agy plugin install <node_modules/predexec/antigravity-plugin>` (bundles the skill; needs `PREDEXEC_ROOT` set in the shell that launches `agy`, see below) | `agy mcp add predexec npx -- -y --package=predexec predexec-mcp --host antigravity` (**recommended** — no extra config needed) | `npx -y predexec install-skill antigravity` (manual path only); or the no-MCP `AGENTS.md` fallback |
 
 Every host also gets the same two verification commands once installed:
 
@@ -521,7 +521,7 @@ agy plugin install <path to node_modules/predexec/antigravity-plugin>
 already) copies the routing skill to `~/.gemini/config/skills/predexec/` (global — Ruling R3,
 supported by Task 19's static evidence; pass `--project` for `.agents/skills/predexec/` instead).
 A fallback with no MCP tool at all, the same idea as Codex's `AGENTS.md` fallback, ships at
-`configs/antigravity/AGENTS.md` — paste it into your workspace's `AGENTS.md`/`GEMINI.md` when you
+`configs/antigravity/AGENTS.md` — paste it into your workspace's `AGENTS.md` when you
 can't register an MCP server at all.
 
 **Session root.** agy starts a workspace MCP server in the directory `agy` was launched from,
@@ -575,7 +575,7 @@ predexec ships a CLI (`bin/predexec.mjs`, node builtins only) for install diagno
 request accounting:
 
 ```bash
-npx -y predexec doctor              # node version + pi / opencode / Claude Code / Codex wiring + skill checks
+npx -y predexec doctor              # node version + pi / opencode / Claude Code / Codex / Antigravity wiring + skill checks
 npx -y predexec doctor --live       # + spawns opencode and probes tool registration
 npx -y predexec stats               # aggregate recorded runs: ops collapsed, requests saved, edge hit-rate
 npx -y predexec install-skill <claude|codex|opencode|antigravity|pi> [--project] [--dry-run] [--force]
