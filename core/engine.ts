@@ -20,7 +20,7 @@ import { isAbsolute, relative, resolve, sep } from "node:path";
 import { conditionStringBudget, evaluateConditionWithDetail, isInsideRoot } from "./conditions.ts";
 import { READ_ONLY_TOOLS, MUTATING_TOOLS, findDestructiveToken } from "./destructive.ts";
 import { runNode, isToolOp, formatToolOpLabel } from "./runner.ts";
-import { ARGV, extractShellCommandClauses, normalizeEnvInvocation, splitCommandSegments, tokenizeShellWords } from "./shell/lexer.ts";
+import { ARGV, extractShellCommandClauses, inspectCommandSubstitutionTree, normalizeEnvInvocation, splitCommandSegments, tokenizeShellWords } from "./shell/lexer.ts";
 import { shellEvalPayload } from "./shell/interpreters.ts";
 import { validateOperation } from "./validation.ts";
 import {
@@ -348,11 +348,13 @@ const MAX_POLICY_SHELL_DEPTH = 8;
 /**
  * The extra spellings of one shell command a host policy must also see, so a
  * rule on `cat .env` cannot be sidestepped by wrapping it: every inner clause
- * of a `sh|bash|zsh|dash -c '<script>'` (recursively), and every clause's
+ * of a `sh|bash|zsh|dash -c '<script>'` (recursively, including one that sits
+ * inside a `$(…)`, backtick or `<(…)` substitution), and every clause's
  * decoded argv form — quotes/escapes removed, leading assignments, `env` and
  * wrappers dropped, head reduced to its basename (`/usr/bin/env '/bin/cat'
  * .env` → `cat .env`). The command itself is not included, and nothing is
- * returned for a command with neither form.
+ * returned for a command with neither form. Throws (fail closed) when the
+ * substitution tree cannot be fully inspected.
  */
 function policyShellVariants(command: string): string[] {
   const variants: string[] = [];
@@ -364,16 +366,26 @@ function policyShellVariants(command: string): string[] {
       variants.push(trimmed);
     }
   };
+  const expanded = new Set<string>();
   const visit = (text: string, depth: number): void => {
-    for (const segment of splitCommandSegments(text)) {
-      for (const clause of new Set([segment, ...extractShellCommandClauses(segment)])) {
-        const argvForm = decodedArgvForm(clause);
-        if (argvForm !== null) add(argvForm);
-        const shell = shellEvalPayload(clause);
-        if (shell?.payload == null || depth >= MAX_POLICY_SHELL_DEPTH) continue;
-        for (const inner of splitCommandSegments(shell.payload)) {
-          add(inner);
-          visit(inner, depth + 1);
+    // The text itself, then every substitution/compound body under it.
+    const tree = inspectCommandSubstitutionTree(text);
+    if (!tree.complete) throw new Error("command substitutions too deep or large to inspect for policy");
+    for (const body of tree.commands) {
+      for (const piece of splitCommandSegments(body)) {
+        for (const clause of new Set([piece, ...extractShellCommandClauses(piece)])) {
+          const argvForm = decodedArgvForm(clause);
+          if (argvForm !== null) add(argvForm);
+          const shell = shellEvalPayload(clause);
+          if (shell?.payload == null || depth >= MAX_POLICY_SHELL_DEPTH) continue;
+          for (const inner of splitCommandSegments(shell.payload)) {
+            // A clause can surface both as a tree body and as a clause of its
+            // parent; expanding it once keeps the walk linear.
+            if (expanded.has(inner)) continue;
+            expanded.add(inner);
+            add(inner);
+            visit(inner, depth + 1);
+          }
         }
       }
     }
