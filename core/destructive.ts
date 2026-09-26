@@ -1591,7 +1591,25 @@ type EvalPrograms =
 const PERL_PRELOAD_MODULES = new Set(["strict", "warnings", "utf8", "JSON::PP", "Data::Dumper", "List::Util"]);
 const RUBY_PRELOAD_LIBRARIES = new Set(["json", "set", "pp", "yaml"]);
 /** Node options that load code before the eval program runs. */
-const NODE_PRELOAD_OPTION_RE = /^(?:-r|--require|--import|--loader|--experimental-loader|--preload|--env-file|--env-file-if-exists)(?:=|$)/;
+const NODE_PRELOAD_OPTION_RE =
+  /^(?:-r|--require|--import|--loader|--experimental-loader|--preload|--env-file|--env-file-if-exists|--experimental-config-file|--experimental-default-config-file)(?:=|$)/;
+
+/**
+ * Environment variables that make an interpreter load code or options before
+ * the eval program (`NODE_OPTIONS='"--require" x'`, `PERL5OPT=-Mevil`, an ini
+ * `auto_prepend_file` via PHPRC). Any value is refused: their parsers (quote
+ * stripping, option splicing) are not worth re-implementing to find a safe one.
+ */
+const INTERPRETER_PRELOAD_ENV: Record<string, ReadonlySet<string>> = {
+  node: new Set(["NODE_OPTIONS"]),
+  bun: new Set(["NODE_OPTIONS", "BUN_OPTIONS"]),
+  deno: new Set(["NODE_OPTIONS", "DENO_OPTIONS"]),
+  perl: new Set(["PERL5OPT", "PERL5LIB", "PERLLIB"]),
+  ruby: new Set(["RUBYOPT", "RUBYLIB"]),
+  php: new Set(["PHPRC", "PHP_INI_SCAN_DIR"]),
+  python: new Set(["PYTHONPATH", "PYTHONSTARTUP", "PYTHONHOME"]),
+  python3: new Set(["PYTHONPATH", "PYTHONSTARTUP", "PYTHONHOME"]),
+};
 
 /**
  * The inline programs of an interpreter invocation, parsed with each
@@ -1611,6 +1629,12 @@ function interpreterEvalPrograms(segment: string): EvalPrograms {
   const programs: string[] = [];
   const violation = (reason: string): EvalPrograms => ({ kind: "violation", reason });
   const result = (join: boolean): EvalPrograms => programs.length > 0 ? { kind: "eval", programs, join } : { kind: "none" };
+
+  const preloadEnv = INTERPRETER_PRELOAD_ENV[head];
+  for (const assignment of normalized.assignments) {
+    const name = ENV_ASSIGNMENT_RE.exec(assignment)?.[1];
+    if (name && preloadEnv?.has(name)) return violation(name);
+  }
 
   if (head === "deno") {
     return argv[1] === "eval" || argv[1] === "run" ? violation(`deno ${argv[1]}`) : { kind: "none" };
@@ -1646,15 +1670,20 @@ function interpreterEvalPrograms(segment: string): EvalPrograms {
 
   if (head === "perl" || head === "ruby") {
     const isPerl = head === "perl";
-    // Per-letter grammar (perlrun / ruby --help): plain switches continue the
-    // cluster, digit-suffixed ones consume only their digits, and the rest
-    // take the remainder of the cluster or, when empty, the next word.
+    // Per-letter grammar, audited against perl.c/perlrun and ruby.c:
+    // - plain switches continue the cluster;
+    // - digit-suffixed ones (`-0777`, `-l`, `-CSD`, `-W0`) consume only
+    //   their own characters;
+    // - attach-only switches (perl -F/-i/-M/-m/-x, ruby -F/-i/-x) take the
+    //   rest of the cluster and NEVER the next word, and ruby -K takes one
+    //   character and continues;
+    // - only perl -e/-E/-I and ruby -e/-E/-r/-I/-C may take the next word.
     const plain = isPerl ? "napsuUtTwWXcvhfgS" : "napslvwdcyUh";
     const digits: Record<string, RegExp> = isPerl
       ? { l: /^[0-7]*/, "0": /^(?:x[0-9a-fA-F]*|[0-7]*)/, C: /^(?:\d+|[IOEioSDAL]*)/ }
-      : { "0": /^[0-7]*/, W: /^[0-2:a-z]*/ };
-    const rest = isPerl ? "eEFiIMmx" : "erIFiCEKx";
-    const restOptional = "i";
+      : { "0": /^[0-7]*/, W: /^[0-2:a-z]*/, K: /^[a-zA-Z]?/ };
+    const separate = isPerl ? "eEI" : "eErIC";
+    const attachOnly = isPerl ? "FiMmx" : "Fix";
     for (let i = 1; i < argv.length; i++) {
       const word = argv[i]!;
       if (word === "--" || word === "-" || !word.startsWith("-")) break;
@@ -1670,17 +1699,26 @@ function interpreterEvalPrograms(segment: string): EvalPrograms {
           j += digitRe.exec(word.slice(j + 1))![0].length;
           continue;
         }
-        if (!rest.includes(letter)) return violation(`-${letter}`);
         let value = word.slice(j + 1);
-        if (!value && !restOptional.includes(letter)) {
-          if (i + 1 >= argv.length) return violation(`-${letter}`);
-          value = argv[++i]!;
-        } else if (value && (letter === "e" || letter === "E") && j === 1) {
-          value = attachedEvalProgram(segment, head as "perl" | "ruby") ?? value;
+        if (separate.includes(letter)) {
+          if (!value) {
+            if (i + 1 >= argv.length) return violation(`-${letter}`);
+            value = argv[++i]!;
+            // A switch value spelled like an option means the words were
+            // not paired the way we think; fail closed.
+            if (value.startsWith("-") && letter !== "e" && letter !== "E") return violation(`-${letter} ${value}`);
+          } else if ((letter === "e" || letter === "E") && j === 1) {
+            value = attachedEvalProgram(segment, head as "perl" | "ruby") ?? value;
+          }
+        } else if (!attachOnly.includes(letter)) {
+          return violation(`-${letter}`);
         }
         if (letter === "e" || letter === "E") programs.push(value);
         else if (isPerl && (letter === "M" || letter === "m")) {
-          if (!PERL_PRELOAD_MODULES.has(value.replace(/[=\s].*$/s, ""))) return violation(`-${letter}${value}`);
+          // perl splices the whole value into `use …;`, so it must be exactly
+          // a reader module name with an optional `=import,list`.
+          const spec = /^([A-Za-z_][\w:]*)(?:=[\w,:]*)?$/.exec(value);
+          if (!spec || !PERL_PRELOAD_MODULES.has(spec[1]!)) return violation(`-${letter}${value}`);
         } else if (!isPerl && letter === "r") {
           if (!RUBY_PRELOAD_LIBRARIES.has(value)) return violation(`-r${value}`);
         } else if (!isPerl && letter === "x") {
@@ -1725,12 +1763,6 @@ function interpreterEvalPrograms(segment: string): EvalPrograms {
     if (/^(?:-e|-p|-pe|-ep|--eval|--print)$/.test(word)) {
       if (i + 1 >= argv.length) return violation(word);
       programs.push(argv[++i]!);
-    }
-  }
-  for (const assignment of programs.length > 0 ? normalized.assignments : []) {
-    const [, name, value] = ENV_ASSIGNMENT_RE.exec(assignment) ?? [];
-    if (name === "NODE_OPTIONS" && /(?:^|\s)(?:-r|--require|--import|--loader|--experimental-loader|--env-file)/.test(value ?? "")) {
-      return violation("NODE_OPTIONS preload");
     }
   }
   return result(false);
@@ -2614,6 +2646,9 @@ function interpreterReaderViolation(payload: string, language: InterpolationLang
   // already masked them, so check them before anything reads as data.
   if (details.shellBodies.length > 0) return `${language} shell command`;
   if (language === "ruby" && /%x[^\w\s]/.test(view)) return "%x";
+  // In-place edit switched on from inside the program (`$^I`, `${^I}`, ruby `$-i`).
+  if (language === "perl" && /\$(?:\^I|\{\s*\^I\s*\})/.test(view)) return "$^I";
+  if (language === "ruby" && /\$-i\b/.test(view)) return "$-i";
   const forbidden = allowlist.forbidden.exec(view);
   if (forbidden) return forbidden[0];
   if (language === "python") {

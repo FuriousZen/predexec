@@ -1635,6 +1635,43 @@ describe("wrapper parity and allowlist-based interpreter eval (CORE-4/5)", () =>
     `deno run x.ts`,
   ])("review-mutating: %s", (c) => expect(isDestructiveCommand(c)).toBe(true));
 
+  // Review round 2: attach-only switches must not swallow the next word,
+  // -M values are spliced verbatim into `use`, and env/config preloads.
+  it.each([
+    `ruby -K -e 'system "id"'`,
+    `perl -x -e '#!perl' -e 'system "id"'`,
+    "perl -F -e 'print `id`'",
+    "ruby -F -e 'puts `id`'",
+    "perl -I -e 'print 1'",
+    `perl "-Mstrict qw(refs);system 'id'" -e 1`,
+    `perl "-Mstrict\t;system 'id'" -e 1`,
+    `perl "-mstrict qw(refs);system 'id'" -e 1`,
+    `perl -M -e 1`,
+    `NODE_OPTIONS='"--require=x"' node -e 1`,
+    `NODE_OPTIONS='"--require" x' node -e 1`,
+    `NODE_OPTIONS=--max-old-space-size=100 node -e 1`,
+    `node --experimental-config-file=c.json -e 1`,
+    `node --experimental-default-config-file -e 1`,
+    `PERL5OPT=-Mevil perl -e 1`,
+    `env PERL5OPT=-Mevil perl -e 1`,
+    `RUBYOPT=-revil ruby -e 1`,
+    `BUN_OPTIONS='--preload x' bun -e 1`,
+    `PHPRC=. php -r 'echo 1;'`,
+    `PHP_INI_SCAN_DIR=. php -r 'echo 1;'`,
+    `perl -e 'local $^I = ""; @ARGV = ("x"); while (<>) { print "y" }'`,
+    `perl -e '\${^I} = ""; print 1'`,
+  ])("review2-mutating: %s", (c) => expect(isDestructiveCommand(c)).toBe(true));
+
+  it.each([
+    `perl -Mstrict -Mwarnings=all -e 'print 1'`,
+    `perl -F: -lane 'print $F[0]' f`,
+    `perl -F, -ane 'print $F[1]' f`,
+    `ruby -Ku -e 'puts 1'`,
+    `ruby -Fx -ane 'puts 1' f`,
+    `ruby -I lib -e 'puts 1'`,
+    `perl -I lib -e 'print 1'`,
+  ])("review2-read-only: %s", (c) => expect(isDestructiveCommand(c)).toBe(false));
+
   it.each([
     `python3 -c "import os.path; print(os.path.exists('x'), os.path.join('a', 'b'))"`,
     `python3 -c "import math, re; print(math.sqrt(4), re.findall('a', 'aa'), hex(3))"`,
