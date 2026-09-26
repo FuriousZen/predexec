@@ -1,4 +1,4 @@
-import { chmodSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { EventEmitter } from "node:events";
 import type { ChildProcess } from "node:child_process";
 import { tmpdir } from "node:os";
@@ -18,6 +18,7 @@ import {
   createToolExecutor,
   findOnPath,
   globToRegExp,
+  GREP_OP_TIMEOUT_MS,
   lsOp,
   runBinary,
   walkFiles,
@@ -96,6 +97,24 @@ afterAll(() => {
   rmSync(parentNodeModulesRoot, { recursive: true, force: true });
   rmSync(parentSiblingSecret, { force: true });
 });
+
+// R26: some environments (root, certain sandboxes) ignore chmod-based deny —
+// probe once rather than assume.
+let permissionDenialWorks = false;
+try {
+  const probe = join(root, ".permission-probe");
+  writeFileSync(probe, "x");
+  chmodSync(probe, 0o000);
+  try {
+    readFileSync(probe);
+  } catch {
+    permissionDenialWorks = true;
+  }
+  chmodSync(probe, 0o644);
+  rmSync(probe, { force: true });
+} catch {
+  // ignore — permissionDenialWorks stays false
+}
 
 /** Forces the pure-Node path regardless of what is installed on this machine. */
 const NODE_ONLY: Partial<ToolExecutorOptions> = { rgPath: null, fdPath: null };
@@ -708,6 +727,30 @@ describe("mcp tool-ops — executor contract", () => {
     }
   });
 
+  it.skipIf(!permissionDenialWorks)(
+    "names a file it could not scan instead of silently skipping it (R26)",
+    async () => {
+      const dir = join(root, "partial-unreadable");
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, "readable.txt"), "hit\n");
+      const blocked = join(dir, "blocked.txt");
+      writeFileSync(blocked, "hit too\n");
+      chmodSync(blocked, 0o000);
+      try {
+        const r = await run({ tool: "grep", pattern: "hit", path: "partial-unreadable" }, NODE_ONLY);
+        // The readable file's match still comes through — one unscannable
+        // file must not fail the whole op — but the skip is NAMED, never
+        // silent (predexec's truncation-must-never-be-silent invariant).
+        expect(r.exitCode).toBe(0);
+        expect(r.stdout).toBe("partial-unreadable/readable.txt:1:hit");
+        expect(r.stderr).toContain("blocked.txt");
+        expect(r.stderr).toContain("skipping");
+      } finally {
+        chmodSync(blocked, 0o644);
+      }
+    },
+  );
+
   it("parses accelerator records whose filenames contain newlines", async () => {
     const filename = "line\nname.txt";
     write(filename, "hit\n");
@@ -830,15 +873,24 @@ describe("mcp tool-ops — bounded fallback scans", () => {
     expect(grep).toMatchObject({ exitCode: 0, stdout: "legacy-lines.txt:2:two\rthree" });
   });
 
-  it("continues scanning for NUL bytes after the match retention cap", async () => {
+  it("keeps matches already found before the retention cap even if the file turns out to be binary afterward", async () => {
+    // A file's binary-ness discovered only PAST the point where the retention
+    // cap was already satisfied by earlier, cleanly-decoded lines must not
+    // retroactively discard those matches: they were pushed only after
+    // scanTextLines parsed them as complete, valid text, and there was no
+    // earlier point in a batch this small (4 real lines, then one immediate
+    // unterminated tail) at which the scan could have been stopped to avoid
+    // ever seeing the NUL byte in the first place.
     write(
       "binary-after-cap.dat",
       Buffer.concat([Buffer.from("hit\nhit\nhit\nhit\n", "utf8"), Buffer.alloc(128 * 1024, 97), Buffer.from([0])]),
     );
     const r = await run({ tool: "grep", pattern: "hit", path: "binary-after-cap.dat", limit: 3 }, NODE_ONLY);
-    expect(r.exitCode).toBe(1);
-    expect(r.stdout).toBe("");
-    expect(r.stderr).not.toContain("match limit reached");
+    expect(r.exitCode).toBe(0);
+    expect(r.stdout).toBe(
+      ["binary-after-cap.dat:1:hit", "binary-after-cap.dat:2:hit", "binary-after-cap.dat:3:hit"].join("\n"),
+    );
+    expect(r.stderr).toContain("match limit reached");
   });
 
   it("classifies aborted fallback read and grep as search-not-run where applicable", async () => {
@@ -883,34 +935,75 @@ describe("mcp tool-ops — bounded fallback scans", () => {
     // isSafeRegex only screens grouped/alternated repetition; an ungrouped run
     // of quantified atoms like a*a*a*a* is a known polynomial-time ReDoS shape
     // that still passes it (documented in core/conditions.ts). Without a
-    // per-execution deadline this single .test() call blocks the walk for
-    // seconds (measured on this pattern/length: ~3.5s uninterrupted).
+    // deadline this single .test() call blocks the walk indefinitely
+    // (measured on this pattern/length: ~3.5s uninterrupted) — the op-level
+    // budget interrupts it at GREP_OP_TIMEOUT_MS, its own first (and only)
+    // batch call getting the full budget as its vm timeout.
     const pattern = "a*a*a*a*b";
     expect(isSafeRegex(pattern)).toBe(true);
     write("slow-regex.txt", `${"a".repeat(180)}\n`);
     const start = Date.now();
     const r = await run({ tool: "grep", pattern, path: "slow-regex.txt" }, NODE_ONLY);
-    expect(Date.now() - start).toBeLessThan(2000);
+    expect(Date.now() - start).toBeLessThan(GREP_OP_TIMEOUT_MS + 500);
     expect(r.exitCode).toBe(2);
     expect(r.stdout).toBe("");
     expect(r.stderr).toContain("time budget");
   });
 
-  it("aborts on a shared cumulative budget, not a fresh per-line window (many moderate-cost lines)", async () => {
-    // Each line here is individually "moderate" — nowhere near catastrophic,
-    // and nowhere near REGEX_EVAL_TIMEOUT_MS on its own — but a per-line-reset
-    // deadline lets an unbounded number of such lines run forever, since none
-    // of them individually trips it. A shared budget across a batch of lines
-    // must still abort once their combined cost crosses it.
+  it("aborts on a shared cumulative budget across MANY batches that are each individually fast", async () => {
+    // Each 1000-line batch here costs roughly 150-200ms on its own — nowhere
+    // near a single batch's own timeout — but the op-level budget is shared
+    // across every batch in the op, not reset per batch: a fixed number of
+    // such batches must still cross GREP_OP_TIMEOUT_MS and abort, which a
+    // per-batch-reset deadline (round 1's design) would never do (measured:
+    // 6.7s with no timeout at 5000-line/101-char-line scale under that
+    // design). 60k lines gives ~60 batches, comfortably enough to cross the
+    // budget partway through regardless of machine speed.
     const pattern = "a*a*a*a*b";
     expect(isSafeRegex(pattern)).toBe(true);
-    write("moderate-regex.txt", `${Array.from({ length: 1500 }, () => "a".repeat(80)).join("\n")}\n`);
+    write("many-batches-regex.txt", `${Array.from({ length: 60_000 }, () => "a".repeat(22)).join("\n")}\n`);
     const start = Date.now();
-    const r = await run({ tool: "grep", pattern, path: "moderate-regex.txt" }, NODE_ONLY);
-    expect(Date.now() - start).toBeLessThan(2000);
+    const r = await run({ tool: "grep", pattern, path: "many-batches-regex.txt" }, NODE_ONLY);
+    const elapsed = Date.now() - start;
+    expect(elapsed).toBeGreaterThan(GREP_OP_TIMEOUT_MS - 200);
+    expect(elapsed).toBeLessThan(GREP_OP_TIMEOUT_MS + 1000);
     expect(r.exitCode).toBe(2);
     expect(r.stdout).toBe("");
     expect(r.stderr).toContain("time budget");
+  });
+
+  it("aborts within the op budget across many FILES, not just many batches in one file", async () => {
+    // Reproduces the reviewer's own probe: 20 files of 101 lines each, no
+    // single file's one-batch cost anywhere near GREP_OP_TIMEOUT_MS alone,
+    // but the budget is shared across files too (a fresh per-file budget,
+    // round-1's design, measured 3.9s across 20 such files with no timeout).
+    for (let i = 0; i < 20; i++) {
+      write(`many-files/f${i}.txt`, `${Array.from({ length: 101 }, () => "a".repeat(38)).join("\n")}\n`);
+    }
+    const pattern = "a*a*a*a*b";
+    expect(isSafeRegex(pattern)).toBe(true);
+    const start = Date.now();
+    const r = await run({ tool: "grep", pattern, path: "many-files" }, NODE_ONLY);
+    const elapsed = Date.now() - start;
+    expect(elapsed).toBeLessThan(GREP_OP_TIMEOUT_MS + 1000);
+    expect(r.exitCode).toBe(2);
+    expect(r.stdout).toBe("");
+    expect(r.stderr).toContain("time budget");
+  });
+
+  it("keeps limit:1 on a large no-match file fast (batch size must not depend on limit)", async () => {
+    // Round 1 tied batch size to `limit - found + 1`, which collapsed to a
+    // 2-line batch for the whole scan at limit:1 (measured: ~2s for 100k
+    // lines, ~35x the default-limit run). Batch size must stay fixed and
+    // large regardless of `limit`; the exact stop-at-limit point is a
+    // host-side computation over a batch's full match list, not the batch
+    // size itself.
+    write("limit-one.txt", `${Array.from({ length: 100_000 }, (_, i) => `line ${i}`).join("\n")}\n`);
+    const start = Date.now();
+    const r = await run({ tool: "grep", pattern: "line 100001", path: "limit-one.txt", limit: 1 }, NODE_ONLY);
+    expect(Date.now() - start).toBeLessThan(500);
+    expect(r.exitCode).toBe(1);
+    expect(r.stdout).toBe("");
   });
 
   it("keeps an ordinary large-file fallback grep fast (regression guard for vm-entry overhead)", async () => {

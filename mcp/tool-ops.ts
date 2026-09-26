@@ -39,7 +39,6 @@ import {
   escapeRegExp,
   isSafeRegex,
   MAX_GREP_PATTERN_LENGTH,
-  REGEX_EVAL_TIMEOUT_MS,
   validateOperation,
   type ToolExecutor,
   type ToolOp,
@@ -735,6 +734,7 @@ async function grepOp(
     );
     if (found.err) return found.err;
     if (found.capped) notes.push(walkCapNote("grep", found.capReason ?? "work"));
+    notes.push(...found.skippedNotes);
     matches = found.matches;
   }
 
@@ -833,28 +833,50 @@ async function grepViaRg(
  * per vm call measured ~800x a bare `.test()` (100k lines: 5ms bare vs 4011ms
  * wrapped), turning an ordinary large-file grep into a multi-second stall.
  * Testing a whole chunk inside ONE vm invocation amortizes that fixed cost
- * across many lines. It also makes REGEX_EVAL_TIMEOUT_MS a genuinely
- * cumulative budget across them: a per-line-reset deadline lets N lines that
- * are each merely slow (well under the deadline individually, never
- * catastrophic on their own) run forever, since none of them individually
- * trips it — sharing one vm invocation (and therefore one clock) across a
- * chunk closes that gap for any chunk-sized run of such lines.
+ * across many lines.
+ *
+ * Batch size is FIXED (capped by lines AND by bytes — a 1000-line batch of
+ * near-MAX_TEXT_LINE_BYTES lines would otherwise be up to 64MB live at once)
+ * and deliberately NOT derived from the caller's `limit`: an earlier revision
+ * shrank the batch toward 1 line as accumulated matches approached `limit`,
+ * which reintroduced per-line-class vm overhead for a small `limit` (e.g.
+ * `limit:1`, or any scan past `limit-1` hits) — exactly the cost this design
+ * exists to amortize. The exact stop-at-`limit` point is instead computed
+ * HOST-SIDE from the full list of matched indices a batch returns (see
+ * `flushChunk` below), so a batch can safely run at full size regardless of
+ * how close the running total is to `limit`.
  */
 const REGEX_MATCH_CHUNK_LINES = 1000;
+/** Caps live batch memory regardless of how long individual lines are. */
+const REGEX_MATCH_CHUNK_MAX_BYTES = 4 * 1024 * 1024;
+
+/**
+ * Wall-clock budget for ALL of one grep op's JS-fallback regex matching —
+ * across every batch AND every file, not reset per batch or per file. A
+ * per-batch-reset deadline (as an earlier revision had) never bounds N
+ * batches that are each individually fast enough to duck under it: measured,
+ * a screened-safe but expensive pattern ran for seconds across many
+ * sub-deadline batches without ever tripping a per-batch timeout. Each vm
+ * call's own timeout is capped at whatever remains of this budget (see
+ * `flushChunk`), so a single pathological batch can still be interrupted
+ * before exhausting the WHOLE budget by itself.
+ */
+export const GREP_OP_TIMEOUT_MS = 2000;
 
 let grepChunkSandbox: { context: Context; script: Script } | undefined;
 
 /**
  * Test `re` against every string in `lines`, ALL inside one vm invocation
- * under one REGEX_EVAL_TIMEOUT_MS deadline for the whole chunk. `timedOut`
- * means the budget ran out somewhere inside the chunk; a killed vm script
- * loses its progress entirely, so the caller cannot know (and must not
- * assume) which lines had already been checked — the whole chunk is
- * unresolved, not partially matched.
+ * under the caller-supplied `timeoutMs`. `timedOut` means the deadline ran
+ * out somewhere inside the batch; a killed vm script loses its progress
+ * entirely, so the caller cannot know (and must not assume) which lines had
+ * already been checked — the whole batch is unresolved, not partially
+ * matched.
  */
 function execChunkWithDeadline(
   re: RegExp,
   lines: readonly string[],
+  timeoutMs: number,
 ): { timedOut: false; matchedIndices: number[] } | { timedOut: true } {
   grepChunkSandbox ??= {
     context: createContext({}),
@@ -866,7 +888,7 @@ function execChunkWithDeadline(
   context.regex = re;
   context.lines = lines;
   try {
-    const hits = script.runInContext(context, { timeout: REGEX_EVAL_TIMEOUT_MS }) as number[];
+    const hits = script.runInContext(context, { timeout: Math.max(1, timeoutMs) }) as number[];
     return { timedOut: false, matchedIndices: hits };
   } catch (error) {
     if ((error as { code?: unknown } | null)?.code === "ERR_SCRIPT_EXECUTION_TIMEOUT") return { timedOut: true };
@@ -887,13 +909,13 @@ async function grepViaNode(
   limit: number,
   signal?: AbortSignal,
 ): Promise<
-  { matches: Match[]; capped: boolean; capReason?: WalkCapReason; err?: undefined } |
-  { matches?: undefined; capped?: undefined; capReason?: undefined; err: OpResult }
+  { matches: Match[]; capped: boolean; capReason?: WalkCapReason; skippedNotes: string[]; err?: undefined } |
+  { matches?: undefined; capped?: undefined; capReason?: undefined; skippedNotes?: undefined; err: OpResult }
 > {
   // isSafeRegex was already applied by the caller (grepOp), before the rg/
   // fallback branch, so both paths reject the same "unsafe" patterns the same
   // way. isSafeRegex is a screen, not a proof (see core/conditions.ts), so
-  // every execution below still runs under REGEX_EVAL_TIMEOUT_MS.
+  // every execution below still runs under a bounded deadline.
   let re: RegExp;
   try {
     const source = flags.literal ? escapeRegExp(pattern) : pattern;
@@ -913,6 +935,9 @@ async function grepViaNode(
   const walked = isDir ? await walkFiles(abs, signal) : { files: [abs], capped: false };
   walked.files.sort();
   const matches: Match[] = [];
+  const skippedNotes: string[] = [];
+  // Shared across every file and every batch in this op — see GREP_OP_TIMEOUT_MS.
+  let regexBudgetRemainingMs = GREP_OP_TIMEOUT_MS;
   for (const file of walked.files) {
     if (signal?.aborted) throw new Error("aborted");
     const rel = displayRel(base, abs, lexicalAbs, file);
@@ -920,48 +945,65 @@ async function grepViaNode(
     const pending: Match[] = [];
     let chunkText: string[] = [];
     let chunkLineNos: number[] = [];
+    let chunkBytes = 0;
     let timedOut = false;
-    // Test the accumulated chunk in ONE vm invocation; returns whether
-    // scanning this file should continue (false = limit reached or timeout).
-    // A `false` return deactivates scanTextLines's callback, which — same as
-    // the old per-line design — also stops it from reading any further than
-    // it has to: a file that turns out to be binary or have an oversized line
-    // PAST the point where the limit was already exceeded doesn't need that
-    // fact discovered, since the matches found so far are being kept anyway.
+    let timedOutAtLine: number | undefined;
+    // Test the accumulated batch in ONE vm invocation; returns whether
+    // scanning this file should continue (false = limit reached or budget
+    // exhausted). A `false` return deactivates scanTextLines's callback,
+    // which also stops it from reading any further than it has to — EXCEPT
+    // for a file whose only real lines fit in a single trailing batch (there
+    // is nothing to stop mid-scan for), which is why the limit check further
+    // down is keyed on `matches.length + pending.length`, not on whether this
+    // function returned false.
     const flushChunk = (): boolean => {
       if (chunkText.length === 0) return true;
-      const result = execChunkWithDeadline(re, chunkText);
-      if (result.timedOut) {
+      if (regexBudgetRemainingMs <= 0) {
         timedOut = true;
+        timedOutAtLine = chunkLineNos[0];
         chunkText = [];
         chunkLineNos = [];
+        chunkBytes = 0;
         return false;
       }
+      const callTimeout = regexBudgetRemainingMs;
+      const startedAt = Date.now();
+      const result = execChunkWithDeadline(re, chunkText, callTimeout);
+      regexBudgetRemainingMs -= Date.now() - startedAt;
+      if (result.timedOut) {
+        timedOut = true;
+        timedOutAtLine = chunkLineNos[0];
+        chunkText = [];
+        chunkLineNos = [];
+        chunkBytes = 0;
+        return false;
+      }
+      // Host-side stop point: take matches from this batch only up to
+      // limit+1 total (the "+1" is what lets grepOp report "match limit
+      // reached" rather than looking like an exact count) — the batch itself
+      // always ran at full size regardless of how close this was.
+      let total = matches.length + pending.length;
       for (const idx of result.matchedIndices) {
+        if (total > limit) break;
         pending.push({ path: rel, canonicalPath: file, line: chunkLineNos[idx]!, text: chunkText[idx]! });
+        total += 1;
       }
       chunkText = [];
       chunkLineNos = [];
-      return matches.length + pending.length <= limit;
+      chunkBytes = 0;
+      return total <= limit;
     };
     try {
       const scan = await scanTextLines(file, (text, line) => {
         chunkText.push(text);
         chunkLineNos.push(line);
-        // The chunk target shrinks as accumulated matches approach `limit`,
-        // down to 1 (i.e. per-line, exactly the old granularity) right at the
-        // boundary where crossing it matters, and grows back up to
-        // REGEX_MATCH_CHUNK_LINES while there's plenty of room — most of an
-        // ordinary large-file scan runs at the big end of that range (there
-        // are no matches yet), so the vm-entry-overhead win from batching
-        // still applies to the bulk of the file; only the final handful of
-        // lines around the limit pay per-line overhead, same as before.
-        const roomLeft = limit - (matches.length + pending.length) + 1;
-        const chunkTarget = Math.max(1, Math.min(REGEX_MATCH_CHUNK_LINES, roomLeft));
-        if (chunkText.length >= chunkTarget) return flushChunk();
+        chunkBytes += Buffer.byteLength(text, "utf8") + 1;
+        if (chunkText.length >= REGEX_MATCH_CHUNK_LINES || chunkBytes >= REGEX_MATCH_CHUNK_MAX_BYTES) {
+          return flushChunk();
+        }
       }, signal);
-      // Flush whatever partial chunk is left (a no-op if a mid-scan flush
-      // above already stopped the callback with an empty chunk).
+      // Flush whatever partial batch is left (a no-op if a mid-scan flush
+      // above already stopped the callback with an empty batch).
       flushChunk();
       // A timeout establishes nothing about the rest of the file (or tree) —
       // returning the matches found so far would be a silent partial result
@@ -971,24 +1013,41 @@ async function grepViaNode(
         return {
           err: fail(
             "grep",
-            `${rel}: regex exceeded its ${REGEX_EVAL_TIMEOUT_MS}ms time budget — narrow the pattern or scope it with \`path\``,
+            `${rel}${timedOutAtLine !== undefined ? `:${timedOutAtLine}` : ""}: regex exceeded its ${GREP_OP_TIMEOUT_MS}ms overall time budget for this search — narrow the pattern or scope it with \`path\``,
           ),
         };
       }
-      if (scan.binary) continue;
-      if (scan.oversized) {
-        return { err: fail("grep", `${rel}: line exceeds the ${MAX_TEXT_LINE_BYTES} byte fallback scan limit`) };
+      // Once this file alone has already pushed the running total past
+      // `limit`, the matches collected are from lines scanTextLines already
+      // decoded as complete and valid — a binary/oversized signal from
+      // whatever came AFTER them in the same file doesn't retroactively
+      // invalidate matches already found from clean content, and (for a file
+      // whose matching lines all arrive before scanTextLines can even be
+      // asked to stop, e.g. a handful of short lines followed immediately by
+      // one huge unterminated tail) there was no earlier point at which the
+      // scan COULD have been stopped to avoid discovering it.
+      const haveEnough = matches.length + pending.length > limit;
+      if (!haveEnough) {
+        if (scan.binary) continue;
+        if (scan.oversized) {
+          return { err: fail("grep", `${rel}: line exceeds the ${MAX_TEXT_LINE_BYTES} byte fallback scan limit`) };
+        }
       }
       matches.push(...pending);
     } catch (err) {
       if (signal?.aborted) throw err;
-      continue; // unreadable file: skip it, the same way rg does
+      // R26: never silently drop a file this couldn't scan — rg itself would
+      // skip an unreadable file too, but predexec's own truncation-must-
+      // never-be-silent invariant means the model needs to be TOLD, not just
+      // see a possibly-incomplete result with no explanation.
+      skippedNotes.push(`grep: skipping ${rel}: ${errText(err)}`);
+      continue;
     }
     if (matches.length > limit) {
       break;
     }
   }
-  return { matches: sortMatches(matches), capped: walked.capped, capReason: walked.capReason };
+  return { matches: sortMatches(matches), capped: walked.capped, capReason: walked.capReason, skippedNotes };
 }
 
 const sortMatches = (matches: Match[]): Match[] =>
