@@ -1,5 +1,5 @@
 /**
- * predexec — Claude Code / Codex CLI (MCP) adapter: the stdio server.
+ * predexec — Claude Code / Codex CLI / Antigravity CLI (MCP) adapter: the stdio server.
  *
  * Registers ONE tool, `predexec`, that runs a pre-planned tree of command
  * batches with deterministic branch conditions in a single model round-trip.

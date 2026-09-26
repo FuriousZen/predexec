@@ -200,7 +200,30 @@ describe("antigravity policy — read_file grants and tool ops", () => {
   it("a tool op with no path targets the node cwd", async () => {
     const { run, ws } = checker({ permissions: { deny: ["read_file(sub)"] } });
     expect(await run({ tool: "ls" }, { cwd: join(ws, "sub") })).not.toBeNull();
-    expect(await run({ tool: "ls" })).toBeNull();
+    expect(await run({ tool: "ls" }, { cwd: join(ws, "other") })).toBeNull();
+  });
+
+  it("a read_file deny also stops grep/find/ls rooted ABOVE the denied path (they would read inside it)", async () => {
+    const { run } = checker({ permissions: { deny: ["read_file(.env)"], ask: ["read_file(secrets/deep)"] } });
+    expect(await run({ tool: "grep", pattern: "KEY", path: "." })).toMatch(/read_file\(\.env\)/);
+    expect(await run({ tool: "grep", pattern: "KEY" })).toMatch(/read_file\(\.env\)/);
+    expect(await run({ tool: "find", pattern: "*", path: "." })).not.toBeNull();
+    expect(await run({ tool: "ls", path: "." })).not.toBeNull();
+    expect(await run({ tool: "grep", pattern: "x", path: "secrets" })).toMatch(/secrets\/deep/);
+    // a search that cannot reach the denied path is fine
+    expect(await run({ tool: "grep", pattern: "KEY", path: "src" })).toBeNull();
+    // a plain read of an ancestor dir's sibling file is not a read of the denied file
+    expect(await run({ tool: "read", path: "README.md" })).toBeNull();
+  });
+
+  it("a read_file target containing $ (an env var) is unknown syntax: fails closed in deny, ignored in allow", async () => {
+    expect(await checker({ permissions: { deny: ["read_file($HOME/.ssh)"] } }).run({ tool: "read", path: "a" })).not.toBeNull();
+    expect(
+      await checker({ toolPermission: "strict", permissions: { allow: ["read_file($PWD)", "read_file(a)"] } }).run({
+        tool: "read",
+        path: "a",
+      }),
+    ).toBeNull();
   });
 
   it("read_file ask stops; read_file(*) matches everything", async () => {
@@ -317,13 +340,52 @@ describe("resolveAntigravityRoot", () => {
     expect(resolveAntigravityRoot({ cwd: join(repo, "sub", "deeper"), env: {} })).toEqual({ root: join(repo, "sub") });
   });
 
-  it("falls back to cwd when no marker exists above it", () => {
-    tmp = realpathSync(mkdtempSync(join(tmpdir(), "px-agy-root-")));
-    // tmpdir() itself may sit below a marker on some machines; a nested dir
-    // with no marker anywhere up to / is not guaranteed, so assert the weaker
-    // property: the result is cwd or an ancestor of it.
-    const r = resolveAntigravityRoot({ cwd: tmp, env: {} });
-    expect("root" in r && tmp.startsWith(r.root)).toBe(true);
+  /** A temp HOME with a marker in it, so the $HOME bound (R49) is exercised hermetically. */
+  function homeTree() {
+    tmp = realpathSync(mkdtempSync(join(tmpdir(), "px-agy-home-root-")));
+    const home = join(tmp, "home");
+    mkdirSync(join(home, ".agents"), { recursive: true });
+    mkdirSync(join(home, "scratch", "deeper"), { recursive: true });
+    return { home };
+  }
+
+  it("falls back to cwd when no marker exists below $HOME — ~/.agents never widens the root to ~", () => {
+    const { home } = homeTree();
+    const cwd = join(home, "scratch", "deeper");
+    expect(resolveAntigravityRoot({ cwd, env: { HOME: home } })).toEqual({ root: cwd });
+  });
+
+  it("never selects an ancestor of $HOME either (a .git above HOME)", () => {
+    const { home } = homeTree();
+    mkdirSync(join(tmp, ".git"));
+    const cwd = join(home, "scratch");
+    expect(resolveAntigravityRoot({ cwd, env: { HOME: home } })).toEqual({ root: cwd });
+  });
+
+  it("a repo under $HOME still resolves to the repo root", () => {
+    const { home } = homeTree();
+    mkdirSync(join(home, "scratch", ".git"));
+    expect(resolveAntigravityRoot({ cwd: join(home, "scratch", "deeper"), env: { HOME: home } })).toEqual({
+      root: join(home, "scratch"),
+    });
+  });
+
+  it("cwd == $HOME yields $HOME only through the cwd fallback", () => {
+    const { home } = homeTree();
+    expect(resolveAntigravityRoot({ cwd: home, env: { HOME: home } })).toEqual({ root: home });
+  });
+
+  it("an explicit root is honored as given, even $HOME", () => {
+    const { home } = homeTree();
+    expect(resolveAntigravityRoot({ cwd: join(home, "scratch"), root: home, env: { HOME: home } })).toEqual({ root: home });
+  });
+
+  it("refuses as a plugin server when cwd is INSIDE PLUGIN_ROOT, not only equal to it", () => {
+    const { repo } = tree();
+    const plugin = join(repo, ".agents", "plugins", "predexec");
+    mkdirSync(join(plugin, "sub"), { recursive: true });
+    const r = resolveAntigravityRoot({ cwd: join(plugin, "sub"), env: { PLUGIN_ROOT: plugin } });
+    expect("error" in r).toBe(true);
   });
 
   it("as a plugin server (cwd == PLUGIN_ROOT) with no explicit root, it is an error naming --root/PREDEXEC_ROOT", () => {

@@ -424,10 +424,12 @@ which may be a subdirectory. It starts a plugin server in the plugin's own direc
 `PLUGIN_ROOT` set (both measured). predexec therefore resolves its root in this order:
 
 1. `--root <dir>` in the server args, or `PREDEXEC_ROOT=<dir>` in the server env.
-2. If running as a plugin server (cwd == `PLUGIN_ROOT`) with neither set: every plan fails
+2. If running as a plugin server (cwd at or inside `PLUGIN_ROOT`) with neither set: every plan fails
    with an error telling you to set one. The plugin directory is never used as the workspace.
-3. Otherwise, the nearest ancestor of the launch dir that contains `.git` or `.agents`.
-4. Otherwise, the launch dir itself.
+3. Otherwise, the nearest ancestor of the launch dir that contains `.git` or `.agents` and lies
+   strictly below `$HOME`. The walk never selects `$HOME` or anything above it, so a stray
+   `~/.agents` cannot widen the root to your whole home directory.
+4. Otherwise, the launch dir itself (which is how launching from `~` yields `~`).
 
 `--root` is rejected with any other `--host`.
 
@@ -436,7 +438,8 @@ which may be a subdirectory. It starts a plugin server in the plugin's own direc
 <https://antigravity.google/docs/permissions>. Shell commands are checked against `command(...)`
 grants and read/grep/find/ls against `read_file(...)` grants, with Deny > Ask > Allow. A deny or
 ask match hard-stops the walk. Under `toolPermission: "strict"` (or an unknown mode), an
-operation stops unless an allow grant covers it. `allowNonWorkspaceAccess: false` stops tool ops
+operation stops unless an allow grant covers it. A `read_file` deny or ask also stops a
+grep/find/ls whose search directory contains the denied path. `allowNonWorkspaceAccess: false` stops tool ops
 that reach outside the workspace. A settings file that will not parse stops everything. So does
 a deny/ask grant predexec cannot evaluate, such as an unknown syntax or a `regex:` that could
 backtrack catastrophically. Grants made in the app/IDE UI and per-project grants are not

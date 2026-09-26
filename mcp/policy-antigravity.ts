@@ -212,8 +212,9 @@ function compilePathGrant(grant: AntigravityGrant, label: string, bases: string[
   const { kind, value } = grant.target;
   if (kind === "any") return { label, any: true, paths: [] };
   if (kind === "regex") return null;
-  // Globs are not part of the documented read_file syntax; refuse to guess.
-  if (/[*?[\]]/.test(value)) return null;
+  // Globs and env vars (`$HOME/...`) are not part of the documented
+  // read_file syntax; refuse to guess (fails closed in deny/ask).
+  if (/[*?[\]$]/.test(value)) return null;
   let target = value;
   if (target === "~" || target.startsWith("~/")) target = join(home, target.slice(1));
   const roots = isAbsolute(target) ? [resolve(target)] : bases.map((b) => resolve(b, target));
@@ -369,8 +370,14 @@ function checkToolOp(op: Exclude<Operation, string>, c: Compiled, ctx: PolicyChe
   // (or absolute when escaping); an omitted path means the node cwd.
   const target = typeof op.path === "string" ? resolve(ctx.sessionRoot, op.path) : resolve(ctx.cwd);
   const candidates = pathVariants(target);
+  // grep/find/ls (and any tool predexec does not know to be single-file)
+  // read everything below their target, so a deny/ask on a path INSIDE the
+  // searched directory applies too — `grep KEY .` must not read a denied `.env`.
+  const recursive = op.tool !== "read";
   for (const bucket of [c.deny, c.ask]) {
-    const hit = bucket.paths.find((g) => pathMatches(g, candidates));
+    const hit = bucket.paths.find(
+      (g) => pathMatches(g, candidates) || (recursive && g.paths.some((gp) => candidates.some((p) => isInside(p, gp)))),
+    );
     if (hit) return hit.label;
   }
   if (c.confineToWorkspace) {
@@ -430,8 +437,9 @@ export function createAntigravityPolicyChecker(opts: AntigravityPolicyOptions): 
  * measured, docs/research/antigravity.md §a). So, in order: `--root` /
  * `PREDEXEC_ROOT` if given (must be an existing directory); an error when
  * running as a plugin (cwd == PLUGIN_ROOT) — the plugin dir is never the
- * workspace; else the nearest ancestor of cwd holding `.git` or `.agents`;
- * else cwd.
+ * workspace (also when cwd is inside PLUGIN_ROOT); else the nearest ancestor
+ * of cwd holding `.git` or `.agents` that lies strictly below $HOME — never
+ * $HOME itself or an ancestor of it (controller ruling R49); else cwd.
  */
 export function resolveAntigravityRoot(opts: {
   cwd: string;
@@ -455,7 +463,7 @@ export function resolveAntigravityRoot(opts: {
     return { root };
   }
   const pluginRoot = env.PLUGIN_ROOT;
-  if (pluginRoot && samePath(pluginRoot, cwd)) {
+  if (pluginRoot && insidePath(pluginRoot, cwd)) {
     return {
       error:
         "predexec: running as an Antigravity plugin server, whose working directory is the plugin's own directory, " +
@@ -464,15 +472,21 @@ export function resolveAntigravityRoot(opts: {
         "Fall back to normal tool calling until then.",
     };
   }
-  for (let dir = cwd; ; dir = dirname(dir)) {
+  // Never select $HOME or an ancestor of it by walking (a stray `~/.agents`
+  // or `~/.git` must not widen the root to the whole home dir): stop at the
+  // first directory that is not strictly below $HOME. cwd == $HOME still
+  // yields $HOME, but only through the cwd fallback below.
+  const home = env.HOME || homedir();
+  for (let dir = cwd; !insidePath(dir, home); dir = dirname(dir)) {
     if (existsSync(join(dir, ".git")) || existsSync(join(dir, ".agents"))) return { root: dir };
     if (dirname(dir) === dir) break;
   }
   return { root: cwd };
 }
 
-function samePath(a: string, b: string): boolean {
-  const va = pathVariants(resolve(a));
-  const vb = pathVariants(resolve(b));
-  return va.some((x) => vb.includes(x));
+/** Is `p` at or below `root`, comparing lexical paths and realpaths? */
+function insidePath(root: string, p: string): boolean {
+  const vr = pathVariants(resolve(root));
+  const vp = pathVariants(resolve(p));
+  return vr.some((r) => vp.some((x) => isInside(r, x)));
 }
