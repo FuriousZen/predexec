@@ -37,8 +37,21 @@ describe("packed artifact verification", () => {
     mkdirSync(extractDir, { recursive: true });
     mkdirSync(installDir, { recursive: true });
 
-    // Pack to temporary tarball
-    const packOutput = execSync(`npm pack --pack-destination="${packDir}"`, {
+    // Pack to temporary tarball. --ignore-scripts skips npm's own `prepack`
+    // lifecycle hook here, deliberately: `prepack` is
+    // "npm run typecheck && npm run build" (package.json), a SECOND,
+    // independent `clean-build.mjs` invocation that is NOT covered by
+    // ensureBuild's cross-process lock above. With multiple `vitest run`
+    // processes running pack.test.ts concurrently (e.g. scripts/stress-test.mjs),
+    // their un-locked `prepack` builds can race each other on clean-build.mjs's
+    // fixed-name scratch dir and briefly corrupt `dist/` for whichever one
+    // loses — this is what caused a flaky "Cannot find module .../dist/core/types.js"
+    // failure here under concurrency. `ensureBuild({force:true})` above already
+    // guarantees a fresh, lock-protected `dist/` before we ever call `npm pack`,
+    // so skipping prepack loses nothing here; the real prepack path (a bare
+    // `npm pack`/`npm publish` outside this test suite) is untouched and still
+    // runs it.
+    const packOutput = execSync(`npm pack --ignore-scripts --pack-destination="${packDir}"`, {
       cwd: root,
       encoding: "utf8",
       env: { ...process.env, npm_config_cache: npmCache },
