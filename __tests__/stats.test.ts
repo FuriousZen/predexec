@@ -109,6 +109,25 @@ describe("stats — recordRun", () => {
     expect(second).toMatchObject({ harness: "opencode", stoppedReason: "noEdgeMatch", nodes: 1, ops: 2, requestsSaved: 1 });
   });
 
+  it("records requestsSaved through estimateRequestsSaved, even for a malformed visited node", async () => {
+    dir = mkdtempSync(join(tmpdir(), "px-stats-"));
+    process.env.PREDEXEC_STATE_DIR = dir;
+    const fixtures: Array<[PlanTree, CoreResult]> = [
+      [plan([{ id: "a", commands: ["c1", "c2", "c3"] }]), result()],
+      [plan([{ id: "a", commands: ["c1"] }, { id: "b", commands: ["c2"] }]), result({ pathTaken: ["a", "b", "a"] })],
+      // A visited node without a commands array: estimateRequestsSaved says 0;
+      // a private duplicate of the formula threw and dropped the whole record.
+      [plan([{ id: "a", commands: undefined as unknown as unknown[] }]), result()],
+    ];
+    for (const [p, r] of fixtures) await recordRun(p, r, "pi");
+    const lines = readFileSync(join(dir, "stats.jsonl"), "utf8").trim().split("\n");
+    expect(lines).toHaveLength(fixtures.length);
+    lines.forEach((line, i) => {
+      const [p, r] = fixtures[i]!;
+      expect(JSON.parse(line).requestsSaved).toBe(estimateRequestsSaved(p, r));
+    });
+  });
+
   it("never rejects when the state dir is unwritable", async () => {
     dir = mkdtempSync(join(tmpdir(), "px-stats-"));
     writeFileSync(join(dir, "not-a-dir"), ""); // state dir nested under a FILE → ENOTDIR

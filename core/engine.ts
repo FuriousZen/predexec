@@ -20,6 +20,8 @@ import { isAbsolute, relative, resolve, sep } from "node:path";
 import { conditionStringBudget, evaluateConditionWithDetail, isInsideRoot } from "./conditions.ts";
 import { READ_ONLY_TOOLS, MUTATING_TOOLS, findDestructiveToken } from "./destructive.ts";
 import { runNode, isToolOp, formatToolOpLabel } from "./runner.ts";
+import { extractShellCommandClauses, splitCommandSegments, stripLeadingAssignmentsAndWrappers } from "./shell/lexer.ts";
+import { shellEvalPayload } from "./shell/interpreters.ts";
 import { validateOperation } from "./validation.ts";
 import {
   DEFAULT_MAX_DEPTH,
@@ -86,7 +88,10 @@ export async function runPlanTree(plan: PlanTree, opts: RunOptions): Promise<Cor
     // a deny/ask match.
     const checkOperationPolicy: OperationPolicyChecker | undefined = opts.checkOperationPolicy;
     if (checkOperationPolicy) {
-      const violation = findPolicyViolation(current, checkOperationPolicy, opts.cwd, effectiveCwd);
+      const violation = await findPolicyViolation(current, checkOperationPolicy, opts.cwd, effectiveCwd, opts.signal);
+      if (violation === "aborted") {
+        return result(pathTaken, depth, "aborted", blocks.join("\n\n"), edgesEvaluated, edgesMatched);
+      }
       if (violation) {
         blocks.push(policyBlock(current, violation));
         return result(pathTaken, depth, "policyStop", blocks.join("\n\n"), edgesEvaluated, edgesMatched);
@@ -261,25 +266,90 @@ function checkToolOpDestructive(op: ToolOp): string | null {
 }
 
 /**
- * Host-policy check over a node's shell strings (incl. `{tool:"bash"}` ops).
- * Runs the adapter-provided checker; a hit means the HOST would deny or prompt
- * for this command — predexec cannot prompt mid-walk, so it hard-stops before
- * running, same contract as the mutation stop.
+ * Host-policy check over a node's operations (shell strings, `{tool:"bash"}`
+ * ops, and native tool ops). Runs the adapter-provided checker, awaiting an
+ * async one; a hit means the HOST would deny or prompt for this command —
+ * predexec cannot prompt mid-walk, so it hard-stops before running, same
+ * contract as the mutation stop. Every operation is checked even after a hit.
+ * A shell command is also checked as each of its `policyShellVariants`. A
+ * checker that throws or rejects is a hit (fail closed); an abort between
+ * checks returns "aborted".
  */
-function findPolicyViolation(
+async function findPolicyViolation(
   node: PlanNode,
   check: OperationPolicyChecker,
   sessionRoot: string,
   effectiveCwd: string,
-): { index: number; command: string; rule: string } | null {
+  signal: AbortSignal | undefined,
+): Promise<{ index: number; command: string; rule: string } | "aborted" | null> {
   let violation: { index: number; command: string; rule: string } | null = null;
   for (let i = 0; i < node.commands.length; i++) {
     const op = node.commands[i]!;
-    const checked = normalizePolicyOperation(op, sessionRoot, effectiveCwd);
-    const rule = check(checked);
-    if (rule && !violation) violation = { index: i, command: isToolOp(op) ? formatToolOpLabel(op) : op, rule };
+    const command = isToolOp(op) ? formatToolOpLabel(op) : op;
+    let rule: string | null;
+    try {
+      const shell = typeof op === "string" ? op : op.tool === "bash" && typeof op.command === "string" ? op.command : null;
+      const checked: Operation[] = [normalizePolicyOperation(op, sessionRoot, effectiveCwd)];
+      if (shell !== null) checked.push(...policyShellVariants(shell));
+      rule = null;
+      for (const operation of checked) {
+        if (signal?.aborted) return "aborted";
+        const verdict = await check(operation);
+        if (verdict && rule === null) rule = verdict;
+      }
+    } catch (err) {
+      rule = `policy check failed: ${err instanceof Error ? err.message : String(err)}`;
+    }
+    if (rule && !violation) violation = { index: i, command, rule };
   }
   return violation;
+}
+
+/** Nesting bound for `sh -c "bash -c '...'"` expansion in policyShellVariants. */
+const MAX_POLICY_SHELL_DEPTH = 8;
+
+/**
+ * The extra spellings of one shell command a host policy must also see, so a
+ * rule on `cat .env` cannot be sidestepped by wrapping it: every inner clause
+ * of a `sh|bash|zsh|dash -c '<script>'` (recursively), and every clause whose
+ * effective head is an absolute path, rewritten to the head's basename
+ * (`/bin/cat .env` → `cat .env`). The command itself is not included, and
+ * nothing is returned for a command with neither form.
+ */
+function policyShellVariants(command: string): string[] {
+  const variants: string[] = [];
+  const seen = new Set<string>([command.trim()]);
+  const add = (text: string): void => {
+    const trimmed = text.trim();
+    if (trimmed && !seen.has(trimmed)) {
+      seen.add(trimmed);
+      variants.push(trimmed);
+    }
+  };
+  const visit = (text: string, depth: number): void => {
+    for (const segment of splitCommandSegments(text)) {
+      for (const clause of new Set([segment, ...extractShellCommandClauses(segment)])) {
+        const basenameForm = absoluteHeadAsBasename(clause);
+        if (basenameForm !== null) add(basenameForm);
+        const shell = shellEvalPayload(clause);
+        if (shell?.payload == null || depth >= MAX_POLICY_SHELL_DEPTH) continue;
+        for (const inner of splitCommandSegments(shell.payload)) {
+          add(inner);
+          visit(inner, depth + 1);
+        }
+      }
+    }
+  };
+  visit(command, 0);
+  return variants;
+}
+
+/** `[wrappers] /abs/path/head args` → `head args`; null when the head is not an unquoted absolute path. */
+function absoluteHeadAsBasename(clause: string): string | null {
+  const stripped = stripLeadingAssignmentsAndWrappers(clause.trim());
+  const head = /^\/[^\s'"\\]*(?=\s|$)/.exec(stripped)?.[0];
+  const base = head?.slice(head.lastIndexOf("/") + 1);
+  return head && base ? base + stripped.slice(head.length) : null;
 }
 
 /** Map native relative targets to the session-root namespace used by hosts. */

@@ -98,21 +98,33 @@ export function coercePlan(params: unknown): PlanTree {
   if (p && typeof p === "object" && typeof (p as { nodes?: unknown }).nodes === "string") {
     p = { ...(p as object), nodes: parseOrThrow((p as { nodes: string }).nodes, "nodes") };
   }
-  const plan = p as PlanTree;
-  if (!plan || typeof plan !== "object" || typeof plan.root !== "string" || !Array.isArray(plan.nodes)) {
+  const input = p as PlanTree;
+  if (!input || typeof input !== "object" || typeof input.root !== "string" || !Array.isArray(input.nodes)) {
     throw new Error(
       "predexec expected a JSON object with `root` (string) and `nodes` (array of {id, commands[]}). " +
       "Pass the plan as an object, not a string.",
     );
   }
-  const budgetError = validatePlanBudget(plan);
+  const budgetError = validatePlanBudget(input);
   if (budgetError) throw new Error(`predexec: ${budgetError}`);
-  for (const node of plan.nodes) {
-    if (!node || typeof node !== "object") {
+  // Coercion rewrites edges (parsed shorthands, filled `source`), so it works
+  // on copies: the caller's plan object is never mutated.
+  const plan: PlanTree = { ...input, nodes: [...input.nodes] };
+  for (let n = 0; n < plan.nodes.length; n++) {
+    const original = plan.nodes[n];
+    if (!original || typeof original !== "object") {
       throw new Error("predexec: every entry in `nodes` must be an object with {id, commands[]}.");
     }
-    if (!node.edges) continue;
-    for (const edge of node.edges) {
+    if (!original.edges) continue;
+    const edges = Array.isArray(original.edges)
+      ? original.edges.map((edge) =>
+        edge && typeof edge === "object"
+          ? { ...edge, when: edge.when && typeof edge.when === "object" ? { ...edge.when } : edge.when }
+          : edge)
+      : original.edges;
+    const node = { ...original, edges };
+    plan.nodes[n] = node;
+    for (const edge of edges) {
       if (typeof edge.when === "string") {
         const parsed = parseConditionString(edge.when);
         if (!parsed) {

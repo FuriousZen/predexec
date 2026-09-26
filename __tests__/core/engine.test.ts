@@ -923,6 +923,97 @@ describe("runPlanTree — operation-wide policy", () => {
   });
 });
 
+describe("runPlanTree — async policy checkers and inner shell commands", () => {
+  it("awaits an async policy checker", async () => {
+    const r = await runPlanTree({ root: "a", nodes: [{ id: "a", commands: ["ls"] }] },
+      { cwd, checkOperationPolicy: async () => "denied by host" });
+    expect(r.stoppedReason).toBe("policyStop");
+    expect(r.pathTaken).toEqual([]);
+    expect(r.transcript).toContain("denied by host");
+  });
+
+  it("runs the node when an async checker allows every operation", async () => {
+    const r = await runPlanTree({ root: "a", nodes: [{ id: "a", commands: ["echo ok"] }] },
+      { cwd, checkOperationPolicy: async () => null });
+    expect(r.stoppedReason).toBe("leaf");
+    expect(r.transcript).toContain("ok");
+  });
+
+  it("fails closed when the policy checker throws or rejects", async () => {
+    const thrown = await runPlanTree({ root: "a", nodes: [{ id: "a", commands: ["echo SHOULD_NOT_RUN"] }] },
+      { cwd, checkOperationPolicy: () => { throw new Error("boom"); } });
+    expect(thrown.stoppedReason).toBe("policyStop");
+    expect(thrown.pathTaken).toEqual([]);
+    expect(thrown.transcript).not.toContain("(exit ");
+    expect(thrown.transcript).toContain("boom");
+    const rejected = await runPlanTree({ root: "a", nodes: [{ id: "a", commands: ["echo SHOULD_NOT_RUN"] }] },
+      { cwd, checkOperationPolicy: async () => { throw new Error("host unavailable"); } });
+    expect(rejected.stoppedReason).toBe("policyStop");
+    expect(rejected.transcript).toContain("host unavailable");
+  });
+
+  it("stops as aborted when the signal fires while a check is pending", async () => {
+    const controller = new AbortController();
+    const seen: unknown[] = [];
+    const r = await runPlanTree({ root: "a", nodes: [{ id: "a", commands: ["echo one", "echo two"] }] },
+      {
+        cwd,
+        signal: controller.signal,
+        checkOperationPolicy: async (op) => {
+          seen.push(op);
+          controller.abort();
+          return null;
+        },
+      });
+    expect(r.stoppedReason).toBe("aborted");
+    expect(seen).toEqual(["echo one"]);
+    expect(r.pathTaken).toEqual([]);
+  });
+
+  it.each(["bash -lc 'cat .env'", "sh -c \"cat .env\"", "/bin/cat .env"])("policy sees inner command of %s", async (c) => {
+    const seen: string[] = [];
+    const r = await runPlanTree({ root: "a", nodes: [{ id: "a", commands: [c] }] },
+      { cwd, checkOperationPolicy: (op) => { if (typeof op === "string") seen.push(op); return typeof op === "string" && op.startsWith("cat .env") ? "deny" : null; } });
+    expect(seen).toContain("cat .env");
+    expect(seen[0]).toBe(c);
+    expect(r.stoppedReason).toBe("policyStop");
+    expect(r.transcript).toContain(c);
+  });
+
+  it.each([
+    ["zsh -ic 'ls; cat .env'", ["ls", "cat .env"]],
+    ["dash -c 'ls && /usr/bin/cat .env'", ["ls", "/usr/bin/cat .env", "cat .env"]],
+    ["bash -c \"sh -c 'cat .env'\"", ["sh -c 'cat .env'", "cat .env"]],
+    ["echo hi; /bin/cat .env", ["cat .env"]],
+    ["timeout 5 /bin/cat .env", ["cat .env"]],
+    ["/bin/bash -c 'cat .env'", ["cat .env"]],
+    ["/cat .env", ["cat .env"]],
+    ["FOO=1 /usr/local/bin/cat .env", ["cat .env"]],
+  ])("expands %s for the checker", async (command, expected) => {
+    const seen: string[] = [];
+    await runPlanTree({ root: "a", nodes: [{ id: "a", commands: [command] }] },
+      { cwd, checkOperationPolicy: (op) => { if (typeof op === "string") seen.push(op); return "stop"; } });
+    expect(seen[0]).toBe(command);
+    for (const inner of expected) expect(seen).toContain(inner);
+  });
+
+  it("expands the command of a bash tool op for the checker", async () => {
+    const seen: unknown[] = [];
+    const r = await runPlanTree({ root: "a", nodes: [{ id: "a", commands: [{ tool: "bash", command: "sh -c 'cat .env'" }] }] },
+      { cwd, checkOperationPolicy: (op) => { seen.push(op); return op === "cat .env" ? "Bash(cat .env)" : null; } });
+    expect(seen).toEqual([{ tool: "bash", command: "sh -c 'cat .env'" }, "cat .env"]);
+    expect(r.stoppedReason).toBe("policyStop");
+    expect(r.transcript).toContain("bash:");
+  });
+
+  it("does not re-check commands that have no inner script or absolute head", async () => {
+    const seen: unknown[] = [];
+    await runPlanTree({ root: "a", nodes: [{ id: "a", commands: ["cat README.md | head -1", "echo 'sh -c x'"] }] },
+      { cwd, checkOperationPolicy: (op) => (seen.push(op), null) });
+    expect(seen).toEqual(["cat README.md | head -1", "echo 'sh -c x'"]);
+  });
+});
+
 describe("validatePlan", () => {
   const v = (plan: PlanTree) => validatePlan(plan, new Map<string, PlanNode>());
 

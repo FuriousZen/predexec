@@ -18,8 +18,13 @@ export interface ToolOp {
 
 /** A single step in a node's batch: a shell command (string) or a tool call (object). */
 export type Operation = string | ToolOp;
-/** Adapter-provided host-policy check for every operation in a node batch. */
-export type OperationPolicyChecker = (operation: Operation) => string | null;
+/** A host-policy verdict: the matched rule/pattern when the host would deny or prompt, null to run. */
+export type PolicyVerdict = string | null;
+/**
+ * Adapter-provided host-policy check for every operation in a node batch. It
+ * may answer asynchronously (a host permission bridge); the engine awaits it.
+ */
+export type OperationPolicyChecker = (operation: Operation) => PolicyVerdict | Promise<PolicyVerdict>;
 
 export interface PlanNode {
   id: NodeId;
@@ -176,6 +181,9 @@ export interface RunOptions {
    * Adapter-provided host-policy check for every operation. Returns the matched
    * rule/pattern when the HOST would deny or prompt for the command (predexec
    * cannot prompt mid-walk → policyStop hard-stop before running), null to run.
+   * Shell commands are also checked per inner clause of a `sh|bash|zsh|dash -c`
+   * script and with an absolute-path head reduced to its basename. A checker
+   * that throws or rejects is a policyStop (fail closed).
    */
   checkOperationPolicy?: OperationPolicyChecker;
   /**

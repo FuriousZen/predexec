@@ -49,7 +49,10 @@ export function statsFilePath(env: NodeJS.ProcessEnv = process.env): string {
 /** Count operations (shell commands + tool ops) across nodes actually visited. */
 function countVisitedOps(plan: PlanTree, result: CoreResult): number {
   const byId = new Map((plan.nodes ?? []).map((node) => [node.id, node]));
-  return result.pathTaken.reduce((ops, id) => ops + (byId.get(id)?.commands.length ?? 0), 0);
+  return result.pathTaken.reduce((ops, id) => {
+    const commands = byId.get(id)?.commands;
+    return ops + (Array.isArray(commands) ? commands.length : 0);
+  }, 0);
 }
 
 /**
@@ -73,7 +76,12 @@ export function estimateRequestsSaved(plan: PlanTree, result: CoreResult): numbe
  */
 export async function recordRun(plan: PlanTree, result: CoreResult, harness: Harness): Promise<void> {
   try {
-    const ops = countVisitedOps(plan, result);
+    let ops = 0;
+    try {
+      ops = countVisitedOps(plan, result);
+    } catch {
+      // A malformed plan still gets a record; ops is informational.
+    }
     const record: StatsRecord = {
       v: 1,
       ts: Date.now(),
@@ -84,7 +92,7 @@ export async function recordRun(plan: PlanTree, result: CoreResult, harness: Har
       ops,
       edgesEvaluated: result.edgesEvaluated,
       edgesMatched: result.edgesMatched,
-      requestsSaved: Math.max(0, ops - 1),
+      requestsSaved: estimateRequestsSaved(plan, result),
     };
     const file = statsFilePath();
     await mkdir(dirname(file), { recursive: true });
