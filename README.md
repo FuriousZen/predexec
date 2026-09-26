@@ -208,21 +208,43 @@ agents, hooks, MCP servers and LSP servers, but cannot register a *tool*. So pre
 Claude Code as a small **stdio MCP server** exposing the same single `predexec` tool, backed by
 the same `core/` engine as the other two adapters.
 
-The one-liner, no plugin required:
+**Install as a plugin (recommended):**
+
+```bash
+/plugin marketplace add FuriousZen/predexec
+/plugin install predexec@predexec
+```
+
+This installs the version-pinned MCP server *and* the routing skill together, both declared in
+`.claude-plugin/plugin.json` / `marketplace.json` — no separate skill-install step.
+
+**Verify:**
+
+```bash
+claude plugin list       # predexec@predexec → ✔ enabled
+npx -y predexec doctor   # shows the plugin install and its bundled skill
+```
+
+**Alternative: MCP server only, no plugin.** Skips the marketplace entirely:
 
 ```bash
 claude mcp add predexec -- npx -y --package=predexec predexec-mcp
+npx -y predexec install-skill claude
 ```
 
-Use `--scope project` to share it with a repo (writes `.mcp.json`, which each collaborator
-approves once), or `--scope user` for every project on the machine.
-
-**Verify:**
+Use `--scope project` to share the server with a repo (writes `.mcp.json`, which each
+collaborator approves once), or `--scope user` for every project on the machine.
+`install-skill claude` copies the routing skill in separately, since this path has no plugin
+manifest to bundle it.
 
 ```bash
 claude mcp list          # predexec → ✔ Connected
 npx -y predexec doctor   # shows the registered scope, and flags "awaiting approval"
 ```
+
+> **Don't do both.** The plugin's `.claude-plugin/plugin.json` already inlines the same MCP
+> server; also running `claude mcp add` registers a second `predexec` server that competes with
+> the plugin's for the same tool name. Pick one install path.
 
 Then try the prompt under [A prompt to see it work](#a-prompt-to-see-it-work).
 
@@ -262,13 +284,17 @@ traversal API, so a malicious concurrent rename/replacement of a parent director
 race a pathname-based open or an `rg`/`fd` accelerator; this is outside the adapter's
 single-process threat model.
 
-#### Plugin form (optional)
+#### Plugin form, in detail
 
-The repo also carries a plugin wrapper (`.claude-plugin/plugin.json`) that bundles the MCP
-server with a routing skill. The server config is **inlined** in the manifest rather than kept in
-a root `.mcp.json` — a root `.mcp.json` is a live project-scope registration, so it would prompt
-anyone who merely opened this repo in Claude Code. It shells out to the same `npx` command rather
-than vendoring `node_modules`, so there is no dependency-bundling step.
+The repo is itself a self-hosting Claude Code plugin *and* marketplace: `.claude-plugin/
+plugin.json` bundles the MCP server with the routing skill (`skills` → `./skills/claude/`), and
+`.claude-plugin/marketplace.json` lists that same plugin with `source: "./"` — one repo, one
+`git clone`/`add` away from an install by name. The server config is **inlined** in the manifest
+rather than kept in a root `.mcp.json` — a root `.mcp.json` is a live project-scope registration,
+so it would prompt anyone who merely opened this repo in Claude Code. It shells out to the same
+version-pinned `npx` command rather than vendoring `node_modules`, so there is no
+dependency-bundling step; `scripts/sync-plugin-version.mjs` keeps both manifests' `version` and
+the npx `--package=predexec@…` pin in step with `package.json` on every `npm version`.
 
 ### Codex CLI
 
@@ -450,7 +476,8 @@ bin/predexec-mcp.mjs               Claude Code / Codex MCP entrypoint (`--host c
 .pi/skills/predexec/SKILL.md       pi routing skill (loaded via pi.skills)       } generated from steering.ts
 skills/<harness>/predexec/SKILL.md claude / codex / opencode routing skills     } by `pnpm skills`;
 antigravity-plugin/skills/predexec/SKILL.md  Antigravity routing skill          } never edit by hand
-.claude-plugin/plugin.json         optional Claude Code plugin wrapper
+.claude-plugin/plugin.json         Claude Code plugin manifest (MCP server + skills path)
+.claude-plugin/marketplace.json    self-hosting marketplace listing (source: "./") for `/plugin install`
 configs/opencode/AGENTS.md         drop-in routing block for opencode projects
 configs/codex/AGENTS.md            drop-in routing block for Codex projects
 ```

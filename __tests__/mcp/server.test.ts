@@ -311,7 +311,7 @@ describe("mcp server — packaging and plugin wiring", () => {
     expect(Object.keys(pkg.dependencies).sort()).toEqual(["@modelcontextprotocol/server", "zod"].sort());
   });
 
-  it("the plugin manifest invokes the bin through its OWN package name", () => {
+  it("the plugin manifest invokes the bin through its OWN package name, pinned to the current version", () => {
     // Inlined into plugin.json on purpose: a root .mcp.json is a live
     // project-scope registration for anyone who opens this repo in Claude Code,
     // and it shipped into every consumer's node_modules.
@@ -320,8 +320,11 @@ describe("mcp server — packaging and plugin wiring", () => {
     expect(server.command).toBe("npx");
     // `npx -y predexec-mcp` resolves a REGISTRY PACKAGE called predexec-mcp,
     // which does not exist — the bin lives inside `predexec`. Without
-    // --package the entry 404s on every machine.
-    expect(server.args).toContain("--package=predexec");
+    // --package the entry 404s on every machine. The version pin keeps a
+    // marketplace install of this plugin from ever resolving a `predexec`
+    // release the manifest hasn't caught up to; sync-plugin-version.mjs keeps
+    // it current (release-hygiene.test.ts guards that).
+    expect(server.args).toContain(`--package=predexec@${readJson("package.json").version}`);
     expect(server.args).toContain("predexec-mcp");
   });
 

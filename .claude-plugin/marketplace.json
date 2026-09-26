@@ -2,21 +2,15 @@
   "name": "predexec",
   "description": "Predictive execution: collapse an adaptive, multi-level read-only tool sequence into a single model round-trip via a deterministic plan tree.",
   "version": "0.4.1",
-  "author": {
+  "owner": {
     "name": "FuriousZen",
     "url": "https://github.com/FuriousZen"
   },
-  "skills": "./skills/claude/",
-  "mcpServers": {
-    "predexec": {
-      "type": "stdio",
-      "command": "npx",
-      "args": [
-        "-y",
-        "--package=predexec@0.4.1",
-        "predexec-mcp"
-      ],
-      "env": {}
+  "plugins": [
+    {
+      "name": "predexec",
+      "source": "./",
+      "description": "Predictive execution: collapse an adaptive, multi-level read-only tool sequence into a single model round-trip via a deterministic plan tree."
     }
-  }
+  ]
 }

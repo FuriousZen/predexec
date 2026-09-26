@@ -32,6 +32,75 @@ describe("release hygiene", () => {
     expect(dir).not.toBe(join(homedir(), ".local", "state", "predexec"));
   });
 
+  it("plugin.json declares an author and scopes skills to the Claude Code subtree", () => {
+    // `skills` ADDS to (never replaces) the default `skills/` scan
+    // (https://code.claude.com/docs/en/plugins-reference#fields), and both the
+    // default scan and a manifest `skills` entry only look one level into the
+    // directory they're given for `<name>/SKILL.md`. This repo's skills/<harness>/
+    // predexec/SKILL.md layout is two levels below `skills/`, so the bare default
+    // scan of the plugin root finds nothing at all — without this field the
+    // plugin bundles zero skills. Pointing `skills` at "./skills/claude/"
+    // resolves the harness-specific subtree only; codex/opencode/pi/antigravity
+    // skills stay invisible to Claude Code.
+    const plugin = JSON.parse(readFileSync(join(".claude-plugin", "plugin.json"), "utf8")) as {
+      author?: { name?: string };
+      skills?: string;
+    };
+    expect(plugin.author?.name).toBeTruthy();
+    expect(plugin.skills).toBe("./skills/claude/");
+  });
+
+  it("plugin.json's npx invocation pins --package to the current package.json version", () => {
+    const pkg = JSON.parse(readFileSync("package.json", "utf8")) as { version: string };
+    const plugin = JSON.parse(readFileSync(join(".claude-plugin", "plugin.json"), "utf8")) as {
+      mcpServers: { predexec: { args: string[] } };
+    };
+    expect(plugin.mcpServers.predexec.args).toContain(`--package=predexec@${pkg.version}`);
+  });
+
+  it("marketplace.json lists the predexec plugin sourced from the repository root", () => {
+    const marketplace = JSON.parse(readFileSync(join(".claude-plugin", "marketplace.json"), "utf8")) as {
+      name: string;
+      owner: { name?: string };
+      plugins: Array<{ name: string; source: string }>;
+    };
+    expect(marketplace.owner?.name).toBeTruthy();
+    const entry = marketplace.plugins.find((p) => p.name === "predexec");
+    expect(entry?.source).toBe("./");
+  });
+
+  it("sync-plugin-version.mjs syncs both plugin.json and marketplace.json to package.json's version", () => {
+    execFileSync(process.execPath, ["scripts/sync-plugin-version.mjs"], { stdio: "pipe" });
+    const pkg = JSON.parse(readFileSync("package.json", "utf8")) as { version: string };
+    const plugin = JSON.parse(readFileSync(join(".claude-plugin", "plugin.json"), "utf8")) as {
+      version: string;
+      mcpServers: { predexec: { args: string[] } };
+    };
+    const marketplace = JSON.parse(readFileSync(join(".claude-plugin", "marketplace.json"), "utf8")) as {
+      version: string;
+    };
+    expect(plugin.version).toBe(pkg.version);
+    expect(marketplace.version).toBe(pkg.version);
+    expect(plugin.mcpServers.predexec.args).toContain(`--package=predexec@${pkg.version}`);
+  });
+
+  it("claude plugin validate . passes, when the claude CLI is on PATH", () => {
+    let claudePath: string;
+    try {
+      claudePath = execFileSync(process.platform === "win32" ? "where" : "which", ["claude"], { stdio: "pipe" })
+        .toString()
+        .trim()
+        .split("\n")[0]!;
+    } catch {
+      return; // no claude CLI on PATH — nothing to check
+    }
+    if (!claudePath) return;
+    // Read-only check: validates the manifest/marketplace files on disk, no
+    // marketplace add/install and no change to the user's own Claude config.
+    const output = execFileSync(claudePath, ["plugin", "validate", "."], { stdio: "pipe" }).toString();
+    expect(output).toMatch(/Validation passed/);
+  });
+
   beforeAll(() => {
     // Serialized across processes: pack.test.ts's beforeAll can run concurrently
     // in a separate vitest worker and also builds dist/. See ensure-build.ts.

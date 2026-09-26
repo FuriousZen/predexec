@@ -48,7 +48,7 @@
     "typecheck": "tsc --noEmit",
     "build": "tsc -p tsconfig.build.json",
     "skills": "pnpm run build && node scripts/gen-skills.mjs",
-    "version": "node scripts/sync-plugin-version.mjs && git add .claude-plugin/plugin.json",
+    "version": "node scripts/sync-plugin-version.mjs && git add .claude-plugin/plugin.json .claude-plugin/marketplace.json",
     "prepack": "npm run typecheck && npm run build"
   },
   "devDependencies": {
