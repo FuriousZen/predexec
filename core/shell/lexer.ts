@@ -1466,6 +1466,51 @@ export interface HeredocSpan {
 
 const HEREDOC_DELIMITER_FOLLOW_RE = /[\s;|&<>)]/;
 
+interface ArithmeticState {
+  /** The bracket that closes the open arithmetic context, or null outside one. */
+  close: ")" | "]" | null;
+  depth: number;
+}
+
+/**
+ * Enter an arithmetic context at `i` when one opens there: `$((`, `$[`, or a
+ * `((` command. Its `<<` is a shift, never a here-document (`echo $((1<<2))`
+ * used to open a heredoc "2" that hid the command lines after it). Returns
+ * how many characters the opener spans, 0 when none opens.
+ */
+function openArithmetic(text: string, i: number, state: ArithmeticState): number {
+  if (text[i] === "$" && text[i + 1] === "(" && text[i + 2] === "(") {
+    state.close = ")";
+    state.depth = 2;
+    return 3;
+  }
+  if (text[i] === "$" && text[i + 1] === "[") {
+    state.close = "]";
+    state.depth = 1;
+    return 2;
+  }
+  if (text[i] === "(" && text[i + 1] === "(" && arithmeticCommandStart(text, i)) {
+    state.close = ")";
+    state.depth = 2;
+    return 2;
+  }
+  return 0;
+}
+
+function stepArithmetic(state: ArithmeticState, ch: string): void {
+  const open = state.close === ")" ? "(" : "[";
+  if (ch === open) state.depth++;
+  else if (ch === state.close && --state.depth === 0) state.close = null;
+}
+
+/** A `((` in command position (after a separator, a group opener or a reserved word) is an arithmetic command. */
+function arithmeticCommandStart(text: string, i: number): boolean {
+  let k = i;
+  while (k > 0 && (text[k - 1] === " " || text[k - 1] === "\t")) k--;
+  if (k === 0 || /[\n\r;|&({!`]/.test(text[k - 1]!)) return true;
+  return /(?:^|[\s;|&(])(?:do|then|else|elif|if|while|until|for)$/.test(text.slice(Math.max(0, k - 6), k));
+}
+
 /**
  * Locate every here-document operator and its body, line by line, with the
  * quote model the masker has always used. `<<<` is a here-string, never a
@@ -1476,6 +1521,7 @@ export function scanHeredocs(cmd: string): HeredocSpan[] {
   const spans: HeredocSpan[] = [];
   const pending: HeredocSpan[] = [];
   let quote: "'" | '"' | null = null;
+  const arithmetic: ArithmeticState = { close: null, depth: 0 };
   let lineStart = 0;
   while (lineStart < cmd.length) {
     const newline = cmd.indexOf("\n", lineStart);
@@ -1497,12 +1543,15 @@ export function scanHeredocs(cmd: string): HeredocSpan[] {
     }
     for (let i = lineStart; i < lineEnd; i++) {
       const ch = cmd[i]!;
+      if (arithmetic.close !== null) { stepArithmetic(arithmetic, ch); continue; }
       if (ch === "\\" && quote !== "'") { i++; continue; }
       if (quote !== null) {
         if (ch === quote) quote = null;
         continue;
       }
       if (ch === "'" || ch === '"') { quote = ch; continue; }
+      const opened = openArithmetic(cmd, i, arithmetic);
+      if (opened > 0) { i += opened - 1; continue; }
       if (ch !== "<" || cmd[i + 1] !== "<") continue;
       if (cmd[i + 2] === "<") {
         while (cmd[i + 1] === "<") i++;
@@ -1571,19 +1620,24 @@ export function maskHeredocBodies(cmd: string): string {
   return maskHeredocSpans(cmd, scanHeredocs(cmd));
 }
 
-/** Literal text a here-string or here-document feeds one simple command's stdin. */
+/** Literal text a here-string or here-document feeds a command's stdin. */
 export interface StdinLiteral {
   kind: "here-string" | "heredoc";
-  /**
-   * The simple command the redirection belongs to, with heredoc bodies blanked
-   * and its here-string/here-document redirections removed.
-   */
-  command: string;
   /**
    * What the command reads, or null when the shell rewrites it first
    * (parameter/command expansion) or its extent cannot be read unambiguously.
    */
   text: string | null;
+}
+
+/** One simple command and where its standard input comes from. */
+export interface CommandStdin {
+  /** The command's text, heredoc bodies blanked and every redirection removed. */
+  command: string;
+  /** Here-strings and here-documents on fd 0, in order. */
+  literals: StdinLiteral[];
+  /** A `<`, `<>` or `<&` redirection on fd 0: stdin is a file or another fd. */
+  redirected: boolean;
 }
 
 /** The body an unquoted-delimiter heredoc delivers, or null when the shell would expand it. */
@@ -1607,10 +1661,11 @@ function heredocText(cmd: string, span: HeredocSpan): string | null {
 }
 
 /**
- * A here-string operand starting at `start`: its end, and its value when the
- * shell does not expand it (`<<< "$x"`, `<<< $(cat f)`, a backtick).
+ * A redirection operand (a here-string's word, a file name) starting at
+ * `start`: its end, and its value when the shell does not expand it
+ * (`<<< "$x"`, `<<< $(cat f)`, a backtick).
  */
-function hereStringOperand(masked: string, start: number, inBacktick: boolean): { end: number; text: string | null } {
+function redirectOperand(masked: string, start: number, inBacktick: boolean): { end: number; text: string | null } {
   let j = start;
   let dynamic = false;
   let quote: "'" | '"' | "$'" | null = null;
@@ -1645,9 +1700,10 @@ function hereStringOperand(masked: string, start: number, inBacktick: boolean): 
 interface StdinFrame {
   /** Offset where the current simple command starts. */
   start: number;
-  /** Here-string/here-document redirections of the current command, in order. */
+  /** Redirections (and a trailing comment) of the current command, in order. */
   redirects: Array<{ start: number; end: number }>;
-  pending: Array<{ kind: StdinLiteral["kind"]; text: string | null }>;
+  literals: StdinLiteral[];
+  redirected: boolean;
   /** Open `case` commands, whose pattern `)` closes no group. */
   caseDepth: number;
 }
@@ -1656,36 +1712,39 @@ const COMMAND_PREFIX_ONLY_RE = /^(?:(?:if|then|elif|else|do|while|until|!|\{|\()
 const WORD_BOUNDARY_BEFORE_RE = /[\s;|&()`]/;
 
 /**
- * Every here-string (`<<<`) and here-document (`<<`, `<<-`) that feeds a
- * command's standard input (no fd, or fd 0), paired with the simple command it
- * is attached to. One linear walk tracks quoting, `$(…)`/backtick/`<(…)`
- * nesting, `(…)` groups, `{ …; }`, case patterns and command separators, so
- * the owning command is found wherever it sits (`x=$(python3 <<E …)`,
- * `case a in a) python3 <<E …`), not just at a pipeline segment's head.
+ * Every simple command in `cmd` with where its standard input comes from:
+ * here-strings (`<<<`) and here-documents (`<<`, `<<-`) on fd 0 with their
+ * literal text, and whether a `<`/`<>`/`<&` redirection replaces it. One
+ * linear walk tracks quoting, `$(…)`/backtick/`<(…)` nesting, `(…)` groups,
+ * `{ }`, case patterns, arithmetic and command separators, so a command is
+ * found wherever it sits (`x=$(python3 <<E …)`, `case a in a) python3 <<E …`),
+ * not only at a pipeline segment's head.
  */
-export function stdinLiterals(cmd: string): StdinLiteral[] {
+export function commandStdin(cmd: string): CommandStdin[] {
   const heredocs = scanHeredocs(cmd);
   const byOperator = new Map(heredocs.map((span) => [span.operator, span]));
   const masked = maskHeredocSpans(cmd, heredocs);
-  const out: StdinLiteral[] = [];
-  const newFrame = (start: number): StdinFrame => ({ start, redirects: [], pending: [], caseDepth: 0 });
+  const out: CommandStdin[] = [];
+  const newFrame = (start: number): StdinFrame => ({ start, redirects: [], literals: [], redirected: false, caseDepth: 0 });
   let frame = newFrame(0);
   let quote: '"' | null = null;
+  const arithmetic: ArithmeticState = { close: null, depth: 0 };
   const stack: Array<{ kind: "substitution" | "backtick" | "group"; outer: StdinFrame; quote: '"' | null }> = [];
 
   const finish = (end: number) => {
-    if (frame.pending.length > 0) {
-      let command = "";
-      let at = frame.start;
-      for (const redirect of frame.redirects) {
-        command += `${masked.slice(at, redirect.start)} `;
-        at = redirect.end;
-      }
-      command += masked.slice(at, Math.max(at, end));
-      for (const literal of frame.pending) out.push({ kind: literal.kind, command, text: literal.text });
+    let command = "";
+    let at = frame.start;
+    for (const redirect of frame.redirects) {
+      command += `${masked.slice(at, redirect.start)} `;
+      at = redirect.end;
     }
-    frame.pending = [];
+    command += masked.slice(at, Math.max(at, end));
+    if (command.trim() !== "" || frame.literals.length > 0 || frame.redirected) {
+      out.push({ command, literals: frame.literals, redirected: frame.redirected });
+    }
+    frame.literals = [];
     frame.redirects = [];
+    frame.redirected = false;
     frame.start = end + 1;
   };
   const push = (kind: "substitution" | "backtick" | "group", start: number) => {
@@ -1698,21 +1757,34 @@ export function stdinLiterals(cmd: string): StdinLiteral[] {
     finish(at);
     frame = top.outer;
     quote = top.quote;
-    if (top.kind === "group") {
-      frame.pending = [];
-      frame.redirects = [];
-      frame.start = at + 1;
-    }
+    if (top.kind === "group") frame.start = at + 1;
   };
   const wordStart = (i: number) => i === 0 || WORD_BOUNDARY_BEFORE_RE.test(masked[i - 1]!);
   const keywordAt = (i: number, word: string) =>
     masked.startsWith(word, i) && wordStart(i) && !/[A-Za-z0-9_]/.test(masked[i + word.length] ?? " ");
+  // An fd number glued to an operator belongs to it only as a whole word.
+  const fdStartOf = (i: number) => {
+    let fdStart = i;
+    while (fdStart > frame.start && /[0-9]/.test(masked[fdStart - 1]!)) fdStart--;
+    if (fdStart < i && !(fdStart === 0 || WORD_BOUNDARY_BEFORE_RE.test(masked[fdStart - 1]!))) fdStart = i;
+    return fdStart;
+  };
+  const operandFrom = (at: number) => {
+    let operand = at;
+    while (operand < masked.length && /[ \t]/.test(masked[operand]!)) operand++;
+    return redirectOperand(masked, operand, stack.at(-1)?.kind === "backtick");
+  };
 
   for (let i = 0; i < masked.length; i++) {
     const ch = masked[i]!;
+    if (arithmetic.close !== null) { stepArithmetic(arithmetic, ch); continue; }
     if (quote === '"') {
       if (ch === "\\") { i++; continue; }
       if (ch === '"') { quote = null; continue; }
+      if (ch === "$" && (masked.startsWith("((", i + 1) || masked[i + 1] === "[")) {
+        i += openArithmetic(masked, i, arithmetic) - 1;
+        continue;
+      }
       if (ch === "$" && masked[i + 1] === "(") { push("substitution", i + 2); i++; continue; }
       if (ch === "`") push("backtick", i + 1);
       continue;
@@ -1730,6 +1802,16 @@ export function stdinLiterals(cmd: string): StdinLiteral[] {
       continue;
     }
     if (ch === '"') { quote = '"'; continue; }
+    // A comment runs to the end of the line.
+    if (ch === "#" && wordStart(i)) {
+      const newline = masked.indexOf("\n", i);
+      const end = newline < 0 ? masked.length : newline;
+      frame.redirects.push({ start: i, end });
+      i = end - 1;
+      continue;
+    }
+    const opened = openArithmetic(masked, i, arithmetic);
+    if (opened > 0) { i += opened - 1; continue; }
     if (ch === "$" && masked[i + 1] === "(") { push("substitution", i + 2); i++; continue; }
     if (ch === "`") {
       if (stack.at(-1)?.kind === "backtick") pop(i);
@@ -1750,8 +1832,13 @@ export function stdinLiterals(cmd: string): StdinLiteral[] {
     }
     if (ch === ";" || ch === "\n" || ch === "\r") { finish(i); continue; }
     if (ch === "&") {
-      const before = masked[i - 1];
-      if (before === ">" || before === "<" || masked[i + 1] === ">") continue;
+      if (masked[i + 1] === ">") {
+        const parsed = operandFrom(i + (masked[i + 2] === ">" ? 3 : 2));
+        frame.redirects.push({ start: i, end: parsed.end });
+        i = parsed.end - 1;
+        continue;
+      }
+      if (masked[i - 1] === ">" || masked[i - 1] === "<") continue;
       finish(i);
       continue;
     }
@@ -1772,20 +1859,30 @@ export function stdinLiterals(cmd: string): StdinLiteral[] {
       frame.caseDepth--;
       continue;
     }
-    if (ch !== "<" || masked[i + 1] !== "<") continue;
-    // An fd number glued to the operator belongs to it only as a whole word.
-    let fdStart = i;
-    while (fdStart > frame.start && /[0-9]/.test(masked[fdStart - 1]!)) fdStart--;
-    if (fdStart < i && !(fdStart === 0 || WORD_BOUNDARY_BEFORE_RE.test(masked[fdStart - 1]!))) fdStart = i;
+    if ((ch !== "<" && ch !== ">") || masked[i + 1] === "(") continue;
+    const fdStart = fdStartOf(i);
     const fd = masked.slice(fdStart, i);
-    const stdin = fd === "" || /^0+$/.test(fd);
+    const onStdin = fd === "" || /^0+$/.test(fd);
+    if (ch === ">") {
+      const parsed = operandFrom(i + (/[>|&]/.test(masked[i + 1] ?? "") ? 2 : 1));
+      frame.redirects.push({ start: fdStart, end: parsed.end });
+      i = parsed.end - 1;
+      continue;
+    }
+    if (masked[i + 1] !== "<") {
+      // `<`, `<>`, `<&`: stdin (on fd 0) is a file or another descriptor.
+      const parsed = operandFrom(i + (masked[i + 1] === ">" || masked[i + 1] === "&" ? 2 : 1));
+      frame.redirects.push({ start: fdStart, end: parsed.end });
+      if (onStdin) frame.redirected = true;
+      i = parsed.end - 1;
+      continue;
+    }
     let end: number;
-    let literal: { kind: StdinLiteral["kind"]; text: string | null };
+    let literal: StdinLiteral;
     if (masked[i + 2] === "<") {
       let operand = i + 2;
       while (masked[operand] === "<") operand++;
-      while (operand < masked.length && /[ \t]/.test(masked[operand]!)) operand++;
-      const parsed = hereStringOperand(masked, operand, stack.at(-1)?.kind === "backtick");
+      const parsed = operandFrom(operand);
       end = parsed.end;
       literal = { kind: "here-string", text: parsed.text };
     } else {
@@ -1794,7 +1891,7 @@ export function stdinLiterals(cmd: string): StdinLiteral[] {
       literal = { kind: "heredoc", text: span ? heredocText(cmd, span) : null };
     }
     frame.redirects.push({ start: fdStart, end });
-    if (stdin) frame.pending.push(literal);
+    if (onStdin) frame.literals.push(literal);
     i = end - 1;
   }
   finish(masked.length);

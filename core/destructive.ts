@@ -31,6 +31,7 @@
 import {
   ARGV,
   blankQuotedAngles,
+  commandStdin,
   effectiveHead,
   envOption,
   extractShellCommandClauses,
@@ -44,7 +45,6 @@ import {
   normalizeEnvInvocation,
   parenthesizedBodies,
   splitCommandSegments,
-  stdinLiterals,
   tokenizeShellWords,
   WRAPPER_DURATION_RE,
   WRAPPER_OPTIONS_WITH_VALUE,
@@ -333,19 +333,31 @@ function interpreterProgramToken(head: string, language: InterpolationLanguage, 
 }
 
 /**
- * A here-string or heredoc on an interpreter with no inline program is that
- * interpreter's program (`python3 <<< '…'`, `python3 - <<'EOF'`), classified
- * like `-c`/`-e`. Text the shell expands first, or an interpreter with no
- * reader allowlist (tclsh, wish, expect), is never read-only.
+ * Where an interpreter's program comes from when it is not inline. A
+ * here-string or heredoc on an interpreter with no inline program is that
+ * program (`python3 <<< '…'`, `python3 - <<'EOF'`), classified like
+ * `-c`/`-e`. Any other stdin (a pipe, a file, a compound command's redirect,
+ * a caller's stdin) is a program nobody can see: an interpreter reading its
+ * program from there is never read-only, and neither is text the shell
+ * expands first or an interpreter with no reader allowlist (tclsh, wish,
+ * expect).
  */
 function stdinProgramToken(cmd: string): string | null {
-  for (const literal of stdinLiterals(cmd)) {
-    const invocation = interpreterStdinProgram(literal.command);
+  for (const { command, literals, redirected } of commandStdin(cmd)) {
+    const invocation = interpreterStdinProgram(command);
     if (invocation.kind === "none") continue;
-    if (invocation.kind === "unvetted" || literal.text === null) return `${invocation.head} stdin program`;
-    if (literal.text.length > LANGUAGE_EVAL_EARLY_LIMIT) return `oversized ${invocation.head} stdin program`;
-    const token = interpreterProgramToken(invocation.head, interpreterLanguage(invocation.head), literal.text);
-    if (token) return token;
+    if (redirected) return `${invocation.head} reads program from stdin`;
+    if (literals.length === 0) {
+      if (invocation.bare) return `${invocation.head} reads program from stdin`;
+      continue;
+    }
+    if (invocation.kind === "unvetted") return `${invocation.head} stdin program`;
+    for (const literal of literals) {
+      if (literal.text === null) return `${invocation.head} stdin program`;
+      if (literal.text.length > LANGUAGE_EVAL_EARLY_LIMIT) return `oversized ${invocation.head} stdin program`;
+      const token = interpreterProgramToken(invocation.head, interpreterLanguage(invocation.head), literal.text);
+      if (token) return token;
+    }
   }
   return null;
 }
@@ -381,10 +393,6 @@ function findDestructiveTokenInternal(cmd: string, depth: number): string | null
 
   const redirect = REDIRECT_RE.exec(sanitized);
   if (redirect) return redirect[0].trim() || ">";
-
-  // Reads the unmasked command: a heredoc body is exactly what is being judged.
-  const stdinProgram = stdinProgramToken(cmd);
-  if (stdinProgram) return stdinProgram;
 
   const segments = splitCommandSegments(shellCommand);
 
@@ -535,7 +543,7 @@ function findDestructiveTokenInternal(cmd: string, depth: number): string | null
       const gitReadOnly = head === "git" && gitTokens[i] === null;
       return head !== null && (READ_ONLY_HEADS.has(head) || gitReadOnly);
     });
-  if (allSafe) return findTaintedEvaluation(cmd);
+  if (allSafe) return stdinProgramToken(cmd) ?? findTaintedEvaluation(cmd);
 
   const caseInspection = inspectShellCommandClauses(shellCommand);
   const wordScanSegments = /^case\b/.test(shellCommand.trim()) && caseInspection.complete && caseInspection.clauses.length > 0
@@ -618,7 +626,8 @@ function findDestructiveTokenInternal(cmd: string, depth: number): string | null
   // context or variable name that evaluates a data-derived value can run a
   // command substitution.
   // It reads the unmasked command: an unquoted heredoc body expands `$((…))`.
-  return findTaintedEvaluation(cmd);
+  // So does the stdin check: a heredoc body is exactly what it judges.
+  return stdinProgramToken(cmd) ?? findTaintedEvaluation(cmd);
 }
 
 /**

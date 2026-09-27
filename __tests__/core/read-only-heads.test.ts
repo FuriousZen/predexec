@@ -265,3 +265,46 @@ describe("here-string/heredoc interpreter programs (E-C)", () => {
   it.each(STDIN_PROGRAM_MUTATING)("mutating: %s", (c) => expect(isDestructiveCommand(c)).toBe(true));
   it.each(STDIN_PROGRAM_READ_ONLY)("read-only: %s", (c) => expect(isDestructiveCommand(c)).toBe(false));
 });
+
+// R14 (a): an interpreter with no inline program and no script reads its
+// program from stdin; unless that stdin is a scanned here-string/heredoc, the
+// program is unseen.
+const UNSEEN_STDIN_MUTATING = [
+  "echo x | python3", "cat f | node", "printf 'x' | ruby -", "echo x | perl", "echo x | php", "echo x | python3 -",
+  "{ python3; } <<< 'print(1)'", "( node ) < f", "while read l; do python3; done < f", "python3 < x.py",
+  "echo x | { python3; }", "echo x | env python3", "echo x | python3.12", "cat f | tclsh", "f() { python3; }; echo x | f",
+  "python3 <<< 'print(1)' < f", "echo x | node --", "echo x | ruby -w",
+];
+const UNSEEN_STDIN_READ_ONLY = [
+  "python3 --version | cat", "echo x | python3 -c 'import sys; print(sys.stdin.read())'", "node --version",
+  "echo x | node -e 'console.log(1)'", "perl -v", "ruby --version", "command -v node", "ls # python3",
+];
+
+describe("interpreters reading an unseen program from stdin (R14a)", () => {
+  it.each(UNSEEN_STDIN_MUTATING)("mutating: %s", (c) => expect(isDestructiveCommand(c)).toBe(true));
+  it.each(UNSEEN_STDIN_READ_ONLY)("read-only: %s", (c) => expect(isDestructiveCommand(c)).toBe(false));
+});
+
+// R14 (b): an arithmetic `<<` is a shift, not a here-document, so the lines
+// after it are commands.
+const ARITHMETIC_SHIFTS = ["echo $((1<<2))", "(( y = 1<<2 ))", "let \"a<<=1\"", "echo $[1<<2]", "x=$((a<<b))", "for ((i=1<<2; i<9; i++)); do :; done"];
+const ARITHMETIC_SHIFT_MUTATING = ARITHMETIC_SHIFTS.flatMap((c) => [`${c}\nrm -rf x\n2`, `${c}\nrm -rf x\nb`]);
+const HEREDOC_STILL_DATA = [
+  "cat <<EOF\nrm -rf x\nEOF", "cat <<-EOF\n\trm -rf x\n\tEOF", "cat << 'EOF'\nrm -rf x\nEOF", "echo $((1<<2)); cat <<EOF\nrm -rf x\nEOF",
+];
+
+describe("arithmetic << is not a heredoc (R14b)", () => {
+  it.each(ARITHMETIC_SHIFT_MUTATING)("mutating: %s", (c) => expect(isDestructiveCommand(c)).toBe(true));
+  it.each([...ARITHMETIC_SHIFTS, ...HEREDOC_STILL_DATA])("read-only: %s", (c) => expect(isDestructiveCommand(c)).toBe(false));
+});
+
+// R14 (c): an inline program spelled with a shell expansion is unseen.
+const DYNAMIC_INLINE_MUTATING = [
+  "python3 -c \"$x\"", "node -e \"$(cat f)\"", "perl -e $p", "ruby -e \"${code}\"", "python3 -c \"`cat f`\"",
+  "node --eval=\"$x\"", "perl -e\"$p\"", "php -r \"$x\"", "python3 -c$x",
+];
+
+describe("dynamic inline interpreter programs (R14c)", () => {
+  it.each(DYNAMIC_INLINE_MUTATING)("mutating: %s", (c) => expect(isDestructiveCommand(c)).toBe(true));
+  it.each(["python3 -c 'print(\"$x\")'", "perl -e 'print $x'"])("read-only: %s", (c) => expect(isDestructiveCommand(c)).toBe(false));
+});

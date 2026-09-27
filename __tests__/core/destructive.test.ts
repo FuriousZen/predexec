@@ -132,7 +132,7 @@ describe("final classifier blockers", () => {
     `python -c "# os.system('echo ok')\\nprint('os.popen')"`,
     `ruby -e "puts 'Open3.capture2(\\\"echo\\\")'"`,
     `perl -e "print 'system(\\\"echo\\\")'"`,
-    `php -r "echo 'shell_exec(\\\"echo\\\")'; // proc_open('x', [], $p);"`,
+    `php -r "echo 'shell_exec(\\\"echo\\\")'; // proc_open('x', [], \\$p);"`,
   ])("allows interpreter execution names in inert data/comments: %s", (command) => {
     expect(findDestructiveToken(command)).toBeNull();
   });

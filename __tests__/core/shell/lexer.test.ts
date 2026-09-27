@@ -5,7 +5,7 @@ import {
   effectiveHead,
   lexShellWords,
   maskHeredocBodies,
-  stdinLiterals,
+  commandStdin,
   stripLeadingAssignmentsAndWrappers,
   tokenizeShellWords,
   WRAPPERS,
@@ -86,18 +86,25 @@ describe("here-strings and heredoc stdin literals", () => {
   });
 
   it("pairs each stdin literal with its owning simple command", () => {
-    expect(stdinLiterals("ls; x=$(python3 - <<'EOF'\nprint(1)\nEOF\n)")).toEqual([
-      { kind: "heredoc", command: "python3 -  ", text: "print(1)\n" },
-    ]);
-    expect(stdinLiterals("case a in a) node <<< 'console.log(1)' 2>&1;; esac")).toEqual([
-      { kind: "here-string", command: " node   2>&1", text: "console.log(1)" },
-    ]);
+    const heredoc = commandStdin("ls; x=$(python3 - <<'EOF'\nprint(1)\nEOF\n)").find((c) => c.literals.length > 0);
+    expect(heredoc?.command.trim()).toBe("python3 -");
+    expect(heredoc?.literals).toEqual([{ kind: "heredoc", text: "print(1)\n" }]);
+    const hereString = commandStdin("case a in a) node <<< 'console.log(1)' 2>&1;; esac").find((c) => c.literals.length > 0);
+    expect(hereString?.command.trim()).toBe("node");
+    expect(hereString?.literals).toEqual([{ kind: "here-string", text: "console.log(1)" }]);
   });
 
-  it("leaves other fds out and marks expanded text unknowable", () => {
-    expect(stdinLiterals("python3 3<<< x")).toEqual([]);
-    expect(stdinLiterals("python3 <<< \"$x\"").map((l) => l.text)).toEqual([null]);
-    expect(stdinLiterals("python3 <<E\n$(cat f)\nE").map((l) => l.text)).toEqual([null]);
-    expect(stdinLiterals("python3 <<'E'OF\nx\nE\nEOF").map((l) => l.text)).toEqual([null]);
+  it("leaves other fds out, flags file stdin and marks expanded text unknowable", () => {
+    const literals = (c: string) => commandStdin(c).flatMap((s) => s.literals.map((l) => l.text));
+    expect(literals("python3 3<<< x")).toEqual([]);
+    expect(literals("python3 <<< \"$x\"")).toEqual([null]);
+    expect(literals("python3 <<E\n$(cat f)\nE")).toEqual([null]);
+    expect(literals("python3 <<'E'OF\nx\nE\nEOF")).toEqual([null]);
+    expect(commandStdin("python3 < f 2>/dev/null").map((c) => [c.command.trim(), c.redirected])).toEqual([["python3", true]]);
+  });
+
+  it("does not open a heredoc at an arithmetic shift", () => {
+    expect(maskHeredocBodies("echo $((1<<2))\nrm x\n2")).toBe("echo $((1<<2))\nrm x\n2");
+    expect(maskHeredocBodies("(( y = 1<<2 ))\nrm x\n2")).toBe("(( y = 1<<2 ))\nrm x\n2");
   });
 });

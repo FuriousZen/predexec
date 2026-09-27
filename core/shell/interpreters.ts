@@ -64,7 +64,8 @@ export function interpreterFamily(head: string): string {
 }
 
 type EvalPrograms =
-  | { kind: "none" }
+  /** `stdin`: the invocation reads its program from standard input (no script operand, or `-`). */
+  | { kind: "none"; stdin: boolean }
   | { kind: "eval"; programs: string[]; join: boolean }
   | { kind: "violation"; reason: string };
 
@@ -93,7 +94,13 @@ export function interpreterEvalPrograms(segment: string): EvalPrograms {
   const argv = normalized.argv;
   const programs: string[] = [];
   const violation = (reason: string): EvalPrograms => ({ kind: "violation", reason });
-  const result = (join: boolean): EvalPrograms => programs.length > 0 ? { kind: "eval", programs, join } : { kind: "none" };
+  const none = (stdin: boolean): EvalPrograms => ({ kind: "none", stdin });
+  const result = (join: boolean, stdin = false): EvalPrograms =>
+    programs.length > 0 ? { kind: "eval", programs, join } : none(stdin);
+  // A program spelled with a shell expansion (`-c "$x"`, `-e $(cat f)`) is
+  // text no scanner can see before the shell produces it.
+  const dynamicWords = new Set(lexShellWords(segment, ARGV).words.filter((word) => word.dynamic).map((word) => word.value));
+  const dynamicProgram = (word: string) => dynamicWords.has(word);
 
   const preloadEnv = INTERPRETER_PRELOAD_ENV[head];
   for (const assignment of normalized.assignments) {
@@ -102,15 +109,17 @@ export function interpreterEvalPrograms(segment: string): EvalPrograms {
   }
 
   if (head === "deno") {
-    return argv[1] === "eval" || argv[1] === "run" ? violation(`deno ${argv[1]}`) : { kind: "none" };
+    return argv[1] === "eval" || argv[1] === "run" ? violation(`deno ${argv[1]}`) : none(argv.length === 1);
   }
 
   if (head === "python" || head === "python3") {
+    let info = false;
     for (let i = 1; i < argv.length; i++) {
       const word = argv[i]!;
-      if (word === "--" || word === "-" || !word.startsWith("-")) return { kind: "none" };
+      if (word === "-" || !word.startsWith("-")) return none(word === "-" && !info);
+      if (word === "--") return none(!info && (argv[i + 1] === undefined || argv[i + 1] === "-"));
       if (word.startsWith("--")) {
-        if (/^--(?:version|help)$/.test(word)) continue;
+        if (/^--(?:version|help)$/.test(word)) { info = true; continue; }
         return violation(word);
       }
       for (let j = 1; j < word.length; j++) {
@@ -120,9 +129,11 @@ export function interpreterEvalPrograms(segment: string): EvalPrograms {
           if (rest) programs.push(rest);
           else if (i + 1 < argv.length) programs.push(argv[++i]!);
           else return violation("-c");
+          if (dynamicProgram(argv[i]!)) return violation("dynamic program");
           return result(false);
         }
-        if (letter === "m") return { kind: "none" };
+        if (letter === "m") return none(false);
+        if (letter === "V" || letter === "h") info = true;
         if (letter === "W" || letter === "X") {
           const value = j === word.length - 1 ? argv[++i] : word.slice(j + 1);
           // A warning filter's category (`action:message:category:...`) is
@@ -135,7 +146,7 @@ export function interpreterEvalPrograms(segment: string): EvalPrograms {
         if (!"bBdEhiIOPqsSuvVxR".includes(letter)) return violation(`-${letter}`);
       }
     }
-    return { kind: "none" };
+    return none(!info);
   }
 
   if (head === "perl" || head === "ruby") {
@@ -154,15 +165,19 @@ export function interpreterEvalPrograms(segment: string): EvalPrograms {
       : { "0": /^[0-7]*/, W: /^[0-2:a-z]*/, K: /^[a-zA-Z]?/ };
     const separate = isPerl ? "eEI" : "eErIC";
     const attachOnly = isPerl ? "FiMmx" : "Fix";
+    let info = false;
+    let operand = argv.length;
     for (let i = 1; i < argv.length; i++) {
       const word = argv[i]!;
-      if (word === "--" || word === "-" || !word.startsWith("-")) break;
+      if (word === "--" || word === "-" || !word.startsWith("-")) { operand = i; break; }
       if (word.startsWith("--")) {
+        if (/^--(?:version|help)$/.test(word)) info = true;
         if (/^--(?:version|help|verbose|disable-gems|disable=gems)$/.test(word)) continue;
         return violation(word);
       }
       for (let j = 1; j < word.length; j++) {
         const letter = word[j]!;
+        if (letter === "v" || letter === "h") info = true;
         if (plain.includes(letter)) continue;
         const digitRe = digits[letter];
         if (digitRe) {
@@ -183,7 +198,10 @@ export function interpreterEvalPrograms(segment: string): EvalPrograms {
         } else if (!attachOnly.includes(letter)) {
           return violation(`-${letter}`);
         }
-        if (letter === "e" || letter === "E") programs.push(value);
+        if (letter === "e" || letter === "E") {
+          if (dynamicProgram(argv[i]!)) return violation("dynamic program");
+          programs.push(value);
+        }
         else if (isPerl && (letter === "M" || letter === "m")) {
           // perl splices the whole value into `use …;`, so it must be exactly
           // a reader module name with an optional `=import,list`.
@@ -197,45 +215,65 @@ export function interpreterEvalPrograms(segment: string): EvalPrograms {
         break;
       }
     }
-    return result(true);
+    const stop = argv[operand];
+    const stdin = stop === undefined || stop === "-" || (stop === "--" && (argv[operand + 1] === undefined || argv[operand + 1] === "-"));
+    return result(true, stdin && !info);
   }
 
   if (head === "php") {
+    let info = false;
+    let operand = argv.length;
     for (let i = 1; i < argv.length; i++) {
       const word = argv[i]!;
-      if (word === "--" || !word.startsWith("-")) break;
+      if (word === "--" || !word.startsWith("-")) { operand = i; break; }
       const program = /^(?:-[rBRE]|--(?:run|process-begin|process-code|process-end))$/.test(word);
       if (program) {
         if (i + 1 >= argv.length) return violation(word);
+        if (dynamicProgram(argv[i + 1]!)) return violation("dynamic program");
         programs.push(argv[++i]!);
         continue;
       }
-      if (/^-[nqHhviem]+$/.test(word)) continue;
+      if (/^-[nqHhviem]+$/.test(word)) {
+        if (/[hvim]/.test(word)) info = true;
+        continue;
+      }
       return violation(word);
     }
-    return result(false);
+    const stop = argv[operand];
+    return result(false, !info && (stop === undefined || stop === "--" || stop === "-"));
   }
 
   // node and bun: options may follow the program, a later `--eval=` replaces
   // an earlier one, and an unknown option may take a separate value, so every
   // eval flag anywhere in argv is collected (a script argument spelled like
   // one fails closed).
+  let info = false;
+  let operand = false;
   for (let i = 1; i < argv.length; i++) {
     const word = argv[i]!;
-    if (word === "--") break;
-    if (!word.startsWith("-")) continue;
+    if (word === "--") {
+      if (argv[i + 1] !== undefined && argv[i + 1] !== "-") operand = true;
+      break;
+    }
+    if (!word.startsWith("-") || word === "-") {
+      if (word !== "-") operand = true;
+      continue;
+    }
+    if (/^(?:-v|--version|-h|--help)$/.test(word)) info = true;
     if (NODE_PRELOAD_OPTION_RE.test(word)) return violation(word.replace(/=.*$/s, ""));
     const attached = /^--(?:eval|print)=(.*)$/s.exec(word);
     if (attached) {
+      if (dynamicProgram(word)) return violation("dynamic program");
       programs.push(attached[1]!);
       continue;
     }
     if (/^(?:-e|-p|-pe|-ep|--eval|--print)$/.test(word)) {
       if (i + 1 >= argv.length) return violation(word);
+      if (dynamicProgram(argv[i + 1]!)) return violation("dynamic program");
       programs.push(argv[++i]!);
     }
   }
-  return result(false);
+  return result(false, !operand && !info);
 }
 
 /**
@@ -246,30 +284,43 @@ const STDIN_UNVETTED_INTERPRETER_RE = /^(?:tclsh|wish|expect)\d*(?:\.\d+)*$/;
 
 export type StdinProgramInvocation =
   | { kind: "none" }
-  | { kind: "program"; head: string }
-  | { kind: "unvetted"; head: string };
+  /**
+   * Stdin text is scanned as `head`'s program. `bare`: there is no script
+   * operand either, so the program comes from stdin whatever feeds it.
+   */
+  | { kind: "program"; head: string; bare: boolean }
+  | { kind: "unvetted"; head: string; bare: boolean };
 
 /**
- * Whether a simple command, given a here-string or here-document on stdin,
- * runs that text as a program. An interpreter with no inline `-c`/`-e`
- * program reads its program from stdin (`-` included); with an inline
- * program, stdin is that program's data. A script or `-m` operand is not told
- * apart: its stdin text is scanned as a program too, which can only over-stop.
- * `program` means: scan the stdin text exactly like an inline program of
- * `head`'s language.
+ * How a simple command treats the text on its standard input. An interpreter
+ * with no inline `-c`/`-e` program reads its program from stdin (`-`
+ * included); with an inline program, stdin is that program's data. A script
+ * or `-m` operand is not told apart for a here-string/heredoc: its stdin text
+ * is scanned as a program too, which can only over-stop.
  */
 export function interpreterStdinProgram(command: string): StdinProgramInvocation {
   const clause = stripShellControlPrefix(command);
-  const normalized = normalizeEnvInvocation(tokenizeShellWords(clause, ARGV));
-  if (!normalized.complete) return { kind: "unvetted", head: "ambiguous command" };
+  const tokens = tokenizeShellWords(clause, ARGV);
+  // `command -v node` looks the name up; it runs nothing.
+  if (tokens[0] === "command" && /^-[vV]+$/.test(tokens[1] ?? "")) return { kind: "none" };
+  const normalized = normalizeEnvInvocation(tokens);
+  if (!normalized.complete) {
+    // Unparseable: stop only when an interpreter could be the one reading.
+    const words = tokens.map((word) => word.replace(/^.*\//, ""));
+    const interpreter = words.find((word) => STDIN_UNVETTED_INTERPRETER_RE.test(word) || EVAL_INTERPRETERS.has(interpreterFamily(word)));
+    return interpreter === undefined ? { kind: "none" } : { kind: "unvetted", head: interpreter, bare: true };
+  }
   if (normalized.argv.length === 0) return { kind: "none" };
   const rawHead = normalized.argv[0]!.replace(/^.*\//, "");
-  if (STDIN_UNVETTED_INTERPRETER_RE.test(rawHead)) return { kind: "unvetted", head: rawHead };
+  if (STDIN_UNVETTED_INTERPRETER_RE.test(rawHead)) {
+    const bare = normalized.argv.length === 1 || normalized.argv[1] === "-";
+    return { kind: "unvetted", head: rawHead, bare };
+  }
   const head = interpreterFamily(rawHead);
   if (!EVAL_INTERPRETERS.has(head)) return { kind: "none" };
   const programs = interpreterEvalPrograms(clause);
-  if (programs.kind === "violation") return { kind: "unvetted", head };
-  return programs.kind === "eval" ? { kind: "none" } : { kind: "program", head };
+  if (programs.kind === "violation") return { kind: "unvetted", head, bare: false };
+  return programs.kind === "eval" ? { kind: "none" } : { kind: "program", head, bare: programs.stdin };
 }
 
 export function interpreterEvalPayload(segment: string): string {
