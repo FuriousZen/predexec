@@ -67,6 +67,19 @@ export interface PolicyRule {
 /** A readable ruleset, or why the policy could not be read (fail closed). */
 export type OpencodeRuleset = PolicyRule[] | { error: string };
 
+/**
+ * Rule objects opencode itself supplies (agent defaults and built-in agent
+ * overrides), as opposed to user-authored config. Identity-tagged so the
+ * ruleset keeps its plain `PolicyRule[]` shape. Only the unresolvable-operand
+ * read trigger consults this (ruling R20): the built-in `read *.env: ask`
+ * governs opencode's read tool, which its own bash tool never applies.
+ */
+const BUILTIN_RULES = new WeakSet<PolicyRule>();
+const builtin = (rules: PolicyRule[]): PolicyRule[] => {
+  for (const rule of rules) BUILTIN_RULES.add(rule);
+  return rules;
+};
+
 type CommandPolicyInspector = (command: string) => { commands: string[]; complete: boolean };
 
 const ACTIONS = new Set<PolicyAction>(["allow", "ask", "deny"]);
@@ -394,7 +407,7 @@ export function buildOpencodeRuleset(config: Json, env: NodeJS.ProcessEnv = proc
   const truncateGlob = join(paths.data, "tool-output", "*");
   const whitelisted = [truncateGlob, join(paths.tmp, "*")];
   const readonlyExternal: Json = { "*": "ask", ...Object.fromEntries(whitelisted.map((dir) => [dir, "allow"])) };
-  const defaults = rulesFromPermission({
+  const defaults = builtin(rulesFromPermission({
     "*": "allow",
     doom_loop: "ask",
     external_directory: { "*": "ask", ...Object.fromEntries(whitelisted.map((dir) => [dir, "allow"])) },
@@ -402,7 +415,7 @@ export function buildOpencodeRuleset(config: Json, env: NodeJS.ProcessEnv = proc
     plan_enter: "deny",
     plan_exit: "deny",
     read: { "*": "allow", "*.env": "ask", "*.env.*": "ask", "*.env.example": "allow" },
-  }, home);
+  }, home));
 
   let permission = isPlainObject(config.permission) ? config.permission : {};
   // `config/config.ts:559-565` then `:567-578` — env permission, then legacy `tools`.
@@ -426,8 +439,8 @@ export function buildOpencodeRuleset(config: Json, env: NodeJS.ProcessEnv = proc
     }
   }
   const name = agent ?? (typeof config.default_agent === "string" ? config.default_agent : "build");
-  const builtin = builtinAgentPermission(name, paths, readonlyExternal);
-  let ruleset = [...defaults, ...(builtin ? rulesFromPermission(builtin, home) : []), ...user];
+  const agentOverrides = builtinAgentPermission(name, paths, readonlyExternal);
+  let ruleset = [...defaults, ...(agentOverrides ? builtin(rulesFromPermission(agentOverrides, home)) : []), ...user];
   const configured = agents[name];
   if (isPlainObject(configured) && isPlainObject(configured.permission)) {
     ruleset = [...ruleset, ...rulesFromPermission(configured.permission, home)];
@@ -996,7 +1009,7 @@ function buildOpencodeV2Ruleset(documents: V2Document[], paths: V2Paths, agent?:
   const top = documents.flatMap((d) => d.rules).map((rule) => v2ExpandHome(rule, paths.home));
   const agents = new Map<string, V2AgentState>();
   for (const [id, mode, hidden] of V2_BUILTIN_AGENTS) {
-    agents.set(id, { rules: [...v2AgentDefaults(paths), ...(v2BuiltinAgentRules(id, paths) ?? []), ...top], mode, hidden });
+    agents.set(id, { rules: [...builtin(v2AgentDefaults(paths)), ...builtin(v2BuiltinAgentRules(id, paths) ?? []), ...top], mode, hidden });
   }
   for (const document of documents) {
     for (const [name, entry] of document.agents) {
@@ -1010,7 +1023,7 @@ function buildOpencodeV2Ruleset(documents: V2Document[], paths: V2Paths, agent?:
         agents.set(name, entry);
         continue;
       }
-      const state = current ?? { rules: [...v2AgentDefaults(paths), ...top], mode: "primary", hidden: false };
+      const state = current ?? { rules: [...builtin(v2AgentDefaults(paths)), ...top], mode: "primary", hidden: false };
       if (!current) agents.set(name, state);
       if (entry.mode !== undefined) state.mode = entry.mode;
       if (entry.hidden !== undefined) state.hidden = entry.hidden;
@@ -1363,15 +1376,15 @@ function liveRestrictiveRules(ruleset: PolicyRule[], permission: string): Policy
 /**
  * A data-fed operand (`echo .env | xargs cat`) never reaches a pattern
  * opencode matches, so it stops when a live shell rule could match the
- * receiving command (R1), or when any live `read` rule exists and the command
- * can open a path. A static stop: it happens before the ask bridge prompts.
+ * receiving command (R1), or when any live user-authored `read` rule exists
+ * and the command can open a path (built-in read defaults don't count, R20). A static stop: it happens before the ask bridge prompts.
  */
 function unresolvableOperandStop(command: string, ruleset: PolicyRule[], hostMajor: 1 | 2): string | null {
   const entries = commandsWithUnresolvableOperands(command);
   if (entries.length === 0) return null;
   const shellRules = liveRestrictiveRules(ruleset, hostMajor === 2 ? "shell" : "bash")
     .map((rule) => ({ rule, words: tokenizeShellWords(rule.pattern) }));
-  const readRule = liveRestrictiveRules(ruleset, "read")[0];
+  const readRule = liveRestrictiveRules(ruleset, "read").find((rule) => !BUILTIN_RULES.has(rule));
   for (const entry of entries) {
     const hit = shellRules.find(({ words }) => ruleHeadCouldMatch(words, entry.head));
     if (hit) return describeUnresolvableOperand(entry, `your opencode rule ${hit.rule.permission}:${hit.rule.pattern}`);

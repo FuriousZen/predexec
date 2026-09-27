@@ -1070,3 +1070,30 @@ describe("data-fed operands (E-B): stop when a rule could match the command that
     expect(r.transcript).toContain("PLAIN");
   });
 });
+
+describe("R20: opencode built-in read defaults don't trigger unresolvable-operand stops", () => {
+  const COMMANDS = ["find . | xargs grep foo", "grep -r \"$PAT\" src"];
+  const check = (hostMajor: 1 | 2, permission?: Record<string, unknown>, agent?: string) => {
+    const ctx = setup();
+    if (permission) ctx.projectConfig({ permission });
+    const rules = readOpencodeRuleset(ctx.project, ctx.env, { hostMajor, ...(agent ? { agent } : {}) });
+    return createPolicyChecker(rules, { directory: ctx.project, hostMajor });
+  };
+
+  it.each([1, 2] as const)("v%s with no user config runs them", (hostMajor) => {
+    for (const command of COMMANDS) expect(check(hostMajor)(command)).toBeNull();
+  });
+
+  it.each([1, 2] as const)("v%s built-in explore agent's read defaults don't cause an operand stop", (hostMajor) => {
+    // v2's explore agent denies `shell` outright (`shell:*`); only the operand stop is under test.
+    for (const command of COMMANDS) expect(check(hostMajor, undefined, "explore")(command) ?? "").not.toMatch(/can't be checked/);
+  });
+
+  it.each([1, 2] as const)("v%s with a user read {\".env\":\"deny\"} stops them", (hostMajor) => {
+    for (const command of COMMANDS) expect(check(hostMajor, { read: { ".env": "deny" } })(command)).toMatch(/can't be checked/);
+  });
+
+  it.each([1, 2] as const)("v%s with a user read {\"*.env\":\"ask\"} (same text as a default) stops them", (hostMajor) => {
+    for (const command of COMMANDS) expect(check(hostMajor, { read: { "*.env": "ask" } })(command)).toMatch(/can't be checked/);
+  });
+});
