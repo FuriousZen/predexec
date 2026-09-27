@@ -268,9 +268,9 @@ function markTestOperands(
     const blank = i === end || /\s/.test(text[i]!);
     if (!blank && wordStart === -1) wordStart = i;
     if (!blank) {
-      // A `$( … )` or backtick substitution is one word even across blanks.
+      // A `$( … )`, `${ … }`, `$[ … ]` or backtick span is one word even across blanks.
       const ch = text[i]!;
-      const close = ch === "`" ? text.indexOf("`", i + 1) : ch === "(" || ch === "{" ? match[i]! : -1;
+      const close = ch === "`" ? text.indexOf("`", i + 1) : ch === "(" || ch === "{" || ch === "[" ? match[i]! : -1;
       if (close > i && close < end) i = close;
       continue;
     }
@@ -665,10 +665,26 @@ function liveArithmeticText(command: string): { text: string; inert: string; com
     }
     return text.length - 1;
   };
+  // R48: unquoted `${…}`, `$((…))` and `$[…]` spans, innermost last. bash
+  // reads each as one matched pair, so a `#` inside is never a comment; one
+  // at a word boundary there fails closed rather than trusting this count.
+  const spans: { open: string; close: string; depth: number }[] = [];
   for (let i = 0; i < text.length; i++) {
     const ch = text[i]!;
     if (ch === "\\") { i++; continue; }
+    const span = spans.at(-1);
+    if (span !== undefined) {
+      if (ch === span.open) span.depth++;
+      else if (ch === span.close && --span.depth === 0) spans.pop();
+    }
+    if (ch === "$" && (text[i + 1] === "{" || text[i + 1] === "[" || (text[i + 1] === "(" && text[i + 2] === "("))) {
+      const bracket = text[i + 1]!;
+      spans.push({ open: bracket, close: bracket === "{" ? "}" : bracket === "[" ? "]" : ")", depth: bracket === "(" ? 2 : 1 });
+      i += bracket === "(" ? 2 : 1;
+      continue;
+    }
     if (ch === "#" && (i === 0 || COMMENT_BOUNDARY_RE.test(text[i - 1]!))) {
+      if (spans.length > 0) { complete = false; continue; }
       let j = i + 1;
       for (; j < text.length && text[j] !== "\n"; j++) if (INERT_QUOTE_RE.test(text[j]!)) out[j] = inert[j] = " ";
       i = j - 1;
@@ -704,6 +720,7 @@ function liveArithmeticText(command: string): { text: string; inert: string; com
     if (j >= text.length) complete = false;
     i = j;
   }
+  if (spans.length > 0) complete = false;
   return { text: out.join(""), inert: inert.join(""), complete };
 }
 
@@ -736,7 +753,9 @@ export function arithmeticAssignedNames(command: string): { names: string[]; com
   }
   const names: string[] = [];
   const complete = ranges.complete && flow.complete && live.complete;
-  let failClosed: string | null = null;
+  // R48: a projection that could not be trusted (a comment inside an open
+  // expansion, an unclosed quote or span) hides contexts: fail closed.
+  let failClosed: string | null = live.complete ? null : "unparsed arithmetic context";
   for (const raw of texts) {
     const text = raw.replace(QUOTED_EXPANSION_RE, "$1");
     if (failClosed === null && /['"\\]/.test(text)) failClosed = "quoted arithmetic";

@@ -423,3 +423,26 @@ describe("R47 — comments and heredoc bodies cannot desync the arithmetic proje
     "git log # don't, won't\n(( 1 ))",
   ])("%j stays read-only", (c) => expect(findDestructiveToken(c)).toBeNull());
 });
+
+// Fix round 5 (R48): a `#` inside an unquoted `${…}`, `$((…))` or `$[…]`
+// span is never a comment; one that would begin a comment there fails closed.
+describe("R48 — comment detection skips expansion spans", () => {
+  it.each([
+    "[[ 1 -eq ${x// #}P\"AT\"H=0 ]]; ls",
+    "[[ ${x// #}P\"AT\"H=0 -eq 1 ]]; ls",
+    "[[ 1 -eq ${x// #}HO\"ME\"=0 ]]; git log",
+    "[[ ${x// #}HO\"ME\"=0 -eq 1 ]]; git log",
+    "[[ 1 -eq ${x// #'}P\"AT\"H=0 ]]; ls",
+    "[[ 1 -eq ${x:-${y// #}}P\"AT\"H=0 ]]; ls",
+    "[[ 1 -eq ${x:-{ #}}P\"AT\"H=0 ]]; ls",
+    "[[ 1 -eq $(( 1 #))P\"AT\"H=0 ]]; ls",
+    "[[ 1 -eq $[ 1 #]P\"AT\"H=0 ]]; ls",
+    "[[ 1 -eq $[ 1 ]P\"AT\"H=0 ]]; ls", "[[ 1 -eq $[ 1 ]PATH=0 ]]; ls", "[[ $[ 1 ]HOME=0 -eq 1 ]]; git log",
+    "echo ${x// #'}\n(( PATH=0 ))\nls # '",
+  ])("%j is mutating", (c) => expect(isDestructiveCommand(c)).toBe(true));
+  it.each([
+    "echo $#; ls", "echo ${#x}; ls", "[[ ${#a[@]} -gt 0 ]] && ls", "echo \"#\"; echo '#'", "echo ${x#a}; ls",
+    "echo ${x:-a} # it's fine, isn't it", "echo $((1+2)) # don't, won't",
+    "ls # don't\nls # won't",
+  ])("%j stays read-only", (c) => expect(findDestructiveToken(c)).toBeNull());
+});
