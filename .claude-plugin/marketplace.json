@@ -1,7 +1,7 @@
 {
   "name": "predexec",
   "description": "Predictive execution: collapse an adaptive, multi-level read-only tool sequence into a single model round-trip via a deterministic plan tree.",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "owner": {
     "name": "FuriousZen",
     "url": "https://github.com/FuriousZen"
