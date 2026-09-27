@@ -446,3 +446,34 @@ describe("R48 — comment detection skips expansion spans", () => {
     "ls # don't\nls # won't",
   ])("%j stays read-only", (c) => expect(findDestructiveToken(c)).toBeNull());
 });
+
+// Post-breaker fix (R50): a backtick or `$(` inside an open `${…}`, `$((…))`
+// or `$[…]` span is not tracked, so the projection fails closed.
+// (R51): a `$[` inside a `[[ … ]]` body fails closed; a stray `[` in a test
+// operand no longer hides the comparison operator.
+describe("R50/R51 — substitutions inside expansion spans; $[ in [[ ]]", () => {
+  it.each([
+    "[[ ${x//`echo }` #}P\"AT\"H=0 -eq 1 ]]; ls",
+    "[[ ${x//`echo }` #}HO\"ME\"=0 -eq 1 ]]; git log",
+    "[[ ${x//$(echo }) #}P\"AT\"H=0 -eq 1 ]]; ls",
+    "[[ ${x//$(echo }) #}HO\"ME\"=0 -eq 1 ]]; git log",
+    "echo ${x:-`echo }`}; ls",
+    "echo ${x:-$(echo })}; ls",
+    "echo $(( `echo 1` )); ls",
+    "echo $[ $(echo 1) ]; ls",
+    "[[ PATH=0,[ -eq 1] ]]; ls",
+    "[[ PATH=0,a[ -eq 1] ]]; ls",
+    "[[ PATH=0,\\[ -eq 1] ]]; ls",
+    "[[ P\"AT\"H=0,a[ -eq 1] ]]; ls",
+    "[[ HOME=0,[ -eq 1 ] ]]; git log",
+    "[[ HOME=0,a[ -eq 1 ] ]]; git log",
+    "[[ HOME=0,\\[ -eq 1 ] ]]; git log",
+    "[[ HO\"ME\"=0,a[ -eq 1 ] ]]; git log",
+    "[[ $[ 1 ] -eq 1 ]]; ls",
+    "[[ 1 -eq $[ 1 ] ]]; ls",
+  ])("%j is mutating", (c) => expect(isDestructiveCommand(c)).toBe(true));
+  it.each([
+    "echo ${x}; ls", "echo $((3*4)); ls", "[[ $a -eq 1 ]] && ls", "echo ${x:-$((1+2))}; ls",
+    "echo $(pwd) ${x}; ls", "echo `pwd` ${#x}; ls", "[[ ${#a[@]} -gt 0 ]] && ls", "[[ $(( a + 1 )) -eq 2 ]] && ls",
+  ])("%j stays read-only", (c) => expect(findDestructiveToken(c)).toBeNull());
+});

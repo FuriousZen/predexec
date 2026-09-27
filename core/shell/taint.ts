@@ -144,6 +144,8 @@ interface ArithmeticRanges {
   nameSubstitution: boolean;
   /** `${NAME:=value}` / `${NAME=value}`: NAME is assigned value. */
   defaults: Array<{ name: string; value: string }>;
+  /** R51: a `$[` inside a `[[ … ]]` body; its operand words are not delimited. */
+  testBracket: boolean;
   complete: boolean;
 }
 
@@ -158,7 +160,7 @@ function arithmeticRangeIdentifiers(text: string): ArithmeticRanges {
   let complete = true;
   const nameReferences: string[] = [];
   const defaults: Array<{ name: string; value: string }> = [];
-  const names = { substitution: false };
+  const names = { substitution: false, testBracket: false };
   const mark = (start: number, end: number) => {
     if (start >= end) return;
     cover[start]!++;
@@ -245,6 +247,7 @@ function arithmeticRangeIdentifiers(text: string): ArithmeticRanges {
     substitution,
     nameSubstitution: names.substitution,
     defaults,
+    testBracket: names.testBracket,
     complete,
   };
 }
@@ -260,17 +263,20 @@ function markTestOperands(
   match: Int32Array,
   mark: (start: number, end: number) => void,
   nameReferences: string[],
-  names: { substitution: boolean },
+  names: { substitution: boolean; testBracket: boolean },
 ): void {
+  // R51: `$[ … ]` spans blanks and its brackets pair across quotes and the
+  // comparison operator, so its words cannot be delimited here: fail closed.
+  for (let k = start; k + 1 < end; k++) if (text[k] === "$" && text[k + 1] === "[") names.testBracket = true;
   const words: Array<[number, number]> = [];
   let wordStart = -1;
   for (let i = start; i <= end; i++) {
     const blank = i === end || /\s/.test(text[i]!);
     if (!blank && wordStart === -1) wordStart = i;
     if (!blank) {
-      // A `$( … )`, `${ … }`, `$[ … ]` or backtick span is one word even across blanks.
+      // A `$( … )` or backtick substitution is one word even across blanks.
       const ch = text[i]!;
-      const close = ch === "`" ? text.indexOf("`", i + 1) : ch === "(" || ch === "{" || ch === "[" ? match[i]! : -1;
+      const close = ch === "`" ? text.indexOf("`", i + 1) : ch === "(" || ch === "{" ? match[i]! : -1;
       if (close > i && close < end) i = close;
       continue;
     }
@@ -673,6 +679,9 @@ function liveArithmeticText(command: string): { text: string; inert: string; com
     const ch = text[i]!;
     if (ch === "\\") { i++; continue; }
     const span = spans.at(-1);
+    // R50: a substitution inside an open span can hold the span's closer;
+    // it is not tracked, so the projection fails closed.
+    if (span !== undefined && (ch === "`" || (ch === "$" && text[i + 1] === "(" && text[i + 2] !== "("))) complete = false;
     if (span !== undefined) {
       if (ch === span.open) span.depth++;
       else if (ch === span.close && --span.depth === 0) spans.pop();
@@ -703,6 +712,7 @@ function liveArithmeticText(command: string): { text: string; inert: string; com
     let j = i + 1;
     while (j < text.length && text[j] !== '"') {
       if (text[j] === "\\") { blank(j, Math.min(j + 2, text.length)); j += 2; continue; }
+      if (spans.length > 0 && (text[j] === "`" || (text[j] === "$" && text[j + 1] === "(" && text[j + 2] !== "("))) complete = false;
       if (text[j] === "$" && (text[j + 1] === "(" && text[j + 2] === "(" || text[j + 1] === "[" || text[j + 1] === "{")) {
         const bracket = text[j + 1]!;
         j = closeOf(j + 1, bracket, bracket === "(" ? ")" : bracket === "[" ? "]" : "}") + 1;
@@ -755,7 +765,9 @@ export function arithmeticAssignedNames(command: string): { names: string[]; com
   const complete = ranges.complete && flow.complete && live.complete;
   // R48: a projection that could not be trusted (a comment inside an open
   // expansion, an unclosed quote or span) hides contexts: fail closed.
-  let failClosed: string | null = live.complete ? null : "unparsed arithmetic context";
+  let failClosed: string | null = !live.complete
+    ? "unparsed arithmetic context"
+    : ranges.testBracket ? "$[ in [[ ]] test" : null;
   for (const raw of texts) {
     const text = raw.replace(QUOTED_EXPANSION_RE, "$1");
     if (failClosed === null && /['"\\]/.test(text)) failClosed = "quoted arithmetic";
