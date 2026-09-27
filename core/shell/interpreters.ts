@@ -278,7 +278,15 @@ export function interpreterEvalPrograms(segment: string): EvalPrograms {
       break;
     }
     if (!word.startsWith("-") || word === "-") {
-      if (!firstWordSeen && word !== "-" && !ambiguous && !(head === "bun" && word === "repl")) operand = true;
+      if (!firstWordSeen && word !== "-" && !ambiguous) {
+        // bun: `repl` reads stdin; `run` reads it unless a script follows
+        // at once (`bun run -`, a bare `bun run`, an option first all stop).
+        if (head !== "bun" || (word !== "repl" && word !== "run")) operand = true;
+        else if (word === "run") {
+          const next = argv[i + 1];
+          operand = next !== undefined && next !== "-" && !next.startsWith("-");
+        }
+      }
       firstWordSeen = true;
       continue;
     }

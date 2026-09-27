@@ -106,5 +106,8 @@ describe("here-strings and heredoc stdin literals", () => {
   it("does not open a heredoc at an arithmetic shift", () => {
     expect(maskHeredocBodies("echo $((1<<2))\nrm x\n2")).toBe("echo $((1<<2))\nrm x\n2");
     expect(maskHeredocBodies("(( y = 1<<2 ))\nrm x\n2")).toBe("(( y = 1<<2 ))\nrm x\n2");
+    expect(maskHeredocBodies("echo $((1<<2)); cat <<EOF\nrm x\nEOF")).toBe("echo $((1<<2)); cat <<EOF\n    \n   ");
+    expect(maskHeredocBodies("ls # <<x\nrm y\nx")).toBe("ls # <<x\nrm y\nx");
+    expect(maskHeredocBodies("echo \"$(( \" <<x \" ))\"\nrm y\nx")).toBe("echo \"$(( \" <<x \" ))\"\nrm y\nx");
   });
 });

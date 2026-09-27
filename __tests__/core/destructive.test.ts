@@ -137,8 +137,11 @@ describe("final classifier blockers", () => {
     expect(findDestructiveToken(command)).toBeNull();
   });
 
-  it("does not treat heredoc body comparisons as shell redirects", () => {
-    expect(findDestructiveToken("cat <<EOF\nvalue > other\nEOF")).toBeNull();
+  // R18: the classifier also reads every heredoc body line as command text, so
+  // a body line that looks like a redirect stops (accepted over-stop). A `>=`
+  // comparison is still no redirect.
+  it("reads heredoc body lines as command text too (R18)", () => {
+    expect(findDestructiveToken("cat <<EOF\nvalue > other\nEOF")).not.toBeNull();
     expect(findDestructiveToken("cat <<'EOF'\nvalue >= other\nEOF")).toBeNull();
   });
 

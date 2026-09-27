@@ -7,6 +7,10 @@
  * substitution walking, heredoc masking, here-string/heredoc stdin literals, and
  * wrapper/assignment stripping.
  *
+ * Heredoc masking decides what is data for one classifier pass only; the
+ * classifier also runs a pass without it (core/destructive.ts, R18), so a
+ * masking miss can no longer hide a command line from classification.
+ *
  * This module deliberately does not know about policy syntax, precedence, or
  * verdicts. Hosts supply their wrapper vocabulary to
  * `stripLeadingAssignmentsAndWrappers` so policy adapters retain ownership of
@@ -1566,11 +1570,19 @@ function scanHeredocsDetailed(cmd: string): { spans: HeredocSpan[]; hazard: stri
         continue;
       }
       if (ch === "\\" && quote !== "'") { i++; continue; }
+      if (quote === '"' && ch === "$" && (cmd.startsWith("((", i + 1) || cmd[i + 1] === "[")) {
+        // Arithmetic inside double quotes nests its own quotes (bash's
+        // matched-pair reader), so it gets the same hazard screen.
+        i += openArithmetic(cmd, i, arithmetic) - 1;
+        continue;
+      }
       if (quote !== null) {
         if (ch === quote) quote = null;
         continue;
       }
       if (ch === "'" || ch === '"') { quote = ch; continue; }
+      // A word-initial `#` comments out the rest of the line, `<<` included.
+      if (ch === "#" && (i === 0 || /[\s;|&()]/.test(cmd[i - 1]!))) break;
       const opened = openArithmetic(cmd, i, arithmetic);
       if (opened > 0) { i += opened - 1; continue; }
       if (ch !== "<" || cmd[i + 1] !== "<") continue;
@@ -1638,7 +1650,25 @@ function maskHeredocSpans(cmd: string, spans: readonly HeredocSpan[]): string {
  * command clauses: a literal `>` or `;` in a heredoc is not shell syntax.
  */
 export function maskHeredocBodies(cmd: string): string {
+  if (!heredocMasking) return cmd;
   return maskHeredocSpans(cmd, scanHeredocs(cmd));
+}
+
+let heredocMasking = true;
+
+/**
+ * Run `classify` with heredoc masking off: every body line stays command
+ * text for every structural walk (segments, clauses, redirects). The
+ * classifier's second pass (R18). Synchronous, and restored on exit.
+ */
+export function withoutHeredocMasking<T>(classify: () => T): T {
+  const previous = heredocMasking;
+  heredocMasking = false;
+  try {
+    return classify();
+  } finally {
+    heredocMasking = previous;
+  }
 }
 
 /** Literal text a here-string or here-document feeds a command's stdin. */
@@ -1662,11 +1692,11 @@ export interface CommandStdin {
 }
 
 /** The body an unquoted-delimiter heredoc delivers, or null when the shell would expand it. */
-function heredocText(cmd: string, span: HeredocSpan): string | null {
+function heredocText(cmd: string, span: HeredocSpan, operatorLineStart: number, crBefore: (offset: number) => number): string | null {
   if (!span.simple) return null;
   // Bash matches the delimiter line raw, CR included; the scan forgives a
   // trailing CR, so with any CR around, its body extent is not bash's.
-  if (cmd.slice(cmd.lastIndexOf("\n", span.operator) + 1, span.end).includes("\r")) return null;
+  if (crBefore(span.end) - crBefore(operatorLineStart) > 0) return null;
   let body = cmd.slice(span.bodyStart, span.bodyEnd);
   if (span.stripTabs) body = body.replace(/^\t+/gm, "");
   if (span.quoted) return body;
@@ -1749,6 +1779,22 @@ export function commandStdin(cmd: string): CommandStdin[] {
   const byOperator = new Map(heredocs.map((span) => [span.operator, span]));
   const masked = maskHeredocSpans(cmd, heredocs);
   const out: CommandStdin[] = [];
+  // CR counts by prefix, and one decoded text per distinct body: unterminated
+  // heredocs on one line share a body, so per-span work would be quadratic.
+  const crPrefix = new Uint32Array(cmd.length + 1);
+  const lineStarts = new Uint32Array(cmd.length + 1);
+  for (let i = 0; i < cmd.length; i++) {
+    crPrefix[i + 1] = crPrefix[i]! + (cmd[i] === "\r" ? 1 : 0);
+    lineStarts[i + 1] = cmd[i] === "\n" ? i + 1 : lineStarts[i]!;
+  }
+  const crBefore = (offset: number) => crPrefix[Math.min(Math.max(offset, 0), cmd.length)]!;
+  const texts = new Map<string, string | null>();
+  const textOf = (span: HeredocSpan) => {
+    const lineStart = lineStarts[span.operator]!;
+    const key = `${span.bodyStart}:${span.bodyEnd}:${span.end}:${span.quoted}:${span.stripTabs}:${span.simple}:${lineStart}`;
+    if (!texts.has(key)) texts.set(key, heredocText(cmd, span, lineStart, crBefore));
+    return texts.get(key)!;
+  };
   const newFrame = (start: number): StdinFrame => ({ start, redirects: [], literals: [], redirected: false, caseDepth: 0 });
   let frame = newFrame(0);
   let quote: '"' | null = null;
@@ -1912,7 +1958,7 @@ export function commandStdin(cmd: string): CommandStdin[] {
     } else {
       const span = byOperator.get(i);
       end = span ? span.operandEnd : i + (masked[i + 2] === "-" ? 3 : 2);
-      literal = { kind: "heredoc", text: span ? heredocText(cmd, span) : null };
+      literal = { kind: "heredoc", text: span ? textOf(span) : null };
     }
     frame.redirects.push({ start: fdStart, end });
     if (onStdin) frame.literals.push(literal);

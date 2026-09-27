@@ -289,8 +289,10 @@ describe("interpreters reading an unseen program from stdin (R14a)", () => {
 // after it are commands.
 const ARITHMETIC_SHIFTS = ["echo $((1<<2))", "(( y = 1<<2 ))", "let \"a<<=1\"", "echo $[1<<2]", "x=$((a<<b))", "for ((i=1<<2; i<9; i++)); do :; done"];
 const ARITHMETIC_SHIFT_MUTATING = ARITHMETIC_SHIFTS.flatMap((c) => [`${c}\nrm -rf x\n2`, `${c}\nrm -rf x\nb`]);
+// Real heredocs after an arithmetic shift still parse (their masking is
+// asserted in lexer.test.ts; under R18 a writer-looking body stops anyway).
 const HEREDOC_STILL_DATA = [
-  "cat <<EOF\nrm -rf x\nEOF", "cat <<-EOF\n\trm -rf x\n\tEOF", "cat << 'EOF'\nrm -rf x\nEOF", "echo $((1<<2)); cat <<EOF\nrm -rf x\nEOF",
+  "cat <<EOF\nhello\nEOF", "cat <<-EOF\n\thello\n\tEOF", "cat << 'EOF'\nhello\nEOF", "echo $((1<<2)); cat <<EOF\nhello\nEOF",
 ];
 
 describe("arithmetic << is not a heredoc (R14b)", () => {
@@ -330,4 +332,30 @@ const FIX1_READ_ONLY = [
 describe("review fix round 1 (R16, R17)", () => {
   it.each(FIX1_MUTATING)("mutating: %s", (c) => expect(isDestructiveCommand(c)).toBe(true));
   it.each(FIX1_READ_ONLY)("read-only: %s", (c) => expect(isDestructiveCommand(c)).toBe(false));
+});
+
+// R18: every known trick that made heredoc masking hide a command line. The
+// classifier also runs a pass with no heredoc masking at all, so none of these
+// (nor any future scanner miss) can hide `rm`.
+const HIDDEN_LINE_TRICKS = [
+  "false && echo \"$(( \" <<x \" ))\"\nrm -rf x\nx", "false && echo \"$(( ' \" <<x \" ' ))\"\nrm -rf x\nx",
+  "false && echo \"$[ \" <<x \" ]\"\nrm -rf x\nx", "# <<x\nrm -rf y\nx", "ls # <<x\nrm -rf y\nx", "ls #<<x\nrm -rf y\nx",
+  "echo $((1<<2))\nrm -rf x\n2", "(( y = 1<<2 ))\nrm -rf x\n2", "echo $[1<<2]\nrm -rf x\n2", "x=$((a<<b))\nrm -rf x\nb",
+  "false && echo $(( \\)\\) <<true ))\nrm -rf x\ntrue", "false && (( \\)\\) <<true ))\nrm -rf x\ntrue",
+  "false && echo $[ \\] <<true ]\nrm -rf x\ntrue", "cat <<< 'E'\nrm -rf x\nE", "cat <<pass\nx\npass\r\nrm -rf x\npass",
+];
+// Under R18 a heredoc body's text is also classified as commands: a body that
+// reads like a writer stops (accepted cost); benign bodies stay read-only.
+const HEREDOC_BODY_AS_TEXT = ["cat <<EOF\nrm -rf x\nEOF", "cat <<'EOF'\nvalue > other\nEOF"];
+const HEREDOC_BENIGN = ["cat <<EOF\nhello world\nEOF", "cat <<-EOF\n\thello\n\tEOF", "cat << 'EOF'\nhello\nEOF", "python3 - <<'EOF'\nprint(1)\nEOF"];
+
+describe("heredoc masking can never hide a line (R18)", () => {
+  it.each([...HIDDEN_LINE_TRICKS, ...HEREDOC_BODY_AS_TEXT])("mutating: %s", (c) => expect(isDestructiveCommand(c)).toBe(true));
+  it.each(HEREDOC_BENIGN)("read-only: %s", (c) => expect(isDestructiveCommand(c)).toBe(false));
+});
+
+// Fix round 2: bun is allowlist-shaped like node.
+describe("bun stdin programs (fix round 2)", () => {
+  it.each(["echo x | bun run -", "echo x | bun run", "echo x | bun run --watch x.ts", "cat f | bun repl"])("mutating: %s", (c) => expect(isDestructiveCommand(c)).toBe(true));
+  it.each(["echo x | bun x.ts", "bun --version", "echo x | bun run x.ts"])("read-only: %s", (c) => expect(isDestructiveCommand(c)).toBe(false));
 });

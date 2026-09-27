@@ -819,7 +819,7 @@ value >= other
 EOF": null,
   "cat <<EOF
 value > other
-EOF": null,
+EOF": ">",
   "cat \`rm x\`": "rm",
   "cat a.txt 1> b.txt": ">",
   "cat bar 2>&1": null,

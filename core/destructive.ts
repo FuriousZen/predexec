@@ -15,6 +15,10 @@
  *      allowlist: an inline program is mutating unless every call it makes
  *      is a known reader (READER_ALLOWLISTS).
  *
+ * Heredoc masking can no longer hide a line from classification:
+ * findDestructiveToken also classifies the command with masking off (every
+ * physical line as command text) and stops if either pass does (R18).
+ *
  * This module is the pipeline; the tables and per-concern scanners live in
  * core/shell/: heads.ts (READ_ONLY_HEADS + per-head argv predicates, and
  * WRITER_HEAD_MODES for mode-sensitive writers such as tar/unzip/gzip), git.ts,
@@ -38,6 +42,7 @@ import {
   hasAnsiCEscapedQuote,
   hasDynamicCommandName,
   heredocScanHazard,
+  withoutHeredocMasking,
   inspectCommandSubstitutions,
   inspectCommandSubstitutionTree,
   inspectShellCommandClauses,
@@ -546,7 +551,7 @@ function findDestructiveTokenInternal(cmd: string, depth: number): string | null
       const gitReadOnly = head === "git" && gitTokens[i] === null;
       return head !== null && (READ_ONLY_HEADS.has(head) || gitReadOnly);
     });
-  if (allSafe) return stdinProgramToken(cmd) ?? findTaintedEvaluation(cmd);
+  if (allSafe) return (judgeStdinPrograms ? stdinProgramToken(cmd) : null) ?? findTaintedEvaluation(cmd);
 
   const caseInspection = inspectShellCommandClauses(shellCommand);
   const wordScanSegments = /^case\b/.test(shellCommand.trim()) && caseInspection.complete && caseInspection.clauses.length > 0
@@ -630,7 +635,7 @@ function findDestructiveTokenInternal(cmd: string, depth: number): string | null
   // command substitution.
   // It reads the unmasked command: an unquoted heredoc body expands `$((…))`.
   // So does the stdin check: a heredoc body is exactly what it judges.
-  return stdinProgramToken(cmd) ?? findTaintedEvaluation(cmd);
+  return (judgeStdinPrograms ? stdinProgramToken(cmd) : null) ?? findTaintedEvaluation(cmd);
 }
 
 /**
@@ -641,8 +646,27 @@ function findDestructiveTokenInternal(cmd: string, depth: number): string | null
 export function findDestructiveToken(cmd: string): string | null {
   if (cmd.length > MAX_COMMAND_LENGTH) return "oversized command";
   if (longestWordLength(cmd) > MAX_CLASSIFY_WORD_LENGTH) return "oversized shell word";
-  return findDestructiveTokenInternal(cmd, 0);
+  const masked = findDestructiveTokenInternal(cmd, 0);
+  if (masked) return masked;
+  // Second pass with no heredoc masking (R18): every physical line is
+  // command text. Masking decides what is data, and each scanner miss there (a
+  // here-string, an arithmetic shift, a comment, quoted arithmetic) used to
+  // hide the next line; now a line the first pass took for heredoc body is
+  // still classified here. Stdin programs are judged by the first pass only.
+  judgeStdinPrograms = false;
+  try {
+    return withoutHeredocMasking(() => findDestructiveTokenInternal(cmd, 0));
+  } finally {
+    judgeStdinPrograms = true;
+  }
 }
+
+/**
+ * False only during findDestructiveToken's unmasked pass, whose erased
+ * the stdin checks would only repeat the first pass's work (they locate
+ * heredocs themselves). The classifier is synchronous, so it cannot leak.
+ */
+let judgeStdinPrograms = true;
 
 export function isDestructiveCommand(cmd: string): boolean {
   return findDestructiveToken(cmd) !== null;
