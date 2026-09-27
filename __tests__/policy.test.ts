@@ -794,9 +794,13 @@ describe("readOpencodeRuleset — hostMajor 2: agent/mode markdown files", () =>
     md(ctx.project, ".opencode/agent/badmode.md", "---\ndescription: x\nmode: sideways\n---\n");
     const errors = opencodeV2AgentFileErrors(ctx.project, ctx.env);
     expect(errors).toEqual([
-      { agent: "badmode", file: join(ctx.project, ".opencode", "agent", "badmode.md"), line: 3, reason: expect.stringContaining("`mode`") },
-      { agent: "review", file: join(ctx.project, ".opencode", "agent", "review.md"), line: 3, reason: expect.stringContaining("mapping value not allowed here") },
+      { agent: "badmode", file: join(ctx.project, ".opencode", "agent", "badmode.md"), line: 3, reason: expect.stringContaining("`mode`"), kind: "schema" },
+      { agent: "review", file: join(ctx.project, ".opencode", "agent", "review.md"), line: 3, reason: expect.stringContaining("mapping value not allowed here"), kind: "syntax" },
     ]);
+    // A schema failure's line is looked up in the frontmatter block only, never the body.
+    md(ctx.project, ".opencode/agent/badmode.md", "---\ndescription: x\n---\nmode: in the body\n");
+    md(ctx.project, ".opencode/agent/nested.md", "---\ndescription: x\ntools:\n  bash: 1\n---\ntools: body\n");
+    expect(opencodeV2AgentFileErrors(ctx.project, ctx.env).find((e) => e.agent === "nested")).toMatchObject({ line: 3, kind: "schema" });
     // The same failures make those agents deny-all on the policy path.
     expect(readOpencodeRuleset(ctx.project, ctx.env, { hostMajor: 2, agent: "review" })).toHaveProperty("error");
   });
@@ -994,6 +998,9 @@ describe("readOpencodeRuleset — hostMajor 2: R45 agent frontmatter is an unamb
     ["underscore-leading int key", 'permission:\n  bash:\n    "*": allow\n    _1: deny', "1"],
     ["YAML 1.1 bool key", 'permission:\n  bash:\n    "*": allow\n    n: deny', "false"],
     ["flow exp key", 'permission: {bash: {"*": allow, 1e3: deny}}', "1000"],
+    // R56: js-yaml's `\.[0-9_]+([eE][-+]?[0-9]+)?` float form — `._e1` is NaN to js-yaml.
+    ["._e1 key (block)", 'permission:\n  bash:\n    "*": deny\n    ._e1: allow', "._e1"],
+    ["._e1 key (flow)", 'permission: {bash: {"*": deny, ._e1: allow}}', "._e1"],
   ])("H: plain keys js-yaml types as non-strings ⇒ deny-all: %s", (_label, yaml, op) => {
     const ctx = setup();
     md(ctx.project, ".opencode/agent/build.md", F(yaml));

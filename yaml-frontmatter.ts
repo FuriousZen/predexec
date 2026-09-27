@@ -112,10 +112,98 @@ const NON_STRING = [
   /^[0-9]{4}-[0-9]{1,2}-[0-9]{1,2}/,
 ];
 
+/**
+ * js-yaml 3.14.2's own implicit resolvers for the default safe schema's
+ * null/bool/int/float types, ported verbatim (`lib/js-yaml/type/{null,bool,int,float}.js`)
+ * so no form they type slips past the looser `NON_STRING` screen above
+ * (R56: `._e1` is a float, NaN, to js-yaml).
+ */
+function jsYamlNull(data: string): boolean {
+  const max = data.length;
+  return (max === 1 && data === "~") || (max === 4 && (data === "null" || data === "Null" || data === "NULL"));
+}
+function jsYamlBool(data: string): boolean {
+  const max = data.length;
+  return (max === 4 && (data === "true" || data === "True" || data === "TRUE")) || (max === 5 && (data === "false" || data === "False" || data === "FALSE"));
+}
+const isHexCode = (c: number) => (0x30 <= c && c <= 0x39) || (0x41 <= c && c <= 0x46) || (0x61 <= c && c <= 0x66);
+const isOctCode = (c: number) => 0x30 <= c && c <= 0x37;
+const isDecCode = (c: number) => 0x30 <= c && c <= 0x39;
+function jsYamlInt(data: string): boolean {
+  const max = data.length;
+  let index = 0;
+  let hasDigits = false;
+  if (!max) return false;
+  let ch = data[index];
+  // sign
+  if (ch === "-" || ch === "+") ch = data[++index];
+  if (ch === "0") {
+    // 0
+    if (index + 1 === max) return true;
+    ch = data[++index];
+    // base 2, base 8, base 16
+    if (ch === "b") {
+      index++;
+      for (; index < max; index++) {
+        ch = data[index];
+        if (ch === "_") continue;
+        if (ch !== "0" && ch !== "1") return false;
+        hasDigits = true;
+      }
+      return hasDigits && ch !== "_";
+    }
+    if (ch === "x") {
+      index++;
+      for (; index < max; index++) {
+        ch = data[index];
+        if (ch === "_") continue;
+        if (!isHexCode(data.charCodeAt(index))) return false;
+        hasDigits = true;
+      }
+      return hasDigits && ch !== "_";
+    }
+    // base 8
+    for (; index < max; index++) {
+      ch = data[index];
+      if (ch === "_") continue;
+      if (!isOctCode(data.charCodeAt(index))) return false;
+      hasDigits = true;
+    }
+    return hasDigits && ch !== "_";
+  }
+  // base 10 (except 0) or base 60; value should not start with `_`
+  if (ch === "_") return false;
+  for (; index < max; index++) {
+    ch = data[index];
+    if (ch === "_") continue;
+    if (ch === ":") break;
+    if (!isDecCode(data.charCodeAt(index))) return false;
+    hasDigits = true;
+  }
+  // Should have digits and should not end with `_`
+  if (!hasDigits || ch === "_") return false;
+  // if !base60 - done
+  if (ch !== ":") return true;
+  return /^(:[0-5]?[0-9])+$/.test(data.slice(index));
+}
+const YAML_FLOAT_PATTERN = new RegExp(
+  "^(?:[-+]?(?:0|[1-9][0-9_]*)(?:\\.[0-9_]*)?(?:[eE][-+]?[0-9]+)?" +
+    "|\\.[0-9_]+(?:[eE][-+]?[0-9]+)?" +
+    "|[-+]?[0-9][0-9_]*(?::[0-5]?[0-9])+\\.[0-9_]*" +
+    "|[-+]?\\.(?:inf|Inf|INF)" +
+    "|\\.(?:nan|NaN|NAN))$",
+);
+function jsYamlFloat(data: string): boolean {
+  return YAML_FLOAT_PATTERN.test(data) && data[data.length - 1] !== "_";
+}
+/** True when js-yaml 3.14.2 would resolve this plain scalar to anything but a string (or a string it built itself). */
+const nonString = (v: string): boolean =>
+  NON_STRING.some((re) => re.test(v)) || jsYamlNull(v) || jsYamlBool(v) || jsYamlInt(v) || jsYamlFloat(v);
+
 /** Plain key: identifier-shaped (or, in the permission map, glob-shaped), not reserved, not something js-yaml types. */
 function checkPlainKey(key: string, inPermission: boolean, flow: boolean): string {
   if (inPermission) return checkPermissionPlainKey(key, flow);
-  if (!KEY_RE.test(key) || NON_STRING.some((re) => re.test(key))) throw new Error(`unsupported mapping key: ${key}`);
+  if (!KEY_RE.test(key) || nonString(key)) throw new Error(`unsupported mapping key: ${key}`);
   if (RESERVED_KEYS.has(key)) throw new Error(`reserved mapping key: ${key}`);
   return key;
 }
@@ -137,7 +225,7 @@ function checkPermissionPlainKey(key: string, flow: boolean): string {
   if (INDICATORS.includes(key[0]!)) throw new Error(`mapping key starts with a YAML indicator: ${key}`);
   if (PERMISSION_KEY_FORBIDDEN.test(key) || (flow && /[,[\]{}]/.test(key))) throw new Error(`unsupported character in mapping key: ${key}`);
   if (key.startsWith("<<")) throw new Error(`merge key: ${key}`);
-  if (NON_STRING.some((re) => re.test(key))) throw new Error(`mapping key js-yaml would not read as a string: ${key}`);
+  if (nonString(key)) throw new Error(`mapping key js-yaml would not read as a string: ${key}`);
   if (RESERVED_KEYS.has(key)) throw new Error(`reserved mapping key: ${key}`);
   return key;
 }
@@ -174,7 +262,7 @@ function plainScalar(v: string): unknown {
   if (v === "true") return true;
   if (v === "false") return false;
   if (/^(0|[1-9][0-9]*)(\.[0-9]+)?$/.test(v)) return Number(v);
-  if (NON_STRING.some((re) => re.test(v))) throw new Error(`plain scalar js-yaml would not read as a string: ${v}`);
+  if (nonString(v)) throw new Error(`plain scalar js-yaml would not read as a string: ${v}`);
   return v;
 }
 

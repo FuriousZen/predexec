@@ -650,6 +650,8 @@ export interface OpencodeAgentFileError {
   /** 1-based line in the file the failure points at (1 when it is not tied to one line). */
   line: number;
   reason: string;
+  /** `syntax`: the frontmatter is outside the YAML core; `schema`: it parsed, but a field fails opencode v2's agent schema. */
+  kind: "syntax" | "schema";
 }
 /**
  * `null` = the document disables the agent; `{ error }` = predexec could not
@@ -920,20 +922,28 @@ function v2MarkdownAgentDocument(directory: string, file: string, primary: boole
     const line = err instanceof FrontmatterError ? err.line : schemaErrorLine(file, reason);
     agents.set(name, {
       error: `${file} could not be read as an opencode agent (${err instanceof Error ? err.message : String(err)})`,
-      file: { agent: name, file, line, reason },
+      file: { agent: name, file, line, reason, kind: err instanceof FrontmatterError ? "syntax" : "schema" },
     });
   }
   return { rules: [], agents };
 }
 
-/** A schema failure names its field as `` `key` ``; point at that top-level key's line when it has one. */
+/**
+ * A schema failure names its field as `` `key` ``; point at that top-level
+ * key's line inside the frontmatter block (lines 2 .. the closing `---`, never
+ * the body), else 1.
+ */
 function schemaErrorLine(file: string, reason: string): number {
   const key = /`([^`]+)`/.exec(reason)?.[1];
   if (key === undefined) return 1;
   try {
     const lines = readFileSync(file, "utf8").split("\n");
-    const at = lines.findIndex((l) => l.startsWith(`${key}:`));
-    return at >= 0 ? at + 1 : 1;
+    for (let i = 1; i < lines.length; i++) {
+      const line = lines[i]!.replace(/\r$/, "");
+      if (line === "---") break;
+      if (line.startsWith(`${key}:`)) return i + 1;
+    }
+    return 1;
   } catch {
     return 1;
   }

@@ -70,7 +70,10 @@ function run(seed) {
 
   // Fragments: mostly benign so plenty of documents are accepted, plus every
   // character class a reader might disagree on.
-  const WORDS = ["git", "rm", "ls", "cat", "npm", "run", "src", "log", "status", "x", "a", "b", "free", "openrouter", "gpt-4o", "v2", "true", "false", "null", "yes", "no", "on", "off", "y", "n", "1", "0", "10", "3.5", "1e3", "0x1f", "010", ".inf", "~", "2024-01-01", "1:30", "NaN"];
+  const WORDS = ["git", "rm", "ls", "cat", "npm", "run", "src", "log", "status", "x", "a", "b", "free", "openrouter", "gpt-4o", "v2", "true", "false", "null", "yes", "no", "on", "off", "y", "n", "1", "0", "10", "3.5", "1e3", "0x1f", "010", ".inf", "~", "2024-01-01", "1:30", "NaN",
+    // R56: js-yaml 3.14.2 int/float/bool/null resolver edges.
+    "._e1", "._E9", ".__e+1", ".5", ".5_", "1_0", "1_", "0x_1", "0b1", "0b_", "0o7", "07", "08", "0_7", "1:30", "1:60", "1:30.5", "190:20:30.15",
+    ".inf", "+.inf", "-.Inf", ".NaN", ".NAN", "-.5e3", "+1", "-0", "+0.5", "1.", "1.e5", "0.0_1", "True", "TRUE", "False", "FALSE", "Null", "NULL"];
   const GLOB = ["*", "**", "?", "/", ".", "-", "_", "~", "!", "[a-z]", "{a,b}", "=", "+", "@", "%", "&", "$", "^", "(", ")", "|", ">", "<", "<<", ";", "\\", "`", ",", "[", "]", "{", "}"];
   const RISKY = [":", ": ", " :", "::", "#", " #", " # c", "'", '"', "''", "\t", "\u00a0", "é", "  ", " ", "---", "...", "- ", "? ", "&a", "*a", "!!str ", "|", ">", "%"];
   const token = (riskP) => (chance(riskP) ? pick(RISKY) : chance(0.3) ? pick(GLOB) : pick(WORDS));
@@ -79,7 +82,13 @@ function run(seed) {
     for (let i = 0; i < n; i++) s += (i && chance(sepP) ? " " : "") + token(riskP);
     return s;
   };
-  const globKey = () => phrase(1 + Math.floor(r() * 4), 0.08, 0.6);
+  const NUMERIC_EDGE = [".", "_", "e", "E", "+", "-", "0", "1", "5", "9", "x", "b", "o", ":", "inf", "nan"];
+  const numericKey = () => {
+    let k = "";
+    for (let i = 0, n = 1 + Math.floor(r() * 6); i < n; i++) k += pick(NUMERIC_EDGE);
+    return k;
+  };
+  const globKey = () => (chance(0.15) ? numericKey() : phrase(1 + Math.floor(r() * 4), 0.08, 0.6));
   const colonValue = () => {
     const forms = [
       () => `${pick(["openrouter", "anthropic", "openai", "google"])}/${pick(WORDS)}:${pick(["free", "beta", "1", "x"])}`,

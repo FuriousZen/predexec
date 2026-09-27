@@ -188,6 +188,16 @@ describe("doctor — opencode v2 agent files that go deny-all", () => {
     ]);
   });
 
+  it("the fix-it hint depends on the failure kind (syntax vs schema)", async () => {
+    const { project, env } = agentFixture();
+    write("proj/.opencode/agent/sideways.md", "---\nmode: sideways\n---\n");
+    const checks = await checkOpencodeAgents({ cwd: project, env });
+    const hint = (agent: string) => checks.find((c: { name: string }) => c.name.endsWith(`agent ${agent} will stop`))?.hint;
+    expect(hint("review")).toMatch(/^quote the value or key/);
+    expect(hint("sideways")).toMatch(/agent schema accepts/);
+    expect(hint("sideways")).not.toMatch(/quote/);
+  });
+
   it("no agent files, or only readable ones ⇒ no checks", async () => {
     scratch();
     const home = join(tmp, "home");

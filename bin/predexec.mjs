@@ -724,7 +724,10 @@ export async function checkOpencodeAgents(opts = {}) {
   return errors.map((e) => ({
     name: `opencode agent ${e.file}:${e.line}: ${e.reason} — every predexec call for agent ${e.agent} will stop`,
     status: "fail",
-    hint: "quote the value or key named above (predexec reads opencode v2 agent frontmatter certainty-or-fail-closed)",
+    hint:
+      e.kind === "syntax"
+        ? "quote the value or key named above (predexec reads opencode v2 agent frontmatter certainty-or-fail-closed)"
+        : "set the field named above to a value opencode v2's agent schema accepts, or remove it (opencode itself drops this agent)",
   }));
 }
 
