@@ -1004,3 +1004,69 @@ describe("readOpencodeRuleset — hostMajor 2: R45 agent frontmatter is an unamb
     expect(evaluateOperation("ls", readOpencodeRuleset(ctx.project, ctx.env, { hostMajor: 2, agent: "nat" }), { directory: ctx.project, hostMajor: 2 }).action).toBe("allow");
   });
 });
+
+describe("data-fed operands (E-B): stop when a rule could match the command that receives them", () => {
+  const DATA_FED = [
+    "echo .env | xargs cat",
+    "while read f; do cat \"$f\"; done < list",
+    "cat $(cat names.txt)",
+  ];
+  const ruleset = (permission: Record<string, unknown>, hostMajor: 1 | 2 = 1) => {
+    const ctx = setup();
+    ctx.projectConfig({ permission });
+    const rules = readOpencodeRuleset(ctx.project, ctx.env, { hostMajor });
+    if (!Array.isArray(rules)) throw new Error(rules.error);
+    return { ctx, rules };
+  };
+
+  it.each(DATA_FED)("v1 bash {\"cat .env*\":\"deny\"} stops %s", (command) => {
+    const { ctx, rules } = ruleset({ bash: { "cat .env*": "deny" } });
+    expect(createPolicyChecker(rules, { directory: ctx.project })(command)).toMatch(/operands of 'cat'.*can't be checked/);
+  });
+
+  it.each(DATA_FED)("v1 read {\".env\":\"deny\"} stops %s", (command) => {
+    const { ctx, rules } = ruleset({ read: { ".env": "deny" } });
+    expect(createPolicyChecker(rules, { directory: ctx.project })(command)).toMatch(/can't be checked/);
+  });
+
+  it.each(DATA_FED)("v2 bash {\"cat .env*\":\"deny\"} stops %s", (command) => {
+    const { ctx, rules } = ruleset({ bash: { "cat .env*": "deny" } }, 2);
+    expect(createPolicyChecker(rules, { directory: ctx.project, hostMajor: 2 })(command)).toMatch(/operands of 'cat'.*can't be checked/);
+  });
+
+  it.each(DATA_FED)("v1 context.ask bridge stops %s statically, before any prompt", async (command) => {
+    const { ctx, rules } = ruleset({ bash: { "cat .env*": "deny" } });
+    const ask = vi.fn<OpencodeAsk>(async () => {});
+    const check = createOpencodeAskBridge(ask, rules, { directory: ctx.project });
+    expect(await check(command)).toMatch(/can't be checked/);
+    expect(ask).not.toHaveBeenCalled();
+  });
+
+  it("a rule shadowed by a later catch-all allow does not count; an ask rule does", () => {
+    const shadowed: PolicyRule[] = [
+      { permission: "bash", pattern: "cat .env*", action: "deny" },
+      { permission: "bash", pattern: "*", action: "allow" },
+    ];
+    expect(createPolicyChecker(shadowed)("echo .env | xargs cat")).toBeNull();
+    const asked: PolicyRule[] = [
+      { permission: "*", pattern: "*", action: "allow" },
+      { permission: "bash", pattern: "cat *", action: "ask" },
+    ];
+    expect(createPolicyChecker(asked)("echo .env | xargs -0 cat")).toMatch(/can't be checked/);
+  });
+
+  it("with no rule naming cat and no read rules, the xargs read runs normally", async () => {
+    const ctx = setup();
+    writeFileSync(join(ctx.project, "note.txt"), "PLAIN\n");
+    const rules: PolicyRule[] = [
+      { permission: "*", pattern: "*", action: "allow" },
+      { permission: "bash", pattern: "git push *", action: "deny" },
+    ];
+    const r = await runPlanTree(
+      { root: "a", nodes: [{ id: "a", commands: ["echo note.txt | xargs cat"] }] },
+      { cwd: ctx.project, checkOperationPolicy: createPolicyChecker(rules, { directory: ctx.project, worktree: ctx.project }) },
+    );
+    expect(r.stoppedReason).not.toBe("policyStop");
+    expect(r.transcript).toContain("PLAIN");
+  });
+});

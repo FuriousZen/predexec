@@ -947,3 +947,61 @@ describe("Claude settings sources — CLAUDE_CONFIG_DIR and managed policy", () 
     }
   });
 });
+
+describe("data-fed operands (E-B): stop when a rule could match the command that receives them", () => {
+  const DATA_FED = [
+    "echo .env | xargs cat",
+    "while read f; do cat \"$f\"; done < list",
+    "cat $(cat names.txt)",
+  ];
+  const bash = (permissions: unknown) => createClaudePolicyChecker(parseClaudeBashRules(JSON.stringify({ permissions })));
+  const read = (permissions: unknown) => {
+    const dir = realpathSync(mkdtempSync(join(tmpdir(), "px-claude-operands-")));
+    const check = createClaudeOperationPolicyChecker(parseClaudeOperationRules(JSON.stringify({ permissions })), [], { projectDir: dir, home: dir });
+    return (command: string) => {
+      try {
+        return check(command, { cwd: dir, sessionRoot: dir });
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    };
+  };
+
+  it.each(DATA_FED)("Bash(cat .env) deny stops %s", (command) => {
+    expect(bash({ deny: ["Bash(cat .env)"] })(command)).toMatch(/operands of 'cat'.*can't be checked/);
+  });
+
+  it.each(DATA_FED)("Read(./.env) deny stops %s", (command) => {
+    expect(read({ deny: ["Read(./.env)"] })(command)).toBeTruthy();
+  });
+
+  it("an ask rule, a :* alias, a wrapper form and a wildcard all count; an unrelated rule does not", () => {
+    expect(bash({ ask: ["Bash(cat:*)"] })("echo .env | xargs -0 cat")).toContain("can't be checked");
+    expect(bash({ deny: ["Bash(timeout 5 cat *)"] })("echo .env | xargs cat")).toContain("can't be checked");
+    expect(bash({ deny: ["Bash(*)"] })("echo .env | xargs cat")).toBeTruthy();
+    expect(bash({ deny: ["Bash(git push *)"] })("echo .env | xargs cat")).toBeNull();
+    expect(bash({ allow: ["Bash(cat .env)"] })("echo .env | xargs cat")).toBeNull();
+  });
+
+  it("with no rule naming cat and no Read rules, the xargs read runs normally", async () => {
+    const dir = realpathSync(mkdtempSync(join(tmpdir(), "px-claude-operands-")));
+    try {
+      writeFileSync(join(dir, "note.txt"), "PLAIN\n");
+      const check = createClaudeHostPolicyChecker(dir, {
+        env: { CLAUDE_CONFIG_DIR: join(dir, "cfg") } as NodeJS.ProcessEnv,
+        managedDir: join(dir, "managed"),
+        home: dir,
+        managedPolicySources: () => [],
+      });
+      const r = await runPlanTree({ root: "a", nodes: [{ id: "a", commands: ["echo note.txt | xargs cat"] }] }, { cwd: dir, checkOperationPolicy: check });
+      expect(r.stoppedReason).not.toBe("policyStop");
+      expect(r.transcript).toContain("PLAIN");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("Read rules do not stop a data-fed operand of a command that never opens a path", () => {
+    expect(read({ deny: ["Read(./.env)"] })("ls | xargs echo")).toBeNull();
+  });
+});

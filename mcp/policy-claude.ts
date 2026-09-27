@@ -44,8 +44,13 @@ import { existsSync, globSync, readFileSync, readdirSync, realpathSync, statSync
 import { homedir, platform, userInfo } from "node:os";
 import { basename, dirname, isAbsolute, join, parse as parsePath, relative, resolve, sep } from "node:path";
 import {
+  commandsWithUnresolvableOperands,
+  describeUnresolvableOperand,
   escapeRegExp,
   inspectCommandSubstitutionTree,
+  operandHeadMayReadPaths,
+  ruleHeadCouldMatch,
+  tokenizeShellWords,
   lexShellWords,
   splitCommandSegments,
   stripLeadingAssignmentsAndWrappers,
@@ -1127,6 +1132,9 @@ export function createClaudeOperationPolicyChecker(
         }
         const hit = matchTargets(compiled, "shell", targets);
         if (hit) return hit;
+        // `xargs cat` names no operand at all; a Read rule cannot see what it reads.
+        const fed = commandsWithUnresolvableOperands(shell).find((entry) => operandHeadMayReadPaths(entry.head));
+        if (fed) return describeUnresolvableOperand(fed, "your Claude Code Read rules");
         return complete ? null : "incomplete shell syntax (Read-rule inspection budget exceeded)";
       } catch {
         return "incomplete shell syntax (Read-rule inspection failed)";
@@ -1288,7 +1296,8 @@ export function createClaudePolicyChecker(
     // Deny before ask across files too, so a stop reports the deny that caught
     // it rather than an ask from a file that happened to be read first. Both
     // stop; only the pattern named in the transcript changes.
-    .sort((a, b) => (a.action === b.action ? 0 : a.action === "deny" ? -1 : 1));
+    .sort((a, b) => (a.action === b.action ? 0 : a.action === "deny" ? -1 : 1))
+    .map((rule) => ({ ...rule, words: tokenizeShellWords(rule.pattern.endsWith(":*") ? rule.pattern.slice(0, -2) : rule.pattern) }));
   return (input: string | Operation) => {
     const cmd = typeof input === "string"
       ? input
@@ -1319,6 +1328,13 @@ export function createClaudePolicyChecker(
       }
       if (!inspected.complete) {
         return "incomplete shell syntax (policy inspection budget exceeded)";
+      }
+      // A data-fed operand (`echo .env | xargs cat`) is invisible to a rule
+      // matched against command text, so any deny/ask that could match the
+      // receiving command stops it (R1).
+      for (const entry of commandsWithUnresolvableOperands(cmd)) {
+        const rule = compiled.find((r) => ruleHeadCouldMatch(r.words, entry.head));
+        if (rule) return describeUnresolvableOperand(entry, `your Claude Code rule Bash(${rule.pattern})`);
       }
       return null;
     } catch {

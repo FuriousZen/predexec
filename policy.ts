@@ -41,7 +41,16 @@
 import { existsSync, readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
-import { inspectCommandSubstitutionTree, lexShellWords, splitCommandSegments } from "./core/index.ts";
+import {
+  commandsWithUnresolvableOperands,
+  describeUnresolvableOperand,
+  inspectCommandSubstitutionTree,
+  lexShellWords,
+  operandHeadMayReadPaths,
+  ruleHeadCouldMatch,
+  splitCommandSegments,
+  tokenizeShellWords,
+} from "./core/index.ts";
 import type { HostPolicyDenial, Operation, PolicyCheckContext, PolicyVerdict } from "./core/types.ts";
 import { MAX_FRONTMATTER_FILE_BYTES, parseFrontmatter } from "./yaml-frontmatter.ts";
 
@@ -1332,6 +1341,47 @@ function resolveContext(options: PolicyCheckerOptions, context?: PolicyCheckCont
   };
 }
 
+/**
+ * Deny/ask rules under `permission` that a later catch-all allow for the same
+ * permission does not override (last match wins, so such a rule can never decide).
+ */
+function liveRestrictiveRules(ruleset: PolicyRule[], permission: string): PolicyRule[] {
+  const live: PolicyRule[] = [];
+  let overridden = false;
+  for (let i = ruleset.length - 1; i >= 0; i--) {
+    const rule = ruleset[i]!;
+    if (!wildcardMatch(permission, rule.permission)) continue;
+    if (rule.action === "allow") {
+      if (rule.pattern === "*") overridden = true;
+    } else if (!overridden) {
+      live.unshift(rule);
+    }
+  }
+  return live;
+}
+
+/**
+ * A data-fed operand (`echo .env | xargs cat`) never reaches a pattern
+ * opencode matches, so it stops when a live shell rule could match the
+ * receiving command (R1), or when any live `read` rule exists and the command
+ * can open a path. A static stop: it happens before the ask bridge prompts.
+ */
+function unresolvableOperandStop(command: string, ruleset: PolicyRule[], hostMajor: 1 | 2): string | null {
+  const entries = commandsWithUnresolvableOperands(command);
+  if (entries.length === 0) return null;
+  const shellRules = liveRestrictiveRules(ruleset, hostMajor === 2 ? "shell" : "bash")
+    .map((rule) => ({ rule, words: tokenizeShellWords(rule.pattern) }));
+  const readRule = liveRestrictiveRules(ruleset, "read")[0];
+  for (const entry of entries) {
+    const hit = shellRules.find(({ words }) => ruleHeadCouldMatch(words, entry.head));
+    if (hit) return describeUnresolvableOperand(entry, `your opencode rule ${hit.rule.permission}:${hit.rule.pattern}`);
+    if (readRule && operandHeadMayReadPaths(entry.head)) {
+      return describeUnresolvableOperand(entry, `your opencode rule ${readRule.permission}:${readRule.pattern}`);
+    }
+  }
+  return null;
+}
+
 /** The strictest static verdict for an operation (exposed for tests and the bridge). */
 export function evaluateOperation(
   operation: Operation,
@@ -1343,7 +1393,11 @@ export function evaluateOperation(
   try {
     const requests = opencodeAsksFor(operation, resolveContext(options, context), options.inspectCommand);
     if (requests === null) return { action: "deny", rule: INCOMPLETE };
-    return staticVerdict(requests, ruleset, options.hostMajor);
+    const verdict = staticVerdict(requests, ruleset, options.hostMajor);
+    if (verdict.action === "deny") return verdict;
+    const command = typeof operation === "string" ? operation : operation.tool === "bash" ? operation.command : undefined;
+    const fed = typeof command === "string" ? unresolvableOperandStop(command, ruleset, options.hostMajor ?? 1) : null;
+    return fed === null ? verdict : { action: "deny", rule: fed };
   } catch {
     return { action: "deny", rule: "incomplete shell syntax (policy inspection failed)" };
   }

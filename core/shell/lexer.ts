@@ -2320,6 +2320,17 @@ function sourceWordExpands(source: string): boolean {
 const RESERVED_PREFIX_RE =
   /^(?:(?:if|then|elif|else|fi|while|until|do|done|for|select|function|coproc)|[!{}])(?=\s|$)\s*/;
 
+/** A segment with its leading reserved words and group keywords removed (bounded). */
+export function stripLeadingReservedWords(segment: string): string {
+  let text = segment.trim();
+  for (let i = 0; i < 8; i++) {
+    const next = text.replace(RESERVED_PREFIX_RE, "");
+    if (next === text) break;
+    text = next;
+  }
+  return text;
+}
+
 /**
  * True when a segment's effective command name (after reserved words,
  * assignments, `env` and wrappers) is not a literal: it holds a parameter
@@ -2332,12 +2343,7 @@ const RESERVED_PREFIX_RE =
  * callers already treat it as incomplete.
  */
 export function hasDynamicCommandName(segment: string): boolean {
-  let text = segment.trim();
-  for (let i = 0; i < 8; i++) {
-    const next = text.replace(RESERVED_PREFIX_RE, "");
-    if (next === text) break;
-    text = next;
-  }
+  const text = stripLeadingReservedWords(segment);
   if (text.startsWith("(")) return false;
   const lex = lexShellWords(text, ARGV);
   const values = lex.words.map((word) => word.value);

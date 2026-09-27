@@ -400,3 +400,41 @@ describe("resolveAntigravityRoot", () => {
     expect(resolveAntigravityRoot({ cwd: plugin, env: { PLUGIN_ROOT: plugin, PREDEXEC_ROOT: repo } })).toEqual({ root: repo });
   });
 });
+
+describe("data-fed operands (E-B): stop when a grant could match the command that receives them", () => {
+  const DATA_FED = [
+    "echo .env | xargs cat",
+    "while read f; do cat \"$f\"; done < list",
+    "cat $(cat names.txt)",
+  ];
+
+  it.each(DATA_FED)("command(cat .env) deny stops %s", (command) => {
+    const { run } = checker({ permissions: { deny: ["command(cat .env)"] } });
+    expect(run(command)).toMatch(/operands of 'cat'.*can't be checked/);
+  });
+
+  it.each(DATA_FED)("read_file(.env) deny stops %s", (command) => {
+    const { run } = checker({ permissions: { deny: ["read_file(.env)"] } });
+    expect(run(command)).toMatch(/can't be checked/);
+  });
+
+  it("ask, regex and wildcard grants count; allow and unrelated grants do not", () => {
+    expect(checker({ permissions: { ask: ["command(cat .env)"] } }).run("echo .env | xargs cat")).toBeTruthy();
+    expect(checker({ permissions: { deny: ["command(regex:ca.* \\.env)"] } }).run("echo .env | xargs cat")).toBeTruthy();
+    expect(checker({ permissions: { deny: ["command(*)"] } }).run("echo .env | xargs cat")).toBeTruthy();
+    expect(checker({ permissions: { allow: ["command(cat .env)"] } }).run("echo .env | xargs cat")).toBeNull();
+    expect(checker({ permissions: { deny: ["command(git push)"] } }).run("echo .env | xargs cat")).toBeNull();
+  });
+
+  it("with no grant naming cat and no read_file grants, the xargs read runs normally", async () => {
+    const { ws, home } = setup({ permissions: { deny: ["command(git push)"] } });
+    writeFileSync(join(ws, "note.txt"), "PLAIN\n");
+    const check = createAntigravityPolicyChecker({ home, cwd: ws, env: {} });
+    const r = await runPlanTree(
+      { root: "a", nodes: [{ id: "a", commands: ["echo note.txt | xargs cat"] }] },
+      { cwd: ws, checkOperationPolicy: check },
+    );
+    expect(r.stoppedReason).not.toBe("policyStop");
+    expect(r.transcript).toContain("PLAIN");
+  });
+});

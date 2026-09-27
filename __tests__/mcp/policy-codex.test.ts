@@ -6,6 +6,7 @@ import {
   createCodexPolicyChecker,
   readCodexRules as readCodexRulesUnisolated,
   type CodexPolicyOptions,
+  type CodexRule,
 } from "../../mcp/policy-codex.ts";
 import { runPlanTree } from "../../core/engine.ts";
 import type { PlanTree } from "../../core/types.ts";
@@ -1008,5 +1009,40 @@ describe("readCodexRules — system config.toml trust layer", () => {
     mkdirSync(systemDir, { recursive: true });
     writeFileSync(join(systemDir, "config.toml"), 'projects = "nope"\n');
     expect(readCodexRules(projectDir, opts).unreadable).toEqual([join(systemDir, "config.toml")]);
+  });
+});
+
+describe("data-fed operands (E-B): stop when a rule could match the command that receives them", () => {
+  const check = (rules: CodexRule[]) => createCodexPolicyChecker(rules, []);
+
+  it.each([
+    "echo .env | xargs cat",
+    "while read f; do cat \"$f\"; done < list",
+    "cat $(cat names.txt)",
+  ])("forbidden [\"cat\",\".env\"] stops %s", (command) => {
+    expect(check([{ pattern: ["cat", ".env"], decision: "forbidden" }])(command)).toMatch(/operands of 'cat'.*can't be checked/);
+  });
+
+  it("prompt rules, alternatives and the match-everything rule count; allow and unrelated rules do not", () => {
+    expect(check([{ pattern: ["cat", ".env"], decision: "prompt" }])("echo .env | xargs cat")).toBeTruthy();
+    expect(check([{ pattern: [["head", "cat"], ".env"], decision: "forbidden" }])("echo .env | xargs cat")).toBeTruthy();
+    expect(check([{ pattern: [], decision: "forbidden" }])("echo .env | xargs cat")).toBeTruthy();
+    expect(check([{ pattern: ["cat", ".env"], decision: "allow" }])("echo .env | xargs cat")).toBeNull();
+    expect(check([{ pattern: ["git", "push"], decision: "forbidden" }])("echo .env | xargs cat")).toBeNull();
+  });
+
+  it("with no rule naming cat, the xargs read runs normally", async () => {
+    const dir = realpathSync(mkdtempSync(join(tmpdir(), "px-codex-operands-")));
+    try {
+      writeFileSync(join(dir, "note.txt"), "PLAIN\n");
+      const r = await runPlanTree(
+        { root: "a", nodes: [{ id: "a", commands: ["echo note.txt | xargs cat"] }] },
+        { cwd: dir, checkOperationPolicy: check([{ pattern: ["git", "push"], decision: "forbidden" }]) },
+      );
+      expect(r.stoppedReason).not.toBe("policyStop");
+      expect(r.transcript).toContain("PLAIN");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

@@ -28,6 +28,13 @@ export {
   type WrapperInspectionOptions,
 } from "./shell/inspection.ts";
 export {
+  commandsWithUnresolvableOperands,
+  describeUnresolvableOperand,
+  operandHeadMayReadPaths,
+  ruleHeadCouldMatch,
+  type UnresolvableOperand,
+} from "./shell/operands.ts";
+export {
   MAX_OPERATIONS_PER_NODE,
   MAX_PARALLEL_CONCURRENCY,
   MAX_PLAN_NODES,

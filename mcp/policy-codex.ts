@@ -103,7 +103,10 @@ import { existsSync, readdirSync, readFileSync, realpathSync, statSync } from "n
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import {
+  commandsWithUnresolvableOperands,
+  describeUnresolvableOperand,
   inspectCommandSubstitutionTree,
+  ruleHeadCouldMatch,
   splitCommandSegments,
   stripLeadingAssignmentsAndWrappers,
   tokenizeShellWords,
@@ -834,6 +837,23 @@ function matchesPrefix(pattern: CodexPatternToken[], tokens: string[]): boolean 
 }
 
 /**
+ * Could a prefix rule match a command run by `head`? Codex tokens are exact
+ * (no globs); an alternatives position counts when any alternative could, and
+ * the empty pattern matches every command.
+ */
+function ruleCouldMatchHead(pattern: CodexPatternToken[], head: string): boolean {
+  if (pattern.length === 0) return true;
+  // A wrapper-led pattern (`["timeout","5",["cat","head"]]`) names its head
+  // later; try each alternative index across the list positions.
+  const width = Math.max(1, ...pattern.map((tok) => (Array.isArray(tok) ? tok.length : 1)));
+  for (let k = 0; k < width; k++) {
+    const words = pattern.map((tok) => (Array.isArray(tok) ? tok[Math.min(k, tok.length - 1)] ?? "" : tok));
+    if (ruleHeadCouldMatch(words, head, { glob: false })) return true;
+  }
+  return false;
+}
+
+/**
  * Remove shell line continuations (`\<newline>`) outside single quotes, as
  * the shell does before word splitting. Without this, the per-line rescan
  * below split `cat \<newline>.env` into `cat \` and `.env`, and neither
@@ -918,6 +938,9 @@ export function createCodexPolicyChecker(
       return null;
     };
   }
+  const restrictive = rules
+    .filter((rule) => rule.decision !== "allow")
+    .sort((a, b) => SEVERITY[b.decision] - SEVERITY[a.decision]);
   return (operation: Operation) => {
     const cmd = typeof operation === "string"
       ? operation
@@ -960,6 +983,13 @@ export function createCodexPolicyChecker(
           }
       }
       if (!inspected.complete) return "incomplete shell syntax (policy inspection budget exceeded)";
+      // A data-fed operand (`echo .env | xargs cat`) never appears as a token
+      // a prefix rule could compare, so any forbidden/prompt rule whose first
+      // token could name the receiving command stops it (R1).
+      for (const entry of commandsWithUnresolvableOperands(cmd)) {
+        const rule = restrictive.find((r) => ruleCouldMatchHead(r.pattern, entry.head));
+        if (rule) return describeUnresolvableOperand(entry, `your Codex rule ${formatPattern(rule.pattern)}`);
+      }
       return null;
     } catch {
       return "incomplete shell syntax (policy inspection failed)";

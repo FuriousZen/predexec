@@ -57,8 +57,12 @@ import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import {
+  commandsWithUnresolvableOperands,
+  describeUnresolvableOperand,
   inspectCommandSubstitutionTree,
   isSafeRegex,
+  operandHeadMayReadPaths,
+  ruleHeadCouldMatch,
   splitCommandSegments,
   stripLeadingAssignmentsAndWrappers,
   tokenizeShellWords,
@@ -122,6 +126,8 @@ interface CommandGrant {
   /** The verbatim target, for the exact full-line match. */
   exact: string | null;
   matches: CommandMatcher;
+  /** Could this grant match some command run by `head` (its first word, R1)? */
+  headMatches: (head: string) => boolean;
 }
 interface PathGrant {
   label: string;
@@ -144,7 +150,7 @@ interface Compiled {
 
 function compileCommandGrant(grant: AntigravityGrant, label: string): CommandGrant | null {
   const { kind, value } = grant.target;
-  if (kind === "any") return { label, any: true, exact: null, matches: () => true };
+  if (kind === "any") return { label, any: true, exact: null, matches: () => true, headMatches: () => true };
   if (kind === "prefix") {
     let want: string[];
     try {
@@ -158,6 +164,7 @@ function compileCommandGrant(grant: AntigravityGrant, label: string): CommandGra
       any: false,
       exact: value,
       matches: (tokens) => tokens.length >= want.length && want.every((w, i) => tokens[i] === w),
+      headMatches: (head) => ruleHeadCouldMatch(want, head, { glob: false }),
     };
   }
   const parts = value.split(/\s+/).filter(Boolean);
@@ -176,6 +183,7 @@ function compileCommandGrant(grant: AntigravityGrant, label: string): CommandGra
     any: false,
     exact: null,
     matches: (tokens) => tokens.length >= res.length && res.every((re, i) => re.test(tokens[i]!)),
+    headMatches: (head) => res[0]!.test(head),
   };
 }
 
@@ -345,6 +353,17 @@ function checkShell(cmd: string, c: Compiled, ctx: PolicyCheckContext): PolicyVe
     }
   }
   if (!inspected.complete) return "incomplete shell syntax (policy inspection budget exceeded)";
+  // A data-fed operand (`echo .env | xargs cat`) is invisible to a grant
+  // matched against command tokens, and to read_file grants, which see only
+  // named paths: any deny/ask that could apply to the receiving command stops it.
+  const readGrant = c.deny.paths[0] ?? c.ask.paths[0];
+  for (const entry of commandsWithUnresolvableOperands(cmd)) {
+    const grant = [...c.deny.commands, ...c.ask.commands].find((g) => g.headMatches(entry.head));
+    if (grant) return describeUnresolvableOperand(entry, `your Antigravity grant "${grant.label}"`);
+    if (readGrant && operandHeadMayReadPaths(entry.head)) {
+      return describeUnresolvableOperand(entry, `your Antigravity grant "${readGrant.label}"`);
+    }
+  }
   if (!c.strict || ctx.variant) return null;
 
   if (c.allow.commands.some((g) => g.any || g.exact === line)) return null;
