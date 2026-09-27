@@ -220,3 +220,48 @@ describe("taint fix round 2", () => {
   it.each(ROUND2_MUTATING)("mutating: %s", (c) => expect(isDestructiveCommand(c)).toBe(true));
   it.each(ROUND2_READ_ONLY)("read-only: %s", (c) => expect(isDestructiveCommand(c)).toBe(false));
 });
+
+// E-C: a here-string or heredoc feeding an interpreter that has no -c/-e
+// program is that interpreter's program, and is classified like one.
+const STDIN_PROGRAM_MUTATING = [
+  // Brief rows.
+  "python3 <<< 'import os;os.remove(\"x\")'", "node <<< 'require(\"fs\").rmSync(\"x\")'",
+  "ruby <<< 'File.write(\"x\",\"y\")'", "python3 - <<'EOF'\nimport os; os.remove(\"x\")\nEOF",
+  "tclsh <<< 'exec id'", "php <<< '<?php unlink(\"x\");'",
+  // Spellings of the redirection and the head.
+  "python3<<<'import os;os.remove(\"x\")'", "<<<'import os;os.remove(\"x\")' python3",
+  "python3 0<<< 'import os;os.remove(\"x\")'", "python3.12 <<< 'import os;os.remove(\"x\")'",
+  "nodejs <<< 'require(\"fs\").rmSync(\"x\")'", "env X=1 python3 <<< 'import os;os.remove(\"x\")'",
+  "python3 <<< $'import os\\nos.remove(\"x\")'", "python3 <<< \"import os;os.remove('x')\"",
+  "python3 <<EOF\nimport os; os.remove(\"x\")\nEOF", "python3 <<-EOF\n\timport os; os.remove(\"x\")\n\tEOF",
+  "python3 <<\"EOF\"\nimport os; os.remove(\"x\")\nEOF", "python3 - <<'EOF'\nimport subprocess\nsubprocess.run(['id'])\nEOF",
+  "perl <<'EOF'\nunlink 'x';\nEOF", "ruby - <<'EOF'\nFile.write('x', 'y')\nEOF",
+  "node <<'EOF'\nrequire('fs').rmSync('x')\nEOF", "python3 <<'EOF' <<< 'import os;os.remove(\"x\")'\nprint(1)\nEOF",
+  // Allowlist, not blocklist: an unlisted call in a stdin program stops too.
+  "python3 <<< '__import__(\"shutil\").rmtree(\"x\")'",
+  // Programs the shell rewrites before the interpreter sees them.
+  "python3 <<< \"$code\"", "python3 <<< $(cat f)", "python3 <<EOF\n$(cat f)\nEOF",
+  "python3 <<EOF\nprint(\"$x\")\nEOF", "python3 <<'E'OF\nprint(1)\nE\nimport os;os.remove('x')\nEOF",
+  // Unterminated heredoc: the program runs to end of input.
+  "python3 <<'EOF'\nimport os; os.remove(\"x\")",
+  // Structural positions.
+  "(python3 <<'EOF'\nimport os; os.remove(\"x\")\nEOF\n)", "if true; then python3 <<'EOF'\nimport os; os.remove(\"x\")\nEOF\nfi",
+  "x=$(python3 <<'EOF'\nimport os; os.remove(\"x\")\nEOF\n)", "case a in a) python3 <<'EOF'\nimport os; os.remove(\"x\")\nEOF\n;; esac",
+  "f() { python3 <<'EOF'\nimport os; os.remove(\"x\")\nEOF\n}; f", "echo $(case a in a) python3 <<'EOF'\nimport os; os.remove(\"x\")\nEOF\n;; esac)",
+  "ls; python3 <<< 'import os;os.remove(\"x\")'", "bash -c 'python3 <<< \"import os;os.remove(1)\"'",
+  // Interpreters with no reader allowlist: any stdin program stops.
+  "tclsh <<'EOF'\nputs hi\nEOF", "wish <<< 'puts hi'", "expect <<< 'spawn id'", "tclsh8.6 <<< 'puts hi'",
+  // A here-string must not open a heredoc that hides the next line.
+  "cat <<< 'E'\nrm -rf x\nE",
+];
+const STDIN_PROGRAM_READ_ONLY = [
+  "python3 <<< 'print(1)'", "node <<< 'console.log(1)'", "perl <<< 'print 1'",
+  "python3 - <<'EOF'\nprint(1)\nEOF", "python3 <<EOF\nprint(1)\nEOF", "(python3 <<'EOF'\nprint(1)\nEOF\n)",
+  "python3 -c 'print(1)' <<< 'hello'", "cat <<'EOF'\nimport os; os.remove(\"x\")\nEOF",
+  "grep x <<< 'os.remove(1)'", "cat <<< 'E'\nls\nE",
+];
+
+describe("here-string/heredoc interpreter programs (E-C)", () => {
+  it.each(STDIN_PROGRAM_MUTATING)("mutating: %s", (c) => expect(isDestructiveCommand(c)).toBe(true));
+  it.each(STDIN_PROGRAM_READ_ONLY)("read-only: %s", (c) => expect(isDestructiveCommand(c)).toBe(false));
+});

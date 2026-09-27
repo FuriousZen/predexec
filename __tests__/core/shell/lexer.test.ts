@@ -4,6 +4,8 @@ import { findDestructiveToken, isDestructiveCommand } from "../../../core/destru
 import {
   effectiveHead,
   lexShellWords,
+  maskHeredocBodies,
+  stdinLiterals,
   stripLeadingAssignmentsAndWrappers,
   tokenizeShellWords,
   WRAPPERS,
@@ -75,5 +77,27 @@ describe("assignment grammar (review round 1)", () => {
   it("resolves through builtin as a wrapper", () => {
     expect(WRAPPERS.has("builtin")).toBe(true);
     expect(effectiveHead("builtin export X=1")).toBe("export");
+  });
+});
+
+describe("here-strings and heredoc stdin literals", () => {
+  it("never reads a here-string's `<<` as a heredoc", () => {
+    expect(maskHeredocBodies("cat <<< 'E'\nrm -rf x\nE")).toBe("cat <<< 'E'\nrm -rf x\nE");
+  });
+
+  it("pairs each stdin literal with its owning simple command", () => {
+    expect(stdinLiterals("ls; x=$(python3 - <<'EOF'\nprint(1)\nEOF\n)")).toEqual([
+      { kind: "heredoc", command: "python3 -  ", text: "print(1)\n" },
+    ]);
+    expect(stdinLiterals("case a in a) node <<< 'console.log(1)' 2>&1;; esac")).toEqual([
+      { kind: "here-string", command: " node   2>&1", text: "console.log(1)" },
+    ]);
+  });
+
+  it("leaves other fds out and marks expanded text unknowable", () => {
+    expect(stdinLiterals("python3 3<<< x")).toEqual([]);
+    expect(stdinLiterals("python3 <<< \"$x\"").map((l) => l.text)).toEqual([null]);
+    expect(stdinLiterals("python3 <<E\n$(cat f)\nE").map((l) => l.text)).toEqual([null]);
+    expect(stdinLiterals("python3 <<'E'OF\nx\nE\nEOF").map((l) => l.text)).toEqual([null]);
   });
 });

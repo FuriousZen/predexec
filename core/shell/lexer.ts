@@ -4,7 +4,8 @@
  * PURE TS, imports nothing outside core/. Every shell-syntax question core and
  * the policy adapters ask goes through here: argv tokenizing (one tokenizer,
  * `lexShellWords`), pipeline/clause splitting, parenthesized-body and
- * substitution walking, heredoc masking, and wrapper/assignment stripping.
+ * substitution walking, heredoc masking, here-string/heredoc stdin literals, and
+ * wrapper/assignment stripping.
  *
  * This module deliberately does not know about policy syntax, precedence, or
  * verdicts. Hosts supply their wrapper vocabulary to
@@ -1438,29 +1439,60 @@ export function stripLeadingAssignmentsAndWrappers(
   return current;
 }
 
+/** One here-document the masker recognized, with its body located in the source. */
+export interface HeredocSpan {
+  /** Offset of the operator's first `<`. */
+  operator: number;
+  /** Offset one past the delimiter word. */
+  operandEnd: number;
+  delimiter: string;
+  /** A quoted delimiter (`'EOF'`, `"EOF"`) keeps the body literal; a bare one expands it. */
+  quoted: boolean;
+  /** `<<-`: leading tabs are stripped from body lines and the delimiter line. */
+  stripTabs: boolean;
+  /**
+   * False when the delimiter word goes on past what was parsed (`<<'E'OF`,
+   * `<<E"O"F`) or its quote never closes: the shell's delimiter then differs
+   * from the one matched here, so the located body is not the shell's.
+   */
+  simple: boolean;
+  bodyStart: number;
+  /** Offset of the delimiter line, or the input's end when unterminated. */
+  bodyEnd: number;
+  /** Offset one past the delimiter line; the input's end when unterminated. */
+  end: number;
+  terminated: boolean;
+}
+
+const HEREDOC_DELIMITER_FOLLOW_RE = /[\s;|&<>)]/;
+
 /**
- * Blank here-document bodies (keeping line breaks) so their text is data, not
- * command clauses: a literal `>` or `;` in a heredoc is not shell syntax.
+ * Locate every here-document operator and its body, line by line, with the
+ * quote model the masker has always used. `<<<` is a here-string, never a
+ * here-document: reading its trailing `<<` as one opened a heredoc whose
+ * "body" hid the command lines after it (`cat <<< 'E'` + `rm -rf x` + `E`).
  */
-export function maskHeredocBodies(cmd: string): string {
-  const chars = cmd.split("");
-  const ranges: Array<[number, number]> = [];
-  const pending: Array<{ delimiter: string; stripTabs: boolean; bodyStart: number }> = [];
+export function scanHeredocs(cmd: string): HeredocSpan[] {
+  const spans: HeredocSpan[] = [];
+  const pending: HeredocSpan[] = [];
   let quote: "'" | '"' | null = null;
   let lineStart = 0;
   while (lineStart < cmd.length) {
     const newline = cmd.indexOf("\n", lineStart);
     const lineEnd = newline < 0 ? cmd.length : newline;
+    const nextLine = newline < 0 ? cmd.length : newline + 1;
     if (pending.length > 0) {
       const candidate = cmd.slice(lineStart, lineEnd).replace(/\r$/, "");
       const expected = pending[0]!;
       const comparable = expected.stripTabs ? candidate.replace(/^\t+/, "") : candidate;
       if (comparable === expected.delimiter) {
-        ranges.push([expected.bodyStart, newline < 0 ? lineEnd : newline + 1]);
+        expected.bodyEnd = lineStart;
+        expected.end = nextLine;
+        expected.terminated = true;
         pending.shift();
-        if (pending.length > 0) pending[0]!.bodyStart = newline < 0 ? lineEnd : newline + 1;
+        if (pending.length > 0) pending[0]!.bodyStart = nextLine;
       }
-      lineStart = newline < 0 ? cmd.length : newline + 1;
+      lineStart = nextLine;
       continue;
     }
     for (let i = lineStart; i < lineEnd; i++) {
@@ -1471,33 +1503,306 @@ export function maskHeredocBodies(cmd: string): string {
         continue;
       }
       if (ch === "'" || ch === '"') { quote = ch; continue; }
-      if (ch !== "<" || cmd[i + 1] !== "<" || cmd[i + 2] === "<") continue;
+      if (ch !== "<" || cmd[i + 1] !== "<") continue;
+      if (cmd[i + 2] === "<") {
+        while (cmd[i + 1] === "<") i++;
+        continue;
+      }
       let cursor = i + 2;
       let stripTabs = false;
       if (cmd[cursor] === "-") { stripTabs = true; cursor++; }
       while (cursor < lineEnd && /[ \t]/.test(cmd[cursor]!)) cursor++;
       let delimiter = "";
       const delimiterQuote = cmd[cursor] === "'" || cmd[cursor] === '"' ? cmd[cursor++] : null;
+      let closed = delimiterQuote === null;
       while (cursor < lineEnd) {
         const next = cmd[cursor]!;
         if (delimiterQuote !== null) {
-          if (next === delimiterQuote) { cursor++; break; }
+          cursor++;
+          if (next === delimiterQuote) { closed = true; break; }
           delimiter += next;
-        } else if (/[A-Za-z0-9_]/.test(next)) delimiter += next;
-        else break;
+          continue;
+        }
+        if (!/[A-Za-z0-9_]/.test(next)) break;
+        delimiter += next;
         cursor++;
       }
-      if (delimiter.length > 0) pending.push({ delimiter, stripTabs, bodyStart: lineEnd + (newline < 0 ? 0 : 1) });
+      if (delimiter.length > 0) {
+        const follow = cmd[cursor];
+        const span: HeredocSpan = {
+          operator: i,
+          operandEnd: cursor,
+          delimiter,
+          quoted: delimiterQuote !== null,
+          stripTabs,
+          simple: closed && (follow === undefined || HEREDOC_DELIMITER_FOLLOW_RE.test(follow)),
+          bodyStart: nextLine,
+          bodyEnd: cmd.length,
+          end: cmd.length,
+          terminated: false,
+        };
+        spans.push(span);
+        pending.push(span);
+      }
       i = Math.max(i, cursor - 1);
     }
-    lineStart = newline < 0 ? cmd.length : newline + 1;
+    lineStart = nextLine;
   }
-  for (const [start, end] of ranges) {
-    for (let i = start; i < end; i++) {
+  return spans;
+}
+
+function maskHeredocSpans(cmd: string, spans: readonly HeredocSpan[]): string {
+  if (!spans.some((span) => span.terminated)) return cmd;
+  const chars = cmd.split("");
+  for (const { bodyStart, end, terminated } of spans) {
+    if (!terminated) continue;
+    for (let i = bodyStart; i < end; i++) {
       if (chars[i] !== "\n" && chars[i] !== "\r") chars[i] = " ";
     }
   }
   return chars.join("");
+}
+
+/**
+ * Blank here-document bodies (keeping line breaks) so their text is data, not
+ * command clauses: a literal `>` or `;` in a heredoc is not shell syntax.
+ */
+export function maskHeredocBodies(cmd: string): string {
+  return maskHeredocSpans(cmd, scanHeredocs(cmd));
+}
+
+/** Literal text a here-string or here-document feeds one simple command's stdin. */
+export interface StdinLiteral {
+  kind: "here-string" | "heredoc";
+  /**
+   * The simple command the redirection belongs to, with heredoc bodies blanked
+   * and its here-string/here-document redirections removed.
+   */
+  command: string;
+  /**
+   * What the command reads, or null when the shell rewrites it first
+   * (parameter/command expansion) or its extent cannot be read unambiguously.
+   */
+  text: string | null;
+}
+
+/** The body an unquoted-delimiter heredoc delivers, or null when the shell would expand it. */
+function heredocText(cmd: string, span: HeredocSpan): string | null {
+  if (!span.simple) return null;
+  let body = cmd.slice(span.bodyStart, span.bodyEnd);
+  if (span.stripTabs) body = body.replace(/^\t+/gm, "");
+  if (span.quoted) return body;
+  let text = "";
+  for (let i = 0; i < body.length; i++) {
+    const ch = body[i]!;
+    if (ch === "$" || ch === "`") return null;
+    if (ch === "\\") {
+      const next = body[i + 1];
+      if (next === "\n") { i++; continue; }
+      if (next === "$" || next === "`" || next === "\\") { text += next; i++; continue; }
+    }
+    text += ch;
+  }
+  return text;
+}
+
+/**
+ * A here-string operand starting at `start`: its end, and its value when the
+ * shell does not expand it (`<<< "$x"`, `<<< $(cat f)`, a backtick).
+ */
+function hereStringOperand(masked: string, start: number, inBacktick: boolean): { end: number; text: string | null } {
+  let j = start;
+  let dynamic = false;
+  let quote: "'" | '"' | "$'" | null = null;
+  while (j < masked.length) {
+    const c = masked[j]!;
+    if (quote === "'") { if (c === "'") quote = null; j++; continue; }
+    if (c === "\\") { j += 2; continue; }
+    if (quote === "$'") { if (c === "'") quote = null; j++; continue; }
+    if (quote === '"') {
+      if (c === '"') quote = null;
+      else if (c === "$" || c === "`") dynamic = true;
+      j++;
+      continue;
+    }
+    if (c === "'" || c === '"') { quote = c; j++; continue; }
+    if (c === "$" && masked[j + 1] === "'") { quote = "$'"; j += 2; continue; }
+    // Inside a backtick substitution an unescaped backtick can only close it.
+    if (c === "`" && inBacktick) break;
+    if (c === "`" || (c === "$" && masked[j + 1] === "(")) { dynamic = true; break; }
+    if (/[\s;|&<>()]/.test(c)) break;
+    if (c === "$") dynamic = true;
+    j++;
+  }
+  const end = Math.min(j, masked.length);
+  if (quote !== null || end === start || dynamic) return { end, text: null };
+  const lex = lexShellWords(masked.slice(start, end));
+  const word = lex.words[0];
+  if (!lex.complete || lex.words.length !== 1 || word === undefined || word.dynamic) return { end, text: null };
+  return { end, text: word.value };
+}
+
+interface StdinFrame {
+  /** Offset where the current simple command starts. */
+  start: number;
+  /** Here-string/here-document redirections of the current command, in order. */
+  redirects: Array<{ start: number; end: number }>;
+  pending: Array<{ kind: StdinLiteral["kind"]; text: string | null }>;
+  /** Open `case` commands, whose pattern `)` closes no group. */
+  caseDepth: number;
+}
+
+const COMMAND_PREFIX_ONLY_RE = /^(?:(?:if|then|elif|else|do|while|until|!|\{|\()\s+)*$/;
+const WORD_BOUNDARY_BEFORE_RE = /[\s;|&()`]/;
+
+/**
+ * Every here-string (`<<<`) and here-document (`<<`, `<<-`) that feeds a
+ * command's standard input (no fd, or fd 0), paired with the simple command it
+ * is attached to. One linear walk tracks quoting, `$(…)`/backtick/`<(…)`
+ * nesting, `(…)` groups, `{ …; }`, case patterns and command separators, so
+ * the owning command is found wherever it sits (`x=$(python3 <<E …)`,
+ * `case a in a) python3 <<E …`), not just at a pipeline segment's head.
+ */
+export function stdinLiterals(cmd: string): StdinLiteral[] {
+  const heredocs = scanHeredocs(cmd);
+  const byOperator = new Map(heredocs.map((span) => [span.operator, span]));
+  const masked = maskHeredocSpans(cmd, heredocs);
+  const out: StdinLiteral[] = [];
+  const newFrame = (start: number): StdinFrame => ({ start, redirects: [], pending: [], caseDepth: 0 });
+  let frame = newFrame(0);
+  let quote: '"' | null = null;
+  const stack: Array<{ kind: "substitution" | "backtick" | "group"; outer: StdinFrame; quote: '"' | null }> = [];
+
+  const finish = (end: number) => {
+    if (frame.pending.length > 0) {
+      let command = "";
+      let at = frame.start;
+      for (const redirect of frame.redirects) {
+        command += `${masked.slice(at, redirect.start)} `;
+        at = redirect.end;
+      }
+      command += masked.slice(at, Math.max(at, end));
+      for (const literal of frame.pending) out.push({ kind: literal.kind, command, text: literal.text });
+    }
+    frame.pending = [];
+    frame.redirects = [];
+    frame.start = end + 1;
+  };
+  const push = (kind: "substitution" | "backtick" | "group", start: number) => {
+    stack.push({ kind, outer: frame, quote });
+    frame = newFrame(start);
+    quote = null;
+  };
+  const pop = (at: number) => {
+    const top = stack.pop()!;
+    finish(at);
+    frame = top.outer;
+    quote = top.quote;
+    if (top.kind === "group") {
+      frame.pending = [];
+      frame.redirects = [];
+      frame.start = at + 1;
+    }
+  };
+  const wordStart = (i: number) => i === 0 || WORD_BOUNDARY_BEFORE_RE.test(masked[i - 1]!);
+  const keywordAt = (i: number, word: string) =>
+    masked.startsWith(word, i) && wordStart(i) && !/[A-Za-z0-9_]/.test(masked[i + word.length] ?? " ");
+
+  for (let i = 0; i < masked.length; i++) {
+    const ch = masked[i]!;
+    if (quote === '"') {
+      if (ch === "\\") { i++; continue; }
+      if (ch === '"') { quote = null; continue; }
+      if (ch === "$" && masked[i + 1] === "(") { push("substitution", i + 2); i++; continue; }
+      if (ch === "`") push("backtick", i + 1);
+      continue;
+    }
+    if (ch === "\\") { i++; continue; }
+    if (ch === "'") {
+      const close = masked.indexOf("'", i + 1);
+      i = close < 0 ? masked.length : close;
+      continue;
+    }
+    if (ch === "$" && masked[i + 1] === "'") {
+      let j = i + 2;
+      while (j < masked.length && masked[j] !== "'") j += masked[j] === "\\" ? 2 : 1;
+      i = j;
+      continue;
+    }
+    if (ch === '"') { quote = '"'; continue; }
+    if (ch === "$" && masked[i + 1] === "(") { push("substitution", i + 2); i++; continue; }
+    if (ch === "`") {
+      if (stack.at(-1)?.kind === "backtick") pop(i);
+      else push("backtick", i + 1);
+      continue;
+    }
+    if (ch === "(") {
+      const before = masked[i - 1];
+      if (before === "$" || before === "<" || before === ">") push("substitution", i + 1);
+      else { finish(i); push("group", i + 1); }
+      continue;
+    }
+    if (ch === ")") {
+      if (frame.caseDepth > 0) { finish(i); continue; }
+      if (stack.length > 0 && stack.at(-1)!.kind !== "backtick") pop(i);
+      else finish(i);
+      continue;
+    }
+    if (ch === ";" || ch === "\n" || ch === "\r") { finish(i); continue; }
+    if (ch === "&") {
+      const before = masked[i - 1];
+      if (before === ">" || before === "<" || masked[i + 1] === ">") continue;
+      finish(i);
+      continue;
+    }
+    if (ch === "|") {
+      if (masked[i - 1] === ">") continue;
+      finish(i);
+      continue;
+    }
+    if ((ch === "{" || ch === "}") && wordStart(i) && /[\s;&|)]|^$/.test(masked[i + 1] ?? "")) {
+      finish(i);
+      continue;
+    }
+    if (keywordAt(i, "case") && COMMAND_PREFIX_ONLY_RE.test(masked.slice(frame.start, i).trimStart())) {
+      frame.caseDepth++;
+      continue;
+    }
+    if (keywordAt(i, "esac") && frame.caseDepth > 0) {
+      frame.caseDepth--;
+      continue;
+    }
+    if (ch !== "<" || masked[i + 1] !== "<") continue;
+    // An fd number glued to the operator belongs to it only as a whole word.
+    let fdStart = i;
+    while (fdStart > frame.start && /[0-9]/.test(masked[fdStart - 1]!)) fdStart--;
+    if (fdStart < i && !(fdStart === 0 || WORD_BOUNDARY_BEFORE_RE.test(masked[fdStart - 1]!))) fdStart = i;
+    const fd = masked.slice(fdStart, i);
+    const stdin = fd === "" || /^0+$/.test(fd);
+    let end: number;
+    let literal: { kind: StdinLiteral["kind"]; text: string | null };
+    if (masked[i + 2] === "<") {
+      let operand = i + 2;
+      while (masked[operand] === "<") operand++;
+      while (operand < masked.length && /[ \t]/.test(masked[operand]!)) operand++;
+      const parsed = hereStringOperand(masked, operand, stack.at(-1)?.kind === "backtick");
+      end = parsed.end;
+      literal = { kind: "here-string", text: parsed.text };
+    } else {
+      const span = byOperator.get(i);
+      end = span ? span.operandEnd : i + (masked[i + 2] === "-" ? 3 : 2);
+      literal = { kind: "heredoc", text: span ? heredocText(cmd, span) : null };
+    }
+    frame.redirects.push({ start: fdStart, end });
+    if (stdin) frame.pending.push(literal);
+    i = end - 1;
+  }
+  finish(masked.length);
+  while (stack.length > 0) {
+    frame = stack.pop()!.outer;
+    finish(masked.length);
+  }
+  return out;
 }
 
 /**

@@ -44,6 +44,7 @@ import {
   normalizeEnvInvocation,
   parenthesizedBodies,
   splitCommandSegments,
+  stdinLiterals,
   tokenizeShellWords,
   WRAPPER_DURATION_RE,
   WRAPPER_OPTIONS_WITH_VALUE,
@@ -66,6 +67,7 @@ import {
 } from "./shell/env.ts";
 import {
   EVAL_WRITER_RE,
+  type InterpolationLanguage,
   LANGUAGE_EVAL_EARLY_LIMIT,
   MAX_LANGUAGE_ARGUMENT_LENGTH,
   executableLanguageView,
@@ -84,6 +86,7 @@ import {
   interpreterEvalPreflight,
   interpreterEvalPrograms,
   interpreterLanguage,
+  interpreterStdinProgram,
   isEvalInvocation,
   languageWordScanSegment,
   shellEvalPayload,
@@ -307,6 +310,47 @@ function interpreterEffectiveHead(segment: string): string | null {
 }
 
 /**
+ * One interpreter program (an inline `-c`/`-e` program, or a here-string or
+ * heredoc it reads on stdin): its exec/spawn and writer calls, then the
+ * reader allowlist. Null when every call is a known reader.
+ */
+function interpreterProgramToken(head: string, language: InterpolationLanguage, program: string): string | null {
+  if (program.length > MAX_LANGUAGE_ARGUMENT_LENGTH) return `${head} eval payload`;
+  const writer = scanLanguagePayload(program, language, {
+    depth: 0,
+    shellBodies: new Set(),
+    shellBodyCount: 0,
+    classifyShell: findDestructiveTokenInternal,
+  });
+  if (writer) return writer;
+  const view = executableLanguageView(program, language);
+  if (view === null) return `${head} eval payload`;
+  const fsWriter = EVAL_WRITER_RE.exec(view);
+  if (fsWriter) return fsWriter[0].trim();
+  const unlisted = interpreterReaderViolation(program, language);
+  if (unlisted) return `${head} eval: ${unlisted}`;
+  return null;
+}
+
+/**
+ * A here-string or heredoc on an interpreter with no inline program is that
+ * interpreter's program (`python3 <<< '…'`, `python3 - <<'EOF'`), classified
+ * like `-c`/`-e`. Text the shell expands first, or an interpreter with no
+ * reader allowlist (tclsh, wish, expect), is never read-only.
+ */
+function stdinProgramToken(cmd: string): string | null {
+  for (const literal of stdinLiterals(cmd)) {
+    const invocation = interpreterStdinProgram(literal.command);
+    if (invocation.kind === "none") continue;
+    if (invocation.kind === "unvetted" || literal.text === null) return `${invocation.head} stdin program`;
+    if (literal.text.length > LANGUAGE_EVAL_EARLY_LIMIT) return `oversized ${invocation.head} stdin program`;
+    const token = interpreterProgramToken(invocation.head, interpreterLanguage(invocation.head), literal.text);
+    if (token) return token;
+  }
+  return null;
+}
+
+/**
  * The classifier. Returns the offending token for the hard-stop message, or
  * null when the command is (heuristically) read-only.
  */
@@ -337,6 +381,10 @@ function findDestructiveTokenInternal(cmd: string, depth: number): string | null
 
   const redirect = REDIRECT_RE.exec(sanitized);
   if (redirect) return redirect[0].trim() || ">";
+
+  // Reads the unmasked command: a heredoc body is exactly what is being judged.
+  const stdinProgram = stdinProgramToken(cmd);
+  if (stdinProgram) return stdinProgram;
 
   const segments = splitCommandSegments(shellCommand);
 
@@ -559,20 +607,8 @@ function findDestructiveTokenInternal(cmd: string, depth: number): string | null
         const language = interpreterLanguage(head);
         const programs = extracted.join ? [extracted.programs.join("\n")] : extracted.programs;
         for (const program of programs) {
-          if (program.length > MAX_LANGUAGE_ARGUMENT_LENGTH) return `${head} eval payload`;
-          const writer = scanLanguagePayload(program, language, {
-            depth: 0,
-            shellBodies: new Set(),
-            shellBodyCount: 0,
-            classifyShell: findDestructiveTokenInternal,
-          });
-          if (writer) return writer;
-          const view = executableLanguageView(program, language);
-          if (view === null) return `${head} eval payload`;
-          const fsWriter = EVAL_WRITER_RE.exec(view);
-          if (fsWriter) return fsWriter[0].trim();
-          const unlisted = interpreterReaderViolation(program, language);
-          if (unlisted) return `${head} eval: ${unlisted}`;
+          const token = interpreterProgramToken(head, language, program);
+          if (token) return token;
         }
       }
     }

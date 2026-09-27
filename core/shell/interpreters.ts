@@ -238,6 +238,40 @@ export function interpreterEvalPrograms(segment: string): EvalPrograms {
   return result(false);
 }
 
+/**
+ * Interpreters with no reader allowlist: any program they read on stdin is
+ * unvetted code (`tclsh <<< 'exec id'`), so it is never read-only.
+ */
+const STDIN_UNVETTED_INTERPRETER_RE = /^(?:tclsh|wish|expect)\d*(?:\.\d+)*$/;
+
+export type StdinProgramInvocation =
+  | { kind: "none" }
+  | { kind: "program"; head: string }
+  | { kind: "unvetted"; head: string };
+
+/**
+ * Whether a simple command, given a here-string or here-document on stdin,
+ * runs that text as a program. An interpreter with no inline `-c`/`-e`
+ * program reads its program from stdin (`-` included); with an inline
+ * program, stdin is that program's data. A script or `-m` operand is not told
+ * apart: its stdin text is scanned as a program too, which can only over-stop.
+ * `program` means: scan the stdin text exactly like an inline program of
+ * `head`'s language.
+ */
+export function interpreterStdinProgram(command: string): StdinProgramInvocation {
+  const clause = stripShellControlPrefix(command);
+  const normalized = normalizeEnvInvocation(tokenizeShellWords(clause, ARGV));
+  if (!normalized.complete) return { kind: "unvetted", head: "ambiguous command" };
+  if (normalized.argv.length === 0) return { kind: "none" };
+  const rawHead = normalized.argv[0]!.replace(/^.*\//, "");
+  if (STDIN_UNVETTED_INTERPRETER_RE.test(rawHead)) return { kind: "unvetted", head: rawHead };
+  const head = interpreterFamily(rawHead);
+  if (!EVAL_INTERPRETERS.has(head)) return { kind: "none" };
+  const programs = interpreterEvalPrograms(clause);
+  if (programs.kind === "violation") return { kind: "unvetted", head };
+  return programs.kind === "eval" ? { kind: "none" } : { kind: "program", head };
+}
+
 export function interpreterEvalPayload(segment: string): string {
   const words = tokenizeShellWords(segment, ARGV);
   const normalized = normalizeEnvInvocation(words);
