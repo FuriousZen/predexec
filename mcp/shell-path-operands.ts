@@ -25,6 +25,8 @@ import {
 interface RawWord {
   value: string;
   raw: string;
+  /** A redirect whose target cannot be determined (R28): always unresolvable. */
+  unresolvable?: boolean;
   /** Taken from an option's `=value`. */
   inline?: boolean;
   /** git's `<rev>:<path>` object names and pathspecs resolve differently from shell paths. */
@@ -104,66 +106,113 @@ const INPUT_REDIRECT_RE = /^\d*<>?(?![<&(])/;
 const DUP_INPUT_REDIRECT_RE = /^\d*<&$/;
 const SKIP_NEXT_REDIRECT_RE = /^(?:\d*<<<?-?|\d*>>?|&>>?|\d*>\||\d*>&)$/;
 const OUTPUT_REDIRECT_RE = /^(?:\d*|&)>/;
-const REDIRECT_OPERATOR_RE = /^(?:<<<|<<-|<<|<>|<&|<|>>|>&|>\||>)/;
+const LEADING_OPERATOR_RE = /^(?:\d*(?:<<<|<<-|<<|<>|<&|<|>>|>&|>\||>)|&>>?)/;
+/** Constructs whose nested quoting the flat word lexer does not model. */
+const SUBSTITUTION_RE = /\$\(|`|\$\{|[<>]\(/;
+
+/** Where the angle brackets of one word's source text sit, by a flat quote scan. */
+interface AngleScan {
+  /** Offsets of unquoted `<` / `>`. */
+  unquoted: number[];
+  /** Count of `<` inside quotes. */
+  quotedLess: number;
+  /** An unterminated quote or escape. */
+  unbalanced: boolean;
+}
+
+function scanAngles(raw: string): AngleScan {
+  const unquoted: number[] = [];
+  let quotedLess = 0;
+  for (let i = 0; i < raw.length; i++) {
+    const ch = raw[i]!;
+    if (ch === "\\") {
+      if (i + 1 >= raw.length) return { unquoted, quotedLess, unbalanced: true };
+      i++;
+    } else if (ch === "'" || (ch === "$" && raw[i + 1] === "'")) {
+      // `'…'` is literal; `$'…'` honors backslash escapes (`\'` does not close it).
+      const ansi = ch === "$";
+      let j = ansi ? i + 2 : i + 1;
+      for (; j < raw.length && raw[j] !== "'"; j++) {
+        if (ansi && raw[j] === "\\") j++;
+        else if (raw[j] === "<") quotedLess++;
+      }
+      if (j >= raw.length) return { unquoted, quotedLess, unbalanced: true };
+      i = j;
+    } else if (ch === '"') {
+      let j = i + 1;
+      for (; j < raw.length && raw[j] !== '"'; j++) {
+        if (raw[j] === "\\") j++;
+        else if (raw[j] === "<") quotedLess++;
+      }
+      if (j >= raw.length) return { unquoted, quotedLess, unbalanced: true };
+      i = j;
+    } else if (ch === "<" || ch === ">") unquoted.push(i);
+  }
+  return { unquoted, quotedLess, unbalanced: false };
+}
+
+/** A token standing for a redirect whose target cannot be determined: it stops under read rules. */
+const unresolvableRedirect = (raw: string): RawWord => ({ value: raw, raw, unresolvable: true });
 
 /**
- * Space out every unquoted redirect operator so it is its own word: bash
+ * The segment's words, with redirect operators split out (R28). Word
+ * boundaries and quoting come from core's lexer (`lexShellWords`); bash
  * splits `cat<.env`, `cat -n<.env` and `x 2>/dev/null<.env` at the operator,
- * but the word lexer keeps them whole. A leading all-digit run (`2>`, `0<`)
- * or `&` (`&>`) stays with its operator, as in bash. Text inside `$(…)`,
- * `${…}`, backticks and process substitutions is left alone — those bodies
- * are inspected as commands of their own.
+ * which the word lexer keeps whole, so a word holding an unquoted `<`/`>` is
+ * split at it — using a quote scan of that word alone, which is exact because
+ * such a word is re-split only when it holds no substitution. Fail-safe: a
+ * word holding a `<` the scan cannot prove quoted — inside a word with a
+ * `$(…)`, backtick, `${…}` or process substitution, in a segment whose
+ * nested quoting the flat lexer may have misread, or with unbalanced quoting
+ * — becomes an unresolvable redirect, and the command stops under read rules.
  */
-function spaceRedirects(segment: string): string {
-  let out = "";
-  let quote: "'" | '"' | null = null;
-  let depth = 0;
-  let backtick = false;
-  for (let i = 0; i < segment.length; i++) {
-    const ch = segment[i]!;
-    if (quote === "'") {
-      out += ch;
-      if (ch === "'") quote = null;
+function redirectAwareTokens(segment: string): RawWord[] {
+  const lex = lexShellWords(segment);
+  const segmentSubstitutes = SUBSTITUTION_RE.test(segment);
+  const out: RawWord[] = [];
+  const valueOf = (raw: string): string => lexShellWords(raw).words.map((w) => w.value).join("");
+  for (const word of lex.words) {
+    const raw = segment.slice(word.start, word.end);
+    if (!raw.includes("<")) {
+      out.push({ value: word.value, raw });
       continue;
     }
-    if (ch === "\\") {
-      out += ch + (segment[i + 1] ?? "");
-      i++;
+    if (!lex.complete) {
+      out.push(unresolvableRedirect(raw));
       continue;
     }
-    if (ch === "`") backtick = !backtick;
-    else if (ch === "$" && (segment[i + 1] === "(" || segment[i + 1] === "{")) {
-      depth++;
-      out += ch + segment[i + 1];
-      i++;
-      continue;
-    } else if (depth > 0 && (ch === "(" || ch === "{")) depth++;
-    else if (depth > 0 && (ch === ")" || ch === "}")) depth--;
-    if (quote === '"') {
-      out += ch;
-      if (ch === '"' && depth === 0 && !backtick) quote = null;
+    if (/^[<>]\(/.test(raw)) {
+      // A process substitution: its body is inspected as a command of its own.
+      out.push(raw.slice(2).includes("<") ? unresolvableRedirect(raw) : { value: word.value, raw });
       continue;
     }
-    if (ch === "'" || ch === '"') {
-      quote = ch;
-      out += ch;
+    const op = LEADING_OPERATOR_RE.exec(raw)?.[0] ?? "";
+    const rest = raw.slice(op.length);
+    const scan = scanAngles(rest);
+    const restHasLess = rest.includes("<");
+    if (restHasLess && (scan.unbalanced || SUBSTITUTION_RE.test(rest) || (scan.quotedLess > 0 && segmentSubstitutes))) {
+      out.push(unresolvableRedirect(raw));
       continue;
     }
-    if ((ch !== "<" && ch !== ">") || depth > 0 || backtick) {
-      out += ch;
+    if (op !== "") out.push({ value: op, raw: op });
+    if (rest === "") continue;
+    if (scan.unquoted.length === 0 || !restHasLess) {
+      out.push(op === "" ? { value: word.value, raw } : { value: valueOf(rest), raw: rest });
       continue;
     }
-    if (segment[i + 1] === "(") {
-      depth++; // `<(…)` / `>(…)`: a process substitution, not a redirect
-      out += ch + "(";
-      i++;
-      continue;
+    // Split the rest at each unquoted operator (a digit run starting a piece stays with it, as in bash).
+    let spaced = "";
+    let at = 0;
+    for (let k = 0; k < scan.unquoted.length; k++) {
+      const pos = scan.unquoted[k]!;
+      if (pos < at) continue;
+      const operator = LEADING_OPERATOR_RE.exec(rest.slice(pos))![0];
+      spaced += `${rest.slice(at, pos)} ${operator} `;
+      at = pos + operator.length;
     }
-    const op = REDIRECT_OPERATOR_RE.exec(segment.slice(i))![0];
-    const fd = /(?:^|\s)(\d+|&)$/.exec(out);
-    const prefix = fd ? fd[1]! : "";
-    out = `${out.slice(0, out.length - prefix.length)} ${prefix}${op} `;
-    i += op.length - 1;
+    spaced += rest.slice(at);
+    spaced = spaced.replace(/(^|\s)(\d+) ([<>])/g, "$1$2$3");
+    for (const piece of lexShellWords(spaced).words) out.push({ value: piece.value, raw: spaced.slice(piece.start, piece.end) });
   }
   return out;
 }
@@ -222,11 +271,14 @@ function shellReadOperands(command: string, wrapperOptions?: WrapperInspectionOp
       for (const segment of splitCommandSegments(line)) {
         // Keep each word's source spelling: brace expansion must know which
         // braces were quoted or escaped (literal) — the value has lost that.
-        const spaced = spaceRedirects(segment);
-        const tokens: RawWord[] = lexShellWords(spaced).words.map((w) => ({ value: w.value, raw: spaced.slice(w.start, w.end) }));
+        const tokens = redirectAwareTokens(segment);
         const words: RawWord[] = [];
         for (let i = 0; i < tokens.length; i++) {
           const token = tokens[i]!;
+          if (token.unresolvable) {
+            operands.push(token);
+            continue;
+          }
           const input = INPUT_REDIRECT_RE.exec(token.raw);
           if (input) {
             // `<`, `N<`, `<>`: the next word (or an attached rest) is read.
@@ -521,6 +573,7 @@ function braceSequence(from: string, to: string, stepText: string | undefined): 
  * with braces AND quoting is unresolvable (fail closed) rather than guessed.
  */
 function resolveShellOperand(word: RawWord, cwd: string, home: string, afterCd: boolean, root: string): string[] | { unresolved: string } {
+  if (word.unresolvable) return { unresolved: word.raw };
   const operand = word.value;
   if (operand === "-" || operand === "") return [];
   if (/[$`]/.test(operand)) return { unresolved: operand };

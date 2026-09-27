@@ -1260,3 +1260,99 @@ describe("Task 7 fix round 1: attached redirects/option values, POSIX classes, i
     expect(r.transcript).not.toContain("TOKEN=1");
   });
 });
+
+describe("Task 7 fix round 2: lexer-derived redirects, perl @ARGV (Claude)", () => {
+  let tmp: string;
+  afterEach(() => tmp && rmSync(tmp, { recursive: true, force: true }));
+  const setup = () => {
+    tmp = realpathSync(mkdtempSync(join(tmpdir(), "px-claude-t7f2-")));
+    const repo = join(tmp, "repo");
+    const home = join(tmp, "home");
+    const managed = join(tmp, "managed");
+    for (const dir of [join(repo, ".claude"), join(repo, ".git"), join(home, ".claude"), managed]) mkdirSync(dir, { recursive: true });
+    writeFileSync(join(repo, ".env"), "TOKEN=1\n");
+    writeFileSync(join(repo, "README.md"), "hello\n");
+    writeFileSync(join(repo, ".claude", "settings.json"), JSON.stringify({ permissions: { deny: ["Read(./.env)"] } }));
+    const check = createClaudeHostPolicyChecker(repo, {
+      env: { CLAUDE_CONFIG_DIR: join(home, ".claude") } as NodeJS.ProcessEnv,
+      managedDir: managed,
+      home,
+      managedPolicySources: () => [],
+    });
+    return (command: string) => check(command, { cwd: repo, sessionRoot: repo });
+  };
+  const STOP = /^\.\/\.env$|unresolvable shell read operand/;
+
+  it.each([
+    'x=`echo "hi"` cat<.env',
+    'x=$(echo "(") cat<.env',
+    'x="$(echo "(")" cat<.env',
+    "x=${y:-(} cat<.env",
+    'cat <<<"$(echo "(")"<.env',
+  ])("reported desync `%s` stops", (command) => {
+    expect(setup()(command)).toMatch(STOP);
+  });
+
+  const PREFIXES = [
+    'x=`echo "hi"` ',
+    "x=`echo '('` ",
+    'x=$(echo "(") ',
+    "x=$(echo ')') ",
+    'x="$(echo "(")" ',
+    'x="$(echo ")")" ',
+    "x=${y:-(} ",
+    "x=${y:-)} ",
+    'x="${y:-"}"}" ',
+    'x="`echo \\"(\\"`" ',
+    "x=$((1<2)) ",
+    'x="a<b" ',
+    "x='a<b' ",
+    '[[ a < b ]] && ',
+    'cat <<<"$(echo "(")" && ',
+    "cat <<<'(' && ",
+    "diff <(echo a) <(echo b); ",
+    "",
+  ];
+  const FORMS = ["cat<.env", "cat -n<.env", "cat 0<.env", "cat 2>/dev/null<.env", "head<'.env'", "cat<\"$PWD/.env\"", "column 3<.env"];
+  const ROWS = PREFIXES.flatMap((prefix) => FORMS.map((form) => prefix + form));
+  it("every prefix x attached-< combination stops", () => {
+    const check = setup();
+    const leaks = ROWS.filter((command) => !STOP.test(check(command) ?? ""));
+    expect(leaks).toEqual([]);
+  });
+
+  it.each([
+    `perl -e 'local @ARGV=(".env"); print <>'`,
+    `perl -e '@ARGV=(".env"); print <>'`,
+    `perl -e '@ARGV=(".env"); print <<>>'`,
+    `perl -e '@ARGV=(".env"); print <ARGV>'`,
+    `perl -e 'local(@ARGV) = (".env"); print <>'`,
+    `perl -e '@ARGV = qw(.env); print <>'`,
+    `perl -e '@ARGV = ("README.md", ".env"); print while <>'`,
+  ])("perl @ARGV read `%s` stops naming the rule", (command) => {
+    expect(setup()(command)).toBe("./.env");
+  });
+
+  it.each([
+    `perl -e 'local @ARGV=(".e"."nv"); print <>'`,
+    `perl -e 'push @ARGV, ".env"; print <>'`,
+    `perl -e 'unshift(@ARGV, ".env"); print <ARGV>'`,
+    `perl -e '$ARGV[0] = ".env"; print <>'`,
+    `perl -e '@ARGV = split / /, "a .env"; print <>'`,
+    `perl -e '*ARGV = [".env"]; print <>'`,
+  ])("perl @ARGV assignment `%s` is unresolvable", (command) => {
+    expect(setup()(command)).toMatch(/unresolvable/);
+  });
+
+  it.each([
+    `perl -e '@ARGV=("README.md"); print <>'`,
+    `perl -e 'print scalar(@ARGV)'`,
+    "cat README.md",
+    "wc -l < README.md",
+    "echo 'a<b' README.md",
+    'grep -c "<" README.md',
+    "diff <(sort README.md) <(sort README.md)",
+  ])("allows `%s`", (command) => {
+    expect(setup()(command)).toBeNull();
+  });
+});

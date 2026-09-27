@@ -20,6 +20,9 @@ describe("inlineProgramReadPaths (R27(c))", () => {
     [`python3 -c "# open('.env')\nprint(1)"`, []],
     [`python3 -c "print('open(.env)')"`, []],
     ["cat .env", []],
+    [`perl -e 'local @ARGV=(".env"); print <>'`, [".env"]],
+    [`perl -e '@ARGV = qw(a .env); print <<>>'`, ["a", ".env"]],
+    [`perl -e 'print scalar(@ARGV)'`, []],
   ])("%s reads %j", (command, paths) => {
     expect(inlineProgramReadPaths(command)).toEqual({ paths, unresolved: null });
   });
@@ -30,6 +33,10 @@ describe("inlineProgramReadPaths (R27(c))", () => {
     `node -e "const p='.env'; console.log(require('fs').readFileSync(p,'utf8'))"`,
     `perl -e 'open(F, $ARGV[0])'`,
     `ruby -e 'puts File.read ".env"'`,
+    `perl -e 'local @ARGV=(".e"."nv"); print <>'`,
+    `perl -e 'push @ARGV, ".env"; print <>'`,
+    `perl -e '$ARGV[0] = ".env"; print <>'`,
+    `perl -e '*ARGV = [".env"]; print <>'`,
   ])("%s is unresolvable", (command) => {
     expect(inlineProgramReadPaths(command).unresolved).not.toBeNull();
   });

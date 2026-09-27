@@ -173,6 +173,10 @@ function programReads(program: Program, out: string[]): string | null {
       }
     }
   }
+  if (language === "perl") {
+    const why = perlArgvReads(text, view, syntax, out);
+    if (why !== null) return why;
+  }
   if (language === "node") {
     // `require('./x.json')` reads (and parses) that file.
     for (const match of view.matchAll(/(?<![\w$.])require\s*\(/g)) {
@@ -182,6 +186,59 @@ function programReads(program: Program, out: string[]): string | null {
       if (name === null) return "require with a non-literal argument";
       if (name.startsWith(".") || name.startsWith("/")) out.push(name);
     }
+  }
+  return null;
+}
+
+/** Closing delimiter for a perl `qw` opener. */
+const QW_CLOSERS: Record<string, string> = { "(": ")", "[": "]", "{": "}", "<": ">" };
+
+/**
+ * Perl's `@ARGV` channel (R28): `<>`, `<<>>` and `<ARGV>` open every element
+ * of `@ARGV` as a file, so a program that fills `@ARGV` itself reads those
+ * paths. A list assignment of static literals (`@ARGV = (".env")`,
+ * `local @ARGV = qw(a b)`) yields its paths; any other way of changing
+ * `@ARGV` (push/unshift/splice, element or `$#ARGV` assignment, a computed
+ * list, a glob or reference alias) is unresolvable. Command-line file
+ * arguments are shell operands, checked by the caller.
+ */
+function perlArgvReads(
+  text: string,
+  view: string,
+  syntax: { hashComments: boolean; slashComments: boolean },
+  out: string[],
+): string | null {
+  if (!/ARGV/.test(view)) return null;
+  if (/\b(?:push|unshift|splice)\s*\(?\s*@ARGV\b/.test(view)) return "@ARGV modified in place";
+  if (/\$#?ARGV\s*(?:\[[^\]]*\]\s*)?(?:[-+*\/.x|&^]|\*\*|\/\/|<<|>>|&&|\|\|)?=(?![=~])/.test(view)) return "$ARGV element assigned";
+  if (/\*ARGV\b|\\\s*@ARGV\b|@\{\s*\\?\s*@?ARGV/.test(view)) return "@ARGV aliased";
+  for (const match of view.matchAll(/@ARGV\s*\)?\s*=(?![=~])/g)) {
+    let at = match.index! + match[0].length;
+    // Skip spaces in the SOURCE: the view blanks a `qw(...)` literal entirely.
+    while (at < text.length && /\s/.test(text[at]!)) at++;
+    if (view[at] === "(") {
+      const args = captureLanguageCall(text, at, syntax);
+      const fields = args === null ? null : splitTopLevelArguments(args, syntax);
+      if (fields === null) return "@ARGV list";
+      for (const field of fields) {
+        if (field.trim() === "") continue;
+        const path = staticString(field, "perl");
+        if (path === null) return `@ARGV element ${field.trim().slice(0, 64)}`;
+        out.push(path);
+      }
+      continue;
+    }
+    const qw = /^qw\s*(\S)/.exec(text.slice(at));
+    if (qw) {
+      const open = qw[1]!;
+      const close = QW_CLOSERS[open] ?? open;
+      const bodyStart = at + qw[0].length;
+      const end = text.indexOf(close, bodyStart);
+      if (end === -1) return "@ARGV qw list";
+      out.push(...text.slice(bodyStart, end).split(/\s+/).filter((word) => word !== ""));
+      continue;
+    }
+    return "@ARGV assigned a computed list";
   }
   return null;
 }

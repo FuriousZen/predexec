@@ -570,3 +570,27 @@ describe("Task 7 fix round 1 (Antigravity)", () => {
     expect(prep()(command)).toBeNull();
   });
 });
+
+describe("Task 7 fix round 2 (Antigravity)", () => {
+  const prep = () => {
+    const c = checker({ permissions: { deny: ["read_file(.env)"] } });
+    writeFileSync(join(c.ws, ".env"), "TOKEN=1\n");
+    writeFileSync(join(c.ws, "README.md"), "hello\n");
+    return c.run;
+  };
+  it.each([
+    'x=`echo "hi"` cat<.env',
+    'x=$(echo "(") cat<.env',
+    'x="$(echo "(")" cat<.env',
+    "x=${y:-(} cat<.env",
+    'cat <<<"$(echo "(")"<.env',
+    `perl -e 'local @ARGV=(".env"); print <>'`,
+    `perl -e '@ARGV=(".env"); print <<>>'`,
+    `perl -e 'local @ARGV=(".e"."nv"); print <>'`,
+  ])("read_file(.env) deny stops `%s`", (command) => {
+    expect(prep()(command)).toMatch(/deny: read_file\(\.env\)/);
+  });
+  it.each([`perl -e '@ARGV=("README.md"); print <>'`, "wc -l < README.md"])("allows `%s`", (command) => {
+    expect(prep()(command)).toBeNull();
+  });
+});
