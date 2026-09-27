@@ -132,6 +132,8 @@ function matchBrackets(text: string): Int32Array {
 
 interface ArithmeticRanges {
   identifiers: string[];
+  /** The raw text of every covered arithmetic run. */
+  covered: string[];
   /** Variables whose values the raw text uses as a name: `${!c}`, `[[ -v $c ]]`. */
   nameReferences: string[];
   /** True when a command substitution's output lands in an arithmetic context. */
@@ -236,6 +238,7 @@ function arithmeticRangeIdentifiers(text: string): ArithmeticRanges {
   }
   return {
     identifiers: covered.flatMap(identifiers),
+    covered,
     nameReferences,
     substitution,
     nameSubstitution: names.substitution,
@@ -311,6 +314,10 @@ interface Flow {
   dataCalls: Set<string>;
   /** Every assignment's name and value identifiers, for the integer pass. */
   assignments: Array<{ name: string; values: string[] }>;
+  /** Raw arithmetic text evaluated at word level: `let` operands, integer-declared assignment values. */
+  arithmeticTexts: string[];
+  /** Every assignment's name and raw value, for the integer pass. */
+  rawAssignments: Array<{ name: string; value: string }>;
   complete: boolean;
 }
 
@@ -337,6 +344,7 @@ function recordAssignment(flow: Flow, segment: string, word: ShellWord, intDecla
   const values = identifiers(rawValue);
   for (const from of values) addDependency(flow, name, from);
   flow.assignments.push({ name, values });
+  flow.rawAssignments.push({ name, value: rawValue });
   if (intDeclared) {
     flow.integerNames.add(name);
     flow.arithmetic.push(...values);
@@ -454,6 +462,7 @@ function scanSegment(flow: Flow, rawSegment: string): void {
     case "let":
       for (const word of args) {
         flow.arithmetic.push(...identifiers(rawWord(segment, word)));
+        flow.arithmeticTexts.push(rawWord(segment, word));
         if (SUBSTITUTION_START_RE.test(rawWord(segment, word))) flow.substitution = true;
       }
       break;
@@ -574,7 +583,7 @@ function taintedNames(flow: Flow): Set<string> {
  * `"arithmetic over data-derived variable c"` or
  * `"data-derived variable c used as a variable name"`, or null when it does not.
  */
-export function findTaintedEvaluation(command: string): string | null {
+function analyze(command: string): { ranges: ArithmeticRanges; flow: Flow } {
   const ranges = arithmeticRangeIdentifiers(command);
   const flow: Flow = {
     sources: new Set(),
@@ -588,6 +597,8 @@ export function findTaintedEvaluation(command: string): string | null {
     functions: new Set(),
     dataCalls: new Set(),
     assignments: [],
+    arithmeticTexts: [],
+    rawAssignments: [],
     complete: ranges.complete,
   };
   const tree = inspectCommandSubstitutionTree(command);
@@ -595,6 +606,36 @@ export function findTaintedEvaluation(command: string): string | null {
   for (const body of tree.commands) {
     for (const segment of splitCommandSegments(body)) scanSegment(flow, segment);
   }
+  return { ranges, flow };
+}
+
+/** `NAME op= …`, `NAME++`/`NAME--`, `++NAME`/`--NAME` (not `==`, `<=`, `>=`, `!=`). */
+const ARITHMETIC_ASSIGNMENT_RE =
+  /(?<![0-9A-Za-z_#$])([A-Za-z_][A-Za-z0-9_]*)\s*(?:\[[^\]]*\]\s*)?(?:(?:<<|>>|[-+*\/%&^|])?=(?!=)|\+\+|--)|(?:\+\+|--)\s*([A-Za-z_][A-Za-z0-9_]*)/g;
+
+/**
+ * R44: the names an arithmetic context assigns — every context
+ * findTaintedEvaluation knows (`$((…))`, `((…))`, `$[…]`, `let`, `[[ … -eq … ]]`
+ * operands, array subscripts, `${x:off:len}`, and assignments to
+ * integer-declared names). `complete` is false when a context could not be
+ * delimited; a caller then treats the command as assigning.
+ */
+export function arithmeticAssignedNames(command: string): { names: string[]; complete: boolean } {
+  const { ranges, flow } = analyze(command);
+  const texts = [...ranges.covered, ...flow.arithmeticTexts];
+  for (const { name, value } of flow.rawAssignments) if (flow.integerNames.has(name)) texts.push(value);
+  const names: string[] = [];
+  const complete = ranges.complete && flow.complete;
+  for (const text of texts) {
+    for (const match of text.matchAll(ARITHMETIC_ASSIGNMENT_RE)) names.push(match[1] ?? match[2]!);
+    // Undelimited: every name in reach may be an assignment target.
+    if (!complete) names.push(...(text.match(IDENTIFIER_RE) ?? []));
+  }
+  return { names, complete };
+}
+
+export function findTaintedEvaluation(command: string): string | null {
+  const { ranges, flow } = analyze(command);
   if (flow.callback) return "mapfile callback evaluates a command";
   if (ranges.substitution || flow.substitution) return "arithmetic over command substitution output";
   if (ranges.nameSubstitution || flow.nameSubstitution) return "command substitution output used as a variable name";

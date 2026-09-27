@@ -89,7 +89,7 @@ import {
 import {
   interpreterReaderViolation,
 } from "./shell/reader-allowlists.ts";
-import { findTaintedEvaluation } from "./shell/taint.ts";
+import { arithmeticAssignedNames, findTaintedEvaluation } from "./shell/taint.ts";
 import { perlDataFedHazard, perlMagicOpenHazard, perlStdinProgramHazard } from "./shell/perl-magic-open.ts";
 import {
   EVAL_INTERPRETERS,
@@ -557,9 +557,11 @@ const VARIABLE_WRITING_HEADS = new Set([
  */
 function environmentTouched(cmd: string, commands: readonly SimpleCommand[]): boolean {
   if (/\$\{[A-Za-z_][A-Za-z0-9_]*(?:\[[^\]]*\])?:?=/.test(cmd)) return true;
+  // R44: an assignment in any arithmetic context (see taint.ts).
+  const arithmetic = arithmeticAssignedNames(cmd);
+  if (!arithmetic.complete || arithmetic.names.length > 0) return true;
   for (const { text } of commands) {
     if (/^(?:for|select)\s/.test(text)) return true;
-    if (text.startsWith("((") && /[^=!<>]=(?!=)|\+\+|--/.test(text)) return true;
     const normalized = normalizeEnvInvocation(tokenizeShellWords(text, ARGV));
     if (!normalized.complete || normalized.assignments.length > 0) return true;
     const head = normalized.argv[0]?.replace(/^.*\//, "");

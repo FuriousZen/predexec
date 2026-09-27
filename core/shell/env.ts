@@ -20,6 +20,7 @@ import {
   lessEnvironmentWrite,
   MAN_COMMAND_ENV,
 } from "./heads.ts";
+import { arithmeticAssignedNames } from "./taint.ts";
 
 /**
  * Directories whose executables are system or package-manager installs, not
@@ -90,6 +91,17 @@ export const DANGEROUS_ENV: ReadonlySet<string> = new Set([
   "GOFLAGS",
   "MAKEFLAGS",
   "MFLAGS",
+  // R44: where tools find their configuration (git's ~/.gitconfig, zsh's
+  // startup files, every XDG-config reader).
+  "HOME",
+  "ZDOTDIR",
+  "XDG_CONFIG_HOME",
+  "XDG_DATA_HOME",
+  "XDG_CACHE_HOME",
+  "XDG_STATE_HOME",
+  "XDG_RUNTIME_DIR",
+  "XDG_CONFIG_DIRS",
+  "XDG_DATA_DIRS",
 ]);
 
 /**
@@ -222,8 +234,9 @@ export function isCommandBearingName(name: string): boolean {
 /**
  * R43 (a): command-bearing names written by constructs that are not an
  * assignment word or a builtin's argv — a `for`/`select` loop variable, a
- * `${NAME:=…}`/`${NAME=…}` expansion, and any variable named inside
- * arithmetic (`(( PATH = 0 ))`, `$(( … ))`, `$[ … ]`). `loopHeaders` are the
+ * `${NAME:=…}`/`${NAME=…}` expansion, and any variable assigned in an
+ * arithmetic context (`(( PATH = 0 ))`, `[[ 1 -eq PATH=0 ]]`, `a[PATH=0]`,
+ * `${x:PATH=0}`, an integer-declared name's value; see taint.ts). `loopHeaders` are the
  * command texts that start with `for`/`select` (from the shared walker). The
  * expansion and arithmetic scans read the raw text, quotes included, which
  * can only over-stop.
@@ -236,16 +249,9 @@ export function commandBearingNameWrite(text: string, loopHeaders: readonly stri
   for (const match of text.matchAll(/\$\{([A-Za-z_][A-Za-z0-9_]*)(?:\[[^\]]*\])?:?=/g)) {
     if (commandBearingEnvironment(match[1]!, undefined)) return match[1]!;
   }
-  for (const [open, close] of [["((", "))"], ["$[", "]"]] as const) {
-    // indexOf pairs, not a lazy regex: a run of unclosed `((` stays linear.
-    for (let at = text.indexOf(open); at !== -1; at = text.indexOf(open, at)) {
-      const end = text.indexOf(close, at + open.length);
-      if (end === -1) break;
-      for (const name of text.slice(at + open.length, end).match(/[A-Za-z_][A-Za-z0-9_]*/g) ?? []) {
-        if (commandBearingEnvironment(name, undefined)) return name;
-      }
-      at = end + close.length;
-    }
+  // R44: every arithmetic context taint.ts knows, and the names it assigns.
+  for (const name of arithmeticAssignedNames(text).names) {
+    if (commandBearingEnvironment(name, undefined)) return name;
   }
   return null;
 }

@@ -79,7 +79,8 @@ function allowedOption(args: readonly string[], i: number, ...sets: ReadOptions[
   const word = args[i]!;
   const eq = word.startsWith("--") ? word.indexOf("=") : -1;
   const name = eq === -1 ? word : word.slice(0, eq);
-  if (eq === -1 && sets.some((set) => set.flags?.includes(word))) return i;
+  // A listed flag may itself hold `=` (`--paging=never`).
+  if (sets.some((set) => set.flags?.includes(word))) return i;
   if (!sets.some((set) => set.values?.includes(name))) return -1;
   if (eq !== -1) return i;
   return i + 1 < args.length ? i + 1 : -1;
@@ -810,24 +811,13 @@ export const READ_ONLY_HEAD_WRITES: Record<string, ReadOnlyHeadWriteCheck> = {
   // holding x/X stops even when it is an option value (`-tx`): fail closed.
   fd: fdWrite,
   fdfind: fdWrite,
-  // -C/--compile writes a compiled magic file; -m/--magic-file loads a magic
-  // source, which is what -C compiles (R43: any write/compile flag stops).
-  file: (args) => {
-    for (const arg of args) {
-      if (arg === "--") break;
-      if (/^--(?:compile|magic-file)(?:=|$)/.test(arg)) return `file ${arg.split("=")[0]}`;
-      if (!/^-[^-]/.test(arg)) continue;
-      for (const letter of arg.slice(1)) {
-        if (letter === "C" || letter === "m") return `file -${letter}`;
-        // -f/-F/-e/-P take the rest of the cluster as their value.
-        if ("fFeP".includes(letter)) break;
-      }
-    }
-    return null;
-  },
+  // R44: an option allowlist. -C/--compile writes, -m/--magic-file loads a
+  // magic source, -z/-Z run decompressors, -p restores (writes) access times,
+  // -S drops the sandbox; long options are matched exactly (no abbreviations).
+  file: fileWrite,
   date: dateWrite,
-  // Any operand (or -F FILE) sets the host name.
-  hostname: (args) => (args.some((arg) => !arg.startsWith("-") || /^-[^-]*F|^--file(?:=|$)/.test(arg)) ? "hostname set" : null),
+  // Any operand, -F FILE, or any long option (`--file=`, abbreviable) may set the host name.
+  hostname: (args) => (args.some((arg) => !arg.startsWith("-") || arg.startsWith("--") || /^-[^-]*F/.test(arg)) ? "hostname set" : null),
   // BSD/macOS base64 writes -o/--output FILE.
   base64: (args) => {
     for (const arg of args) {
@@ -1200,6 +1190,40 @@ function dateWrite(args: string[]): string | null {
       continue;
     }
     return `date ${arg}`;
+  }
+  return null;
+}
+
+const FILE_FLAG_LETTERS = "bcdEhiIkLlNnrs0v";
+const FILE_VALUE_LETTERS = "eFPf";
+const FILE_LONG_FLAGS = new Set([
+  "--brief", "--debug", "--no-dereference", "--dereference", "--mime", "--mime-type", "--mime-encoding", "--keep-going",
+  "--list", "--no-pad", "--no-buffer", "--raw", "--special-files", "--print0", "--version", "--help", "--extension",
+  "--apple", "--checking-printout",
+]);
+const FILE_LONG_VALUES = new Set(["--exclude", "--exclude-quiet", "--separator", "--parameter", "--files-from"]);
+function fileWrite(args: string[]): string | null {
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i]!;
+    if (arg === "--") break;
+    if (arg.startsWith("--")) {
+      const name = arg.split("=")[0]!;
+      if (FILE_LONG_FLAGS.has(arg)) continue;
+      if (FILE_LONG_VALUES.has(name)) {
+        if (!arg.includes("=")) i++;
+        continue;
+      }
+      return `file ${name}`;
+    }
+    if (!arg.startsWith("-") || arg === "-") continue;
+    for (let j = 1; j < arg.length; j++) {
+      const letter = arg[j]!;
+      if (FILE_VALUE_LETTERS.includes(letter)) {
+        if (j === arg.length - 1) i++;
+        break;
+      }
+      if (!FILE_FLAG_LETTERS.includes(letter)) return `file -${letter}`;
+    }
   }
   return null;
 }

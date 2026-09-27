@@ -340,3 +340,39 @@ describe("R43 (e)–(h) — brew paths, file compile, date/hostname set, cargo t
     "date -r 0", "hostname", "hostname -s", "brew info node", "brew info python@3.12"])(
     "%s stays read-only", (c) => expect(findDestructiveToken(c)).toBeNull());
 });
+
+// Fix round 2 (R44).
+describe("R44 (a) — assignments in every arithmetic context", () => {
+  it.each([
+    "[[ 1 -eq PATH=0 ]]; ls", "echo ${a[PATH=0]}; ls", "a[PATH=0]=1; ls", "declare -i n; n=PATH=0; ls",
+    "echo ${x:PATH=0}; ls", "echo $((KUBECONFIG=0)); kubectl get pods", "[[ 1 -eq HOME=0 ]]; kubectl get pods",
+    "echo $((HOME=0)); gh pr view 1", "echo ${a[HOME=0]}; curl -s https://x", "(( x = 1 )); kubectl get pods",
+    "echo $((i++)); gh pr list", "echo $[y+=2]; docker ps", "a[i=1]=x; pip list",
+  ])("%s is mutating", (c) => expect(isDestructiveCommand(c)).toBe(true));
+  it.each(["[[ 1 -eq 1 ]] && ls", "echo $((1 + 2)); kubectl get pods", "[[ $a -le 3 ]] && gh pr list",
+    "echo ${a[1]}; docker ps", "(( x == 1 )) && curl -s https://x", "echo ${x:1:2}; ls"])(
+    "%s stays read-only", (c) => expect(findDestructiveToken(c)).toBeNull());
+});
+
+describe("R44 (b) — HOME and XDG base directories are command-bearing", () => {
+  it.each([
+    ["export HOME=.; git log", "HOME"], ["HOME=. git log", "HOME"], ["XDG_CONFIG_HOME=. git log", "XDG_CONFIG_HOME"],
+    ["env ZDOTDIR=. ls", "ZDOTDIR"], ["export XDG_DATA_DIRS=.; ls", "XDG_DATA_DIRS"], ["unset HOME; ls", "HOME"],
+    ["read XDG_CACHE_HOME < f", "XDG_CACHE_HOME"], ["XDG_RUNTIME_DIR=x ls", "XDG_RUNTIME_DIR"],
+    ["XDG_STATE_HOME=x ls", "XDG_STATE_HOME"], ["XDG_CONFIG_DIRS=x ls", "XDG_CONFIG_DIRS"], ["XDG_DATA_HOME=x ls", "XDG_DATA_HOME"],
+  ])("%s -> %s", (c, token) => expect(findDestructiveToken(c)).toBe(token));
+});
+
+describe("R44 (c) — file and hostname options are allowlists", () => {
+  it.each(["file --comp f", "file --co f", "file --mag=m f", "file -z f", "file -Z f", "file -p f", "file -S f",
+    "file --uncompress f", "file --no-sandbox f", "hostname --fil=x", "hostname --file=x", "hostname --long"])(
+    "%s is mutating", (c) => expect(isDestructiveCommand(c)).toBe(true));
+  it.each(["file -b f", "file -bi f", "file --mime-type f", "file -L f", "file -e ascii f", "file -F : f", "file -- -x",
+    "hostname -s", "hostname -f"])("%s stays read-only", (c) => expect(findDestructiveToken(c)).toBeNull());
+});
+
+describe("R44 (d) — listed options containing `=`", () => {
+  it.each(["bat --paging=never f", "bat -P f"])("%s stays read-only", (c) => expect(findDestructiveToken(c)).toBeNull());
+  it.each(["bat --paging=always f", "bat --paging=never --pager=x f"])("%s is mutating", (c) =>
+    expect(isDestructiveCommand(c)).toBe(true));
+});
