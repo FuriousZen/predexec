@@ -150,7 +150,7 @@ const POLICY_PARAGRAPH: Readonly<Record<SkillHarness, string | null>> = Object.f
   claude:
     "Permissions: shell commands and read/grep/find/ls tool ops are re-checked against your Claude Code permission rules. " +
     "A deny OR ask match hard-stops the walk (`policyStop`), because predexec cannot prompt mid-walk — run that step with your own Bash/Read tool instead. " +
-    "`Read(...)` deny rules use gitignore-style paths and also cover shell readers (cat, head, …).",
+    "`Read(...)` deny rules use gitignore-style paths and also cover every shell command's path operands.",
   codex:
     "Permissions: shell commands are re-checked against your Codex execpolicy rules (`/etc/codex/rules`, `~/.codex/rules`, and a trusted project's `.codex/rules`; most-restrictive wins). " +
     "A forbidden OR prompt match hard-stops the walk (`policyStop`), because predexec cannot prompt mid-walk — run that step with your own shell tool instead. " +
@@ -167,6 +167,10 @@ const POLICY_PARAGRAPH: Readonly<Record<SkillHarness, string | null>> = Object.f
     "Under `toolPermission: \"strict\"` every step needs a matching allow, `allowNonWorkspaceAccess: false` stops tool ops outside the workspace, " +
     "and an unreadable settings file stops everything until it is fixed.",
 });
+
+/** E-B: operands a static check cannot see stop under host rules (hosts with a policy paragraph only). */
+const DATA_OPERANDS_LINE =
+  "Operands built from data (`xargs`, `while read` loops, `$(…)`) cannot be checked, so they stop when a deny or ask rule could cover them.";
 
 /** The host's own shell tool, named the way that host names it. */
 const SHELL_TOOL: Readonly<Record<SkillHarness, string>> = Object.freeze({
@@ -211,11 +215,11 @@ export function renderSkill(h: SkillHarness): string {
     `Edge conditions — ${WHEN_SYNTAX_LINE.trim()}`,
     VERIFY_FIRST_LINE.trim(),
     "predexec hard-stops (`mutationStop`) before writes, installs and deletes — including interpreter one-liners that write, " +
-      "shell scripts (`bash x.sh`), `sh -c` with writes, and commands whose name is computed at run time (`$c`). " +
-      "It does NOT stop an interpreter running an existing script file (`python3 script.py`, `node x.js`, `node --test`): " +
-      `that code is not inspected, so run a script you do not know to be read-only with ${shell}. ` +
-      `Run writes, installs, deletes and interactive commands with ${shell}.`,
-    ...(policy ? [policy] : []),
+      "`sh -c` with writes, and commands whose name is computed at run time (`$c`). " +
+      "Unknown commands and repository code (`bash x.sh`, `python3 script.py`, `node x.js`, `npm test`, `make`) stop too: " +
+      `run them with ${shell}. Run writes, installs, deletes and interactive commands with ${shell}. ` +
+      "Only the user can widen the read-only set (`PREDEXEC_READONLY_HEADS`/`PREDEXEC_ALLOW_SCRIPTS` or `~/.config/predexec/config.json`); a repository cannot.",
+    ...(policy ? [policy + " " + DATA_OPERANDS_LINE] : []),
     RECOVERY_LINE.trim() +
       (policy ? " `policyStop` recovers the same way." : "") +
       (shell.toLowerCase() === "bash" ? "" : ` ("bash" here means ${shell}.)`),

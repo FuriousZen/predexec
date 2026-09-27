@@ -7,6 +7,8 @@ only for writes/installs/deletes and interactive commands.
 - Relative paths resolve against the session directory (the transcript's `# cwd:` header). Don't
   build depth on unverified paths — verify layout in the first node (`ls`) and gate children with
   `file exists` edges.
-- predexec hard-stops before any write/install/delete — run those directly with `run_command` instead.
+- predexec hard-stops before any write/install/delete, and before unknown commands and
+  repository code (`bash x.sh`, `python3 script.py`, `npm test`, `make`) — run those directly with
+  `run_command` instead.
 - `mutationStop` / `noEdgeMatch` / `policyStop` is recoverable: read the transcript and resume
   normally. Never retry the same plan blindly.

@@ -84,13 +84,23 @@ describe("skills — single source (steering.ts → SKILL.md)", () => {
     expect(body).toMatch(/exit 1 means it ran and found nothing/);
   });
 
-  it.each(SKILL_HARNESSES)("%s: states precisely what is stopped, and that script files are not (R15/R23)", (h) => {
+  it.each(SKILL_HARNESSES)("%s: states precisely what is stopped, including unknown commands and repo code (D1)", (h) => {
     const skill = renderSkill(h);
     expect(skill).not.toMatch(/before any write\/install\/delete\/exec/);
     expect(skill).not.toContain("before anything that mutates");
     expect(skill).toMatch(/interpreter one-liners that write/);
-    expect(skill).toMatch(/shell scripts \(`bash x\.sh`\)/);
-    expect(skill).toMatch(/does NOT stop an interpreter running an existing script file \(`python3 script\.py`, `node x\.js`/);
+    expect(skill).toMatch(/Unknown commands and repository code \(`bash x\.sh`, `python3 script\.py`, `node x\.js`/);
+    expect(skill).not.toContain("does NOT stop an interpreter");
+    expect(skill).toContain("PREDEXEC_READONLY_HEADS");
+    expect(skill).toContain("PREDEXEC_ALLOW_SCRIPTS");
+    expect(skill).toContain("~/.config/predexec/config.json");
+    expect(skill).toMatch(/a repository cannot/);
+  });
+
+  it.each(SKILL_HARNESSES)("%s: data-fed operands stop under host rules only where a policy exists (E-B)", (h) => {
+    const skill = renderSkill(h);
+    if (h === "pi") expect(skill).not.toContain("Operands built from data");
+    else expect(skill).toMatch(/Operands built from data \(`xargs`, `while read` loops, `\$\(…\)`\)[^.]*stop/);
   });
 
   it("pi omits policyStop; every other harness has a policy paragraph", () => {

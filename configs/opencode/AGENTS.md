@@ -27,6 +27,7 @@ and interactive commands.
 - Relative paths resolve against the session directory (the transcript's `# cwd:` header). Don't
   build depth on unverified paths — verify layout in the first node (`ls`) and gate children with
   `file exists` edges.
-- predexec hard-stops before any write/install/delete — use bash for those.
+- predexec hard-stops before any write/install/delete, and before unknown commands and
+  repository code (`bash x.sh`, `python3 script.py`, `npm test`, `make`) — use bash for those.
 - `mutationStop` / `noEdgeMatch` is recoverable: read the transcript and resume with bash.
   Never retry the same plan blindly.

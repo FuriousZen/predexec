@@ -232,7 +232,13 @@ describe("packed artifact verification", () => {
     const ver = execSync(`node_modules/.bin/predexec --version`, { cwd: installDir, encoding: "utf8" }).trim();
     expect(ver).toMatch(/^\d+\.\d+\.\d+/);
 
-    const doc = execSync(`node_modules/.bin/predexec doctor`, { cwd: installDir, encoding: "utf8" });
+    // A throwaway HOME: doctor exits non-zero on a broken [!] install, and the
+    // developer's real ~/.claude, ~/.codex, … state (e.g. a globally installed
+    // skill from an older release) must not decide this test.
+    const home = mkdtempSync(join(packDir, "home-"));
+    const env = { ...process.env, HOME: home, XDG_CONFIG_HOME: join(home, ".config") };
+    for (const key of ["CLAUDE_CONFIG_DIR", "CODEX_HOME", "PREDEXEC_ROOT"]) delete env[key];
+    const doc = execSync(`node_modules/.bin/predexec doctor`, { cwd: installDir, encoding: "utf8", env });
     expect(doc).toContain("predexec doctor");
   });
 
