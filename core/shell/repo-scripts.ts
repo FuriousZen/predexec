@@ -49,13 +49,78 @@ const PYTHON_READER_MODULES: Readonly<Record<string, (args: readonly string[]) =
   },
 };
 
-/** A python invocation's `-m` module and its arguments, or its script operand. */
-function pythonTarget(args: readonly string[]): { module: string; moduleArgs: string[] } | { script: string | null } {
+/**
+ * R62: the options an interpreter takes before its script operand without a
+ * value. A one-word allowScripts entry names the script, so the operand must
+ * be certain: any value-taking option (attached or separate — `-I dir`,
+ * `-Ilib`, `-r mod`, `--require=x`, which also loads another file) or any
+ * option not listed here means no script is named (fail closed). An exact
+ * argv-prefix entry still matches.
+ */
+interface OperandGrammar {
+  /** Short-option letters that take no value, clusterable. */
+  shortLetters: string;
+  /** Long options that take no value. */
+  long: ReadonlySet<string>;
+}
+
+const OPERAND_GRAMMARS: Readonly<Record<string, OperandGrammar>> = {
+  python: {
+    shortLetters: "bBdEhiIOPqRsSuvVx",
+    long: new Set(["--version", "--help", "--help-env", "--help-xoptions", "--help-all"]),
+  },
+  perl: { shortLetters: "acnpsStTuUvwWXh", long: new Set() },
+  ruby: {
+    shortLetters: "acdhlnpsSvwy",
+    long: new Set(["--verbose", "--version", "--copyright", "--yydebug", "--help", "--jit", "--yjit"]),
+  },
+  node: {
+    shortLetters: "",
+    long: new Set([
+      "--no-warnings", "--trace-warnings", "--enable-source-maps", "--experimental-strip-types",
+      "--no-experimental-strip-types", "--experimental-transform-types", "--no-deprecation", "--trace-deprecation",
+      "--throw-deprecation", "--trace-uncaught", "--preserve-symlinks", "--preserve-symlinks-main", "--expose-gc",
+      "--abort-on-uncaught-exception", "--experimental-vm-modules",
+    ]),
+  },
+  bun: { shortLetters: "", long: new Set(["--watch", "--hot", "--smol", "--bun", "--silent"]) },
+  php: { shortLetters: "nqHlsw", long: new Set() },
+};
+
+/**
+ * The script operand after the options in `args`, or null when there is none
+ * or an option before it is value-taking or unknown to `grammar`.
+ */
+function certainOperand(args: readonly string[], grammar: OperandGrammar): { index: number } | null {
   for (let i = 0; i < args.length; i++) {
     const word = args[i]!;
-    if (!word.startsWith("-") || word === "-") return { script: word };
-    if (word === "--") return { script: args[i + 1] ?? null };
-    if (word.startsWith("--")) continue;
+    if (word === "--") return i + 1 < args.length ? { index: i + 1 } : null;
+    if (!word.startsWith("-") || word === "-") return { index: i };
+    if (word.startsWith("--")) {
+      if (grammar.long.has(word)) continue;
+      return null;
+    }
+    for (let j = 1; j < word.length; j++) if (!grammar.shortLetters.includes(word[j]!)) return null;
+  }
+  return null;
+}
+
+/**
+ * A python invocation's `-m` module and its arguments, or its script operand
+ * (null when not certain, R62 / M2). `-W`/`-X` take a value (attached or the
+ * next word); they leave `-m` detection intact but name no script.
+ */
+function pythonTarget(args: readonly string[]): { module: string; moduleArgs: string[] } | { script: string | null } {
+  const grammar = OPERAND_GRAMMARS.python!;
+  let valueTaken = false;
+  for (let i = 0; i < args.length; i++) {
+    const word = args[i]!;
+    if (!word.startsWith("-") || word === "-") return { script: valueTaken ? null : word };
+    if (word === "--") return { script: valueTaken ? null : args[i + 1] ?? null };
+    if (word.startsWith("--")) {
+      if (grammar.long.has(word)) continue;
+      return { script: null };
+    }
     for (let j = 1; j < word.length; j++) {
       const letter = word[j]!;
       if (letter === "m") {
@@ -64,9 +129,11 @@ function pythonTarget(args: readonly string[]): { module: string; moduleArgs: st
         return module === undefined ? { script: null } : { module, moduleArgs: args.slice(i + 1) };
       }
       if (letter === "W" || letter === "X") {
+        valueTaken = true;
         if (j === word.length - 1) i++;
         break;
       }
+      if (!grammar.shortLetters.includes(letter)) return { script: null };
     }
   }
   return { script: null };
@@ -85,7 +152,11 @@ function interpreterScript(family: string, segment: string, args: readonly strin
     if (sub !== undefined && DENO_NON_RUNNING.has(sub)) return undefined;
     if (sub === undefined || DENO_RUNNING.has(sub)) {
       const at = sub === undefined ? -1 : args.indexOf(sub);
-      return args.slice(at + 1).find((arg) => !arg.startsWith("-")) ?? null;
+      // R62: `--config x`, `--import-map x` and the like take the next word,
+      // so only permission and plain switches may precede a named script.
+      const rest = args.slice(at + 1);
+      const operand = rest.findIndex((arg) => !DENO_VALUELESS_RE.test(arg));
+      return operand === -1 || rest[operand]!.startsWith("-") ? null : rest[operand]!;
     }
     return sub;
   }
@@ -103,21 +174,22 @@ function interpreterScript(family: string, segment: string, args: readonly strin
     }
     return target.script;
   }
-  const operand = args.findIndex((arg) => !arg.startsWith("-") || arg === "--");
-  const script = operand === -1 ? null : args[args[operand] === "--" ? operand + 1 : operand] ?? null;
-  // perl -I / ruby -I -r -C may take the next word as a value: the operand
-  // position is then unknown, so no script path is named (a bare-path
-  // allowlist entry cannot match; an exact prefix still can).
-  const valueLetters = family === "perl" ? /^-[^-].*I$/ : family === "ruby" ? /^-[^-].*[IrC]$/ : null;
-  if (valueLetters && args.slice(0, operand === -1 ? args.length : operand).some((arg) => valueLetters.test(arg))) return null;
-  if (family === "bun" && script !== null && BUN_RUNNING.has(script)) {
-    return args.slice(operand + 1).find((arg) => !arg.startsWith("-")) ?? null;
+  const grammar = OPERAND_GRAMMARS[family];
+  if (grammar === undefined) return null;
+  const operand = certainOperand(args, grammar);
+  if (operand === null) return null;
+  const script = args[operand.index]!;
+  if (family === "bun" && BUN_RUNNING.has(script)) {
+    const after = certainOperand(args.slice(operand.index + 1), grammar);
+    return after === null ? null : args[operand.index + 1 + after.index]!;
   }
   return script;
 }
 
 // Not fmt (rewrites files unless --check, and reads repo config) or lint
 // (--fix rewrites; deno.json lint.plugins run repository code).
+/** deno options that take no separate value (R62). */
+const DENO_VALUELESS_RE = /^(?:--(?:allow|deny)-[a-z-]+(?:=.*)?|-A|--allow-all|-q|--quiet|--no-check|--unstable(?:-[a-z-]+)?|--watch)$/;
 const DENO_NON_RUNNING = new Set(["eval", "repl", "check", "info", "doc", "types", "completions", "help"]);
 const DENO_RUNNING = new Set(["run", "serve", "test", "bench", "task", "x", "compile", "install", "jupyter"]);
 const BUN_RUNNING = new Set(["run", "test", "x", "exec"]);

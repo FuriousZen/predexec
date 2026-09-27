@@ -102,3 +102,70 @@ describe("M1 — git --exec-path=<dir> before a verb (R66)", () => {
   it.each(["git --exec-path", "git --exec-path=/usr/libexec/git-core", "git log"])("%j stays read-only", (c) =>
     expect(findDestructiveToken(c)).toBeNull());
 });
+
+// I2 / M2 / R62: a one-word allowScripts path entry names the script an
+// interpreter runs. A value-taking option before the operand (bare `-I dir`,
+// `-r lib`, `--check-hash-based-pycs mode`, node `-r mod`) could make the
+// entry match the option's value while a different file runs, so any
+// value-taking or unknown option before the operand means no script is named
+// (fail closed); an exact argv-prefix entry still matches.
+describe("I2 — allowScripts one-word entries and value-taking options (R62)", () => {
+  const byPath = { allowScripts: ["scripts/r.py", "scripts/r.pl", "scripts/r.rb", "scripts/r.js", "scripts/r.php", "scripts/r.ts"] };
+  it.each([
+    "perl -I scripts/r.pl other.pl",
+    "perl -wI scripts/r.pl other.pl",
+    "perl -Mstrict scripts/r.pl",
+    "perl -Ilib scripts/r.pl",
+    "ruby -I scripts/r.rb other.rb",
+    "ruby -C scripts/r.rb other.rb",
+    "ruby -r scripts/r.rb other.rb",
+    "ruby -wr scripts/r.rb other.rb",
+    "ruby --encoding scripts/r.rb other.rb",
+    "python3 --check-hash-based-pycs scripts/r.py other.py",
+    "python3 -W scripts/r.py other.py",
+    "python3 -X scripts/r.py other.py",
+    "python3 --unknown scripts/r.py",
+    "node -r scripts/r.js other.js",
+    "node --require scripts/r.js other.js",
+    "node --import scripts/r.js other.js",
+    "node --require=./x.js scripts/r.js",
+    "bun --preload scripts/r.js other.js",
+    "php -c scripts/r.php other.php",
+    "php -d x=1 scripts/r.php",
+    "deno run --config scripts/r.ts other.ts",
+  ])("no one-word match: %j", (c) => expect(isDestructiveCommand(c, byPath)).toBe(true));
+  it.each([
+    "perl scripts/r.pl",
+    "perl -w scripts/r.pl",
+    "ruby -w scripts/r.rb",
+    "ruby --verbose scripts/r.rb",
+    "python3 scripts/r.py",
+    "python3 -u scripts/r.py",
+    "python3 -bB scripts/r.py",
+    "node scripts/r.js",
+    "node --no-warnings scripts/r.js",
+    "bun scripts/r.js",
+    "bun run scripts/r.js",
+    "php scripts/r.php",
+  ])("one-word match: %j", (c) => expect(findDestructiveToken(c, byPath)).toBeNull());
+  it("an exact argv-prefix entry still matches with value-taking options", () => {
+    expect(findDestructiveToken("perl -I lib scripts/r.pl", { allowScripts: ["perl -I lib scripts/r.pl"] })).toBeNull();
+    expect(findDestructiveToken("python3 -W ignore scripts/r.py", { allowScripts: ["python3 -W ignore scripts/r.py"] })).toBeNull();
+  });
+  it("python -m module detection survives a leading value option", () => {
+    expect(findDestructiveToken("python3 -W ignore -m json.tool f.json")).toBeNull();
+    expect(isDestructiveCommand("python3 --check-hash-based-pycs always -m json.tool f.json")).toBe(true);
+  });
+});
+
+describe("I2 — deno script operand after value-taking options (R62)", () => {
+  // deno run is also stopped by the eval rules; this pins D1's own verdict.
+  it("names no script after --config", async () => {
+    const { repositoryScriptRun } = await import("../../core/shell/repo-scripts.ts");
+    expect(repositoryScriptRun("deno run --config scripts/r.ts other.ts")?.script).toBeNull();
+    expect(repositoryScriptRun("deno run --allow-read scripts/r.ts")?.script).toBe("scripts/r.ts");
+    expect(repositoryScriptRun("deno run -A --unstable-kv scripts/r.ts")?.script).toBe("scripts/r.ts");
+    expect(repositoryScriptRun("perl -I scripts/r.pl other.pl")?.script).toBeNull();
+    expect(repositoryScriptRun("ruby -w scripts/r.rb")?.script).toBe("scripts/r.rb");
+  });
+});
