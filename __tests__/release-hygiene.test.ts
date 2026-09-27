@@ -159,6 +159,28 @@ describe("release hygiene", () => {
     expect(server.env_vars).toContain("CODEX_HOME");
   });
 
+  it(".codex-plugin/mcp.json forwards the user-config variables (R64)", () => {
+    // The README's env settings and a custom XDG_CONFIG_HOME otherwise silently
+    // do nothing on Codex, whose MCP child env starts empty.
+    const mcp = JSON.parse(readFileSync(join(".codex-plugin", "mcp.json"), "utf8")) as {
+      mcpServers: { predexec: { env_vars: string[] } };
+    };
+    for (const key of ["PREDEXEC_READONLY_HEADS", "PREDEXEC_ALLOW_SCRIPTS", "XDG_CONFIG_HOME"]) {
+      expect(mcp.mcpServers.predexec.env_vars).toContain(key);
+    }
+  });
+
+  it("README's manual Codex config snippets forward the user-config variables (R64)", () => {
+    const readme = readFileSync("README.md", "utf8");
+    const lines = readme.split("\n").filter((line) => /^env_vars = \[/.test(line));
+    expect(lines.length).toBeGreaterThanOrEqual(2);
+    for (const line of lines) {
+      for (const key of ["CODEX_HOME", "PREDEXEC_READONLY_HEADS", "PREDEXEC_ALLOW_SCRIPTS", "XDG_CONFIG_HOME"]) {
+        expect(line).toContain(`"${key}"`);
+      }
+    }
+  });
+
   it(".agents/plugins/marketplace.json lists the predexec plugin sourced from the repository root", () => {
     const marketplace = JSON.parse(readFileSync(join(".agents", "plugins", "marketplace.json"), "utf8")) as {
       name: string;

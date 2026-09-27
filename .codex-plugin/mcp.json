@@ -10,7 +10,10 @@
         "codex"
       ],
       "env_vars": [
-        "CODEX_HOME"
+        "CODEX_HOME",
+        "PREDEXEC_READONLY_HEADS",
+        "PREDEXEC_ALLOW_SCRIPTS",
+        "XDG_CONFIG_HOME"
       ]
     }
   }

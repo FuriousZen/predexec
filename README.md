@@ -88,6 +88,14 @@ Known limits of a static classifier:
 - **Recursive directory operands are not checked against deny rules.** `grep -r x .` or `rg x .`
   reads every file under the directory, including files a host `Read(...)` rule denies. The
   directory itself is the only operand checked (the host's own shell tool has the same gap).
+- **pnpm's `.pnpmfile.cjs` hooks are not modelled.** pnpm may load a repository's
+  `.pnpmfile.cjs` on reader verbs such as `pnpm list` or `pnpm why`. This has not been measured,
+  and predexec never runs a probe to find out, so those verbs stay read-only for now. Whether to
+  stop them is an open decision.
+- **rustup toolchain overrides are not modelled.** A repository's `rust-toolchain.toml` can name
+  a custom toolchain `path`, and `cargo +toolchain` selects one. rustup then runs that directory's
+  `cargo` for every cargo reader (`cargo version`, `cargo search`, …). Stopping every cargo reader
+  is a D1-scale decision left open.
 - **Raw git objects are not mapped to paths.** `git cat-file -p <sha>`/`git show <blob-sha>`, and
   tree-wide `git grep`/`git archive`, can print a denied file's content. Mapping a hash to a path
   would take running git.
@@ -427,8 +435,10 @@ codex plugin add predexec@predexec
 
 This installs the version-pinned MCP server *and* the routing skill together, both declared in
 `.codex-plugin/plugin.json` / `.agents/plugins/marketplace.json` — no separate skill-install step.
-The plugin's MCP registration also forwards `CODEX_HOME` into the subprocess
-(`env_vars: ["CODEX_HOME"]`) — a bare `codex mcp add` cannot do this (see the sandbox note below).
+The plugin's MCP registration also forwards `CODEX_HOME` and predexec's user-config variables
+(`PREDEXEC_READONLY_HEADS`, `PREDEXEC_ALLOW_SCRIPTS`, `XDG_CONFIG_HOME`) into the subprocess via
+`env_vars` — Codex starts an MCP child with an almost empty environment, and a bare
+`codex mcp add` cannot request this (see the sandbox note below).
 
 **Verify:**
 
@@ -446,12 +456,13 @@ npx -y predexec install-skill codex
 
 `codex mcp add` registers **globally** (`~/.codex/config.toml`) — there's no per-project scope
 flag the way Claude Code has `--scope project`. This path has no manifest to request env
-forwarding, so if your shell sets a custom `CODEX_HOME`, add it by hand (`npx -y predexec doctor`
+forwarding, so if your shell sets a custom `CODEX_HOME`, or you use predexec's environment
+settings or a custom `XDG_CONFIG_HOME` (see Configuration), add them by hand (`npx -y predexec doctor`
 flags a registration that's missing this):
 
 ```toml
 [mcp_servers.predexec]
-env_vars = ["CODEX_HOME"]
+env_vars = ["CODEX_HOME", "PREDEXEC_READONLY_HEADS", "PREDEXEC_ALLOW_SCRIPTS", "XDG_CONFIG_HOME"]
 ```
 
 `install-skill codex` copies the routing skill in separately, since this path has no plugin
@@ -472,7 +483,7 @@ with an explicit value. Add it to `~/.codex/config.toml`:
 [mcp_servers.predexec]
 command = "npx"
 args = ["-y", "--package=predexec", "predexec-mcp", "--host", "codex"]
-env_vars = ["CODEX_HOME"]
+env_vars = ["CODEX_HOME", "PREDEXEC_READONLY_HEADS", "PREDEXEC_ALLOW_SCRIPTS", "XDG_CONFIG_HOME"]
 tool_timeout_sec = 120
 ```
 
@@ -659,8 +670,12 @@ tool result carries a warning naming it.
 those words are an **exact prefix** of the command's argv (after wrappers such as `env` and leading
 `VAR=value` assignments are dropped). Trailing arguments are not checked: `npm run lint` also
 allows `npm run lint --fix`. A one-word `allowScripts` entry may instead name the script path
-itself (`scripts/report.py` allows `python3 scripts/report.py`). Only the argv is matched, so
-`./x.sh` can be allowlisted but does not cover `bash ./x.sh`, which is a different argv.
+itself (`scripts/report.py` allows `python3 scripts/report.py`), but only when every option
+before the script is one predexec knows takes no value: `perl -I lib x.pl`, `node -r ./y.js x.js`
+or `python3 -W ignore x.py` name no script, so only an exact-prefix entry matches them. Only the
+argv is matched, so `./x.sh` can be allowlisted but does not cover `bash ./x.sh`, and no entry
+can: running a script through a shell interpreter is a separate stop that the allowlist never
+lifts.
 
 An `allowScripts` entry lifts only the "runs repository script" stop; every other check still
 applies to the command. Two consequences worth knowing before you add an entry:
@@ -679,9 +694,22 @@ Absolute command paths under `/usr/` (which includes `/usr/local/`), `/bin/`, `/
 `/opt/homebrew/` and `/nix/store/` count as system programs, not repository files. A symlink
 installed there that points into a repository is not detected.
 
-**Security: a repository cannot configure predexec.** These lists are read only from the
-environment and from the user-level file above, never from any file inside the repository or
-session root, so a cloned repository cannot allowlist `rm` or its own scripts.
+**Security: where the lists come from, and what a repository can reach.** predexec reads these
+lists only from its own process environment and from the user-level file above; it never looks for
+a config file inside the repository. A repository can still reach those two sources indirectly, so
+predexec checks for the cases it can see and then **disables the allowlists for that session**
+(fail closed, with a warning in the tool result, on stderr for MCP hosts, and in `doctor`):
+
+- the config file path resolves inside the session root (for example, `XDG_CONFIG_HOME` or `HOME`
+  points into the checkout, or you run the agent from your home directory);
+- on Claude Code, the project's `.claude/settings.json` or `.claude/settings.local.json` sets
+  `PREDEXEC_READONLY_HEADS`, `PREDEXEC_ALLOW_SCRIPTS` or `XDG_CONFIG_HOME` in its `env` block.
+  If you set these deliberately in project settings, move them to your user settings or the
+  config file.
+
+A repository-scoped MCP registration (`.mcp.json`, or a Codex or Antigravity project MCP entry)
+is out of scope: once you approve one, it chooses the server command itself, and so has full
+trust. Its `env` block is part of that trust, and predexec cannot tell it apart from yours.
 
 ## Doctor & stats
 
