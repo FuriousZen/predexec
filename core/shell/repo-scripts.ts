@@ -218,8 +218,6 @@ function subcommandToolRuns(tool: SubcommandTool, args: readonly string[]): bool
   return tool.hazard !== undefined && rest.some(tool.hazard);
 }
 
-/** `make -n`: print, don't run. `-t` (touch) still writes. */
-const MAKE_DRY_RUN = new Set(["-n", "--dry-run", "--just-print", "--recon", "-q", "--question"]);
 const JUST_LISTING = new Set([
   "--list", "-l", "--summary", "--dump", "--groups", "--variables", "--version", "-V", "--help", "-h",
 ]);
@@ -243,12 +241,9 @@ const RUN_SUBCOMMANDS: Readonly<Record<string, ReadonlySet<string>>> = {
 
 function taskRunnerRuns(head: string, args: readonly string[]): boolean {
   if (TEST_AND_TASK_RUNNERS.has(head)) return !onlyFlags(args, VERSION_HELP);
-  if (head === "make" || head === "gmake" || head === "bmake") {
-    if (onlyFlags(args, VERSION_HELP)) return false;
-    // `--eval`/`-E` text is evaluated even under `-n`.
-    return !args.some((arg) => MAKE_DRY_RUN.has(arg)) ||
-      args.some((arg) => arg === "-t" || arg === "--touch" || /^(?:--eval|-E)/.test(arg));
-  }
+  // make reads the Makefile for any target, dry runs included: `-n`/`-q`
+  // still expand `$(shell …)` while parsing and run `+` recipes (R34).
+  if (head === "make" || head === "gmake" || head === "bmake") return !onlyFlags(args, VERSION_HELP);
   if (head === "just") {
     for (let i = 0; i < args.length; i++) {
       if (args[i] === "--show" || args[i] === "-s") { i++; continue; }
