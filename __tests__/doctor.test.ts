@@ -19,6 +19,7 @@ import {
   checkOpencodeAgents,
   checkOpencodeSkill,
   checkPi,
+  checkUserConfigTrust,
   claudeSkillRoots,
   codexSkillRoots,
   findOpencodeConfigs,
@@ -1383,5 +1384,32 @@ describe("stats aggregation", () => {
       edgesMatched: 2,
       avgDepth: 1,
     });
+  });
+});
+
+// R63: doctor notes when the user's allowlists are disabled for the cwd's session.
+describe("checkUserConfigTrust (R63)", () => {
+  it("is silent when the config lies outside the session and no project env selects it", async () => {
+    scratch();
+    mkdirSync(join(tmp, "proj"), { recursive: true });
+    const env = { HOME: join(tmp, "home"), XDG_CONFIG_HOME: join(tmp, "xdg") } as NodeJS.ProcessEnv;
+    expect(await checkUserConfigTrust({ cwd: join(tmp, "proj"), env })).toEqual([]);
+  });
+  it("notes a config path inside the session root", async () => {
+    scratch();
+    mkdirSync(join(tmp, "proj"), { recursive: true });
+    const env = { HOME: join(tmp, "home"), XDG_CONFIG_HOME: join(tmp, "proj", "cfg") } as NodeJS.ProcessEnv;
+    const checks = await checkUserConfigTrust({ cwd: join(tmp, "proj"), env });
+    expect(checks).toHaveLength(1);
+    expect(checks[0].status).toBe("info");
+    expect(checks[0].name).toMatch(/user allowlists disabled.*inside the session root/);
+  });
+  it("notes a Claude project settings env block selecting the allowlists", async () => {
+    scratch();
+    write("proj/.claude/settings.json", JSON.stringify({ env: { PREDEXEC_ALLOW_SCRIPTS: "make" } }));
+    const env = { HOME: join(tmp, "home"), XDG_CONFIG_HOME: join(tmp, "xdg") } as NodeJS.ProcessEnv;
+    const checks = await checkUserConfigTrust({ cwd: join(tmp, "proj"), env });
+    expect(checks).toHaveLength(1);
+    expect(checks[0].name).toMatch(/Claude Code.*PREDEXEC_ALLOW_SCRIPTS/);
   });
 });

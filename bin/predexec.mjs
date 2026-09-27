@@ -731,6 +731,44 @@ export async function checkOpencodeAgents(opts = {}) {
   }));
 }
 
+/**
+ * R63: the user's allowlists are disabled for a session whose repository
+ * could have chosen them — the config file resolves inside the session root,
+ * or (Claude Code only) a project settings `env` block sets
+ * PREDEXEC_READONLY_HEADS, PREDEXEC_ALLOW_SCRIPTS or XDG_CONFIG_HOME. Checked
+ * for the cwd as the session root with predexec's own compiled
+ * `dist/user-config.js`. A note, not a failure: predexec fails closed.
+ */
+export async function checkUserConfigTrust(opts = {}) {
+  const cwd = opts.cwd ?? process.cwd();
+  const env = opts.env ?? process.env;
+  let trust;
+  try {
+    trust = await import(new URL("../dist/user-config.js", import.meta.url).href);
+  } catch (err) {
+    return [
+      {
+        name: "user allowlists: could not be checked",
+        status: "info",
+        detail: err instanceof Error ? err.message : String(err),
+        hint: "run `pnpm run build` in a predexec checkout (dist/ is missing)",
+      },
+    ];
+  }
+  const everywhere = trust.sessionTrustProblem({ sessionRoot: cwd, env });
+  const claude = everywhere ?? trust.sessionTrustProblem({ sessionRoot: cwd, host: "claude-code", env });
+  if (claude === null) return [];
+  return [
+    {
+      name: `user allowlists disabled in ${everywhere ? "every host's" : "Claude Code"} sessions here: ${claude}`,
+      status: "info",
+      hint: everywhere
+        ? "keep the predexec config outside the repository (set an absolute XDG_CONFIG_HOME, or HOME, elsewhere)"
+        : "remove those keys from the project settings env block; set them in your user settings or ~/.config/predexec/config.json instead",
+    },
+  ];
+}
+
 /** opencode: config entry + cache install + zod + loader-contract shape. */
 export function checkOpencode(opts = {}) {
   const cwd = opts.cwd ?? process.cwd();
@@ -1894,6 +1932,7 @@ async function doctor(args) {
     ...checkCodexSkill({}, codexRegistered),
     ...antigravityChecks,
     ...checkAntigravitySkill({}, antigravityRegistered),
+    ...(await checkUserConfigTrust()),
   ];
   if (args.includes("--live")) {
     // Only a silent loader skip counts as a failure — see liveProbe.

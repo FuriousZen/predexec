@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { loadUserConfig, userConfigPath } from "../user-config.ts";
+import { loadUserConfig, sessionTrustProblem, userConfigPath } from "../user-config.ts";
 import { executeAdapterPlan, userClassifierOptions } from "../adapter-runtime.ts";
 
 /**
@@ -146,6 +146,80 @@ describe("loadUserConfig", () => {
     } finally {
       process.env.XDG_CONFIG_HOME = saved.xdg;
       process.env.PREDEXEC_ALLOW_SCRIPTS = saved.allow;
+    }
+  });
+});
+
+/**
+ * I3 / R63: the user's allowlists are disabled (fail closed) when the
+ * repository could have chosen them: (a) the resolved config file lies inside
+ * the session root, or (b) on Claude Code, a project-scope settings file in
+ * the session root declares an `env` key that selects them. Throwaway HOME,
+ * XDG and repo dirs only.
+ */
+describe("session trust (R63)", () => {
+  let home: string;
+  let xdg: string;
+  let repo: string;
+
+  beforeEach(() => {
+    home = mkdtempSync(join(tmpdir(), "px-st-home-"));
+    xdg = mkdtempSync(join(tmpdir(), "px-st-xdg-"));
+    repo = mkdtempSync(join(tmpdir(), "px-st-repo-"));
+  });
+  afterEach(() => {
+    for (const dir of [home, xdg, repo]) rmSync(dir, { recursive: true, force: true });
+  });
+
+  const claudeSettings = (name: string, content: string) => {
+    mkdirSync(join(repo, ".claude"), { recursive: true });
+    writeFileSync(join(repo, ".claude", name), content);
+  };
+
+  it("accepts a config outside the session root", () => {
+    expect(sessionTrustProblem({ sessionRoot: repo, host: "claude-code", env: { HOME: home, XDG_CONFIG_HOME: xdg } })).toBeNull();
+  });
+
+  it("(a) refuses a config file path inside the session root", () => {
+    const problem = sessionTrustProblem({ sessionRoot: repo, host: "pi", env: { HOME: home, XDG_CONFIG_HOME: join(repo, "cfg") } });
+    expect(problem).toMatch(/inside the session root/);
+    expect(sessionTrustProblem({ sessionRoot: repo, host: "codex", env: { HOME: repo } })).toMatch(/inside the session root/);
+  });
+
+  it.each(["settings.json", "settings.local.json"])("(b) refuses Claude project %s env selecting the allowlists", (name) => {
+    for (const key of ["PREDEXEC_READONLY_HEADS", "PREDEXEC_ALLOW_SCRIPTS", "XDG_CONFIG_HOME"]) {
+      claudeSettings(name, JSON.stringify({ env: { [key]: "x" } }));
+      const problem = sessionTrustProblem({ sessionRoot: repo, host: "claude-code", env: { HOME: home, XDG_CONFIG_HOME: xdg } });
+      expect(problem).toContain(key);
+    }
+  });
+
+  it("(b) ignores other env keys, other hosts, and fails closed on an unreadable settings file", () => {
+    claudeSettings("settings.json", JSON.stringify({ env: { FOO: "1" }, permissions: {} }));
+    const env = { HOME: home, XDG_CONFIG_HOME: xdg };
+    expect(sessionTrustProblem({ sessionRoot: repo, host: "claude-code", env })).toBeNull();
+    claudeSettings("settings.json", JSON.stringify({ env: { PREDEXEC_ALLOW_SCRIPTS: "make" } }));
+    expect(sessionTrustProblem({ sessionRoot: repo, host: "codex", env })).toBeNull();
+    claudeSettings("settings.json", "{ nope");
+    expect(sessionTrustProblem({ sessionRoot: repo, host: "claude-code", env })).toMatch(/could not be read/);
+  });
+
+  it("the adapter runtime disables the allowlists and says so in the transcript", async () => {
+    const saved = { xdg: process.env.XDG_CONFIG_HOME, allow: process.env.PREDEXEC_ALLOW_SCRIPTS, home: process.env.HOME };
+    try {
+      process.env.HOME = home;
+      process.env.XDG_CONFIG_HOME = xdg;
+      process.env.PREDEXEC_ALLOW_SCRIPTS = "./hello.sh";
+      claudeSettings("settings.local.json", JSON.stringify({ env: { PREDEXEC_ALLOW_SCRIPTS: "./hello.sh" } }));
+      const plan = { root: "a", nodes: [{ id: "a", commands: ["./hello.sh"] }] };
+      const stopped = await executeAdapterPlan(plan, "claude-code", { cwd: repo });
+      expect(stopped.stoppedReason).toBe("mutationStop");
+      expect(stopped.transcript).toMatch(/allowlists disabled/);
+      expect(userClassifierOptions()).toEqual({});
+    } finally {
+      process.env.XDG_CONFIG_HOME = saved.xdg;
+      process.env.PREDEXEC_ALLOW_SCRIPTS = saved.allow;
+      process.env.HOME = saved.home;
     }
   });
 });

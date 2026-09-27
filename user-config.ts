@@ -12,13 +12,18 @@
  * `XDG_CONFIG_HOME` (which would resolve against the cwd) is ignored, as the
  * XDG spec requires.
  *
+ * R63: the repository can still reach these sources indirectly — a config
+ * path that resolves inside the session root, or (on Claude Code) a project
+ * settings `env` block that sets the variables. `sessionTrustProblem` detects
+ * both, and the adapter runtime then disables the allowlists (fail closed).
+ *
  * File format: `{ "readOnlyHeads": string[], "allowScripts": string[] }`.
  * A malformed file never throws: it contributes nothing, with a warning.
  */
 
-import { readFileSync, statSync } from "node:fs";
+import { readFileSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { isAbsolute, join } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import type { ClassifierOptions } from "./core/index.ts";
 
 export interface UserConfig {
@@ -107,4 +112,89 @@ export function loadUserConfig(env: NodeJS.ProcessEnv = process.env): UserConfig
     if (unique.length > 0) classifier[FILE_KEYS[key]] = unique;
   }
   return { classifier, warnings };
+}
+
+/**
+ * The environment keys that choose the user's allowlists: a repository that
+ * sets one picks what speculation may run.
+ */
+const ALLOWLIST_ENV_KEYS = ["PREDEXEC_READONLY_HEADS", "PREDEXEC_ALLOW_SCRIPTS", "XDG_CONFIG_HOME"] as const;
+
+/** Largest Claude project settings file inspected; bigger fails closed. */
+const MAX_SETTINGS_BYTES = 1024 * 1024;
+
+/** `path` with its longest existing prefix resolved through symlinks. */
+function canonical(path: string): string {
+  const absolute = resolve(path);
+  const tail: string[] = [];
+  let dir = absolute;
+  for (;;) {
+    try {
+      return join(realpathSync(dir), ...tail.reverse());
+    } catch {
+      const parent = dirname(dir);
+      if (parent === dir) return absolute;
+      tail.push(basename(dir));
+      dir = parent;
+    }
+  }
+}
+
+function inside(root: string, path: string): boolean {
+  const rel = relative(root, path);
+  return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+}
+
+/** The allowlist env keys a Claude settings file's `env` block sets, or an error. */
+function settingsEnvKeys(path: string): string[] | { error: string } {
+  let text: string;
+  try {
+    const stat = statSync(path);
+    if (!stat.isFile()) return { error: "not a regular file" };
+    if (stat.size > MAX_SETTINGS_BYTES) return { error: "too large" };
+    text = readFileSync(path, "utf8");
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return [];
+    return { error: (err as Error).message };
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch (err) {
+    return { error: (err as Error).message };
+  }
+  if (typeof parsed !== "object" || parsed === null) return { error: "not a JSON object" };
+  const env = (parsed as Record<string, unknown>).env;
+  if (env === undefined) return [];
+  if (typeof env !== "object" || env === null) return { error: "env is not an object" };
+  return ALLOWLIST_ENV_KEYS.filter((key) => Object.hasOwn(env, key));
+}
+
+/**
+ * R63: why the user's allowlists cannot be trusted for this session, or null.
+ * (a) the resolved config file lies inside the session root; (b) on Claude
+ * Code, `<root>/.claude/settings.json` or `settings.local.json` sets one of
+ * ALLOWLIST_ENV_KEYS in its `env` block (an unreadable one fails closed).
+ * An approved repo-scoped MCP registration chooses the server command itself,
+ * so its env block is outside this check (and outside predexec's containment).
+ */
+export function sessionTrustProblem(input: { sessionRoot: string; host?: string; env?: NodeJS.ProcessEnv }): string | null {
+  const env = input.env ?? process.env;
+  const root = canonical(input.sessionRoot);
+  let path: string;
+  try {
+    path = canonical(userConfigPath(env));
+  } catch (err) {
+    return `the user config could not be located (${(err as Error).message})`;
+  }
+  if (inside(root, path)) return `the user config ${path} is inside the session root ${root}`;
+  if (input.host === "claude-code") {
+    for (const name of ["settings.json", "settings.local.json"]) {
+      const file = join(root, ".claude", name);
+      const keys = settingsEnvKeys(file);
+      if ("error" in keys) return `${file} could not be read (${keys.error})`;
+      if (keys.length > 0) return `${file} sets ${keys.join(", ")} in its env block`;
+    }
+  }
+  return null;
 }
