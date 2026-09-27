@@ -560,6 +560,8 @@ const WATCH_GETOPT: GetoptSpec = {
 const TAR_WRITE_LONG = [
   "create", "extract", "get", "update", "append", "concatenate", "catenate", "delete", "remove-files",
   "to-command", "use-compress-program", "info-script", "new-volume-script", "checkpoint-action",
+  // Write a listing/volume-number file, or run a remote-shell/rmt program.
+  "index-file", "volno-file", "rsh-command", "rmt-command",
 ];
 /** Short/bundled letters: c/x/u/r/A modes, -I compress program, -F info script. */
 const TAR_WRITE_LETTERS = /[cxurAIF]/;
@@ -626,6 +628,85 @@ function compressorWrite(head: string, args: string[]): string | null {
 }
 
 /**
+ * Environment variables man reads a command or options from: its pager
+ * (MANPAGER, then PAGER), its default options (MANOPT, which may hold `-P`),
+ * and the browser `-H` runs.
+ */
+export const MAN_COMMAND_ENV: ReadonlySet<string> = new Set(["MANPAGER", "PAGER", "MANOPT", "BROWSER"]);
+const MAN_EXEC_LONG = ["pager", "html", "config-file"];
+
+/**
+ * man runs a pager (`-P`/`--pager`), a browser (`-H`/`--html`), or whatever a
+ * config file (`-C`) defines. Short clusters are not split into values: any
+ * cluster holding P/H/C stops, which can only over-stop.
+ */
+function manWrite(args: string[], { assignments }: ReadOnlyHeadContext): string | null {
+  for (const assignment of assignments) {
+    const name = ENV_ASSIGNMENT_RE.exec(assignment)?.[1];
+    if (name && MAN_COMMAND_ENV.has(name)) return name;
+  }
+  for (const arg of args) {
+    if (arg === "--") break;
+    if (arg.startsWith("--")) {
+      const name = arg.slice(2).split("=")[0]!;
+      if (name.length > 0 && MAN_EXEC_LONG.some((long) => long.startsWith(name))) return `man --${name}`;
+      continue;
+    }
+    if (/^-[^-]/.test(arg) && /[PHC]/.test(arg.slice(1))) return `man ${arg}`;
+  }
+  return null;
+}
+
+/**
+ * vi-family editors run ex commands from `-c`/`+cmd`/`--cmd`/`-S`, their
+ * vimrc/exrc and modelines, and write any buffer: only an info-only
+ * invocation is read-only.
+ */
+const VIM_INFO_FLAGS = new Set(["--version", "--help", "-h"]);
+function vimWrite(head: string, args: string[]): string | null {
+  return args.length > 0 && args.every((arg) => VIM_INFO_FLAGS.has(arg)) ? null : head;
+}
+
+/** util-linux flock: `flock [OPTS] FILE|DIR -c CMD`, `flock [OPTS] FILE|DIR CMD [ARG]...`, `flock [OPTS] FD`. */
+const FLOCK_GETOPT: GetoptSpec = {
+  short: {
+    s: "flag", e: "flag", x: "flag", u: "flag", n: "flag", o: "flag", F: "flag", w: "value", E: "value",
+    c: "value", h: "flag", V: "flag",
+  },
+  long: {
+    shared: "flag", exclusive: "flag", unlock: "flag", nonblock: "flag", nb: "flag", close: "flag",
+    "no-fork": "flag", timeout: "value", wait: "value", "conflict-exit-code": "value", command: "value",
+    verbose: "flag", help: "flag", version: "flag",
+  },
+  stopAtOperand: true,
+};
+
+/** flock runs its command (`sh -c` text, or an argv) under the lock; that command is classified in turn. */
+function flockWrite(args: string[], { inspect, inspectText }: ReadOnlyHeadContext): string | null {
+  const items = getopt(args, FLOCK_GETOPT);
+  if (items === null) return "flock option";
+  const operands = items.filter((item) => item.kind === "operand").map((item) => item.value);
+  const rest = operands.slice(1);
+  let nested: string | null = null;
+  const commandOption = optionNamed(items, ["c", "command"]);
+  if (rest.length > 0 && /^(?:-c|--command)$/.test(rest[0]!)) {
+    if (rest.length < 2) return "flock -c";
+    nested = inspectText(rest[1]!);
+  } else if (rest.length > 0 && /^(?:-c|--command=)/.test(rest[0]!)) {
+    return "flock -c";
+  } else if (rest.length > 0) {
+    nested = inspect(rest);
+  } else if (commandOption) {
+    nested = inspectText((commandOption as { value: string }).value);
+  }
+  return nested ? `flock ${nested}` : null;
+}
+
+/** Heads that only ever create or write files (outside --help/--version). */
+const PLAIN_WRITERS = ["split", "csplit", "mkfifo"];
+const WRITER_INFO_FLAGS = new Set(["--help", "--version"]);
+
+/**
  * Heads outside READ_ONLY_HEADS whose writes the word scan cannot see: each
  * returns the offending token, or null for its read-only modes. Unlike
  * READ_ONLY_HEAD_WRITES, a null here does not skip the word scan.
@@ -643,6 +724,14 @@ export const WRITER_HEAD_MODES: Record<string, ReadOnlyHeadWriteCheck> = {
   unxz: (args) => compressorWrite("unxz", args),
   zstd: (args) => compressorWrite("zstd", args),
   unzstd: (args) => compressorWrite("unzstd", args),
+  man: manWrite,
+  flock: flockWrite,
+  ...Object.fromEntries(["vi", "vim", "view", "ex", "nvim", "vimdiff", "rvim", "rview", "gvim"].map(
+    (head): [string, ReadOnlyHeadWriteCheck] => [head, (args) => vimWrite(head, args)],
+  )),
+  ...Object.fromEntries(PLAIN_WRITERS.map(
+    (head): [string, ReadOnlyHeadWriteCheck] => [head, (args) => (args.length === 1 && WRITER_INFO_FLAGS.has(args[0]!) ? null : head)],
+  )),
   // `patch` applies to files (from stdin or -i) unless it is a dry run.
   patch: (args) => (args.includes("--dry-run") ? null : "patch"),
   // A database shell: any statement or dot-command may write the database or

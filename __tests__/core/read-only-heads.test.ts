@@ -369,3 +369,31 @@ describe("backtick heredocs and unmasked stdin programs (fix round 3)", () => {
   ])("mutating: %s", (c) => expect(isDestructiveCommand(c)).toBe(true));
   it.each(["echo `cat <<x`\nls\nx", "echo $(cat <<x\nhello\nx\n)"])("read-only: %s", (c) => expect(isDestructiveCommand(c)).toBe(false));
 });
+
+// Task 5 (E-D): exec-capable editors/debuggers/tools and missed writers.
+const EXEC_CAPABLE_MUTATING = [
+  "osascript -e 'x'", "osascript f.scpt", "osascript",
+  "vim -c '!id' f", "vim +'!id' f", "view -c '!id' f", "ex -c '!id' f", "nvim -c '!id' f",
+  "emacs --batch --eval '(x)'", "emacs -batch -l f.el",
+  "gdb -batch -ex 'shell id'", "gdb -x f",
+  "expect -c 'spawn id'", "expect f.exp",
+  "R -e 'x'", "R -f f.R", "R --file=f.R",
+  "tclsh f.tcl", "wish f.tcl",
+  "man -P 'sh -c id' ls", "man --pager='x' ls", "MANPAGER='sh -c id' man ls",
+  "flock /tmp/l -c 'rm x'", "flock /tmp/l rm x",
+  "tar --index-file=o -tf a.tar", "tar --volno-file=o -tf a", "tar --rsh-command=/bin/sh -tf h:a", "tar --rmt-command=x -tf h:a",
+  "split -l 10 f out", "csplit f 5", "mkfifo p",
+  // Siblings of the rows above: versioned/wrapped heads, exported pager, nested flock payloads.
+  "tclsh8.6 f.tcl", "nice vim -c '!id' f", "vim f", "gdb", "export MANPAGER='sh -c id'", "man -HP x ls",
+  "flock -w 5 /tmp/l python3 -c 'import os; os.remove(\"x\")'", "flock /tmp/l -c 'echo hi > x'", "flock /tmp/l -c",
+  "tar --rsh=/bin/sh -tf h:a",
+];
+const EXEC_CAPABLE_READ_ONLY = [
+  "vim --version", "man ls", "tar -tf a.tar", "flock /tmp/l cat f",
+  "gdb --version", "emacs --version", "R --version", "man -k printf", "flock 3", "flock -s /tmp/l -c 'cat f'", "split --help",
+];
+
+describe("exec-capable tools and missed writers (E-D)", () => {
+  it.each(EXEC_CAPABLE_MUTATING)("mutating: %s", (c) => expect(isDestructiveCommand(c)).toBe(true));
+  it.each(EXEC_CAPABLE_READ_ONLY)("read-only: %s", (c) => expect(isDestructiveCommand(c)).toBe(false));
+});

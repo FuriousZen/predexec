@@ -313,6 +313,41 @@ export function interpreterEvalPrograms(segment: string): EvalPrograms {
  */
 const STDIN_UNVETTED_INTERPRETER_RE = /^(?:tclsh|wish|expect)\d*(?:\.\d+)*$/;
 
+/**
+ * Interpreters and program-running tools with no reader allowlist: their
+ * program comes from an inline flag (`osascript -e`, `emacs --eval`, `gdb -ex`,
+ * `expect -c`, `R -e`), a script operand (`tclsh f.tcl`, `gdb -x f`,
+ * `R --file=f.R`), an init file they load by default, or stdin. Nothing in any
+ * of those can be vetted, so an invocation is read-only only when every
+ * argument is an info-only flag (`gdb --version`). osascript and tclsh/wish
+ * have none.
+ */
+const UNVETTED_INTERPRETER_INFO_FLAGS: Readonly<Record<string, ReadonlySet<string>>> = {
+  osascript: new Set(),
+  emacs: new Set(["--version", "--help"]),
+  gdb: new Set(["--version", "--help", "-version", "-help"]),
+  expect: new Set(["-v"]),
+  R: new Set(["--version", "--help"]),
+  tclsh: new Set(),
+  wish: new Set(),
+};
+
+/**
+ * The offending head when a segment runs an unvetted interpreter (see
+ * UNVETTED_INTERPRETER_INFO_FLAGS) for anything but an info-only flag.
+ */
+export function unvettedInterpreterInvocation(segment: string): string | null {
+  const normalized = normalizeEnvInvocation(tokenizeShellWords(segment, ARGV));
+  if (!normalized.complete || normalized.argv.length === 0) return null;
+  const rawHead = normalized.argv[0]!.replace(/^.*\//, "");
+  // Versioned Tcl/expect executables (`tclsh8.6`) share their family's rule.
+  const head = STDIN_UNVETTED_INTERPRETER_RE.test(rawHead) ? rawHead.replace(/[\d.]+$/, "") : rawHead;
+  if (!Object.hasOwn(UNVETTED_INTERPRETER_INFO_FLAGS, head)) return null;
+  const info = UNVETTED_INTERPRETER_INFO_FLAGS[head]!;
+  const args = normalized.argv.slice(1);
+  return args.length > 0 && args.every((arg) => info.has(arg)) ? null : head;
+}
+
 export type StdinProgramInvocation =
   | { kind: "none" }
   /**

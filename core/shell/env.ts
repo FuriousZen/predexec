@@ -18,6 +18,7 @@ import {
 } from "./git.ts";
 import {
   lessEnvironmentWrite,
+  MAN_COMMAND_ENV,
 } from "./heads.ts";
 
 /**
@@ -67,6 +68,7 @@ const PRELOAD_ENV_NAMES: ReadonlySet<string> = new Set(
 /** Whether a variable, set to `value` (undefined: unknown), can make a later command run code. */
 function commandBearingEnvironment(name: string, value: string | undefined): boolean {
   if (lessEnvironmentWrite(name, value)) return true;
+  if (MAN_COMMAND_ENV.has(name)) return true;
   if (PRELOAD_ENV_NAMES.has(name) || DANGEROUS_ENV.has(name)) return true;
   return gitEnvironmentPrefixMutation([`${name}=`]) !== null;
 }

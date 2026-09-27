@@ -97,6 +97,7 @@ import {
   languageWordScanSegment,
   shellEvalPayload,
   stripShellControlPrefix,
+  unvettedInterpreterInvocation,
 } from "./shell/interpreters.ts";
 
 // The interpreter budgets and eval preflight moved to core/shell/ with the rest
@@ -507,6 +508,13 @@ function findDestructiveTokenInternal(cmd: string, depth: number): string | null
     const followingText = at === -1 ? null : shellCommand.slice(at + segment.length);
     if (at !== -1) segmentCursor = at + segment.length;
     const token = readOnlyHeadWrite(stripShellControlPrefix(segment), depth, followingText);
+    if (token) return token;
+  }
+
+  // Interpreters with no reader allowlist (osascript, emacs, gdb, expect, R,
+  // tclsh/wish) run unvettable programs for anything but an info-only flag.
+  for (const segment of segments) {
+    const token = unvettedInterpreterInvocation(stripShellControlPrefix(segment));
     if (token) return token;
   }
 
