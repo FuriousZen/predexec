@@ -249,8 +249,10 @@ export function commandBearingNameWrite(text: string, loopHeaders: readonly stri
   for (const match of text.matchAll(/\$\{([A-Za-z_][A-Za-z0-9_]*)(?:\[[^\]]*\])?:?=/g)) {
     if (commandBearingEnvironment(match[1]!, undefined)) return match[1]!;
   }
-  // R44: every arithmetic context taint.ts knows, and the names it assigns.
-  for (const name of arithmeticAssignedNames(text).names) {
+  // R44/R45: every arithmetic context taint.ts knows, and the names it assigns.
+  const arithmetic = arithmeticAssignedNames(text);
+  if (arithmetic.failClosed) return arithmetic.failClosed;
+  for (const name of arithmetic.names) {
     if (commandBearingEnvironment(name, undefined)) return name;
   }
   return null;

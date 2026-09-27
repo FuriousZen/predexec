@@ -559,7 +559,7 @@ function environmentTouched(cmd: string, commands: readonly SimpleCommand[]): bo
   if (/\$\{[A-Za-z_][A-Za-z0-9_]*(?:\[[^\]]*\])?:?=/.test(cmd)) return true;
   // R44: an assignment in any arithmetic context (see taint.ts).
   const arithmetic = arithmeticAssignedNames(cmd);
-  if (!arithmetic.complete || arithmetic.names.length > 0) return true;
+  if (!arithmetic.complete || arithmetic.failClosed !== null || arithmetic.names.length > 0) return true;
   for (const { text } of commands) {
     if (/^(?:for|select)\s/.test(text)) return true;
     const normalized = normalizeEnvInvocation(tokenizeShellWords(text, ARGV));

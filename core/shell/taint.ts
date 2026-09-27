@@ -462,7 +462,9 @@ function scanSegment(flow: Flow, rawSegment: string): void {
     case "let":
       for (const word of args) {
         flow.arithmetic.push(...identifiers(rawWord(segment, word)));
-        flow.arithmeticTexts.push(rawWord(segment, word));
+        // bash expands the word, then evaluates it: a literal word's decoded
+        // value is exactly the expression (`let "a<<=1"`).
+        flow.arithmeticTexts.push(word.dynamic ? rawWord(segment, word) : word.value);
         if (SUBSTITUTION_START_RE.test(rawWord(segment, word))) flow.substitution = true;
       }
       break;
@@ -613,25 +615,112 @@ function analyze(command: string): { ranges: ArithmeticRanges; flow: Flow } {
 const ARITHMETIC_ASSIGNMENT_RE =
   /(?<![0-9A-Za-z_#$])([A-Za-z_][A-Za-z0-9_]*)\s*(?:\[[^\]]*\]\s*)?(?:(?:<<|>>|[-+*\/%&^|])?=(?!=)|\+\+|--)|(?:\+\+|--)\s*([A-Za-z_][A-Za-z0-9_]*)/g;
 
+/** `$name`/`${name}` right before an assignment operator, or after `++`/`--`. */
+const INDIRECT_ASSIGNMENT_RE =
+  /\$\{?[A-Za-z_][A-Za-z0-9_]*\}?\s*(?:\[[^\]]*\]\s*)?(?:(?:<<|>>|[-+*\/%&^|])?=(?!=)|\+\+|--)|(?:\+\+|--)\s*\$/;
+/** A double-quoted simple expansion (`"$n"`, `"${n}"`): its quotes hide no spelling. */
+const QUOTED_EXPANSION_RE = /"(\$\{?[A-Za-z_][A-Za-z0-9_]*\}?)"/g;
 /**
- * R44: the names an arithmetic context assigns — every context
+ * A value with no name in it: an integer literal, or numbers and operators
+ * only (`1<<2`). Evaluating it can reference or assign no variable.
+ */
+const NAMELESS_VALUE_RE = /^[\s0-9+\-*\/%<>=!&|^~()?:,]+$/;
+
+/**
+ * The text as the shell sees its bare arithmetic contexts: the contents of
+ * single-quoted and `$'…'` strings are blanked, and so is double-quoted text
+ * except the `$name`, `$((…))`, `$[…]` and `${…}` expansions that stay live there. The
+ * quote characters themselves stay, so a quote splitting a name inside a
+ * context (`P"AT"H=0`) is still seen. Same length as the input; linear.
+ */
+function liveArithmeticText(text: string): string {
+  const out = text.split("");
+  const blank = (from: number, to: number) => { for (let k = from; k < to; k++) if (out[k] !== "\n") out[k] = " "; };
+  const closeOf = (start: number, open: string, close: string) => {
+    let depth = 0;
+    for (let k = start; k < text.length; k++) {
+      if (text[k] === open) depth++;
+      else if (text[k] === close && --depth === 0) return k;
+    }
+    return text.length - 1;
+  };
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i]!;
+    if (ch === "\\") { i++; continue; }
+    if (ch === "'" || (ch === "$" && text[i + 1] === "'")) {
+      const open = ch === "'" ? i : i + 1;
+      let j = open + 1;
+      while (j < text.length && text[j] !== "'") j += ch === "$" && text[j] === "\\" ? 2 : 1;
+      blank(open + 1, Math.min(j, text.length));
+      i = j;
+      continue;
+    }
+    if (ch !== '"') continue;
+    let j = i + 1;
+    while (j < text.length && text[j] !== '"') {
+      if (text[j] === "\\") { blank(j, Math.min(j + 2, text.length)); j += 2; continue; }
+      if (text[j] === "$" && (text[j + 1] === "(" && text[j + 2] === "(" || text[j + 1] === "[" || text[j + 1] === "{")) {
+        const bracket = text[j + 1]!;
+        j = closeOf(j + 1, bracket, bracket === "(" ? ")" : bracket === "[" ? "]" : "}") + 1;
+        continue;
+      }
+      // `$name` stays live too (`[[ "$n" -eq 3 ]]` evaluates n's value).
+      if (text[j] === "$" && /[A-Za-z_]/.test(text[j + 1] ?? "")) {
+        j++;
+        while (j < text.length && /[A-Za-z0-9_]/.test(text[j]!)) j++;
+        continue;
+      }
+      blank(j, j + 1);
+      j++;
+    }
+    i = j;
+  }
+  return out.join("");
+}
+
+/**
+ * R44/R45: the names an arithmetic context assigns — every context
  * findTaintedEvaluation knows (`$((…))`, `((…))`, `$[…]`, `let`, `[[ … -eq … ]]`
  * operands, array subscripts, `${x:off:len}`, and assignments to
  * integer-declared names). `complete` is false when a context could not be
- * delimited; a caller then treats the command as assigning.
+ * delimited; a caller then treats the command as assigning. `failClosed` is
+ * set when the assigned names cannot be read off the text at all:
+ * - a quote or backslash inside a context (`PA\TH=0`, `P"AT"H=0`), other
+ *   than quotes around one simple expansion;
+ * - an expansion as the target (`$v=0`, `++$v`);
+ * - a name referenced there whose value this command assigns as anything
+ *   but an integer literal (`w=PATH=0; (( w ))` assigns PATH).
  */
-export function arithmeticAssignedNames(command: string): { names: string[]; complete: boolean } {
-  const { ranges, flow } = analyze(command);
+export function arithmeticAssignedNames(command: string): { names: string[]; complete: boolean; failClosed: string | null } {
+  const { flow } = analyze(command);
+  // Contexts come from the live text: quoted program text (`python3 -c
+  // "print(d['a'])"`) holds no shell arithmetic.
+  const ranges = arithmeticRangeIdentifiers(liveArithmeticText(command));
   const texts = [...ranges.covered, ...flow.arithmeticTexts];
   for (const { name, value } of flow.rawAssignments) if (flow.integerNames.has(name)) texts.push(value);
+  const values = new Map<string, string[]>();
+  for (const { name, value } of flow.rawAssignments) {
+    let list = values.get(name);
+    if (!list) values.set(name, (list = []));
+    list.push(value);
+  }
   const names: string[] = [];
   const complete = ranges.complete && flow.complete;
-  for (const text of texts) {
+  let failClosed: string | null = null;
+  for (const raw of texts) {
+    const text = raw.replace(QUOTED_EXPANSION_RE, "$1");
+    if (failClosed === null && /['"\\]/.test(text)) failClosed = "quoted arithmetic";
+    if (failClosed === null && INDIRECT_ASSIGNMENT_RE.test(text)) failClosed = "indirect arithmetic assignment";
     for (const match of text.matchAll(ARITHMETIC_ASSIGNMENT_RE)) names.push(match[1] ?? match[2]!);
-    // Undelimited: every name in reach may be an assignment target.
-    if (!complete) names.push(...(text.match(IDENTIFIER_RE) ?? []));
+    for (const name of text.match(IDENTIFIER_RE) ?? []) {
+      // Undelimited: every name in reach may be an assignment target.
+      if (!complete) names.push(name);
+      if (failClosed === null && (values.get(name) ?? []).some((value) => !NAMELESS_VALUE_RE.test(value))) {
+        failClosed = "unknown arithmetic assignment";
+      }
+    }
   }
-  return { names, complete };
+  return { names, complete, failClosed };
 }
 
 export function findTaintedEvaluation(command: string): string | null {

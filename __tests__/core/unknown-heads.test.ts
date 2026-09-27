@@ -376,3 +376,18 @@ describe("R44 (d) — listed options containing `=`", () => {
   it.each(["bat --paging=always f", "bat --paging=never --pager=x f"])("%s is mutating", (c) =>
     expect(isDestructiveCommand(c)).toBe(true));
 });
+
+// Fix round 3 (R45): no spelling enumeration inside arithmetic.
+describe("R45 — quoted, escaped, indirect or data-valued arithmetic", () => {
+  it.each([
+    "[[ 1 -eq PATH\\=0 ]]; ls", "[[ 1 -eq P\"AT\"H=0 ]]; ls", "[[ 1 -eq PA\\TH=0 ]]; ls", "declare -i n; n=P\\ATH=0; ls",
+    "[[ 1 -eq HOME\\=0 ]]; git log", "[[ 1 -eq HO\"\"ME++ ]]; git log", "[[ 1 -eq KUBE\"CONFIG\"=0 ]]; kubectl get pods",
+    "[[ 1 -eq x\\=0 ]]; kubectl get pods", "echo ${a['PATH=0']}; ls", "echo ${x:'PATH=0'}; ls", "let 'PATH=0'; ls",
+    "v=PATH; (( $v=0 )); ls", "(( ${v}+=1 ))", "(( ++$v ))", "echo $(( $v-- ))",
+    "w=PATH=0; (( w )); ls", "u=PATH=0; [[ 1 -eq u ]]; ls", "s=PATH=0; echo ${a[s]}; ls", "s=PATH=0; echo ${x:s}; ls",
+    "x=abc; echo $((x+1))", "x=(a b); (( x ))", "x=\"PATH=0\"; (( x ))",
+  ])("%s is mutating", (c) => expect(isDestructiveCommand(c)).toBe(true));
+  it.each(["x=5; echo $((x+1))", "echo $((RANDOM%3))", "[[ $n -eq 3 ]] && ls", "[[ \"$n\" -eq 3 ]] && ls",
+    "x=-2; (( x < 0 )) && echo neg", "x=1<<2; echo $((x))", "for ((i=1<<2; i<9; i++)); do :; done", "echo \"$((1 + 2))\"", "[[ ${#a[@]} -gt 0 ]] && ls"])(
+    "%s stays read-only", (c) => expect(findDestructiveToken(c)).toBeNull());
+});
