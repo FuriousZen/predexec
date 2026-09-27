@@ -52,7 +52,7 @@ import {
   tokenizeShellWords,
 } from "./core/index.ts";
 import type { HostPolicyDenial, Operation, PolicyCheckContext, PolicyVerdict } from "./core/types.ts";
-import { MAX_FRONTMATTER_FILE_BYTES, parseFrontmatter } from "./yaml-frontmatter.ts";
+import { FrontmatterError, MAX_FRONTMATTER_FILE_BYTES, parseFrontmatter } from "./yaml-frontmatter.ts";
 
 export type PolicyAction = "allow" | "ask" | "deny";
 
@@ -643,8 +643,19 @@ interface V2Agent {
   mode?: string;
   hidden?: boolean;
 }
-/** `null` = the document disables the agent; `{ error }` = predexec could not read it (fail closed for that agent). */
-type V2AgentEntry = V2Agent | null | { error: string };
+/** Where and why an agent markdown file could not be read (surfaced by `predexec doctor`). */
+export interface OpencodeAgentFileError {
+  agent: string;
+  file: string;
+  /** 1-based line in the file the failure points at (1 when it is not tied to one line). */
+  line: number;
+  reason: string;
+}
+/**
+ * `null` = the document disables the agent; `{ error }` = predexec could not
+ * read it (fail closed for that agent), with `file` set for a markdown file.
+ */
+type V2AgentEntry = V2Agent | null | { error: string; file?: OpencodeAgentFileError };
 
 interface V2Document {
   /** `[...tools, ...permission, ...permissions]` — core `config/normalize.ts:179-183`. */
@@ -905,9 +916,47 @@ function v2MarkdownAgentDocument(directory: string, file: string, primary: boole
     const agent = legacy ? v2LegacyAgent(data, file) : v2NativeAgent(native, file);
     agents.set(name, agent && primary ? { ...agent, mode: "primary" } : agent);
   } catch (err) {
-    agents.set(name, { error: `${file} could not be read as an opencode agent (${err instanceof Error ? err.message : String(err)})` });
+    const reason = err instanceof FrontmatterError ? err.reason : err instanceof Error ? err.message.replace(`${file}: `, "") : String(err);
+    const line = err instanceof FrontmatterError ? err.line : schemaErrorLine(file, reason);
+    agents.set(name, {
+      error: `${file} could not be read as an opencode agent (${err instanceof Error ? err.message : String(err)})`,
+      file: { agent: name, file, line, reason },
+    });
   }
   return { rules: [], agents };
+}
+
+/** A schema failure names its field as `` `key` ``; point at that top-level key's line when it has one. */
+function schemaErrorLine(file: string, reason: string): number {
+  const key = /`([^`]+)`/.exec(reason)?.[1];
+  if (key === undefined) return 1;
+  try {
+    const lines = readFileSync(file, "utf8").split("\n");
+    const at = lines.findIndex((l) => l.startsWith(`${key}:`));
+    return at >= 0 ? at + 1 : 1;
+  } catch {
+    return 1;
+  }
+}
+
+/**
+ * Every opencode v2 agent/mode markdown file visible from `projectDir` that
+ * predexec could not read, so the agent it defines goes deny-all: each with
+ * the agent name, file, line and reason (`predexec doctor`).
+ */
+export function opencodeV2AgentFileErrors(projectDir: string, env: NodeJS.ProcessEnv = process.env): OpencodeAgentFileError[] {
+  const base = opencodePaths(env);
+  const paths: V2Paths = { ...base, v2Config: env.OPENCODE_CONFIG_DIR ?? base.config };
+  const out: OpencodeAgentFileError[] = [];
+  for (const source of v2ConfigSources(projectDir, env, paths)) {
+    if (!("agentDir" in source)) continue;
+    for (const { file, primary } of v2AgentFiles(source.agentDir)) {
+      for (const entry of v2MarkdownAgentDocument(source.agentDir, file, primary)?.agents.values() ?? []) {
+        if (entry && "error" in entry && entry.file) out.push(entry.file);
+      }
+    }
+  }
+  return out;
 }
 
 /** Built-in agent pushes (core `plugin/agent.ts:85-156`, `plugin/plan.ts:32-42`), after `Info.default`. */

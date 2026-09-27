@@ -1,11 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { parseFrontmatter, parseYamlSubset } from "../yaml-frontmatter.ts";
+import { FrontmatterError, parseFrontmatter, parseYamlSubset } from "../yaml-frontmatter.ts";
 
 describe("yaml-frontmatter — the subset opencode v2 agent files use", () => {
   it("splits frontmatter from body; no frontmatter ⇒ empty data", () => {
     expect(parseFrontmatter("---\na: 1\n---\nbody\n")).toEqual({ data: { a: 1 }, body: "body\n" });
     expect(parseFrontmatter("just text")).toEqual({ data: {}, body: "just text" });
     expect(parseFrontmatter("---\n---\nx")).toEqual({ data: {}, body: "x" });
+    expect(parseFrontmatter("---\n# only a comment\n  # another\n---\nx")).toEqual({ data: {}, body: "x" });
   });
 
   it("block mappings, quoted keys, comments, scalars", () => {
@@ -32,6 +33,48 @@ describe("yaml-frontmatter — the subset opencode v2 agent files use", () => {
     expect(parseYamlSubset('description: "Reviews code: carefully"')).toEqual({ description: "Reviews code: carefully" });
   });
 
+  it("R46: plain permission keys may carry spaces and glob characters", () => {
+    expect(parseYamlSubset("permission:\n  bash:\n    git *: allow\n    rm -rf *: deny")).toEqual({
+      permission: { bash: { "git *": "allow", "rm -rf *": "deny" } },
+    });
+    expect(
+      parseYamlSubset("permission:\n  bash:\n    npm run  test ?: ask # c\n  read: {src/**/*.ts: allow, ~/x/*: deny}\n  external_directory:\n    /tmp/**: allow"),
+    ).toEqual({
+      permission: { bash: { "npm run  test ?": "ask" }, read: { "src/**/*.ts": "allow", "~/x/*": "deny" }, external_directory: { "/tmp/**": "allow" } },
+    });
+    const out = parseYamlSubset("permission:\n  bash:\n    git *: allow") as Record<string, any>;
+    expect(Object.getPrototypeOf(out.permission.bash)).toBe(null);
+  });
+
+  it("R46: top-level plain values may contain ':' not followed by a space", () => {
+    expect(parseYamlSubset("model: openrouter/x:free\ndescription: see https://x.y/z")).toEqual({
+      model: "openrouter/x:free",
+      description: "see https://x.y/z",
+    });
+    // A ` #` still ends a plain value as a comment, exactly as in js-yaml.
+    expect(parseYamlSubset("model: openrouter/x:free # c")).toEqual({ model: "openrouter/x:free" });
+  });
+
+  it("the first failure carries its line and reason — file lines for parseFrontmatter", () => {
+    const fail = (fn: () => unknown): FrontmatterError => {
+      try {
+        fn();
+      } catch (err) {
+        expect(err).toBeInstanceOf(FrontmatterError);
+        return err as FrontmatterError;
+      }
+      throw new Error("did not throw");
+    };
+    const e = fail(() => parseFrontmatter("---\nmode: subagent\ndescription: a: b\n---\nbody\n"));
+    expect(e.line).toBe(3);
+    expect(e.reason).toContain("mapping value not allowed here");
+    expect(fail(() => parseYamlSubset("a: 1\nb:\n  c: x\n  c: y")).line).toBe(4);
+    expect(fail(() => parseFrontmatter("---\npermission:\n  bash:\n    git *: allow\n    it's: deny\n---\n")).line).toBe(5);
+    expect(fail(() => parseFrontmatter("---\na: |-\n  x\n  # c\n---\n")).line).toBe(4);
+    expect(fail(() => parseFrontmatter("---\na: 1\n")).line).toBe(1);
+    expect(fail(() => parseFrontmatter("---\na: 1\n----\n")).line).toBe(3);
+  });
+
   it("every mapping is prototype-free (Object.create(null))", () => {
     const out = parseYamlSubset("a: {b: {c: x}}\nd:\n  e: w\nf:\n  - g: z") as Record<string, any>;
     for (const o of [out, out.a, out.a.b, out.d, out.f[0]]) expect(Object.getPrototypeOf(o)).toBe(null);
@@ -50,7 +93,10 @@ describe("yaml-frontmatter — the subset opencode v2 agent files use", () => {
     ["line over 4 KiB", `a: ${"x".repeat(5000)}`],
     // R45 — anything outside the unambiguous core throws.
     ["top-level `a: b: c` (v2 sanitize retry)", "description: Reviews code: carefully"],
-    ["top-level unquoted colon", "model: a/b:c"],
+    ["top-level value ending in ':'", "model: a/b:"],
+    ["comment-only block with a bare '#' line (gray-matter: null data)", "# c\n   #"],
+    ["' #' in a flow plain value", "description: [foo #bar]"],
+    ["' #' in a nested flow permission value", "permission: {bash: {git *: allow #x}}"],
     ["flow duplicate key", "a: {b: 1, b: 2}"],
     ["nested flow duplicate key", 'permission: {bash: {"x": deny, "x": allow}}'],
     ["__proto__", "__proto__: {a: 1}"],
@@ -59,7 +105,30 @@ describe("yaml-frontmatter — the subset opencode v2 agent files use", () => {
     ["quoted key outside permission", '"a": 1'],
     ["escaped quoted key", 'permission: {"a\\"b": 1}'],
     ["single-quote escape in key", "permission: {'a''b': 1}"],
-    ["non-identifier plain key", "permission:\n  git *: allow"],
+    ["non-identifier plain key outside permission", "tools:\n  git *: true"],
+    ["top-level key with a space", "a b: 1"],
+    ["space before colon in a permission key", "permission:\n  bash:\n    git * : allow"],
+    ["permission key with ' #' (comment)", "permission:\n  bash:\n    git #x: allow"],
+    ["permission key with '#'", "permission:\n  bash:\n    c#: allow"],
+    ["permission key with ':'", "permission:\n  bash:\n    a:b: allow"],
+    ["permission key with a quote", "permission:\n  bash:\n    it's: allow"],
+    ["permission key with a backslash", "permission:\n  bash:\n    a\\b: allow"],
+    ["permission key starting with *", "permission:\n  bash:\n    * rm: allow"],
+    ["permission key starting with -", "permission:\n  bash:\n    -rf x: allow"],
+    ["permission key starting with !", "permission:\n  bash:\n    !x: allow"],
+    ["permission key starting with ?", "permission:\n  bash:\n    ? x: allow"],
+    ["permission key starting with &", "permission:\n  bash:\n    &a x: allow"],
+    ["permission key starting with [", "permission:\n  bash:\n    [a] x: allow"],
+    ["permission merge key", "permission:\n  bash:\n    <<: {a: allow}"],
+    ["permission merge key (flow)", "permission: {bash: {<<: {a: allow}}}"],
+    ["flow permission key with [", "permission: {bash: {a[b: allow}}"],
+    ["flow permission key with {", "permission: {bash: {a{b: allow}}"],
+    ["permission key null", "permission:\n  bash:\n    null: allow"],
+    ["permission key y", "permission:\n  bash:\n    y: allow"],
+    ["permission key number", "permission:\n  bash:\n    10: allow"],
+    ["permission key __proto__", "permission:\n  bash:\n    __proto__: allow"],
+    ["permission duplicate glob key", "permission:\n  bash:\n    git *: allow\n    git *: deny"],
+    ["permission value colon-space", "permission:\n  bash:\n    git *: allow: x"],
     ["key with space before colon", "a : 1"],
     ["lone CR", "a: x\rb: y"],
     ["control char", "a: x\x01y"],

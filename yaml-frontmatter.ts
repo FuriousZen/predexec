@@ -10,21 +10,41 @@
  * runs): block mappings and sequences, single-line flow `{}`/`[]`, quoted and
  * plain scalars, `|`/`>` block scalars, comments. Anything else THROWS, and the
  * caller fails closed (deny-all) for that agent rather than guess:
- * - keys other than `^[A-Za-z_][A-Za-z0-9_-]*$` (quoted keys only inside the
- *   `permission` map, and without escapes), `__proto__`/`constructor`/
- *   `prototype`, and duplicate keys at any level, block or flow;
+ * - keys other than `^[A-Za-z_][A-Za-z0-9_-]*$` outside the `permission` map;
+ *   inside it (R46), plain keys may also carry spaces and glob characters
+ *   (`git *: allow`) within js-yaml's plain-key rules (see
+ *   `checkPermissionPlainKey`), and quoted keys are allowed without escapes;
+ *   `__proto__`/`constructor`/`prototype`, `<<`, and duplicate keys at any
+ *   level, block or flow;
  * - control characters (tab and lone CR included), non-ASCII whitespace, line
  *   separators, lone surrogates;
  * - plain scalars that start with a YAML indicator, contain `: `/` #`, or that
  *   js-yaml would type as anything but a string (null, YAML 1.1 bools, every
  *   int/float/timestamp form) — except the canonical `true`/`false`, decimal
  *   ints and `d.d` floats, returned typed for the caller's schema checks;
- * - an unquoted top-level plain value containing `:` (the sanitize trigger);
+ * - (R46) a top-level plain value is held to the same `: `/` #` rule as any
+ *   other: a bare `:` as in `openrouter/x:free` or `https://x.y` is plain
+ *   content to js-yaml, whose first parse then succeeds, so v2's sanitize
+ *   retry (which rewrites top-level values containing `:`) never runs;
  * - anchors, aliases, tags, merge keys, multi-document and multi-line flow.
- * Every mapping is built with `Object.create(null)`.
+ * Every mapping is built with `Object.create(null)`. The first failure is
+ * thrown as a `FrontmatterError` carrying the 1-based line (in the whole file
+ * for `parseFrontmatter`, in the YAML text for `parseYamlSubset`) and reason.
  */
 
 type Json = Record<string, unknown>;
+
+/** Why and where a document fell outside the core — `predexec doctor` prints both. */
+export class FrontmatterError extends Error {
+  readonly line: number;
+  readonly reason: string;
+  constructor(line: number, reason: string) {
+    super(`line ${line}: ${reason}`);
+    this.name = "FrontmatterError";
+    this.line = line;
+    this.reason = reason;
+  }
+}
 
 export interface Frontmatter {
   data: Json;
@@ -46,21 +66,28 @@ export const MAX_FRONTMATTER_LINE_CHARS = 4096;
 export function parseFrontmatter(content: string): Frontmatter {
   const text = content.replace(/^﻿/, "");
   if (!text.startsWith("---")) return { data: Object.create(null), body: text };
-  if (text.length > MAX_FRONTMATTER_FILE_BYTES) throw new Error("agent file too large");
+  if (text.length > MAX_FRONTMATTER_FILE_BYTES) throw new FrontmatterError(1, "agent file too large");
   const lines = text.split("\n");
   const bare = (i: number) => (lines[i] ?? "").replace(/\r$/, "");
-  if (bare(0) !== "---") throw new Error("frontmatter opening line must be exactly ---");
+  if (bare(0) !== "---") throw new FrontmatterError(1, "frontmatter opening line must be exactly ---");
   let close = -1;
   for (let i = 1; i < lines.length; i++) {
     if (!bare(i).startsWith("---")) continue;
-    if (bare(i) !== "---") throw new Error("frontmatter closing line must be exactly ---");
+    if (bare(i) !== "---") throw new FrontmatterError(i + 1, "frontmatter closing line must be exactly ---");
     close = i;
     break;
   }
-  if (close < 0) throw new Error("unclosed frontmatter");
+  if (close < 0) throw new FrontmatterError(1, "unclosed frontmatter");
   const yaml = lines.slice(1, close).map((_, i) => bare(i + 1)).join("\n");
-  const data = yaml.trim() === "" ? Object.create(null) : parseYamlSubset(yaml);
-  if (data === null || typeof data !== "object" || Array.isArray(data)) throw new Error("frontmatter is not a mapping");
+  let data: unknown;
+  try {
+    data = yaml.trim() === "" ? Object.create(null) : parseYamlSubset(yaml);
+  } catch (err) {
+    // The YAML starts on the file's line 2.
+    if (err instanceof FrontmatterError) throw new FrontmatterError(err.line + 1, err.reason);
+    throw err;
+  }
+  if (data === null || typeof data !== "object" || Array.isArray(data)) throw new FrontmatterError(2, "frontmatter is not a mapping");
   return { data: data as Json, body: lines.slice(close + 1).join("\n") };
 }
 
@@ -85,9 +112,32 @@ const NON_STRING = [
   /^[0-9]{4}-[0-9]{1,2}-[0-9]{1,2}/,
 ];
 
-/** Plain key: identifier-shaped, not reserved, not something js-yaml types. */
-function checkPlainKey(key: string): string {
+/** Plain key: identifier-shaped (or, in the permission map, glob-shaped), not reserved, not something js-yaml types. */
+function checkPlainKey(key: string, inPermission: boolean, flow: boolean): string {
+  if (inPermission) return checkPermissionPlainKey(key, flow);
   if (!KEY_RE.test(key) || NON_STRING.some((re) => re.test(key))) throw new Error(`unsupported mapping key: ${key}`);
+  if (RESERVED_KEYS.has(key)) throw new Error(`reserved mapping key: ${key}`);
+  return key;
+}
+
+/**
+ * R46 — a plain key inside the `permission` map may hold spaces and glob
+ * characters (`git *`, `rm -rf *`, `src/**`), within js-yaml 3's plain-scalar
+ * rules (loader `readPlainScalar`): the first character is no indicator, the
+ * key ends at the first `: ` (the caller's split), it has no ` #` (a comment),
+ * and no surrounding whitespace (js-yaml trims it; this refuses rather than
+ * trims). In a flow mapping the flow indicators `,[]{}` end a plain scalar,
+ * so they are refused there. `#`, `:` and quote characters are refused
+ * anywhere in the key — legal in js-yaml mid-scalar, but not needed for a
+ * command glob and each one is a place a reader can disagree.
+ */
+const PERMISSION_KEY_FORBIDDEN = /[#:'"\\]/;
+function checkPermissionPlainKey(key: string, flow: boolean): string {
+  if (key === "" || key !== key.trim()) throw new Error(`unsupported mapping key: ${key}`);
+  if (INDICATORS.includes(key[0]!)) throw new Error(`mapping key starts with a YAML indicator: ${key}`);
+  if (PERMISSION_KEY_FORBIDDEN.test(key) || (flow && /[,[\]{}]/.test(key))) throw new Error(`unsupported character in mapping key: ${key}`);
+  if (key.startsWith("<<")) throw new Error(`merge key: ${key}`);
+  if (NON_STRING.some((re) => re.test(key))) throw new Error(`mapping key js-yaml would not read as a string: ${key}`);
   if (RESERVED_KEYS.has(key)) throw new Error(`reserved mapping key: ${key}`);
   return key;
 }
@@ -112,14 +162,15 @@ function quoted(t: string): { value: string; rest: string; escaped: boolean } {
  * canonical `true`/`false`/decimal int/`d.d` float typed; any other form js-yaml
  * would not read as the same string throws.
  */
-function plainScalar(v: string, topLevel: boolean): unknown {
+function plainScalar(v: string): unknown {
   if (v === "") throw new Error("empty plain scalar");
   if (v !== v.trim()) throw new Error("plain scalar with surrounding whitespace");
   if (INDICATORS.includes(v[0]!)) throw new Error(`plain scalar starts with a YAML indicator: ${v}`);
-  if (/: |:$| #/.test(v)) throw new Error(`mapping value not allowed here: ${v}`);
   // js-yaml throws on `a: b: c`, and v2 then rewrites EVERY top-level value
-  // containing `:` (config/markdown.ts:22-37) — so any top-level colon is doubt.
-  if (topLevel && v.includes(":")) throw new Error(`unquoted top-level value containing ':' (quote it): ${v}`);
+  // containing `:` (config/markdown.ts:22-37). A `:` NOT followed by a space
+  // (`openrouter/x:free`, `https://x.y`) is plain-scalar content to js-yaml,
+  // whose first parse then succeeds, so the retry never runs (R46).
+  if (/: |:$| #/.test(v)) throw new Error(`mapping value not allowed here (quote it): ${v}`);
   if (v === "true") return true;
   if (v === "false") return false;
   if (/^(0|[1-9][0-9]*)(\.[0-9]+)?$/.test(v)) return Number(v);
@@ -147,7 +198,7 @@ function splitKey(t: string, inPermission: boolean): { key: string; rest: string
     if (c === ":" && (i + 1 === t.length || t[i + 1] === " ")) break;
   }
   if (i === t.length) return null;
-  return { key: checkPlainKey(t.slice(0, i)), rest: t.slice(i + 1) };
+  return { key: checkPlainKey(t.slice(0, i), inPermission, false), rest: t.slice(i + 1) };
 }
 
 interface Line {
@@ -212,7 +263,7 @@ function inlineValue(raw: string, topLevel: boolean, inPermission: boolean): unk
     p.end();
     return out;
   }
-  return plainScalar(stripComment(v).trim(), topLevel);
+  return plainScalar(stripComment(v).trim());
 }
 
 /** Single-line flow collections. Whitespace is the ASCII space only (tabs never get here). */
@@ -246,7 +297,7 @@ class FlowParser {
       if (":#{[".includes(this.s[this.i]!)) throw new Error("unsupported character in a flow plain scalar");
       this.i++;
     }
-    return plainScalar(this.s.slice(start, this.i).trimEnd(), false);
+    return plainScalar(this.s.slice(start, this.i).trimEnd());
   }
   private key(inPermission: boolean): string {
     this.ws();
@@ -258,7 +309,7 @@ class FlowParser {
     }
     const start = this.i;
     while (this.i < this.s.length && !":,}]".includes(this.s[this.i]!)) this.i++;
-    return checkPlainKey(this.s.slice(start, this.i));
+    return checkPlainKey(this.s.slice(start, this.i), inPermission, true);
   }
   private map(inPermission: boolean): Json {
     this.i++;
@@ -296,10 +347,22 @@ class FlowParser {
   }
 }
 
-/** Parses the frontmatter YAML subset. Throws on anything outside it. */
+/** Parses the frontmatter YAML subset. Throws a `FrontmatterError` on anything outside it. */
 export function parseYamlSubset(yaml: string): unknown {
+  // Index of the line being read when a check throws; rethrown with it below.
+  const where = { at: 0 };
+  try {
+    return parseYamlLines(yaml, where);
+  } catch (err) {
+    if (err instanceof FrontmatterError) throw err;
+    throw new FrontmatterError(where.at + 1, err instanceof Error ? err.message : String(err));
+  }
+}
+
+function parseYamlLines(yaml: string, where: { at: number }): unknown {
   const lines: Line[] = [];
   for (const raw of yaml.split(/\r?\n/)) {
+    where.at = lines.length;
     if (raw.length > MAX_FRONTMATTER_LINE_CHARS) throw new Error("frontmatter line too long");
     if (FORBIDDEN_CHAR.test(raw)) throw new Error("control character, lone CR or non-ASCII whitespace in frontmatter");
     const text = raw.trimEnd();
@@ -328,6 +391,7 @@ export function parseYamlSubset(yaml: string): unknown {
     const collected: string[] = [];
     let indent = -1;
     while (pos < lines.length) {
+      where.at = pos;
       const l = lines[pos]!;
       if (l.skip) {
         if (l.raw !== "") {
@@ -390,6 +454,7 @@ export function parseYamlSubset(yaml: string): unknown {
       skipBlank();
       const l = lines[pos];
       if (!l || l.indent < indent) return out;
+      where.at = pos;
       if (l.indent > indent) throw new Error(`unexpected indentation: ${l.text}`);
       if (l.text.startsWith("- ") || l.text === "-") return out; // sibling sequence belongs to the parent
       const m = splitKey(l.text, inPermission);
@@ -407,6 +472,7 @@ export function parseYamlSubset(yaml: string): unknown {
       skipBlank();
       const l = lines[pos];
       if (!l || l.indent !== indent || !(l.text.startsWith("- ") || l.text === "-")) return out;
+      where.at = pos;
       const item = l.text === "-" ? "" : l.text.slice(2);
       const itemIndent = indent + 2 + (item.length - item.trimStart().length);
       if (item.trim() === "") {
@@ -434,10 +500,22 @@ export function parseYamlSubset(yaml: string): unknown {
 
   skipBlank();
   const first = lines[pos];
-  if (!first) return Object.create(null);
+  if (!first) {
+    // Comments only. gray-matter 4.0.3 (index.js:101-110) returns `{}` without
+    // parsing only when removing `^\s*#[^\n]+` lines leaves nothing; a bare `#`
+    // line survives that, so js-yaml parses the block and yields `null` data.
+    const bare = lines.findIndex((l) => l.raw.trimStart() === "#");
+    if (bare >= 0) {
+      where.at = bare;
+      throw new Error("comment-only frontmatter with a bare '#' line (gray-matter reads it as null)");
+    }
+    return Object.create(null);
+  }
+  where.at = pos;
   if (first.indent !== 0) throw new Error("frontmatter must start at column 0");
   const result = node(0, false);
   skipBlank();
+  where.at = pos;
   if (pos < lines.length) throw new Error(`unparsed frontmatter line: ${lines[pos]!.text}`);
   return result;
 }

@@ -8,6 +8,7 @@ import {
   evaluateOperation,
   evaluatePermission,
   mergeDeep,
+  opencodeV2AgentFileErrors,
   readOpencodeRuleset,
   wildcardMatch,
   type OpencodeAsk,
@@ -774,6 +775,32 @@ describe("readOpencodeRuleset — hostMajor 2: agent/mode markdown files", () =>
     expect(readOpencodeRuleset(ctx.project, ctx.env, { hostMajor: 2, agent: "alias" })).toHaveProperty("error");
   });
 
+  it("R46: plain glob keys in `permission` and colon-bearing top-level values are read, not deny-all", () => {
+    const ctx = setup();
+    md(
+      ctx.project,
+      ".opencode/agent/review.md",
+      "---\ndescription: see https://x.y/z\nmodel: openrouter/x:free\npermission:\n  bash:\n    git *: allow\n    cat *: deny\n---\nReview.\n",
+    );
+    expect(v2(ctx, "cat x", "review")).toBe("deny");
+    expect(v2(ctx, "git status", "review")).toBe("allow");
+    expect(opencodeV2AgentFileErrors(ctx.project, ctx.env)).toEqual([]);
+  });
+
+  it("opencodeV2AgentFileErrors names each deny-all agent's file, line and reason", () => {
+    const ctx = setup();
+    md(ctx.project, ".opencode/agent/ok.md", "---\nmode: subagent\n---\n");
+    md(ctx.project, ".opencode/agent/review.md", "---\nmode: subagent\ndescription: Reviews code: carefully\n---\n");
+    md(ctx.project, ".opencode/agent/badmode.md", "---\ndescription: x\nmode: sideways\n---\n");
+    const errors = opencodeV2AgentFileErrors(ctx.project, ctx.env);
+    expect(errors).toEqual([
+      { agent: "badmode", file: join(ctx.project, ".opencode", "agent", "badmode.md"), line: 3, reason: expect.stringContaining("`mode`") },
+      { agent: "review", file: join(ctx.project, ".opencode", "agent", "review.md"), line: 3, reason: expect.stringContaining("mapping value not allowed here") },
+    ]);
+    // The same failures make those agents deny-all on the policy path.
+    expect(readOpencodeRuleset(ctx.project, ctx.env, { hostMajor: 2, agent: "review" })).toHaveProperty("error");
+  });
+
   it("R43: default_agent naming a subagent or hidden agent falls back to build", () => {
     const ctx = setup();
     ctx.projectConfig({ default_agent: "general", agent: { build: { permission: { bash: { "cat *": "deny" } } } } });
@@ -921,7 +948,8 @@ describe("readOpencodeRuleset — hostMajor 2: R45 agent frontmatter is an unamb
 
   it.each([
     ["A: colon in a top-level description + flow permission (v2 sanitize retry)", F("description: Reviews code: finds bugs\npermission: {bash: allow}")],
-    ["A: unquoted colon in any top-level value", F("model: openrouter/x:free\npermission: {bash: allow}")],
+    ["A: colon-space after a colon value", F("model: openrouter/x:free: y\npermission: {bash: allow}")],
+    ["A: `permission` key with a space before the colon (R46 keeps it)", F("permission:\n  bash:\n    cat * : allow")],
     ["B: duplicate key in a nested flow map", F('permission: {bash: {"cat *": deny, "cat *": allow}}')],
     ["B: duplicate key in a flow map", F("permission: {bash: deny, bash: allow}")],
     ["C: plain value starting with `-`", F("description: - foo\npermission:\n  bash: allow")],
@@ -999,6 +1027,9 @@ describe("readOpencodeRuleset — hostMajor 2: R45 agent frontmatter is an unamb
     );
     expect(buildVerdict(ctx)).toBe("allow");
     expect(buildVerdict(ctx, "ls")).toBe("deny");
+    // R46: an unquoted colon (not colon-space) in a top-level value is read, as js-yaml reads it.
+    md(ctx.project, ".opencode/agent/build.md", F("model: openrouter/x:free\npermission: {bash: allow}"));
+    expect(buildVerdict(ctx)).toBe("allow");
     md(ctx.project, ".opencode/agent/nat.md", F('description: Native\nsteps: 2\npermissions:\n  - action: shell\n    resource: "cat *"\n    effect: deny'));
     expect(evaluateOperation("cat x", readOpencodeRuleset(ctx.project, ctx.env, { hostMajor: 2, agent: "nat" }), { directory: ctx.project, hostMajor: 2 }).action).toBe("deny");
     expect(evaluateOperation("ls", readOpencodeRuleset(ctx.project, ctx.env, { hostMajor: 2, agent: "nat" }), { directory: ctx.project, hostMajor: 2 }).action).toBe("allow");

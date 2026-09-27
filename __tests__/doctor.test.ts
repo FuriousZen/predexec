@@ -1,7 +1,7 @@
 import { spawnSync } from "node:child_process";
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import {
@@ -16,6 +16,7 @@ import {
   checkCodexSkill,
   checkNodeVersion,
   checkOpencode,
+  checkOpencodeAgents,
   checkOpencodeSkill,
   checkPi,
   claudeSkillRoots,
@@ -159,6 +160,59 @@ describe("doctor — pi checks", () => {
     write("agent/npm/node_modules/predexec/package.json", JSON.stringify({ version: "0.1.3" }));
     write("agent/npm/node_modules/predexec/node_modules/zod/package.json", JSON.stringify({ version: "4.1.8" }));
     expect(checkPi(piOpts()).every((c) => c.status === "ok")).toBe(true);
+  });
+});
+
+// R46 / D2: an opencode v2 agent file predexec cannot read makes that agent
+// deny-all; doctor names file, line and reason. Every path is under a tmp HOME
+// and tmp project — the real ~/.config/opencode is never read.
+describe("doctor — opencode v2 agent files that go deny-all", () => {
+  const agentFixture = () => {
+    scratch();
+    const home = join(tmp, "home");
+    const project = join(tmp, "proj");
+    mkdirSync(join(project, ".git"), { recursive: true });
+    write("home/.config/opencode/agent/ok.md", "---\nmodel: openrouter/x:free\npermission:\n  bash:\n    git *: allow\n---\n");
+    write("home/.config/opencode/agent/global-bad.md", "---\nmode: subagent\ndescription: Reviews code: carefully\n---\n");
+    write("proj/.opencode/agent/review.md", "---\ndescription: fine\npermission:\n  bash:\n    git *: allow\n    it's: deny\n---\n");
+    return { home, project, env: { HOME: home, XDG_CONFIG_HOME: join(home, ".config"), OPENCODE_TEST_HOME: home } as NodeJS.ProcessEnv };
+  };
+
+  it("lists each deny-all agent as [!] with file:line: reason", async () => {
+    const { home, project, env } = agentFixture();
+    const checks = await checkOpencodeAgents({ cwd: project, env });
+    expect(checks.map((c: { status: string }) => c.status)).toEqual(["fail", "fail"]);
+    expect(checks.map((c: { name: string }) => c.name)).toEqual([
+      `opencode agent ${join(home, ".config", "opencode", "agent", "global-bad.md")}:3: mapping value not allowed here (quote it): Reviews code: carefully — every predexec call for agent global-bad will stop`,
+      `opencode agent ${join(project, ".opencode", "agent", "review.md")}:6: unsupported character in mapping key: it's — every predexec call for agent review will stop`,
+    ]);
+  });
+
+  it("no agent files, or only readable ones ⇒ no checks", async () => {
+    scratch();
+    const home = join(tmp, "home");
+    mkdirSync(join(tmp, "proj", ".git"), { recursive: true });
+    const env = { HOME: home, XDG_CONFIG_HOME: join(home, ".config"), OPENCODE_TEST_HOME: home } as NodeJS.ProcessEnv;
+    expect(await checkOpencodeAgents({ cwd: join(tmp, "proj"), env })).toEqual([]);
+    write("home/.config/opencode/agent/ok.md", "---\nmodel: openrouter/x:free\n---\n");
+    expect(await checkOpencodeAgents({ cwd: join(tmp, "proj"), env })).toEqual([]);
+  });
+
+  it("`predexec doctor` prints the [!] line and exits 1 (subprocess, tmp HOME)", () => {
+    const { home, project } = agentFixture();
+    const bin = fileURLToPath(new URL("../bin/predexec.mjs", import.meta.url));
+    const run = spawnSync(process.execPath, [bin, "doctor"], {
+      cwd: project,
+      encoding: "utf8",
+      env: { PATH: dirname(process.execPath), HOME: home },
+    });
+    // The child's cwd is the realpath (macOS tmp lives under /private/var).
+    expect(run.stdout).toContain(
+      `[!] opencode agent ${join(realpathSync(project), ".opencode", "agent", "review.md")}:6: unsupported character in mapping key: it's — every predexec call for agent review will stop`,
+    );
+    expect(run.stdout).toContain(`global-bad.md:3: mapping value not allowed here`);
+    expect(run.stdout).not.toContain("ok.md");
+    expect(run.status).toBe(1);
   });
 });
 

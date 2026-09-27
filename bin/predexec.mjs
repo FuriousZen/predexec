@@ -696,6 +696,38 @@ export function findOpencodeConfigs(cwd = process.cwd(), home = homedir()) {
   return found;
 }
 
+/**
+ * opencode v2 agent/mode markdown files predexec cannot read. predexec reads
+ * their frontmatter certainty-or-fail-closed, so such a file makes its agent
+ * deny-all: every predexec call under it stops. Each one is a `fail` naming
+ * the file, line and reason. The reader is predexec's own compiled
+ * `dist/policy.js` (the same code the plugin runs), loaded lazily so the rest
+ * of doctor keeps working in an unbuilt checkout.
+ */
+export async function checkOpencodeAgents(opts = {}) {
+  const cwd = opts.cwd ?? process.cwd();
+  const env = opts.env ?? process.env;
+  let errors;
+  try {
+    const policy = await import(new URL("../dist/policy.js", import.meta.url).href);
+    errors = policy.opencodeV2AgentFileErrors(cwd, env);
+  } catch (err) {
+    return [
+      {
+        name: "opencode agent files: could not be checked",
+        status: "info",
+        detail: err instanceof Error ? err.message : String(err),
+        hint: "run `pnpm run build` in a predexec checkout (dist/ is missing)",
+      },
+    ];
+  }
+  return errors.map((e) => ({
+    name: `opencode agent ${e.file}:${e.line}: ${e.reason} — every predexec call for agent ${e.agent} will stop`,
+    status: "fail",
+    hint: "quote the value or key named above (predexec reads opencode v2 agent frontmatter certainty-or-fail-closed)",
+  }));
+}
+
 /** opencode: config entry + cache install + zod + loader-contract shape. */
 export function checkOpencode(opts = {}) {
   const cwd = opts.cwd ?? process.cwd();
@@ -1851,6 +1883,7 @@ async function doctor(args) {
     checkNodeVersion(),
     ...checkPi(),
     ...opencodeChecks,
+    ...(await checkOpencodeAgents()),
     ...checkOpencodeSkill({}, opencodeRegistered),
     ...claudeChecks,
     ...checkClaudeSkill({}, claudeRegistered),
