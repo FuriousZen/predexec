@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { findTaintedEvaluation } from "../../../core/shell/taint.ts";
+import { assignmentScanCounter, findTaintedEvaluation } from "../../../core/shell/taint.ts";
 
 // E-A: in an arithmetic context bash evaluates a variable's VALUE as an
 // expression, so `c='a[$(cmd)]'; echo $((c))` runs cmd. A value that comes
@@ -287,5 +287,47 @@ describe("fix round 2: declare-family operands, wait clusters, mapfile callbacks
     expect(performance.now() - started).toBeLessThan(10_000);
     expect(findTaintedEvaluation("x=([0]=a [1]=b); echo $((x))")).toBeNull();
     expect(findTaintedEvaluation("x=(a[0-9]); echo $((x))")).toBe("arithmetic over data-derived variable x");
+  });
+});
+
+// I1 / R61: an `( … )` array value is bounded at its matching `)`. It used to
+// run to the end of the segment, so every array-assignment word rescanned
+// everything after it (quadratic). An array whose end cannot be found fails
+// closed instead of rescanning.
+describe("final review I1: array assignment values are bounded (R61)", () => {
+  const scanned = (command: string) => {
+    assignmentScanCounter.chars = 0;
+    findTaintedEvaluation(command);
+    return assignmentScanCounter.chars;
+  };
+  it("scans a repeated array-assignment unit in linear operations", () => {
+    const small = scanned(`ls ${"x=(a) ".repeat(1_000)}`);
+    const large = scanned(`ls ${"x=(a) ".repeat(8_000)}`);
+    expect(small).toBeGreaterThan(0);
+    // Linear: 8x the input is ~8x the work; quadratic would be ~64x.
+    expect(large).toBeLessThanOrEqual(small * 9);
+  });
+  it("scans nested unclosed array openers in linear operations", () => {
+    const small = scanned(`ls ${"x=(".repeat(1_000)}`);
+    const large = scanned(`ls ${"x=(".repeat(8_000)}`);
+    expect(large).toBeLessThanOrEqual(Math.max(small, 1) * 9);
+  });
+  it("finishes a long repeated unit inside a generous guard", () => {
+    const started = performance.now();
+    findTaintedEvaluation(`ls ${"x=(a) ".repeat(20_000)}`);
+    expect(performance.now() - started).toBeLessThan(5_000);
+  });
+  it("keeps bounded array semantics", () => {
+    expect(findTaintedEvaluation("x=(a b); echo $((x))")).toBeNull();
+    expect(findTaintedEvaluation("x=($(cat f)); echo $((x))")).toBe("arithmetic over data-derived variable x");
+    expect(findTaintedEvaluation("x=(a b) y=$x; echo $((y))")).toBeNull();
+    expect(findTaintedEvaluation("x=(*) y=x; echo $((y))")).toBe("arithmetic over data-derived variable y");
+  });
+  it.each([
+    "x=(a; echo $((x))",
+    "x=(\")\" $(cat f)); echo $((x))",
+    "x=(a)(b); echo $((x))",
+  ])("fails closed on an array whose end is not a word end: %s", (command) => {
+    expect(findTaintedEvaluation(command)).toBe("unbounded array assignment");
   });
 });

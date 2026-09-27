@@ -326,6 +326,8 @@ interface Flow {
   arithmeticTexts: string[];
   /** Every assignment's name and raw value, for the integer pass. */
   rawAssignments: Array<{ name: string; value: string }>;
+  /** R61: an `( … )` array value whose matching `)` could not be found. */
+  unboundedArray: boolean;
   complete: boolean;
 }
 
@@ -335,15 +337,54 @@ function addDependency(flow: Flow, name: string, from: string): void {
   set.add(from);
 }
 
-/** Record `NAME=value` (and `NAME=( … )` through the rest of the segment). */
-function recordAssignment(flow: Flow, segment: string, word: ShellWord, intDeclared: boolean): boolean {
+/** Test hook (final review I1 / R61): characters the assignment scan visits. */
+export const assignmentScanCounter = { chars: 0 };
+
+/** Per-segment state for array-value bounding, built once per segment. */
+interface ArrayBounds {
+  /** matchBrackets over the segment, computed on the first `NAME=(`. */
+  match: Int32Array | null;
+  /** Word end offsets in the segment. */
+  ends: Set<number>;
+}
+
+/**
+ * Record `NAME=value`, or `NAME=( … )` through its matching `)`. Returns the
+ * segment offset where the assignment ends, or -1 when `word` is not one.
+ *
+ * R61: the array value is bounded at its matching `)` (one bracket-matching
+ * pass per segment), so each array is scanned once. A `)` that is not the
+ * end of a lexer word (a quoted `)`, `x=(a)(b)`) or a missing one fails
+ * closed rather than guessing where the elements end.
+ */
+function recordAssignment(
+  flow: Flow,
+  segment: string,
+  word: ShellWord,
+  intDeclared: boolean,
+  bounds: ArrayBounds,
+): number {
   const assignment = ENV_ASSIGNMENT_RE.exec(word.value);
-  if (!assignment) return false;
+  if (!assignment) return -1;
   const name = assignment[1]!;
   const raw = segment.slice(word.start, word.end);
   const equals = raw.indexOf("=");
   const value = raw.slice(equals + 1);
-  const rawValue = value.startsWith("(") ? segment.slice(word.start + equals + 1) : value;
+  let rawValue = value;
+  let end = word.end;
+  if (value.startsWith("(")) {
+    const open = word.start + equals + 1;
+    bounds.match ??= matchBrackets(segment);
+    const close = bounds.match[open]!;
+    if (close <= open || !bounds.ends.has(close + 1)) {
+      flow.unboundedArray = true;
+      flow.sources.add(name);
+      return segment.length;
+    }
+    rawValue = segment.slice(open, close + 1);
+    end = close + 1;
+  }
+  assignmentScanCounter.chars += rawValue.length;
   const substitutions = inspectCommandSubstitutions(rawValue);
   if (!substitutions.complete || substitutions.bodies.length > 0) flow.sources.add(name);
   // `x=(*)`: an array's elements undergo expansion and globbing, so a glob or
@@ -357,7 +398,7 @@ function recordAssignment(flow: Flow, segment: string, word: ShellWord, intDecla
     flow.integerNames.add(name);
     flow.arithmetic.push(...values);
   }
-  return true;
+  return end;
 }
 
 /**
@@ -418,8 +459,16 @@ function scanSegment(flow: Flow, rawSegment: string): void {
   const args = words.slice(head + 1);
   const declaresInteger = DECLARE_HEADS.has(command) &&
     args.some((word) => /^-[A-Za-z]*i/.test(word.value));
+  const bounds: ArrayBounds = { match: null, ends: new Set(words.map((word) => word.end)) };
+  // Words inside an array value are its elements, not assignments.
+  let assignedThrough = -1;
   for (const word of words) {
-    if (recordAssignment(flow, segment, word, declaresInteger)) continue;
+    if (word.start < assignedThrough) continue;
+    const end = recordAssignment(flow, segment, word, declaresInteger, bounds);
+    if (end !== -1) {
+      assignedThrough = end;
+      continue;
+    }
     if (declaresInteger && IDENTIFIER_WORD_RE.test(word.value) && word !== words[head]) {
       flow.integerNames.add(word.value);
     }
@@ -609,6 +658,7 @@ function analyze(command: string): { ranges: ArithmeticRanges; flow: Flow } {
     assignments: [],
     arithmeticTexts: [],
     rawAssignments: [],
+    unboundedArray: false,
     complete: ranges.complete,
   };
   const tree = inspectCommandSubstitutionTree(command);
@@ -767,6 +817,7 @@ export function arithmeticAssignedNames(command: string): { names: string[]; com
   // expansion, an unclosed quote or span) hides contexts: fail closed.
   let failClosed: string | null = !live.complete
     ? "unparsed arithmetic context"
+    : flow.unboundedArray ? "unbounded array assignment"
     : ranges.testBracket ? "$[ in [[ ]] test" : null;
   for (const raw of texts) {
     const text = raw.replace(QUOTED_EXPANSION_RE, "$1");
@@ -786,6 +837,7 @@ export function arithmeticAssignedNames(command: string): { names: string[]; com
 
 export function findTaintedEvaluation(command: string): string | null {
   const { ranges, flow } = analyze(command);
+  if (flow.unboundedArray) return "unbounded array assignment";
   if (flow.callback) return "mapfile callback evaluates a command";
   if (ranges.substitution || flow.substitution) return "arithmetic over command substitution output";
   if (ranges.nameSubstitution || flow.nameSubstitution) return "command substitution output used as a variable name";
