@@ -590,7 +590,12 @@ describe("Task 7 fix round 2 (Antigravity)", () => {
   ])("read_file(.env) deny stops `%s`", (command) => {
     expect(prep()(command)).toMatch(/deny: read_file\(\.env\)/);
   });
-  it.each([`perl -e '@ARGV=("README.md"); print <>'`, "wc -l < README.md"])("allows `%s`", (command) => {
+  // R31: a literal @ARGV list is no longer trusted, even a harmless one.
+  it("stops `perl -e '@ARGV=(\"README.md\"); print <>'`", () => {
+    expect(prep()(`perl -e '@ARGV=("README.md"); print <>'`)).toMatch(/deny: read_file\(\.env\)/);
+  });
+
+  it.each(["wc -l < README.md"])("allows `%s`", (command) => {
     expect(prep()(command)).toBeNull();
   });
 });
@@ -610,7 +615,41 @@ describe("Task 7 fix round 3 (Antigravity)", () => {
   ])("read_file(.env) deny stops `%s`", (command) => {
     expect(prep()(command)).toMatch(/deny: read_file\(\.env\)/);
   });
-  it.each(["perl -ne 'print if /x/' README.md", `perl -e 'local @ARGV=("README.md"); print <>'`])("allows `%s`", (command) => {
+  it("stops `perl -e 'local @ARGV=(\"README.md\"); print <>'` (R31)", () => {
+    expect(prep()(`perl -e 'local @ARGV=("README.md"); print <>'`)).toMatch(/deny: read_file\(\.env\)/);
+  });
+
+  it.each(["perl -ne 'print if /x/' README.md"])("allows `%s`", (command) => {
+    expect(prep()(command)).toBeNull();
+  });
+});
+
+describe("Task 7 fix round 4: perl magic-open channel (R31, Antigravity)", () => {
+  const prep = () => {
+    const c = checker({ permissions: { deny: ["read_file(.env)"] } });
+    writeFileSync(join(c.ws, ".env"), "TOKEN=1\n");
+    writeFileSync(join(c.ws, "README.md"), "hello\n");
+    return c.run;
+  };
+  it.each([
+    `perl -e '@ARGV = ("<.env"); print <>'`,
+    `perl -e '@ARGV = (" .env"); print <>'`,
+    `perl -e '@ARGV = (".env "); print <>'`,
+    `perl -e '@ARGV = ("+<.env"); print <>'`,
+    `perl -e '@ARGV = qw(<.env); print <>'`,
+    `perl -e '@ARGV=("x|"); print <>'`,
+    `perl -e '*F = $::{"AR"."GV"}; @F = (".env"); print <>'`,
+    `perl -e '*F = $main::{"AR"."GV"}; @F = (".env"); print <>'`,
+    `perl -e '(*F) = $::{"AR"."GV"}; @F = (".env"); print <>'`,
+    `perl -e '*F = "AR"."GV"; @F = (".env"); print <>'`,
+    `perl -ne print 'x|'`,
+    `perl -pe 1 '<.env'`,
+    `perl -ne 1 ' .env'`,
+    `perl -e 'print <>' '+<.env'`,
+  ])("read_file(.env) deny stops `%s`", (command) => {
+    expect(prep()(command)).toMatch(/deny: read_file\(\.env\)/);
+  });
+  it.each([`perl -ne 'print if /x/' README.md`, `perl -e 'print <<>>' README.md`, `perl -ne 'print' -`])("allows `%s`", (command) => {
     expect(prep()(command)).toBeNull();
   });
 });

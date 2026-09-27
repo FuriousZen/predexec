@@ -2018,3 +2018,43 @@ describe("interpreter alias families (final review #4)", () => {
     `pypy -c 'print(1)'`,
   ])("read-only: %s", (c) => expect(isDestructiveCommand(c)).toBe(false));
 });
+
+describe("perl magic-open channel (R31)", () => {
+  // `<>`/`-n`/`-p` open @ARGV names with 2-arg open: a trailing `|` runs a
+  // command and a leading `<`/`>`/`+` is a mode. Classifier assertions only.
+  it.each([
+    `perl -e '@ARGV=("x|"); print <>'`,
+    `perl -e '@ARGV=qw(x|); print <>'`,
+    `perl -e 'local @ARGV=("x|"); print <>'`,
+    `perl -ne 'BEGIN{@ARGV=("x|")} print'`,
+    `timeout 5 perl -e '@ARGV=("x|"); print <>'`,
+    `perl <<< '@ARGV=("x|"); print <>'`,
+    `perl -e '*F = $::{"AR"."GV"}; @F = ("f"); print <>'`,
+    `perl -e '*F = $main::{"AR"."GV"}; @F = ("f"); print <>'`,
+    `perl -e 'local *F = $::{"AR"."GV"}; @F = ("f"); print <F>'`,
+    `perl -e '(*F) = $::{"AR"."GV"}; @F = ("f"); print <>'`,
+    `perl -e '*F = "AR"."GV"; @F = ("f"); print <>'`,
+    `perl -e 'for my $k (keys %::) { 1 } print <>'`,
+    `perl -e 'my $n = "AR"."GV"; $n->[0] = "f"; print <>'`,
+    `perl -ne print 'x|'`,
+    `perl -pe 1 '<f'`,
+    `perl -ne 1 ' f'`,
+    `perl -ne 1 'f '`,
+    `perl -e 'print <>' '+<f'`,
+    `perl -e 'print <>' '>f'`,
+    `perl -e 'print <>' -- '-f'`,
+    `perl -ne print "$f"`,
+    `perl -ne print *.txt`,
+    `timeout 5 perl -ne print 'x|'`,
+    `perl script.pl 'x|'`,
+  ])("mutating: %s", (c) => expect(isDestructiveCommand(c)).toBe(true));
+
+  it.each([
+    `perl -e 'print <<>>' README.md`,
+    `perl -ne 'print' -`,
+    `perl -e 'print <>' < README.md`,
+    `perl -lane '$s += $F[0] * $F[1]; END{print $s}' f`,
+    `perl -e 'print 1' 'x|'`,
+    `perl script.pl README.md`,
+  ])("read-only: %s", (c) => expect(isDestructiveCommand(c)).toBe(false));
+});

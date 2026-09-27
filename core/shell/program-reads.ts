@@ -50,6 +50,7 @@ import {
   executableLanguageView,
   splitTopLevelArguments,
 } from "./language-scan.ts";
+import { perlArgvInfluence, perlMagicOpenHazard, perlUsesMagicOpen } from "./perl-magic-open.ts";
 
 export interface InlineProgramReads {
   /** Static path literals the programs open, as written (relative to the process cwd). */
@@ -61,6 +62,8 @@ export interface InlineProgramReads {
 interface Program {
   language: InterpolationLanguage;
   text: string;
+  /** perl: a `-n`/`-p` loop reads the magic-open channel. */
+  loop?: boolean;
 }
 
 /** A call whose listed argument positions are paths the program reads. */
@@ -174,7 +177,7 @@ function programReads(program: Program, out: string[]): string | null {
     }
   }
   if (language === "perl") {
-    const why = perlArgvReads(text, view, syntax, out);
+    const why = perlArgvReads(text, view, program.loop ?? false);
     if (why !== null) return why;
   }
   if (language === "node") {
@@ -190,78 +193,26 @@ function programReads(program: Program, out: string[]): string | null {
   return null;
 }
 
-/** Closing delimiter for a perl `qw` opener. */
-const QW_CLOSERS: Record<string, string> = { "(": ")", "[": "]", "{": "}", "<": ">" };
-
 /**
- * Perl's `@ARGV` channel (R28/R29): `<>`, `<<>>`, `<ARGV>`, `readline`/`eof`
- * on ARGV and the `-n`/`-p` loops open every element of `@ARGV` as a file,
- * and `@ARGV` can be rewritten in more ways than any list of spellings covers
- * (aliasing through `for`/`map`/`s///`, slices, `@main::ARGV`, symbolic
- * `@{"AR"."GV"}`, …). So instead of enumerating writes, a perl program is
- * accepted only when the RAW text — strings included — mentions `ARGV` solely
- * inside recognized literal list assignments (`@ARGV = (".a", ".b")`,
- * `local @ARGV = qw(a b)`, `local(@ARGV) = …`) or a `<ARGV>` read in code,
- * with the assignments' elements becoming paths
- * for the caller to check; and its code has no symbolic dereference
- * (`@{…}`/`${…}`/`*{…}`/`%{…}`/`&{…}` around anything but a plain identifier,
- * or `@$x`-style), no `eval`, no `do`, no `require`. Anything else is
- * unresolvable. This applies to every perl program, not just ones that read
- * `<>` visibly: a symbolic glob can alias ARGV into any filehandle.
- * Command-line file arguments are shell operands, checked by the caller.
+ * Perl's magic-open channel (R29/R31): `<>`, `<ARGV>`, `readline`/`eof` and
+ * the `-n`/`-p` loops open every element of `@ARGV` with 2-argument `open`.
+ * No literal list assignment is trusted: a program that reads the channel
+ * (perlUsesMagicOpen, over-approximate) and can influence `@ARGV` in any
+ * spelling (perlArgvInfluence: any `ARGV` write or alias, glob, stash,
+ * symbolic dereference, `eval`/`do`/`require`) is unresolvable, and the
+ * caller stops. `eval`/`do`/`require` and symbolic dereference stay
+ * unresolvable in every perl program, channel or not. Command-line file
+ * arguments are shell operands, checked by the caller.
  */
-function perlArgvReads(
-  text: string,
-  view: string,
-  syntax: { hashComments: boolean; slashComments: boolean },
-  out: string[],
-): string | null {
+function perlArgvReads(text: string, view: string, loop: boolean): string | null {
   const dynamic = /\b(?:eval|do|require)\b/.exec(view);
   if (dynamic) return `perl ${dynamic[0]}`;
   if (/[@$%*&]\s*\{(?!\s*\^?[A-Za-z_]\w*\s*\})/.test(view) || /[@%*&]\s*\$|\$\s*\$(?=\s*[\w{$:])/.test(view)) {
     return "perl symbolic dereference";
   }
-  if (!text.includes("ARGV")) return null;
-  const spans: [number, number][] = [];
-  const paths: string[] = [];
-  const assignment = /(?<![\w:$@%&*{\\])(?:local\s*(?:\(\s*)?)?(?:\(\s*)?@ARGV(?![\w:])\s*\)?\s*=(?![=~])/g;
-  for (const match of text.matchAll(assignment)) {
-    let at = match.index! + match[0].length;
-    while (at < text.length && /\s/.test(text[at]!)) at++;
-    let end: number;
-    if (text[at] === "(") {
-      const args = captureLanguageCall(text, at, syntax);
-      const fields = args === null ? null : splitTopLevelArguments(args, syntax);
-      if (args === null || fields === null) return "@ARGV list";
-      for (const field of fields) {
-        if (field.trim() === "") continue;
-        const path = staticString(field, "perl");
-        if (path === null) return `@ARGV element ${field.trim().slice(0, 64)}`;
-        paths.push(path);
-      }
-      end = at + args.length + 2;
-    } else {
-      const qw = /^qw\s*(\S)/.exec(text.slice(at));
-      if (!qw) return "@ARGV assigned a computed list";
-      const close = QW_CLOSERS[qw[1]!] ?? qw[1]!;
-      const bodyStart = at + qw[0].length;
-      const closeAt = text.indexOf(close, bodyStart);
-      if (closeAt === -1) return "@ARGV qw list";
-      paths.push(...text.slice(bodyStart, closeAt).split(/\s+/).filter((word) => word !== ""));
-      end = closeAt + 1;
-    }
-    // The literal list must be the whole right-hand side (`(".e") . "nv"` is not).
-    if (!/^\s*(?:;|\}|$)/.test(text.slice(end))) return "@ARGV assigned a computed list";
-    spans.push([match.index!, end]);
-  }
-  // `<ARGV>` in code only reads the channel whose elements are checked.
-  for (const read of view.matchAll(/<\s*ARGV\s*>/g)) spans.push([read.index!, read.index! + read[0].length]);
-  for (const mention of text.matchAll(/ARGV/g)) {
-    const at = mention.index!;
-    if (!spans.some(([start, end]) => at >= start && at < end)) return "ARGV used outside a literal @ARGV list assignment";
-  }
-  out.push(...paths);
-  return null;
+  if (!perlUsesMagicOpen(text, view, loop)) return null;
+  const influence = perlArgvInfluence(text, view);
+  return influence === null ? null : `perl magic open: ${influence}`;
 }
 
 /** Shell-quote one word so re-tokenizing yields exactly `word`. */
@@ -274,6 +225,10 @@ function inlinePrograms(command: string): { programs: Program[]; unresolved: str
   if (!tree.complete) return { programs, unresolved: "incomplete shell syntax" };
   for (const text of tree.commands) {
     for (const rawSegment of splitCommandSegments(text)) {
+      // A perl operand spelled like a 2-arg open mode (`'<.env'`) or a program
+      // that can rewrite @ARGV opens names no path check sees (R31).
+      const magic = perlMagicOpenHazard(rawSegment);
+      if (magic !== null) return { programs, unresolved: magic };
       let segment = stripShellControlPrefix(rawSegment);
       let head = effectiveHead(segment);
       if (head !== null && !EVAL_INTERPRETERS.has(interpreterFamily(head))) {
@@ -294,7 +249,7 @@ function inlinePrograms(command: string): { programs: Program[]; unresolved: str
       if (extracted.kind === "eval") {
         const language = interpreterLanguage(family);
         const texts = extracted.join ? [extracted.programs.join("\n")] : extracted.programs;
-        for (const program of texts) programs.push({ language, text: program });
+        for (const program of texts) programs.push({ language, text: program, loop: extracted.perl?.loop });
       }
     }
   }
@@ -304,7 +259,9 @@ function inlinePrograms(command: string): { programs: Program[]; unresolved: str
     if (invocation.kind === "unvetted") return { programs, unresolved: `${invocation.head} stdin program` };
     for (const literal of literals) {
       if (literal.text === null) return { programs, unresolved: `${invocation.head} stdin program` };
-      programs.push({ language: interpreterLanguage(invocation.head), text: literal.text });
+      const shape = interpreterEvalPrograms(stripShellControlPrefix(clause));
+      const loop = shape.kind !== "violation" && (shape.perl?.loop ?? false);
+      programs.push({ language: interpreterLanguage(invocation.head), text: literal.text, loop });
     }
   }
   return { programs, unresolved: null };

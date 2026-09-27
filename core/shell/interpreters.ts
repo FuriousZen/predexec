@@ -63,10 +63,20 @@ export function interpreterFamily(head: string): string {
   return head;
 }
 
+/**
+ * A perl invocation's view of its own `@ARGV` channel: whether a `-n`/`-p`
+ * loop (or `-a`/`-F`, which imply `-n`) reads it, and the command-line words
+ * that start out in `@ARGV` (after the program or script).
+ */
+export interface PerlArgv {
+  loop: boolean;
+  operands: string[];
+}
+
 type EvalPrograms =
   /** `stdin`: the invocation reads its program from standard input (no script operand, or `-`). */
-  | { kind: "none"; stdin: boolean }
-  | { kind: "eval"; programs: string[]; join: boolean }
+  | { kind: "none"; stdin: boolean; perl?: PerlArgv }
+  | { kind: "eval"; programs: string[]; join: boolean; perl?: PerlArgv }
   | { kind: "violation"; reason: string };
 
 /** Modules a `perl -M`/`-m` or `ruby -r` preload may name: loading them runs no repo code. */
@@ -190,6 +200,7 @@ export function interpreterEvalPrograms(segment: string): EvalPrograms {
     // perl's -v/-V/-h always exit; ruby's -v exits only as the sole switch.
     const info = isPerl ? infoOnly(/^(?:-v|-V|-h|--version|--help)$/) : infoOnly(/^(?:-v|-h|--version|--help)$/, true);
     let operand = argv.length;
+    let loop = false;
     for (let i = 1; i < argv.length; i++) {
       const word = argv[i]!;
       if (word === "--" || word === "-" || !word.startsWith("-")) { operand = i; break; }
@@ -199,6 +210,7 @@ export function interpreterEvalPrograms(segment: string): EvalPrograms {
       }
       for (let j = 1; j < word.length; j++) {
         const letter = word[j]!;
+        if ("npaF".includes(letter)) loop = true;
         if (plain.includes(letter)) continue;
         const digitRe = digits[letter];
         if (digitRe) {
@@ -238,7 +250,15 @@ export function interpreterEvalPrograms(segment: string): EvalPrograms {
     }
     const stop = argv[operand];
     const stdin = stop === undefined || stop === "-" || (stop === "--" && (argv[operand + 1] === undefined || argv[operand + 1] === "-"));
-    return result(true, stdin && !info);
+    const extracted = result(true, stdin && !info);
+    if (isPerl && extracted.kind !== "violation") {
+      let operands = argv.slice(operand);
+      if (operands[0] === "--") operands = operands.slice(1);
+      // With no inline program, the first operand is the script (`-`: stdin).
+      if (programs.length === 0) operands = operands.slice(1);
+      extracted.perl = { loop, operands };
+    }
+    return extracted;
   }
 
   if (head === "php") {

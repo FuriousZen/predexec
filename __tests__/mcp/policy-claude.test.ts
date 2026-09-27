@@ -1329,8 +1329,11 @@ describe("Task 7 fix round 2: lexer-derived redirects, perl @ARGV (Claude)", () 
     `perl -e 'local(@ARGV) = (".env"); print <>'`,
     `perl -e '@ARGV = qw(.env); print <>'`,
     `perl -e '@ARGV = ("README.md", ".env"); print while <>'`,
-  ])("perl @ARGV read `%s` stops naming the rule", (command) => {
-    expect(setup()(command)).toBe("./.env");
+    // R31: literal lists are no longer trusted, so a harmless one stops too.
+    `perl -e '@ARGV=("README.md"); print <>'`,
+    `perl -e 'local @ARGV=("README.md"); print <>'`,
+  ])("perl @ARGV read `%s` stops as unresolvable (R31)", (command) => {
+    expect(setup()(command)).toMatch(/unresolvable/);
   });
 
   it.each([
@@ -1345,9 +1348,7 @@ describe("Task 7 fix round 2: lexer-derived redirects, perl @ARGV (Claude)", () 
   });
 
   it.each([
-    `perl -e '@ARGV=("README.md"); print <>'`,
     "perl -ne 'print if /x/' README.md",
-    `perl -e 'local @ARGV=("README.md"); print <>'`,
     "cat README.md",
     "wc -l < README.md",
     "echo 'a<b' README.md",
@@ -1402,16 +1403,70 @@ describe("Task 7 fix round 3: perl ARGV channel fails closed (R29, Claude)", () 
     `perl -e 'eval q{@ARGV=(".env")}; print <>'`,
     `perl -e 'do "x.pl"; print <>'`,
     `perl -e 'require "x.pl"; print <>'`,
+    `perl -e 'local @ARGV=("README.md"); print <>'`,
+    `perl -e '@ARGV = qw(README.md); print while <>'`,
   ])("stops `%s` as unresolvable", (command) => {
     expect(setup()(command)).toMatch(/unresolvable/);
   });
 
   it.each([
     "perl -ne 'print if /x/' README.md",
-    `perl -e 'local @ARGV=("README.md"); print <>'`,
-    `perl -e '@ARGV = qw(README.md); print while <>'`,
     `perl -e 'my %h = (a => 1); print "\${x}"'`,
   ])("allows `%s`", (command) => {
     expect(setup()(command)).toBeNull();
+  });
+});
+
+describe("Task 7 fix round 4: perl magic-open channel (R31, Claude)", () => {
+  let tmp: string;
+  afterEach(() => tmp && rmSync(tmp, { recursive: true, force: true }));
+  const setup = () => {
+    tmp = realpathSync(mkdtempSync(join(tmpdir(), "px-claude-t7f4-")));
+    const repo = join(tmp, "repo");
+    const home = join(tmp, "home");
+    const managed = join(tmp, "managed");
+    for (const dir of [join(repo, ".claude"), join(repo, ".git"), join(home, ".claude"), managed]) mkdirSync(dir, { recursive: true });
+    writeFileSync(join(repo, ".env"), "TOKEN=1\n");
+    writeFileSync(join(repo, "README.md"), "hello\n");
+    writeFileSync(join(repo, ".claude", "settings.json"), JSON.stringify({ permissions: { deny: ["Read(./.env)"] } }));
+    const check = createClaudeHostPolicyChecker(repo, {
+      env: { CLAUDE_CONFIG_DIR: join(home, ".claude") } as NodeJS.ProcessEnv,
+      managedDir: managed,
+      home,
+      managedPolicySources: () => [],
+    });
+    return (command: string) => check(command, { cwd: repo, sessionRoot: repo });
+  };
+
+  it.each([
+    `perl -e '@ARGV = ("<.env"); print <>'`,
+    `perl -e '@ARGV = (" .env"); print <>'`,
+    `perl -e '@ARGV = (".env "); print <>'`,
+    `perl -e '@ARGV = ("+<.env"); print <>'`,
+    `perl -e '@ARGV = qw(<.env); print <>'`,
+    `perl -e '@ARGV=("x|"); print <>'`,
+    `perl -e '@ARGV=qw(x|); print <>'`,
+    `perl -e 'local @ARGV=("x|"); print <>'`,
+    `perl -ne 'BEGIN{@ARGV=("x|")} print'`,
+    `perl -e '*F = $::{"AR"."GV"}; @F = (".env"); print <>'`,
+    `perl -e '*F = $main::{"AR"."GV"}; @F = (".env"); print <>'`,
+    `perl -e 'local *F = $::{"AR"."GV"}; @F = (".env"); print <F>'`,
+    `perl -e 'for my $k (keys %::) { *F = $::{$k} if $k eq "AR"."GV" } @F = (".env"); print <>'`,
+    `perl -e '(*F) = $::{"AR"."GV"}; @F = (".env"); print <>'`,
+    `perl -e '*F = "AR"."GV"; @F = (".env"); print <>'`,
+    `perl -ne print 'x|'`,
+    `perl -pe 1 '<.env'`,
+    `perl -ne 1 ' .env'`,
+    `perl -e 'print <>' '+<.env'`,
+  ])("stops `%s` as unresolvable", (command) => {
+    expect(setup()(command)).toMatch(/unresolvable/);
+  });
+
+  it.each([`perl -ne 'print if /x/' README.md`, `perl -e 'print <<>>' README.md`, `perl -ne 'print' -`])("allows `%s`", (command) => {
+    expect(setup()(command)).toBeNull();
+  });
+
+  it("still path-checks a plain operand", () => {
+    expect(setup()(`perl -ne 'print' .env`)).toBe("./.env");
   });
 });

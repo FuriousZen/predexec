@@ -83,6 +83,7 @@ import {
   interpreterReaderViolation,
 } from "./shell/reader-allowlists.ts";
 import { findTaintedEvaluation } from "./shell/taint.ts";
+import { perlMagicOpenHazard, perlStdinProgramHazard } from "./shell/perl-magic-open.ts";
 import {
   EVAL_INTERPRETERS,
   interpreterFamily,
@@ -364,6 +365,10 @@ function stdinProgramToken(cmd: string): string | null {
       if (literal.text.length > LANGUAGE_EVAL_EARLY_LIMIT) return `oversized ${invocation.head} stdin program`;
       const token = interpreterProgramToken(invocation.head, interpreterLanguage(invocation.head), literal.text);
       if (token) return token;
+      if (interpreterFamily(invocation.head) === "perl") {
+        const magic = perlStdinProgramHazard(command, literal.text);
+        if (magic) return magic;
+      }
     }
   }
   return null;
@@ -636,6 +641,14 @@ function findDestructiveTokenInternal(cmd: string, depth: number): string | null
         }
       }
     }
+  }
+
+  // Perl's magic-open channel opens `@ARGV` names with 2-argument open: a
+  // program that can rewrite the list, or an operand spelled like a mode or
+  // a pipe, turns a read into a write or a command.
+  for (const segment of segments) {
+    const token = perlMagicOpenHazard(segment);
+    if (token) return token;
   }
 
   // Last, so it only turns a read-only verdict into a stop: an arithmetic

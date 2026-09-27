@@ -20,8 +20,6 @@ describe("inlineProgramReadPaths (R27(c))", () => {
     [`python3 -c "# open('.env')\nprint(1)"`, []],
     [`python3 -c "print('open(.env)')"`, []],
     ["cat .env", []],
-    [`perl -e 'local @ARGV=(".env"); print <>'`, [".env"]],
-    [`perl -e '@ARGV = qw(a .env); print <<>>'`, ["a", ".env"]],
     [`perl -ne 'print if /x/'`, []],
   ])("%s reads %j", (command, paths) => {
     expect(inlineProgramReadPaths(command)).toEqual({ paths, unresolved: null });
@@ -40,6 +38,15 @@ describe("inlineProgramReadPaths (R27(c))", () => {
     `perl -e 'print scalar(@ARGV)'`,
     `perl -e '@{"AR"."GV"}=(".env"); print <>'`,
     `perl -e '$_ = ".env" for @ARGV; print <>'`,
+    // R31: no literal @ARGV list is trusted, and aliasing that never spells ARGV counts.
+    `perl -e 'local @ARGV=(".env"); print <>'`,
+    `perl -e '@ARGV = qw(a .env); print <<>>'`,
+    `perl -e '*F = $::{"AR"."GV"}; @F = (".env"); print <>'`,
+    `perl -e '*F = $main::{"AR"."GV"}; @F = (".env"); print <F>'`,
+    `perl -e '(*F) = $::{"AR"."GV"}; @F = (".env"); print <>'`,
+    `perl -e '*F = "AR"."GV"; @F = (".env"); print <>'`,
+    `perl -e 'for my $k (keys %::) { 1 } print <>'`,
+    `perl -ne 'BEGIN { local *F = "AR"."GV" } print'`,
   ])("%s is unresolvable", (command) => {
     expect(inlineProgramReadPaths(command).unresolved).not.toBeNull();
   });
