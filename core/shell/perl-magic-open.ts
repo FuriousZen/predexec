@@ -20,6 +20,10 @@
 import { ARGV, lexShellWords, stripLeadingAssignmentsAndWrappers } from "./lexer.ts";
 import { interpreterEvalPrograms, interpreterFamily, stripShellControlPrefix } from "./interpreters.ts";
 import { executableLanguageView } from "./language-scan.ts";
+import { ANY_HEAD, commandsWithUnresolvableOperands } from "./operands.ts";
+
+/** Shell-quote one word so re-tokenizing yields exactly `word`. */
+const quoteWord = (word: string): string => `'${word.replace(/'/g, `'\\''`)}'`;
 
 /**
  * True when a perl program may read the magic-open channel. Over-approximate:
@@ -33,9 +37,14 @@ export function perlUsesMagicOpen(text: string, view: string, loop: boolean): bo
   return /\b(?:readline|eof|getc|read|sysread)\b/.test(view);
 }
 
-/** `ARGV` mentions that only read the channel or the current file name. */
+/**
+ * `ARGV` mentions that only read the channel or the current file name. A
+ * `$ARGV` followed (past whitespace) by `[`/`{`, a `#` comment, a `=pod`
+ * block or `->` may be an element access of @ARGV/%ARGV spelled across a
+ * comment, so it is not a scalar read: fail closed.
+ */
 const ARGV_READS_RE =
-  /<\s*ARGV\s*>|\b(?:readline|eof)\s*\(?\s*\*?ARGV\s*\)?|(?<![\w$@%*&\\#:'{}])\$ARGV(?![\w:'[{]|\s*(?:[[{]|->))/g;
+  /<\s*ARGV\s*>|\b(?:readline|eof)\s*\(?\s*\*?ARGV\s*\)?|(?<![\w$@%*&\\#:'{}])\$ARGV(?![\w:'[{]|\s*[[{#=-])/g;
 
 /**
  * Symbolic dereference that needs no operator-position context: a sigil block
@@ -145,7 +154,7 @@ export function perlMagicOpenHazard(segment: string): string | null {
   const head = stripped[0]?.replace(/^.*\//, "");
   if (head === undefined || interpreterFamily(head) !== "perl") return null;
   // Re-quoted verbatim, so the grammar sees exactly these words.
-  const extracted = interpreterEvalPrograms(stripped.map((word) => `'${word.replace(/'/g, `'\\''`)}'`).join(" "));
+  const extracted = interpreterEvalPrograms(stripped.map(quoteWord).join(" "));
   if (extracted.kind === "violation" || extracted.perl === undefined) return null; // judged elsewhere
   let channel = extracted.kind !== "eval" || extracted.perl.loop;
   if (extracted.kind === "eval") {
@@ -180,4 +189,31 @@ export function perlStdinProgramHazard(clause: string, program: string): string 
   if (!perlUsesMagicOpen(program, view, loop)) return null;
   const influence = perlArgvInfluence(program, view);
   return influence ? `perl magic open: ${influence}` : null;
+}
+
+/**
+ * Perl run with filenames the shell only produces at run time (`xargs perl
+ * -ne …`, `find -exec perl … {} +`, `parallel perl … ::: $(ls)`): a
+ * pipe-shaped or mode-prefixed name in the data reaches 2-argument open, so a
+ * program that may use the magic-open channel is mutating. A launcher whose
+ * command could not be determined is checked for any perl word in it.
+ */
+export function perlDataFedHazard(command: string): string | null {
+  for (const entry of commandsWithUnresolvableOperands(command)) {
+    if (entry.head !== ANY_HEAD && interpreterFamily(entry.head) !== "perl") continue;
+    const lex = lexShellWords(entry.clause, ARGV);
+    if (!lex.complete) return "perl magic open with data-fed filenames";
+    const values = lex.words.map((word) => word.value);
+    for (let i = 0; i < values.length; i++) {
+      if (interpreterFamily(values[i]!.replace(/^.*\//, "")) !== "perl") continue;
+      const extracted = interpreterEvalPrograms(values.slice(i).map(quoteWord).join(" "));
+      if (extracted.kind !== "eval") return "perl magic open with data-fed filenames";
+      const text = extracted.programs.join("\n");
+      const view = executableLanguageView(text, "perl");
+      if (view === null || perlUsesMagicOpen(text, view, extracted.perl?.loop ?? true)) {
+        return "perl magic open with data-fed filenames";
+      }
+    }
+  }
+  return null;
 }

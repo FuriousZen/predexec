@@ -2058,3 +2058,27 @@ describe("perl magic-open channel (R31)", () => {
     `perl script.pl README.md`,
   ])("read-only: %s", (c) => expect(isDestructiveCommand(c)).toBe(false));
 });
+
+describe("perl magic-open channel, fix round 5", () => {
+  it.each([
+    'perl -e \'$ARGV #c\n[0] = "x|"; print <>\' f',
+    'perl -e \'$ARGV#c\n[0] = "x|"; print <>\' f',
+    'perl -e \'$ARGV # c\n\n{x} = 1; print <>\' f',
+    'perl -e \'$ARGV\n=pod\n\n=cut\n[0] = "x|"; print <>\' f',
+    'perl -ne \'BEGIN { $ARGV #c\n[0] = "x|" } print\' f',
+    "ls | xargs perl -ne print",
+    "ls | xargs -0 -n1 perl -e 'print <>'",
+    "find . -type f -exec perl -ne print {} +",
+    "find . -type f -exec perl -ne print {} \\;",
+    "parallel perl -ne print ::: $(ls)",
+    "ls | xargs perl script.pl",
+  ])("mutating: %j", (c) => expect(isDestructiveCommand(c)).toBe(true));
+
+  it.each([
+    "perl -ne 'print $ARGV' f",
+    "perl -ne 'print $ARGV, $_' README.md",
+    "perl -ne print README.md",
+    "find . -name '*.md' -exec perl -e 'print 1' {} +",
+  ])("channel reads of $ARGV stay as before: %j", (c) => expect(findDestructiveToken(c) ?? "").not.toMatch(/magic open/));
+});
+

@@ -83,7 +83,7 @@ import {
   interpreterReaderViolation,
 } from "./shell/reader-allowlists.ts";
 import { findTaintedEvaluation } from "./shell/taint.ts";
-import { perlMagicOpenHazard, perlStdinProgramHazard } from "./shell/perl-magic-open.ts";
+import { perlDataFedHazard, perlMagicOpenHazard, perlStdinProgramHazard } from "./shell/perl-magic-open.ts";
 import {
   EVAL_INTERPRETERS,
   interpreterFamily,
@@ -553,6 +553,12 @@ function findDestructiveTokenInternal(cmd: string, depth: number): string | null
       readOnlyShellSegments.add(i);
     }
   }
+
+  // Perl fed filenames at run time (`xargs perl -ne …`, `find -exec perl …`)
+  // opens each with 2-argument open; checked before the safe tier, which
+  // would wave `find … -exec perl` through.
+  const dataFed = perlDataFedHazard(shellCommand);
+  if (dataFed) return dataFed;
 
   // Safe tier: every head is a pure reader (its write/exec forms were already
   // stopped above), and there is no subshell content we can't attribute.
