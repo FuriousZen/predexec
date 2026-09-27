@@ -110,9 +110,11 @@ describe("pi extension — real host (discoverAndLoadExtensions)", () => {
 
   it("appends the batching nudge to a read-only powershell tool_result (PI-4)", async () => {
     const event = {
+      // A shell reader PowerShell also aliases: since Task 9 a cmdlet such as
+      // Get-Content is an unknown command head, so it gets no read-only nudge.
       toolName: "powershell",
       isError: false,
-      input: { command: "Get-Content foo.txt" },
+      input: { command: "cat foo.txt" },
       content: [{ type: "text", text: "contents" }],
     };
     const patches = await Promise.all(toolResultHandlers.map((handler) => handler(event)));

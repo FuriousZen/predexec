@@ -360,6 +360,19 @@ const UNVETTED_INTERPRETER_INFO_FLAGS: Readonly<Record<string, ReadonlySet<strin
   wish: new Set(),
 };
 
+/** Versioned Tcl/expect executables (`tclsh8.6`) share their family's rule. */
+function unvettedFamily(rawHead: string): string {
+  return STDIN_UNVETTED_INTERPRETER_RE.test(rawHead) ? rawHead.replace(/[\d.]+$/, "") : rawHead;
+}
+
+/**
+ * Whether unvettedInterpreterInvocation judges this head: once it has let an
+ * invocation through (info flags only), the allowlist inversion accepts it.
+ */
+export function isUnvettedInterpreter(head: string): boolean {
+  return Object.hasOwn(UNVETTED_INTERPRETER_INFO_FLAGS, unvettedFamily(head));
+}
+
 /**
  * The offending head when a segment runs an unvetted interpreter (see
  * UNVETTED_INTERPRETER_INFO_FLAGS) for anything but an info-only flag.
@@ -367,9 +380,7 @@ const UNVETTED_INTERPRETER_INFO_FLAGS: Readonly<Record<string, ReadonlySet<strin
 export function unvettedInterpreterInvocation(segment: string): string | null {
   const normalized = normalizeEnvInvocation(tokenizeShellWords(segment, ARGV));
   if (!normalized.complete || normalized.argv.length === 0) return null;
-  const rawHead = normalized.argv[0]!.replace(/^.*\//, "");
-  // Versioned Tcl/expect executables (`tclsh8.6`) share their family's rule.
-  const head = STDIN_UNVETTED_INTERPRETER_RE.test(rawHead) ? rawHead.replace(/[\d.]+$/, "") : rawHead;
+  const head = unvettedFamily(normalized.argv[0]!.replace(/^.*\//, ""));
   if (!Object.hasOwn(UNVETTED_INTERPRETER_INFO_FLAGS, head)) return null;
   const info = UNVETTED_INTERPRETER_INFO_FLAGS[head]!;
   const args = normalized.argv.slice(1);

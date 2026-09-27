@@ -13,10 +13,13 @@ import {
 
 /**
  * Command heads that only ever read (absent a write/exec form caught by
- * READ_ONLY_HEAD_WRITES below). Membership buys ONE thing: skipping the
+ * READ_ONLY_HEAD_WRITES below). Membership buys two things: skipping the
  * word-scan, so quoted writer words in their arguments (grep/rg patterns, jq
- * programs) stop false-positive hard-stopping. The redirect check still
- * applies to them.
+ * programs) stop false-positive hard-stopping; and passing the allowlist
+ * inversion (an unknown head is mutating). The redirect check still applies
+ * to them. Curated from a measured exploration set (Task 9): add a head only
+ * when it can neither write nor run another program, or when a
+ * READ_ONLY_HEAD_WRITES predicate stops every form that does.
  */
 export const READ_ONLY_HEADS = new Set([
   "cat", "ls", "head", "tail", "wc", "grep", "egrep", "fgrep", "rg", "file",
@@ -26,7 +29,202 @@ export const READ_ONLY_HEADS = new Set([
   "rev", "nl", "od", "xxd", "hexdump", "strings", "basename", "dirname",
   "realpath", "readlink", "md5sum", "sha1sum", "sha256sum", "diff", "cmp",
   "less", "more", "tree", "jq", "yq", "awk", "gawk", "mawk", "sed", "find",
+  "tac", "sha224sum", "sha384sum", "sha512sum", "b2sum", "cksum", "sum", "shasum", "md5",
+  "seq", "expr", "yes", "uptime", "nproc", "sw_vers", "locale", "groups", "pgrep", "lsof",
+  "tty", "logname", "users", "who", "getconf", "fd", "fdfind", "base64", "mapfile", "readarray",
+  "look", "pr", "iconv", "bat", "batcat",
 ]);
+
+/**
+ * Shell builtins (and `sleep`) that neither write nor run command text: they
+ * pass the allowlist inversion but, unlike READ_ONLY_HEADS, keep the word
+ * scan. Declarations of command-bearing variables (`export LESSOPEN=…`) are
+ * stopped earlier (env.ts), and `let`'s arithmetic over data-derived values
+ * by taint.ts. Deliberately absent: `eval`/`source`/`.`/`exec` (run text),
+ * `alias` (defines commands), `trap` (runs text on a signal), `shopt`,
+ * `ulimit`, `umask`.
+ */
+export const SHELL_BUILTIN_READERS: ReadonlySet<string> = new Set([
+  ":", "true", "false", "test", "[", "[[", "cd", "pushd", "popd", "dirs", "read", "export", "declare",
+  "typeset", "local", "readonly", "unset", "set", "shift", "exit", "return", "break", "continue", "wait",
+  "getopts", "sleep", "let",
+]);
+
+/**
+ * A multi-tool whose read verbs are known. Global options before the
+ * subcommand must be listed (valueless, or taking the next word or an
+ * attached `=value`); anything else leaves the subcommand position unknown.
+ */
+interface SubcommandReaders {
+  flagGlobals?: readonly string[];
+  valueGlobals?: readonly string[];
+  /** Read verbs; a list names the word that must follow at once (`config view`). */
+  readers: Readonly<Record<string, readonly string[] | null>>;
+  /** An argument anywhere after the subcommand that makes it write or run something. */
+  hazard?: (arg: string) => boolean;
+}
+
+const HELP_OR_VERSION = new Set(["--help", "-h", "--version", "-v", "-V"]);
+
+function subcommandReads(spec: SubcommandReaders, args: readonly string[]): boolean {
+  if (args.length > 0 && args.every((arg) => HELP_OR_VERSION.has(arg))) return true;
+  let i = 0;
+  for (; i < args.length; i++) {
+    const word = args[i]!;
+    if (Object.hasOwn(spec.readers, word) || !word.startsWith("-")) break;
+    const name = word.split("=")[0]!;
+    if (spec.flagGlobals?.includes(word)) continue;
+    if (spec.valueGlobals?.includes(name)) {
+      if (!word.includes("=")) i++;
+      continue;
+    }
+    return false;
+  }
+  const sub = args[i];
+  // A bare invocation (or globals only) prints usage.
+  if (sub === undefined) return i === args.length;
+  if (!Object.hasOwn(spec.readers, sub)) return false;
+  const second = spec.readers[sub];
+  const rest = args.slice(i + 1);
+  if (second && !second.includes(rest[0] ?? "")) return false;
+  return spec.hazard === undefined || !rest.some(spec.hazard);
+}
+
+const KUBECTL: SubcommandReaders = {
+  flagGlobals: ["--insecure-skip-tls-verify"],
+  valueGlobals: ["-n", "--namespace", "--context", "--cluster", "--user", "-s", "--server", "--request-timeout"],
+  readers: {
+    get: null, describe: null, logs: null, explain: null, "api-resources": null, "api-versions": null, version: null,
+    top: null, events: null,
+    config: ["view", "get-contexts", "current-context", "get-clusters", "get-users"],
+    auth: ["can-i", "whoami"],
+  },
+  // A kubeconfig names exec credential plugins: a repository file must not choose them.
+  hazard: (arg) => /^--kubeconfig(?:=|$)/.test(arg),
+};
+
+const DOCKER: SubcommandReaders = {
+  flagGlobals: ["-D", "--debug"],
+  // Not --config/-H/--host: a config directory or remote host chooses helpers to run.
+  valueGlobals: ["--context", "-c", "--log-level", "-l"],
+  readers: {
+    ps: null, images: null, inspect: null, logs: null, version: null, info: null, history: null, port: null, top: null,
+    stats: null, diff: null, search: null,
+    image: ["ls", "list", "inspect", "history"],
+    container: ["ls", "list", "inspect", "logs", "port", "top", "stats", "diff"],
+    network: ["ls", "list", "inspect"],
+    volume: ["ls", "list", "inspect"],
+    system: ["df", "info"],
+    context: ["ls", "list", "inspect", "show"],
+  },
+};
+
+const GH: SubcommandReaders = {
+  readers: {
+    pr: ["view", "list", "diff", "status", "checks"],
+    issue: ["view", "list", "status"],
+    repo: ["view", "list"],
+    run: ["view", "list"],
+    release: ["view", "list"],
+    workflow: ["view", "list"],
+    search: ["repos", "issues", "prs", "code", "commits"],
+    label: ["list"],
+    auth: ["status"],
+    status: null,
+  },
+  // --web opens a browser.
+  hazard: (arg) => /^(?:--web(?:=|$)|-[a-zA-Z]*w)/.test(arg),
+};
+
+const PIP: SubcommandReaders = {
+  // Not --python: pip re-executes itself under that interpreter.
+  flagGlobals: ["-q", "--quiet", "-v", "--verbose", "--no-color", "--disable-pip-version-check", "--isolated"],
+  readers: { list: null, show: null, freeze: null, check: null, inspect: null, help: null, config: ["list", "get"] },
+};
+
+const BREW: SubcommandReaders = {
+  flagGlobals: ["-q", "--quiet", "-v", "--verbose", "-d", "--debug"],
+  // Not outdated/upgrade/tap/update: those may auto-update or write.
+  readers: {
+    list: null, ls: null, info: null, abv: null, search: null, deps: null, uses: null, leaves: null, desc: null,
+    config: null, doctor: null, commands: null, "--prefix": null, "--cellar": null, "--repository": null,
+    "--repo": null, "--cache": null, "--caskroom": null, "--env": null,
+  },
+};
+
+/** curl options that only shape a request or its console output. */
+const CURL_FLAGS = new Set([
+  "--silent", "--show-error", "--location", "--fail", "--fail-with-body", "--head", "--include", "--verbose",
+  "--insecure", "--compressed", "--globoff", "--no-buffer", "--http1.1", "--http2", "--no-progress-meter",
+]);
+const CURL_FLAG_LETTERS = /^-[sSLfIivkgN46]+$/;
+const CURL_VALUE_OPTIONS = new Set([
+  "-H", "--header", "-A", "--user-agent", "-e", "--referer", "-m", "--max-time", "--connect-timeout", "--retry",
+  "-u", "--user", "--url",
+]);
+
+/**
+ * A curl GET/HEAD printed to stdout. Anything else — an output, header,
+ * cookie-jar, trace or config file, a request body or upload, `-w`
+ * (`%output{}` writes a file), another method — is not a known read.
+ */
+function curlReads(args: readonly string[]): boolean {
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i]!;
+    if (!arg.startsWith("-")) continue;
+    if (CURL_FLAGS.has(arg) || CURL_FLAG_LETTERS.test(arg)) continue;
+    if (CURL_VALUE_OPTIONS.has(arg)) {
+      if (++i >= args.length) return false;
+      continue;
+    }
+    if (arg === "-X" || arg === "--request") {
+      if (!/^(?:GET|HEAD)$/.test(args[++i] ?? "")) return false;
+      continue;
+    }
+    if (/^-X(?:GET|HEAD)$/.test(arg)) continue;
+    return false;
+  }
+  return true;
+}
+
+/** wget writing only to stdout (`-O-`, `-qO-`, `-O -`); every other option is unknown. */
+function wgetReads(args: readonly string[]): boolean {
+  let stdout = false;
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i]!;
+    if (!arg.startsWith("-")) continue;
+    if (arg === "-O-" || arg === "-qO-" || arg === "--output-document=-") { stdout = true; continue; }
+    if ((arg === "-O" || arg === "-qO" || arg === "--output-document") && args[i + 1] === "-") {
+      stdout = true;
+      i++;
+      continue;
+    }
+    if (arg === "-q" || arg === "--quiet" || arg === "-nv" || arg === "--no-verbose" || arg === "-S" ||
+      arg === "--server-response" || /^--(?:header|user-agent|timeout|tries)=/.test(arg)) continue;
+    return false;
+  }
+  return stdout;
+}
+
+/**
+ * Multi-mode tools whose read forms pass the allowlist inversion: multi-tools'
+ * read verbs, plus curl/wget to stdout and `crontab -l`. Each predicate gets
+ * the argv after the head; true means a known read. Git (git.ts) and
+ * npm/pnpm/cargo/go (repo-scripts.ts) keep their own verb tables. Any
+ * environment assignment on the invocation (KUBECONFIG, DOCKER_HOST, a pager,
+ * CURL_HOME) fails closed in the caller.
+ */
+export const READ_ONLY_SUBCOMMANDS: Readonly<Record<string, (args: readonly string[]) => boolean>> = {
+  curl: curlReads,
+  wget: wgetReads,
+  crontab: (args) => args.length === 1 && args[0] === "-l",
+  kubectl: (args) => subcommandReads(KUBECTL, args),
+  docker: (args) => subcommandReads(DOCKER, args),
+  gh: (args) => subcommandReads(GH, args),
+  pip: (args) => subcommandReads(PIP, args),
+  pip3: (args) => subcommandReads(PIP, args),
+  brew: (args) => subcommandReads(BREW, args),
+};
 
 /**
  * Decides whether one invocation of a read-only head writes or execs. Receives
@@ -450,6 +648,36 @@ export const READ_ONLY_HEAD_WRITES: Record<string, ReadOnlyHeadWriteCheck> = {
     }
     return null;
   },
+  // -x/--exec and -X/--exec-batch run a command per result. A short cluster
+  // holding x/X stops even when it is an option value (`-tx`): fail closed.
+  fd: fdWrite,
+  fdfind: fdWrite,
+  // BSD/macOS base64 writes -o/--output FILE.
+  base64: (args) => {
+    for (const arg of args) {
+      if (arg === "--") break;
+      if (/^--output(?:=|$)/.test(arg) || (/^-[^-]/.test(arg) && arg.includes("o"))) return "base64 -o";
+    }
+    return null;
+  },
+  // GNU iconv writes -o/--output FILE; -f/-t take the rest of a cluster.
+  iconv: (args) => {
+    for (const arg of args) {
+      if (arg === "--") break;
+      if (/^--output(?:=|$)/.test(arg)) return "iconv --output";
+      if (!/^-[^-]/.test(arg)) continue;
+      for (const letter of arg.slice(1)) {
+        if (letter === "o") return "iconv -o";
+        if (letter === "f" || letter === "t") break;
+      }
+    }
+    return null;
+  },
+  bat: batWrite,
+  batcat: batWrite,
+  // -C runs a callback command every -c lines.
+  mapfile: mapfileWrite,
+  readarray: mapfileWrite,
   // -o writes the listing to a file; -R re-runs tree with `-o 00Tree.html` in
   // every directory.
   tree: (args) => {
@@ -751,6 +979,40 @@ export const WRITER_HEAD_MODES: Record<string, ReadOnlyHeadWriteCheck> = {
     return nested ? `watch ${nested}` : null;
   },
 };
+
+/**
+ * bat runs a pager (--pager, --paging=always, or one named by its
+ * environment/config) and `bat cache --build` writes its cache. Any
+ * environment assignment on the invocation (BAT_PAGER, PAGER,
+ * BAT_CONFIG_PATH, LESSOPEN, ...) stops too.
+ */
+function batWrite(args: string[], { assignments }: ReadOnlyHeadContext): string | null {
+  if (assignments.length > 0) return "bat environment";
+  for (const arg of args) {
+    if (arg === "--") break;
+    if (/^--pag(?:er|ing)(?:=|$)/.test(arg) && arg !== "--paging=never") return `bat ${arg.split("=")[0]}`;
+    if (/^--(?:config-file|config-dir|cache-dir)(?:=|$)/.test(arg)) return `bat ${arg.split("=")[0]}`;
+  }
+  const operand = args.find((arg) => !arg.startsWith("-"));
+  return operand === "cache" ? "bat cache" : null;
+}
+
+function mapfileWrite(args: string[]): string | null {
+  for (const arg of args) {
+    if (arg === "--") break;
+    if (/^-[^-]/.test(arg) && arg.includes("C")) return "mapfile -C";
+  }
+  return null;
+}
+
+function fdWrite(args: string[]): string | null {
+  for (const arg of args) {
+    if (arg === "--") break;
+    if (/^--exec(?:-batch)?(?:=|$)/.test(arg)) return `fd ${arg.split("=")[0]}`;
+    if (/^-[^-]/.test(arg) && /[xX]/.test(arg)) return "fd -x";
+  }
+  return null;
+}
 
 /** uniq writes its second operand: `uniq [OPTION]... [INPUT [OUTPUT]]`. */
 function uniqWrite(args: string[]): string | null {

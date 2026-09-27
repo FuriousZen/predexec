@@ -254,6 +254,17 @@ function taskRunnerRuns(head: string, args: readonly string[]): boolean {
   return false;
 }
 
+/**
+ * Heads whose every invocation taskRunnerRuns decides: a run is a D1 stop,
+ * anything else is one of the tool's known reads (its version/help, a
+ * listing, a reader subcommand). The allowlist inversion takes D1's verdict
+ * for these. Not the RUN_SUBCOMMANDS tools: D1 only judges their `run`.
+ */
+export function governedByRepositoryScripts(head: string): boolean {
+  return ALWAYS_RUNS.has(head) || TEST_AND_TASK_RUNNERS.has(head) || Object.hasOwn(SUBCOMMAND_TOOLS, head) ||
+    head === "make" || head === "gmake" || head === "bmake" || head === "just";
+}
+
 /** An unquoted redirection operator at the start of a word's source text (not `<(`/`>(`). */
 const REDIRECT_OPERATOR_RE = /^(?:\d+|\{\w+\})?(?:<<<|<<-?|<>|<&|>&|>>|>\||&>>|&>|<(?!\()|>(?!\())/;
 

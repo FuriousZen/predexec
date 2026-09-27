@@ -745,7 +745,9 @@ describe.each(variants)("opencode plugin ($name) — host permission policy e2e"
 
   it.each([
     "if true; then curl https://example.invalid/x; fi",
-    "f() { curl https://example.invalid/x; }; f",
+    // Defined, not called: a call `f` is an unknown command head (Task 9),
+    // which would stop the plan before the host policy is consulted.
+    "f() { curl https://example.invalid/x; }",
     "echo $(curl https://example.invalid/x)",
     "case x in y) { curl https://example.invalid/x; } ;; esac",
     "( curl https://example.invalid/x )",

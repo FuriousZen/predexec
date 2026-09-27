@@ -331,7 +331,9 @@ describe("interpreter eval — fs-writer APIs are caught", () => {
   it("a plain script invocation (no eval flag) runs repository code: D1 stops it", () => {
     expect(findDestructiveToken("node scripts/report.js")).toMatch(/^runs repository script /);
     expect(findDestructiveToken("pnpm test")).toMatch(/^runs repository script /);
-    expect(isDestructiveCommand("tsc --noEmit")).toBe(false);
+    // Task 9: tsc is not a known reader (a repo tsconfig's `incremental`
+    // writes .tsbuildinfo even under --noEmit), so the inversion stops it.
+    expect(findDestructiveToken("tsc --noEmit")).toBe("unknown command tsc");
   });
 
   const languageWriters = [
@@ -1393,9 +1395,16 @@ describe("mutation classifier — env split-string composition", () => {
     'env -S "FOO=bar" printf ok',
     'echo \'env -S "GIT_EXTERNAL_DIFF=/hook" git diff\'',
     'env -u GIT_PAGER -S "FOO=bar" git log',
-    'env --split-string "FOO=bar" -- git status',
+    'env --split-string "FOO=bar" git status',
   ])("preserves safe split-string composition: %s", (command) => {
     expect(findDestructiveToken(command)).toBeNull();
+  });
+
+  // Task 9: GNU env stops option parsing at the split `FOO=bar`, so the `--`
+  // after it is the command name (`env: '--': No such file or directory`).
+  // An unknown head under the allowlist inversion.
+  it("a `--` after split assignments is the command name", () => {
+    expect(findDestructiveToken('env --split-string "FOO=bar" -- git status')).toBe("unknown command --");
   });
 
   it.each([
@@ -1982,7 +1991,6 @@ describe("dynamic command names (final review #3)", () => {
     "for f in *.ts; do wc -l \"$f\"; done",
     "ls *.ts",
     "cat '$literal'",
-    "\\$not-expanded",
     // Arithmetic is not a command name, even with a `*` in it.
     "echo $((3*4))",
     "(( x*2 ))",

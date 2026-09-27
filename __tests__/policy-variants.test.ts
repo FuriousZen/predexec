@@ -118,8 +118,11 @@ describe("policyShellVariants — masked and unmasked lines (R19)", () => {
   });
 });
 
+// A backtick heredoc has no body in the outer parse, so its later lines run as
+// commands, the delimiter-looking one included: it is `true` so that the
+// allowlist inversion (Task 9) has nothing to stop and the checker decides.
 describe.each(checkers)("lines hidden by heredoc masking reach the checker — %s", (_name, make) => {
-  it.each(["echo `cat <<x`\ncat .env\nx", "echo `cat <<x`\nsh -c 'cat .env'\nx", "cat <<x\nsh -c 'cat .env'\nx", "cat <<x\ncat .env\nx"])("%s", async (command) => {
+  it.each(["echo `cat <<true`\ncat .env\ntrue", "echo `cat <<true`\nsh -c 'cat .env'\ntrue", "cat <<x\nsh -c 'cat .env'\nx", "cat <<x\ncat .env\nx"])("%s", async (command) => {
     const r = await run(command, make());
     expect(r.stoppedReason).toBe("policyStop");
     expect(r.pathTaken).toEqual([]);

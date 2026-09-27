@@ -290,9 +290,11 @@ describe.each(variants)("pi extension ($name) — tool_result nudge hook", ({ pr
     const hook = events.get("tool_result")!;
 
     const event = {
+      // A shell reader PowerShell also aliases: since Task 9 a cmdlet such as
+      // Get-Content is an unknown command head, so it gets no read-only nudge.
       toolName: "powershell",
       isError: false,
-      input: { command: "Get-Content foo.txt" },
+      input: { command: "cat foo.txt" },
       content: [{ type: "text", text: "contents" }],
     };
     const out = await hook(event);

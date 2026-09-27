@@ -680,7 +680,9 @@ describe("Claude Read rules — tool ops and shell readers", () => {
 
   it("Read(./.env) sees a `cat .env` line after a backtick heredoc (R19)", async () => {
     const { check, repo } = setup({ deny: ["Read(./.env)"] });
-    const r = await run(repo, check, ["echo `cat <<x`\ncat .env\nx"]);
+    // `true`, not `x`: the delimiter-looking line runs as a command, and an
+    // unknown head would stop it before the checker (Task 9).
+    const r = await run(repo, check, ["echo `cat <<true`\ncat .env\ntrue"]);
     expect(r.stoppedReason).toBe("policyStop");
     expect(r.transcript).not.toContain("TOKEN=1");
   });

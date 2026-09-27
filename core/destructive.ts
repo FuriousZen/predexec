@@ -27,9 +27,11 @@
  * scanning), reader-allowlists.ts, and taint.ts (arithmetic over data-derived
  * variables, the pipeline's last stage).
  *
- * Deliberately out of scope: allowlist-only inversion for commands in general
- * (the adapters' `mutates` guidance wants tests/builds speculating), and
- * rsync (mode-sensitive parsing).
+ * Last, the allowlist inversion (Task 9): every simple command's head must be
+ * known — a curated reader, a shell builtin, git, a D1-governed tool, an
+ * interpreter whose program was vetted above, a read verb of a multi-tool
+ * (READ_ONLY_SUBCOMMANDS), or the user's extraReadOnlyHeads — or the command
+ * is mutating ("unknown command <head>").
  */
 
 import {
@@ -42,6 +44,7 @@ import {
   hasAnsiCEscapedQuote,
   hasDynamicCommandName,
   heredocScanHazard,
+  withHeredocMasking,
   withoutHeredocMasking,
   inspectCommandSubstitutions,
   inspectCommandSubstitutionTree,
@@ -59,13 +62,15 @@ import {
   WRAPPERS_WITH_DURATION,
 } from "./shell/lexer.ts";
 import { type ClassifierOptions, MAX_CLASSIFY_WORD_LENGTH, MAX_COMMAND_LENGTH, TOOL_NAMES } from "./types.ts";
-import { type RepositoryScriptRun, repositoryScriptRun } from "./shell/repo-scripts.ts";
+import { governedByRepositoryScripts, type RepositoryScriptRun, repositoryScriptRun } from "./shell/repo-scripts.ts";
 import {
   findGitMutationToken,
 } from "./shell/git.ts";
 import {
   READ_ONLY_HEADS,
   READ_ONLY_HEAD_WRITES,
+  READ_ONLY_SUBCOMMANDS,
+  SHELL_BUILTIN_READERS,
   WRITER_HEAD_MODES,
 } from "./shell/heads.ts";
 import {
@@ -96,6 +101,7 @@ import {
   interpreterLanguage,
   interpreterStdinProgram,
   isEvalInvocation,
+  isUnvettedInterpreter,
   languageWordScanSegment,
   shellEvalPayload,
   stripShellControlPrefix,
@@ -419,11 +425,112 @@ function repositoryScriptToken(segments: readonly string[]): string | null {
   return null;
 }
 
+/** Unescaped backtick-body passes left in this classification (see the substitution loop). */
+let unescapeBudget = 0;
+const UNESCAPE_BUDGET = 64;
+
+/** activeOptions.extraReadOnlyHeads decoded to argv words, once per classification. */
+let activeReadOnlyEntries: readonly string[][] = [];
+
+/** Whether the user declared this argv read-only: an extraReadOnlyHeads entry is an exact prefix of it. */
+function userListsReadOnly(argv: readonly string[]): boolean {
+  return activeReadOnlyEntries.some((words) =>
+    words.length > 0 && words.length <= argv.length && words.every((word, i) => word === argv[i]));
+}
+
+/** Control words before a command (`if`, `do`, `!`, `{`, ...); `for`/`case` headers are not commands. */
+const COMMAND_CONTROL_PREFIX_RE = /^(?:if|then|elif|else|while|until|do|done|fi|coproc|[!{}])(?=\s|$)\s*/;
+const NON_COMMAND_HEADER_RE = /^(?:for|select|case|function|esac)(?=\s|$)/;
+
+/**
+ * Whether `((…))` text is an arithmetic command the way bash decides it: the
+ * paren matching the second `(` must be followed at once by the closing `)`,
+ * which ends the text. Otherwise bash re-reads it as nested subshells —
+ * `((foo) )` runs foo — whose commands the shared walker skipped as
+ * arithmetic. Any quote or escape fails closed.
+ */
+function isArithmeticCommand(text: string): boolean {
+  let depth = 0;
+  for (let i = 1; i < text.length; i++) {
+    const ch = text[i]!;
+    if (ch === "'" || ch === '"' || ch === "\\" || ch === "`") return false;
+    if (ch === "(") depth++;
+    else if (ch === ")" && --depth === 0) return text[i + 1] === ")" && text.slice(i + 2).trim() === "";
+  }
+  return false;
+}
+
+/**
+ * The inversion's verdict on one simple command (redirections already
+ * removed): null when its effective head is known, else the stop reason.
+ * Every other rule has run by now; this only turns "nothing objected" into
+ * "and the program is one we know".
+ */
+function unknownHeadToken(text: string): string | null {
+  const tokens = tokenizeShellWords(text, ARGV);
+  // `command -v make` looks the name up; it runs nothing.
+  if (tokens[0] === "command" && /^-[vV]+$/.test(tokens[1] ?? "")) return null;
+  const normalized = normalizeEnvInvocation(tokens);
+  const label = (head: string) => `unknown command ${head.length > MAX_SCRIPT_LABEL ? `${head.slice(0, MAX_SCRIPT_LABEL)}…` : head}`;
+  if (!normalized.complete) return label(tokens[0] ?? text);
+  const argv = normalized.argv;
+  // Assignments only, or a bare wrapper (`env`, `xargs` → echo, `nice`).
+  if (argv.length === 0) return null;
+  if (userListsReadOnly(argv)) return null;
+  const head = argv[0]!.replace(/^.*\//, "");
+  const shown = head || argv[0] || '""';
+  if (READ_ONLY_HEADS.has(head) || SHELL_BUILTIN_READERS.has(head) || head === "git") return null;
+  // Tools whose every write/run form an earlier rule stops: mode-sensitive
+  // writers, vetted interpreters and shells, D1's runners and reader tables.
+  if (Object.hasOwn(WRITER_HEAD_MODES, head) || EVAL_SHELLS.has(head) || isUnvettedInterpreter(head)) return null;
+  if (EVAL_INTERPRETERS.has(interpreterFamily(head)) || governedByRepositoryScripts(head)) return null;
+  const run = repositoryScriptRun(text);
+  if (run && userAllowsScript(run)) return null;
+  const reads = Object.hasOwn(READ_ONLY_SUBCOMMANDS, head) ? READ_ONLY_SUBCOMMANDS[head]! : null;
+  if (reads && normalized.assignments.length === 0 && reads(argv.slice(1))) return null;
+  return label(shown);
+}
+
+/**
+ * The allowlist inversion over every simple command in `cmd`, wherever it
+ * sits (pipelines, lists, groups, loops, case arms, substitutions). Heredoc
+ * bodies are data here in both passes: in the unmasked second pass (R18)
+ * every body line would otherwise read as a command, and body lines are
+ * prose. What an unquoted body runs, its `$(…)`, reaches this check through
+ * the second pass's substitution recursion, which masking hid from the first.
+ * The cost: a line a heredoc scanner miss takes for body text is judged by
+ * every rule but this one.
+ */
+function unknownCommandToken(cmd: string): string | null {
+  for (const { command, notCommand } of withHeredocMasking(() => commandStdin(cmd))) {
+    if (notCommand) continue;
+    let text = command.trim();
+    for (let i = 0; i < 8; i++) {
+      const next = text.replace(COMMAND_CONTROL_PREFIX_RE, "");
+      if (next === text) break;
+      text = next;
+    }
+    // `((…))` is arithmetic; loop/case/function headers hold no command.
+    if (text.startsWith("((")) {
+      if (isArithmeticCommand(text)) continue;
+      return "complex shell syntax";
+    }
+    if (text === "" || NON_COMMAND_HEADER_RE.test(text)) continue;
+    const token = unknownHeadToken(text);
+    if (token) return token;
+  }
+  return null;
+}
+
 /**
  * The classifier. Returns the offending token for the hard-stop message, or
- * null when the command is (heuristically) read-only.
+ * null when the command is (heuristically) read-only. A `fragment` is a
+ * clause or group cut out of a larger command (a loop header, a case arm, a
+ * `( … )` body — or an arithmetic `( … )` the group extractor mistakes for
+ * one): its enclosing call already ran the allowlist inversion over the
+ * whole text, whose walk (commandStdin) reaches every command in it.
  */
-function findDestructiveTokenInternal(cmd: string, depth: number): string | null {
+function findDestructiveTokenInternal(cmd: string, depth: number, fragment = false): string | null {
   if (depth >= 32) return "complex shell syntax";
   const normalized = normalizeEnvInvocation(tokenizeShellWords(cmd, ARGV));
   if (!normalized.complete) return "ambiguous env invocation";
@@ -466,6 +573,16 @@ function findDestructiveTokenInternal(cmd: string, depth: number): string | null
     for (const substitution of substitutions) {
       const nested = findDestructiveTokenInternal(substitution, depth + 1);
       if (nested) return nested;
+      // Inside backticks, `\``, `\$` and `\\` lose their backslash before the
+      // body runs, so `echo \`foo\`` in a backtick body is itself a command
+      // substitution. The extractor returns bodies raw; classify the unescaped
+      // text too (for a `$(…)` body this can only over-stop). Budgeted: each
+      // level would otherwise classify its nested bodies twice.
+      if (/\\[`$\\]/.test(substitution)) {
+        if (--unescapeBudget < 0) return "complex shell syntax";
+        const unescaped = findDestructiveTokenInternal(substitution.replace(/\\([`$\\])/g, "$1"), depth + 1);
+        if (unescaped) return unescaped;
+      }
     }
   }
 
@@ -482,7 +599,7 @@ function findDestructiveTokenInternal(cmd: string, depth: number): string | null
   // segment starts with `(`. Inspect each group recursively, while the
   // quote-aware extractor leaves literal parentheses untouched.
   for (const group of parenthesizedBodies(shellCommand)) {
-    const nested = findDestructiveTokenInternal(group, depth + 1);
+    const nested = findDestructiveTokenInternal(group, depth + 1, true);
     if (nested) return nested;
   }
 
@@ -492,7 +609,7 @@ function findDestructiveTokenInternal(cmd: string, depth: number): string | null
   // leading syntax and remain in the established safe tier.
   for (const segment of segments) {
     for (const clause of extractShellCommandClauses(segment)) {
-      const nested = findDestructiveTokenInternal(clause, depth + 1);
+      const nested = findDestructiveTokenInternal(clause, depth + 1, true);
       if (nested) return nested;
     }
   }
@@ -504,7 +621,7 @@ function findDestructiveTokenInternal(cmd: string, depth: number): string | null
   // (`if ! (...); then case ... esac; fi`). Removing either one changes
   // verdicts in __tests__/core/destructive-corpus.test.ts.
   for (const clause of extractShellCommandClauses(shellCommand)) {
-    const nested = findDestructiveTokenInternal(clause, depth + 1);
+    const nested = findDestructiveTokenInternal(clause, depth + 1, true);
     if (nested) return nested;
   }
 
@@ -617,7 +734,7 @@ function findDestructiveTokenInternal(cmd: string, depth: number): string | null
     });
   // A relative-path head (`./cat`) is a repository file even when its
   // basename is a known reader.
-  if (allSafe) return repositoryScriptToken(segments) ?? stdinProgramToken(cmd) ?? findTaintedEvaluation(cmd);
+  if (allSafe) return repositoryScriptToken(segments) ?? inversionToken(cmd, fragment) ?? stdinProgramToken(cmd) ?? findTaintedEvaluation(cmd);
 
   const caseInspection = inspectShellCommandClauses(shellCommand);
   const wordScanSegments = /^case\b/.test(shellCommand.trim()) && caseInspection.complete && caseInspection.clauses.length > 0
@@ -709,8 +826,15 @@ function findDestructiveTokenInternal(cmd: string, depth: number): string | null
   // command substitution.
   // It reads the unmasked command: an unquoted heredoc body expands `$((…))`.
   // So does the stdin check: a heredoc body is exactly what it judges.
-  // D1 goes first so a script run reads as one, not as a stdin program.
-  return repositoryScriptToken(segments) ?? stdinProgramToken(cmd) ?? findTaintedEvaluation(cmd);
+  // D1 goes first so a script run reads as one, not as a stdin program or an
+  // unknown command.
+  return repositoryScriptToken(segments) ?? inversionToken(cmd, fragment) ?? stdinProgramToken(cmd) ??
+    findTaintedEvaluation(cmd);
+}
+
+/** The inversion, unless `cmd` is a fragment (see findDestructiveTokenInternal). */
+function inversionToken(cmd: string, fragment: boolean): string | null {
+  return fragment ? null : unknownCommandToken(cmd);
 }
 
 /**
@@ -722,8 +846,12 @@ export function findDestructiveToken(cmd: string, options: ClassifierOptions = {
   if (cmd.length > MAX_COMMAND_LENGTH) return "oversized command";
   if (longestWordLength(cmd) > MAX_CLASSIFY_WORD_LENGTH) return "oversized shell word";
   const previous = activeOptions;
+  const previousEntries = activeReadOnlyEntries;
+  const previousBudget = unescapeBudget;
   activeOptions = options;
+  activeReadOnlyEntries = (options.extraReadOnlyHeads ?? []).map((entry) => tokenizeShellWords(entry, ARGV));
   try {
+    unescapeBudget = UNESCAPE_BUDGET;
     const masked = findDestructiveTokenInternal(cmd, 0);
     if (masked) return masked;
     // Second pass with no heredoc masking (R18): every physical line is
@@ -732,9 +860,12 @@ export function findDestructiveToken(cmd: string, options: ClassifierOptions = {
     // an arithmetic shift, a comment, quoted arithmetic, a backtick heredoc)
     // used to hide the next line; now a line the first pass took for heredoc
     // body is still classified here.
+    unescapeBudget = UNESCAPE_BUDGET;
     return withoutHeredocMasking(() => findDestructiveTokenInternal(cmd, 0));
   } finally {
     activeOptions = previous;
+    activeReadOnlyEntries = previousEntries;
+    unescapeBudget = previousBudget;
   }
 }
 

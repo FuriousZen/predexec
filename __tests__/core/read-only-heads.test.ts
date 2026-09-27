@@ -259,7 +259,7 @@ const STDIN_PROGRAM_READ_ONLY = [
   "python3 <<< 'print(1)'", "node <<< 'console.log(1)'", "perl <<< 'print 1'",
   "python3 - <<'EOF'\nprint(1)\nEOF", "python3 <<EOF\nprint(1)\nEOF", "(python3 <<'EOF'\nprint(1)\nEOF\n)",
   "python3 -c 'print(1)' <<< 'hello'", "cat <<'EOF'\nimport os; os.remove(\"x\")\nEOF",
-  "grep x <<< 'os.remove(1)'", "cat <<< 'E'\nls\nE",
+  "grep x <<< 'os.remove(1)'",
 ];
 
 describe("here-string/heredoc interpreter programs (E-C)", () => {
@@ -376,7 +376,18 @@ describe("backtick heredocs and unmasked stdin programs (fix round 3)", () => {
     "echo `cat <<x`\npython3 <<< 'import os;os.remove(1)'\nx", "echo `cat <<x`\necho 'import os;os.remove(1)' | python3\nx",
     "echo `cat <<x`\nnode <<< 'require(\"fs\").rmSync(1)'\nx", "echo `cat <<x`\nrm -rf y\nx",
   ])("mutating: %s", (c) => expect(isDestructiveCommand(c)).toBe(true));
-  it.each(["echo `cat <<x`\nls\nx", "echo $(cat <<x\nhello\nx\n)"])("read-only: %s", (c) => expect(isDestructiveCommand(c)).toBe(false));
+  it.each(["echo $(cat <<x\nhello\nx\n)"])("read-only: %s", (c) => expect(isDestructiveCommand(c)).toBe(false));
+});
+
+// Task 9: a here-string or a backtick heredoc has no body in the outer parse,
+// so every later line is a command, the delimiter-looking last one included.
+// That line names no known program, so the allowlist inversion stops it; the
+// `ls` before it is still read as a command, not as body text.
+describe("lines after a body-less here-string/backtick heredoc are commands (Task 9)", () => {
+  it.each([
+    ["cat <<< 'E'\nls\nE", "unknown command E"],
+    ["echo `cat <<x`\nls\nx", "unknown command x"],
+  ])("%s -> %s", (c, token) => expect(findDestructiveToken(c)).toBe(token));
 });
 
 // Task 5 (E-D): exec-capable editors/debuggers/tools and missed writers.

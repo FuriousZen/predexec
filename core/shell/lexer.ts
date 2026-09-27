@@ -1675,6 +1675,20 @@ export function withoutHeredocMasking<T>(classify: () => T): T {
   }
 }
 
+/**
+ * Run `walk` with heredoc masking on, even inside withoutHeredocMasking: for
+ * a check that must read heredoc bodies as data in both passes.
+ */
+export function withHeredocMasking<T>(walk: () => T): T {
+  const previous = heredocMasking;
+  heredocMasking = true;
+  try {
+    return walk();
+  } finally {
+    heredocMasking = previous;
+  }
+}
+
 /** Literal text a here-string or here-document feeds a command's stdin. */
 export interface StdinLiteral {
   kind: "here-string" | "heredoc";
@@ -1693,6 +1707,13 @@ export interface CommandStdin {
   literals: StdinLiteral[];
   /** A `<`, `<>` or `<&` redirection on fd 0: stdin is a file or another fd. */
   redirected: boolean;
+  /**
+   * The shell never runs the text as a command: a `case` pattern (`a` and `b`
+   * in `a|b)`), the name in a `NAME ( )` function definition, or the words of
+   * a `(` glued to a preceding word — an array (`x=(a b)`), an extglob
+   * (`@(a|b)`), or a syntax error (`-eputs("ok")`).
+   */
+  notCommand: boolean;
 }
 
 /** The body an unquoted-delimiter heredoc delivers, or null when the shell would expand it. */
@@ -1764,6 +1785,29 @@ interface StdinFrame {
   redirected: boolean;
   /** Open `case` commands, whose pattern `)` closes no group. */
   caseDepth: number;
+  /** Inside an open `case`, between `in`/`;;` and the pattern's `)`. */
+  inCasePattern: boolean;
+  /** A group whose `(` is glued to a word: its words are not commands. */
+  gluedGroup: boolean;
+}
+
+const CASE_HEADER_LIMIT = 1024;
+
+/** Words after which a glued `(` still opens a subshell (`if(true)`, `!(x)`). */
+const GROUP_PREFIX_WORDS = new Set(["if", "then", "elif", "else", "do", "while", "until", "!", "time", "coproc"]);
+
+/**
+ * Whether the `(` at `i` follows a word with no separator between them.
+ * `(` is a shell metacharacter, so it still ends that word: after a reserved
+ * word it opens a subshell, and otherwise the group is an array value
+ * (`x=(`), an extglob (`@(`), or a syntax error — never a command list. The
+ * backward scan stops at the previous metacharacter, so it is linear overall.
+ */
+function parenGluedToWord(text: string, i: number): boolean {
+  let j = i;
+  while (j > 0 && !/[\s;|&(){}<>`]/.test(text[j - 1]!)) j--;
+  const word = text.slice(j, i);
+  return word !== "" && !GROUP_PREFIX_WORDS.has(word);
 }
 
 const COMMAND_PREFIX_ONLY_RE = /^(?:(?:if|then|elif|else|do|while|until|!|\{|\()\s+)*$/;
@@ -1801,13 +1845,15 @@ export function commandStdin(cmd: string): CommandStdin[] {
     if (!texts.has(key)) texts.set(key, heredocText(cmd, span, lineStart, crBefore));
     return texts.get(key)!;
   };
-  const newFrame = (start: number): StdinFrame => ({ start, redirects: [], literals: [], redirected: false, caseDepth: 0 });
+  const newFrame = (start: number): StdinFrame => ({
+    start, redirects: [], literals: [], redirected: false, caseDepth: 0, inCasePattern: false, gluedGroup: false,
+  });
   let frame = newFrame(0);
   let quote: '"' | null = null;
   const arithmetic: ArithmeticState = { close: null, depth: 0 };
   const stack: Array<{ kind: "substitution" | "backtick" | "group"; outer: StdinFrame; quote: '"' | null }> = [];
 
-  const finish = (end: number) => {
+  const finish = (end: number, notCommand = false) => {
     let command = "";
     let at = frame.start;
     for (const redirect of frame.redirects) {
@@ -1816,7 +1862,7 @@ export function commandStdin(cmd: string): CommandStdin[] {
     }
     command += masked.slice(at, Math.max(at, end));
     if (command.trim() !== "" || frame.literals.length > 0 || frame.redirected) {
-      out.push({ command, literals: frame.literals, redirected: frame.redirected });
+      out.push({ command, literals: frame.literals, redirected: frame.redirected, notCommand: notCommand || frame.gluedGroup });
     }
     frame.literals = [];
     frame.redirects = [];
@@ -1895,18 +1941,44 @@ export function commandStdin(cmd: string): CommandStdin[] {
       continue;
     }
     if (ch === "(") {
+      // `case x in (a) …`: a pattern's optional leading parenthesis.
+      if (frame.inCasePattern && masked.slice(frame.start, i).trim() === "") {
+        frame.start = i + 1;
+        continue;
+      }
       const before = masked[i - 1];
       if (before === "$" || before === "<" || before === ">") push("substitution", i + 1);
-      else { finish(i); push("group", i + 1); }
+      else {
+        const glued = parenGluedToWord(masked, i);
+        // `NAME ( )`: a function definition's name, not a command.
+        const definition = /^\s*\)/.test(masked.slice(i + 1, i + 64)) &&
+          /^\s*[A-Za-z_][A-Za-z0-9_]*\s*$/.test(masked.slice(frame.start, i));
+        finish(i, definition);
+        push("group", i + 1);
+        frame.gluedGroup = glued;
+      }
       continue;
     }
     if (ch === ")") {
-      if (frame.caseDepth > 0) { finish(i); continue; }
+      if (frame.caseDepth > 0) {
+        finish(i, frame.inCasePattern);
+        frame.inCasePattern = false;
+        continue;
+      }
       if (stack.length > 0 && stack.at(-1)!.kind !== "backtick") pop(i);
       else finish(i);
       continue;
     }
-    if (ch === ";" || ch === "\n" || ch === "\r") { finish(i); continue; }
+    if (ch === ";" || ch === "\n" || ch === "\r") {
+      finish(i);
+      // `;;`, `;&` and `;;&` end a case arm: the next words are a pattern.
+      if (ch === ";" && frame.caseDepth > 0 && (masked[i + 1] === ";" || masked[i + 1] === "&")) {
+        frame.inCasePattern = true;
+        i += masked[i + 1] === ";" && masked[i + 2] === "&" ? 2 : 1;
+        frame.start = i + 1;
+      }
+      continue;
+    }
     if (ch === "&") {
       if (masked[i + 1] === ">") {
         const parsed = operandFrom(i + (masked[i + 2] === ">" ? 3 : 2));
@@ -1920,7 +1992,8 @@ export function commandStdin(cmd: string): CommandStdin[] {
     }
     if (ch === "|") {
       if (masked[i - 1] === ">") continue;
-      finish(i);
+      // `a|b)`: alternatives of one pattern.
+      finish(i, frame.inCasePattern);
       continue;
     }
     if ((ch === "{" || ch === "}") && wordStart(i) && /[\s;&|)]|^$/.test(masked[i + 1] ?? "")) {
@@ -1929,10 +2002,22 @@ export function commandStdin(cmd: string): CommandStdin[] {
     }
     if (keywordAt(i, "case") && COMMAND_PREFIX_ONLY_RE.test(masked.slice(frame.start, i).trimStart())) {
       frame.caseDepth++;
+      frame.inCasePattern = false;
+      continue;
+    }
+    // `case WORD in`: the first pattern follows. Only a short frame can be
+    // `case WORD` (bounded, so a body full of `in` words stays linear); a
+    // longer subject leaves the patterns read as commands, which fails closed.
+    if (keywordAt(i, "in") && frame.caseDepth > 0 && !frame.inCasePattern && i - frame.start <= CASE_HEADER_LIMIT &&
+      /^(?:(?:if|then|elif|else|do|while|until|!|\{|\()\s+)*case\s+\S+\s*$/.test(masked.slice(frame.start, i).trimStart())) {
+      finish(i + 2);
+      frame.inCasePattern = true;
+      i++;
       continue;
     }
     if (keywordAt(i, "esac") && frame.caseDepth > 0) {
       frame.caseDepth--;
+      frame.inCasePattern = false;
       continue;
     }
     if ((ch !== "<" && ch !== ">") || masked[i + 1] === "(") continue;
