@@ -359,3 +359,13 @@ describe("bun stdin programs (fix round 2)", () => {
   it.each(["echo x | bun run -", "echo x | bun run", "echo x | bun run --watch x.ts", "cat f | bun repl"])("mutating: %s", (c) => expect(isDestructiveCommand(c)).toBe(true));
   it.each(["echo x | bun x.ts", "bun --version", "echo x | bun run x.ts"])("read-only: %s", (c) => expect(isDestructiveCommand(c)).toBe(false));
 });
+
+// Fix round 3: a heredoc inside backticks has no body in the outer parse, and
+// the unmasked pass judges stdin programs too.
+describe("backtick heredocs and unmasked stdin programs (fix round 3)", () => {
+  it.each([
+    "echo `cat <<x`\npython3 <<< 'import os;os.remove(1)'\nx", "echo `cat <<x`\necho 'import os;os.remove(1)' | python3\nx",
+    "echo `cat <<x`\nnode <<< 'require(\"fs\").rmSync(1)'\nx", "echo `cat <<x`\nrm -rf y\nx",
+  ])("mutating: %s", (c) => expect(isDestructiveCommand(c)).toBe(true));
+  it.each(["echo `cat <<x`\nls\nx", "echo $(cat <<x\nhello\nx\n)"])("read-only: %s", (c) => expect(isDestructiveCommand(c)).toBe(false));
+});

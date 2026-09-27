@@ -20,7 +20,7 @@ import { isAbsolute, relative, resolve, sep } from "node:path";
 import { conditionStringBudget, evaluateConditionWithDetail, isInsideRoot } from "./conditions.ts";
 import { READ_ONLY_TOOLS, MUTATING_TOOLS, findDestructiveToken } from "./destructive.ts";
 import { runNode, isToolOp, formatToolOpLabel } from "./runner.ts";
-import { ARGV, extractShellCommandClauses, hasDynamicCommandName, inspectCommandSubstitutionTree, normalizeEnvInvocation, splitCommandSegments, tokenizeShellWords } from "./shell/lexer.ts";
+import { ARGV, extractShellCommandClauses, hasDynamicCommandName, inspectCommandSubstitutionTree, normalizeEnvInvocation, splitCommandSegments, tokenizeShellWords, withoutHeredocMasking } from "./shell/lexer.ts";
 import { shellEvalPayload } from "./shell/interpreters.ts";
 import { validateOperation } from "./validation.ts";
 import {
@@ -356,7 +356,8 @@ const MAX_POLICY_SHELL_DEPTH = 8;
  * inside a `$(…)`, backtick or `<(…)` substitution), and every clause's
  * decoded argv form — quotes/escapes removed, leading assignments, `env` and
  * wrappers dropped, head reduced to its basename (`/usr/bin/env '/bin/cat'
- * .env` → `cat .env`). The command itself is not included, and nothing is
+ * .env` → `cat .env`) — and, from a second walk with heredoc masking off,
+ * every line the masked walk took for heredoc body. The command itself is not included, and nothing is
  * returned for a command with neither form. Throws (fail closed) when the
  * substitution tree cannot be fully inspected, the shell nesting exceeds
  * MAX_POLICY_SHELL_DEPTH, or a clause's command name is an expansion.
@@ -371,13 +372,17 @@ export function policyShellVariants(command: string): string[] {
       variants.push(trimmed);
     }
   };
-  const expanded = new Set<string>();
+  let expanded = new Set<string>();
+  // Pieces the masked walk saw; the unmasked walk adds any other piece itself.
+  const maskedPieces = new Set<string>();
+  let onPiece = (piece: string): void => void maskedPieces.add(piece.trim());
   const visit = (text: string, depth: number): void => {
     // The text itself, then every substitution/compound body under it.
     const tree = inspectCommandSubstitutionTree(text);
     if (!tree.complete) throw new Error("command substitutions too deep or large to inspect for policy");
     for (const body of tree.commands) {
       for (const piece of splitCommandSegments(body)) {
+        onPiece(piece);
         for (const clause of new Set([piece, ...extractShellCommandClauses(piece)])) {
           // No host rule can match a program chosen at run time (`$c .env`).
           if (hasDynamicCommandName(clause)) {
@@ -403,6 +408,14 @@ export function policyShellVariants(command: string): string[] {
     }
   };
   visit(command, 0);
+  // R19: the same union the classifier takes. Walk again with heredoc
+  // masking off, so a line the masked walk took for heredoc body (rightly, or
+  // by a scanner miss) is still a command every host checker sees.
+  expanded = new Set<string>();
+  onPiece = (piece: string): void => {
+    if (!maskedPieces.has(piece.trim())) add(piece);
+  };
+  withoutHeredocMasking(() => visit(command, 0));
   return variants;
 }
 

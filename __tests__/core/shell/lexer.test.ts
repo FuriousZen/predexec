@@ -108,6 +108,8 @@ describe("here-strings and heredoc stdin literals", () => {
     expect(maskHeredocBodies("(( y = 1<<2 ))\nrm x\n2")).toBe("(( y = 1<<2 ))\nrm x\n2");
     expect(maskHeredocBodies("echo $((1<<2)); cat <<EOF\nrm x\nEOF")).toBe("echo $((1<<2)); cat <<EOF\n    \n   ");
     expect(maskHeredocBodies("ls # <<x\nrm y\nx")).toBe("ls # <<x\nrm y\nx");
+    expect(maskHeredocBodies("echo `cat <<x`\nrm y\nx")).toBe("echo `cat <<x`\nrm y\nx");
+    expect(maskHeredocBodies("echo $(cat <<x\nrm y\nx\n)")).toBe("echo $(cat <<x\n    \n \n)");
     expect(maskHeredocBodies("echo \"$(( \" <<x \" ))\"\nrm y\nx")).toBe("echo \"$(( \" <<x \" ))\"\nrm y\nx");
   });
 });

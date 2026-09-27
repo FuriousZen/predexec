@@ -1538,6 +1538,9 @@ export function heredocScanHazard(cmd: string): string | null {
 
 function scanHeredocsDetailed(cmd: string): { spans: HeredocSpan[]; hazard: string | null } {
   let hazard: string | null = null;
+  // Inside backticks bash reads the text as a string and parses it later, so
+  // a `<<` there collects no body from the outer lines.
+  let backtick = false;
   const spans: HeredocSpan[] = [];
   const pending: HeredocSpan[] = [];
   let quote: "'" | '"' | null = null;
@@ -1581,12 +1584,13 @@ function scanHeredocsDetailed(cmd: string): { spans: HeredocSpan[]; hazard: stri
         continue;
       }
       if (ch === "'" || ch === '"') { quote = ch; continue; }
+      if (ch === "`") { backtick = !backtick; continue; }
       // A word-initial `#` comments out the rest of the line, `<<` included.
       if (ch === "#" && (i === 0 || /[\s;|&()]/.test(cmd[i - 1]!))) break;
       const opened = openArithmetic(cmd, i, arithmetic);
       if (opened > 0) { i += opened - 1; continue; }
       if (ch !== "<" || cmd[i + 1] !== "<") continue;
-      if (cmd[i + 2] === "<") {
+      if (cmd[i + 2] === "<" || backtick) {
         while (cmd[i + 1] === "<") i++;
         continue;
       }
@@ -1777,7 +1781,9 @@ const WORD_BOUNDARY_BEFORE_RE = /[\s;|&()`]/;
 export function commandStdin(cmd: string): CommandStdin[] {
   const heredocs = scanHeredocs(cmd);
   const byOperator = new Map(heredocs.map((span) => [span.operator, span]));
-  const masked = maskHeredocSpans(cmd, heredocs);
+  // With masking off (the classifier's unmasked pass), body lines are walked as
+  // commands too, so a scanner miss cannot hide a stdin program either.
+  const masked = heredocMasking ? maskHeredocSpans(cmd, heredocs) : cmd;
   const out: CommandStdin[] = [];
   // CR counts by prefix, and one decoded text per distinct body: unterminated
   // heredocs on one line share a body, so per-span work would be quadratic.

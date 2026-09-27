@@ -678,6 +678,13 @@ describe("Claude Read rules — tool ops and shell readers", () => {
   const run = (repo: string, check: ReturnType<typeof createClaudeHostPolicyChecker>, commands: PlanTree["nodes"][number]["commands"]) =>
     runPlanTree({ root: "a", nodes: [{ id: "a", commands }] }, { cwd: repo, checkOperationPolicy: check });
 
+  it("Read(./.env) sees a `cat .env` line after a backtick heredoc (R19)", async () => {
+    const { check, repo } = setup({ deny: ["Read(./.env)"] });
+    const r = await run(repo, check, ["echo `cat <<x`\ncat .env\nx"]);
+    expect(r.stoppedReason).toBe("policyStop");
+    expect(r.transcript).not.toContain("TOKEN=1");
+  });
+
   it("Read(.env) denies a nested config/.env (bare names match at any depth)", () => {
     const { check, ctx, repo } = setup({ deny: ["Read(.env)"] });
     mkdirSync(join(repo, "config"));

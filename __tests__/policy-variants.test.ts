@@ -100,3 +100,29 @@ describe("policyShellVariants — dynamic command names", () => {
     expect(() => policyShellVariants(command)).not.toThrow();
   });
 });
+
+// R19: policy expansion sees the union of the masked and unmasked line views,
+// so a line heredoc masking takes for body (rightly or by a scanner miss)
+// still reaches every host checker.
+describe("policyShellVariants — masked and unmasked lines (R19)", () => {
+  it.each([
+    ["echo `cat <<x`\nsh -c 'cat .env'\nx", "cat .env"],
+    ["cat <<x\nsh -c 'cat .env'\nx", "cat .env"],
+    ["echo $(cat <<x\n/bin/cat .env\nx\n)", "cat .env"],
+  ])("%s includes %s", (command, variant) => {
+    expect(policyShellVariants(command)).toContain(variant);
+  });
+
+  it("a single-line command gains no variants", () => {
+    expect(policyShellVariants("cat README.md")).toEqual([]);
+  });
+});
+
+describe.each(checkers)("lines hidden by heredoc masking reach the checker — %s", (_name, make) => {
+  it.each(["echo `cat <<x`\ncat .env\nx", "echo `cat <<x`\nsh -c 'cat .env'\nx", "cat <<x\nsh -c 'cat .env'\nx", "cat <<x\ncat .env\nx"])("%s", async (command) => {
+    const r = await run(command, make());
+    expect(r.stoppedReason).toBe("policyStop");
+    expect(r.pathTaken).toEqual([]);
+    expect(r.transcript).not.toContain("SECRET=1");
+  });
+});
