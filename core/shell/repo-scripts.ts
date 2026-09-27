@@ -80,7 +80,7 @@ function interpreterScript(family: string, segment: string, args: readonly strin
     if (onlyFlags(args, VERSION_HELP)) return undefined;
     const sub = args.find((arg) => !arg.startsWith("-"));
     // eval/repl are the inline and stdin rules' to judge; these others run
-    // no repository program.
+    // no repository program and write nothing.
     if (sub !== undefined && DENO_NON_RUNNING.has(sub)) return undefined;
     if (sub === undefined || DENO_RUNNING.has(sub)) {
       const at = sub === undefined ? -1 : args.indexOf(sub);
@@ -97,7 +97,8 @@ function interpreterScript(family: string, segment: string, args: readonly strin
     const target = pythonTarget(args);
     if ("module" in target) {
       const reader = Object.hasOwn(PYTHON_READER_MODULES, target.module) ? PYTHON_READER_MODULES[target.module]! : null;
-      return reader?.(target.moduleArgs) ? undefined : target.module;
+      // A module is not a script path: a one-word path entry never names it.
+      return reader?.(target.moduleArgs) ? undefined : null;
     }
     return target.script;
   }
@@ -114,7 +115,9 @@ function interpreterScript(family: string, segment: string, args: readonly strin
   return script;
 }
 
-const DENO_NON_RUNNING = new Set(["eval", "repl", "lint", "check", "info", "doc", "types", "completions", "help", "fmt"]);
+// Not fmt (rewrites files unless --check, and reads repo config) or lint
+// (--fix rewrites; deno.json lint.plugins run repository code).
+const DENO_NON_RUNNING = new Set(["eval", "repl", "check", "info", "doc", "types", "completions", "help"]);
 const DENO_RUNNING = new Set(["run", "serve", "test", "bench", "task", "x", "compile", "install", "jupyter"]);
 const BUN_RUNNING = new Set(["run", "test", "x", "exec"]);
 
@@ -162,22 +165,14 @@ const SUBCOMMAND_TOOLS: Readonly<Record<string, SubcommandTool>> = {
     bareRuns: false,
     hazard: (arg) => arg === "--fix",
   },
-  yarn: {
-    valuelessGlobals: new Set(["-s", "--silent", "--json", "--no-progress"]),
-    readers: {
-      list: null, info: null, why: null, outdated: null, audit: null, help: null, bin: null,
-      licenses: ["ls", "list"], config: ["get", "list"], workspaces: ["info", "list"],
-    },
-    // A bare `yarn` installs, running lifecycle scripts.
-    bareRuns: true,
-  },
   cargo: {
     // Any other subcommand may be a repository alias (`.cargo/config.toml`)
-    // or a build that runs build.rs and proc macros.
+    // or a build that runs build.rs and proc macros; `tree`/`metadata` query
+    // the target through `build.rustc`/`build.rustc-wrapper`, which repo
+    // config can point at a repository program.
     valuelessGlobals: new Set(["-q", "--quiet", "-v", "-vv", "--verbose", "--locked", "--offline", "--frozen"]),
     readers: {
-      tree: null, metadata: null, version: null, help: null, search: null, "locate-project": null, pkgid: null,
-      "verify-project": null, "read-manifest": null, info: null,
+      version: null, help: null, search: null, "locate-project": null, "verify-project": null, "read-manifest": null,
     },
     bareRuns: false,
   },
@@ -187,16 +182,6 @@ const SUBCOMMAND_TOOLS: Readonly<Record<string, SubcommandTool>> = {
     readers: { version: null, env: null, list: null, doc: null, help: null, mod: ["graph", "why", "verify"] },
     bareRuns: false,
     hazard: (arg) => /^--?(?:w|u|toolexec|exec|overlay|modfile)(?:=|$)/.test(arg),
-  },
-  composer: {
-    // `composer NAME` runs a composer.json script of that name.
-    valuelessGlobals: new Set(["-q", "--quiet", "-v", "-vv", "-vvv", "--no-interaction", "-n", "--no-plugins", "--no-scripts"]),
-    readers: {
-      show: null, info: null, depends: null, why: null, prohibits: null, "why-not": null, outdated: null,
-      licenses: null, validate: null, diagnose: null, help: null, list: null, search: null,
-      "check-platform-reqs": null, audit: null, fund: null,
-    },
-    bareRuns: false,
   },
 };
 
@@ -222,10 +207,20 @@ const JUST_LISTING = new Set([
   "--list", "-l", "--summary", "--dump", "--groups", "--variables", "--version", "-V", "--help", "-h",
 ]);
 
+/**
+ * Tools that run repository-configured code for every invocation, version
+ * queries included: yarn execs `.yarnrc.yml` `yarnPath`; composer loads
+ * vendor plugins and `pre-command-run` scripts; `mvn` splices
+ * `.mvn/jvm.config` into every JVM start; gradle reads the repo's
+ * `gradle.properties` JVM args; pytest loads the initial conftest.py while
+ * parsing options.
+ */
+const ALWAYS_RUNS = new Set(["yarn", "composer", "mvn", "gradle", "pytest", "py.test"]);
+
 /** Tools that run repository code for everything but a version/help query. */
 const TEST_AND_TASK_RUNNERS = new Set([
-  "Rscript", "npx", "pnpx", "bunx", "uvx", "pytest", "py.test", "jest", "vitest", "mocha", "ava", "tsx", "ts-node",
-  "rake", "gradle", "mvn", "tox", "nox", "invoke", "phpunit", "rspec",
+  "Rscript", "npx", "pnpx", "bunx", "uvx", "jest", "vitest", "mocha", "ava", "tsx", "ts-node",
+  "rake", "tox", "nox", "invoke", "phpunit", "rspec",
 ]);
 
 /** Environment managers whose `run`/`exec` subcommand runs a repository command. */
@@ -240,6 +235,7 @@ const RUN_SUBCOMMANDS: Readonly<Record<string, ReadonlySet<string>>> = {
 };
 
 function taskRunnerRuns(head: string, args: readonly string[]): boolean {
+  if (ALWAYS_RUNS.has(head)) return true;
   if (TEST_AND_TASK_RUNNERS.has(head)) return !onlyFlags(args, VERSION_HELP);
   // make reads the Makefile for any target, dry runs included: `-n`/`-q`
   // still expand `$(shell …)` while parsing and run `+` recipes (R34).
@@ -258,11 +254,6 @@ function taskRunnerRuns(head: string, args: readonly string[]): boolean {
   return false;
 }
 
-/**
- * Whether a simple command runs a repository script (D1), and which. Null
- * when it does not, or when its argv cannot be resolved (other rules decide
- * those).
- */
 /** An unquoted redirection operator at the start of a word's source text (not `<(`/`>(`). */
 const REDIRECT_OPERATOR_RE = /^(?:\d+|\{\w+\})?(?:<<<|<<-?|<>|<&|>&|>>|>\||&>>|&>|<(?!\()|>(?!\())/;
 
@@ -282,6 +273,26 @@ function withoutRedirections(segment: string): string {
   return kept.join(" ");
 }
 
+/**
+ * Directories whose executables are system or package-manager installs, not
+ * repository files. The classifier does not know the session root, so any
+ * other absolute path may be inside the checkout and fails closed (R38).
+ */
+const SYSTEM_PREFIXES = ["/usr/", "/bin/", "/sbin/", "/opt/homebrew/", "/nix/store/"];
+
+/** A path head that may be a repository file: relative, `~`, or absolute outside SYSTEM_PREFIXES. */
+function maybeRepositoryPath(head: string): boolean {
+  if (!head.includes("/")) return false;
+  // `..`/`.` segments can climb out of a system prefix (`/usr/../Users/…`).
+  if (/(?:^|\/)\.\.?(?:\/|$)/.test(head)) return true;
+  return !SYSTEM_PREFIXES.some((prefix) => head.startsWith(prefix));
+}
+
+/**
+ * Whether a simple command runs a repository script (D1), and which. Null
+ * when it does not, or when its argv cannot be resolved (other rules decide
+ * those).
+ */
 export function repositoryScriptRun(rawSegment: string): RepositoryScriptRun | null {
   const segment = withoutRedirections(rawSegment);
   const tokens = tokenizeShellWords(segment, ARGV);
@@ -291,9 +302,9 @@ export function repositoryScriptRun(rawSegment: string): RepositoryScriptRun | n
   if (!normalized.complete || normalized.argv.length === 0) return null;
   const argv = normalized.argv;
   const rawHead = argv[0]!;
-  // A relative-path executable (`./build.sh`, `scripts/run`,
-  // `node_modules/.bin/x`) is a repository file.
-  if (rawHead.includes("/") && !rawHead.startsWith("/") && !rawHead.startsWith("~")) return { argv, script: rawHead };
+  // A path executable (`./build.sh`, `scripts/run`, `node_modules/.bin/x`,
+  // `/abs/repo/build.sh`) outside the system prefixes may be a repository file.
+  if (maybeRepositoryPath(rawHead)) return { argv, script: rawHead };
   const head = rawHead.replace(/^.*\//, "");
   const args = argv.slice(1);
   const family = interpreterFamily(head);

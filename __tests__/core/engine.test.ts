@@ -987,7 +987,9 @@ describe("runPlanTree — async policy checkers and inner shell commands", () =>
     ["echo hi; /bin/cat .env", ["cat .env"]],
     ["timeout 5 /bin/cat .env", ["cat .env"]],
     ["/bin/bash -c 'cat .env'", ["cat .env"]],
-    ["/cat .env", ["cat .env"]],
+    // `/cat` itself is now a D1 stop (absolute path outside the system
+    // prefixes, R38), so the non-standard-dir spelling uses Homebrew's.
+    ["/opt/homebrew/bin/cat .env", ["cat .env"]],
     ["bash -lc -- 'cat .env'", ["cat .env"]],
     ["bash -c -- 'cat .env'", ["cat .env"]],
     ["bash --norc -c 'cat .env'", ["cat .env"]],

@@ -1,9 +1,10 @@
+import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { loadUserConfig, userConfigPath } from "../user-config.ts";
-import { executeAdapterPlan } from "../adapter-runtime.ts";
+import { executeAdapterPlan, userClassifierOptions } from "../adapter-runtime.ts";
 
 /**
  * The D1 opt-in is USER-level only: env vars and the XDG config file. Every
@@ -85,6 +86,26 @@ describe("loadUserConfig", () => {
     });
   }
 
+  it("a FIFO, a directory or an oversized file at the config path warns and is never read (no hang)", () => {
+    mkdirSync(join(xdg, "predexec", "config.json"), { recursive: true });
+    const dir = loadUserConfig({ HOME: home, XDG_CONFIG_HOME: xdg });
+    expect(dir.classifier).toEqual({});
+    expect(dir.warnings[0]).toMatch(/not a regular file/);
+    rmSync(join(xdg, "predexec"), { recursive: true });
+
+    writeConfig(xdg, JSON.stringify({ allowScripts: ["x".repeat(70 * 1024)] }));
+    const big = loadUserConfig({ HOME: home, XDG_CONFIG_HOME: xdg });
+    expect(big.classifier).toEqual({});
+    expect(big.warnings[0]).toMatch(/larger than 65536 bytes/);
+    rmSync(join(xdg, "predexec"), { recursive: true });
+
+    mkdirSync(join(xdg, "predexec"));
+    execFileSync("mkfifo", [join(xdg, "predexec", "config.json")]);
+    const fifo = loadUserConfig({ HOME: home, XDG_CONFIG_HOME: xdg });
+    expect(fifo.classifier).toEqual({});
+    expect(fifo.warnings[0]).toMatch(/not a regular file/);
+  });
+
   it("takes no cwd and never reads config from under the session root", async () => {
     expect(loadUserConfig.length).toBeLessThanOrEqual(1);
     const hostile = JSON.stringify({ allowScripts: ["python3 script.py"], readOnlyHeads: ["python3"] });
@@ -104,5 +125,27 @@ describe("loadUserConfig", () => {
     );
     expect(result.stoppedReason).toBe("mutationStop");
     expect(result.transcript).toContain("runs repository script python3 script.py");
+  });
+
+  it("adapters load the config once per plan run and surface its warnings in the transcript (R38 minor 6)", async () => {
+    const saved = { xdg: process.env.XDG_CONFIG_HOME, allow: process.env.PREDEXEC_ALLOW_SCRIPTS };
+    try {
+      process.env.XDG_CONFIG_HOME = xdg;
+      process.env.PREDEXEC_ALLOW_SCRIPTS = "";
+      const plan = { root: "a", nodes: [{ id: "a", commands: ["echo ok"] }] };
+      await executeAdapterPlan(plan, "pi", { cwd: repo });
+      expect(userClassifierOptions()).toEqual({});
+      // A nudge between plan runs reuses the plan run's load, not a re-read.
+      process.env.PREDEXEC_ALLOW_SCRIPTS = "npm run lint";
+      expect(userClassifierOptions()).toEqual({});
+      // A malformed file: the next plan run reloads and reports it.
+      writeConfig(xdg, "{ nope");
+      const result = await executeAdapterPlan(plan, "pi", { cwd: repo });
+      expect(result.transcript).toContain(`predexec: ignoring ${join(xdg, "predexec", "config.json")}`);
+      expect(userClassifierOptions()).toEqual({ allowScripts: ["npm run lint"] });
+    } finally {
+      process.env.XDG_CONFIG_HOME = saved.xdg;
+      process.env.PREDEXEC_ALLOW_SCRIPTS = saved.allow;
+    }
   });
 });

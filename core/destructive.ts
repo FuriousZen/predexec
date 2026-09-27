@@ -380,6 +380,9 @@ function stdinProgramToken(cmd: string): string | null {
  * findDestructiveToken for the duration of one synchronous call (and restored
  * after), so every recursive pass — substitutions, clauses, `-exec` bodies,
  * shell bodies inside interpreter programs — sees the same options.
+ * This is sound only while the classifier stays fully synchronous: an
+ * `await` anywhere under findDestructiveToken would let another call's
+ * options leak into this one.
  */
 let activeOptions: ClassifierOptions = {};
 

@@ -16,7 +16,7 @@
  * A malformed file never throws: it contributes nothing, with a warning.
  */
 
-import { readFileSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import type { ClassifierOptions } from "./core/index.ts";
@@ -45,14 +45,20 @@ function envList(value: string | undefined): string[] {
 
 /** The file's entries, or a reason it is malformed. Missing file = no entries. */
 function readConfigFile(path: string): { entries: Partial<Record<FileKey, string[]>> } | { error: string } {
+  // Stat before reading: a FIFO would block the read forever and a special
+  // or huge file would read unboundedly.
   let text: string;
   try {
+    const stat = statSync(path);
+    if (!stat.isFile()) return { error: "not a regular file" };
+    if (stat.size > MAX_CONFIG_BYTES) return { error: `larger than ${MAX_CONFIG_BYTES} bytes` };
     text = readFileSync(path, "utf8");
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === "ENOENT") return { entries: {} };
     return { error: `unreadable (${(err as Error).message})` };
   }
-  if (text.length > MAX_CONFIG_BYTES) return { error: `larger than ${MAX_CONFIG_BYTES} bytes` };
+  // Re-checked in bytes: the file may have grown between stat and read.
+  if (Buffer.byteLength(text, "utf8") > MAX_CONFIG_BYTES) return { error: `larger than ${MAX_CONFIG_BYTES} bytes` };
   let parsed: unknown;
   try {
     parsed = JSON.parse(text);

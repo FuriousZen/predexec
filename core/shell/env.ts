@@ -42,8 +42,11 @@ export const INTERPRETER_PRELOAD_ENV: Record<string, ReadonlySet<string>> = {
  * Loader and shell/interpreter startup variables that run code in whatever
  * process inherits them, whichever command that is: dynamic-linker preloads
  * (`LD_PRELOAD`, `DYLD_INSERT_LIBRARIES`, library search paths), shell
- * startup files (`BASH_ENV`, POSIX `ENV`), and `PYTHONWARNINGS`, whose
- * category field imports a module. Any value, any head, any setting form.
+ * startup files (`BASH_ENV`, POSIX `ENV`), `PYTHONWARNINGS`, whose
+ * category field imports a module, and build-tool variables that name a
+ * program to run or flags that do (`RUSTC_WRAPPER`, `GOFLAGS=-toolexec=…`,
+ * `MAKEFLAGS=--eval=…`; `npm_config_*` via isDangerousEnv). Any value, any
+ * head, any setting form.
  */
 export const DANGEROUS_ENV: ReadonlySet<string> = new Set([
   "LD_PRELOAD",
@@ -55,7 +58,23 @@ export const DANGEROUS_ENV: ReadonlySet<string> = new Set([
   "BASH_ENV",
   "ENV",
   "PYTHONWARNINGS",
+  "RUSTC",
+  "RUSTC_WRAPPER",
+  "CARGO_BUILD_RUSTC",
+  "CARGO_BUILD_RUSTC_WRAPPER",
+  "GOFLAGS",
+  "MAKEFLAGS",
+  "MFLAGS",
 ]);
+
+/**
+ * DANGEROUS_ENV, plus every npm config variable: npm reads any
+ * `npm_config_<key>` (either case) as config, and keys such as `script-shell`
+ * and `node-options` choose what runs.
+ */
+export function isDangerousEnv(name: string): boolean {
+  return DANGEROUS_ENV.has(name) || /^npm_config_/i.test(name);
+}
 
 /** Shell builtins whose operands set (and may export) variables. */
 const DECLARATION_HEADS = new Set(["export", "declare", "typeset", "readonly", "local"]);
@@ -69,7 +88,7 @@ const PRELOAD_ENV_NAMES: ReadonlySet<string> = new Set(
 function commandBearingEnvironment(name: string, value: string | undefined): boolean {
   if (lessEnvironmentWrite(name, value)) return true;
   if (MAN_COMMAND_ENV.has(name)) return true;
-  if (PRELOAD_ENV_NAMES.has(name) || DANGEROUS_ENV.has(name)) return true;
+  if (PRELOAD_ENV_NAMES.has(name) || isDangerousEnv(name)) return true;
   return gitEnvironmentPrefixMutation([`${name}=`]) !== null;
 }
 
@@ -85,7 +104,7 @@ export function commandBearingEnvironmentSetting(segment: string): string | null
   if (!normalized.complete) return null;
   for (const assignment of normalized.assignments) {
     const name = ENV_ASSIGNMENT_RE.exec(assignment)?.[1];
-    if (name && DANGEROUS_ENV.has(name)) return name;
+    if (name && isDangerousEnv(name)) return name;
   }
   let settings: readonly string[];
   // Assignments (`NAME=v`, `NAME+=v`, `NAME[i]=v`) name the bare variable;

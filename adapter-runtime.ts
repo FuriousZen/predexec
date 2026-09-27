@@ -24,7 +24,14 @@ import {
   type RunOptions,
 } from "./core/index.ts";
 import { recordRun, type Harness } from "./stats.ts";
-import { loadUserConfig } from "./user-config.ts";
+import { loadUserConfig, type UserConfig } from "./user-config.ts";
+
+/**
+ * The user config as of the latest plan run. Loaded once per plan run (its
+ * warnings go in that run's transcript) and reused by classifications
+ * between runs, so a native shell call's nudge never re-reads the file.
+ */
+let latestUserConfig: UserConfig | null = null;
 
 const errText = (e: unknown): string => (e instanceof Error ? e.message : String(e));
 
@@ -54,6 +61,7 @@ export async function executeAdapterPlan(
   }
 
   const userConfig = loadUserConfig();
+  latestUserConfig = userConfig;
   let result: CoreResult;
   try {
     result = await runPlanTree(plan, { ...options, classifier: options.classifier ?? userConfig.classifier });
@@ -74,8 +82,11 @@ export async function executeAdapterPlan(
 
 /**
  * The user-level classifier options, for an adapter that classifies outside a
- * plan run (e.g. deciding whether to nudge after a native shell call).
+ * plan run (e.g. deciding whether to nudge after a native shell call): the
+ * latest plan run's load, or one load if no plan has run yet. Its warnings
+ * surface in the next plan run's transcript, which reloads.
  */
 export function userClassifierOptions(): ClassifierOptions {
-  return loadUserConfig().classifier;
+  latestUserConfig ??= loadUserConfig();
+  return latestUserConfig.classifier;
 }

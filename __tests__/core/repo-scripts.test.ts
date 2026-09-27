@@ -67,6 +67,31 @@ describe("D1 — interpreters and task runners running repo files are mutating",
     "echo $(node x.js)",
     "find . -name '*.js' -exec node {} \\;",
     "npm --prefix sub run lint",
+    // R38 I3: an executable by absolute path outside the system prefixes may
+    // be a repository file (the classifier does not know the session root).
+    "/Users/u/repo/build.sh",
+    "/tmp/x/run",
+    "~/bin/tool",
+    "/usr/../Users/u/repo/build.sh",
+    "/usr/bin/../../Users/u/x",
+    "$PWD/build.sh",
+    // R38 I4: readers that execute repository-configured code.
+    "yarn why react",
+    "yarn info",
+    "yarn --version",
+    "composer show",
+    "composer --version",
+    "cargo tree",
+    "cargo metadata --format-version 1",
+    "mvn -v",
+    "mvn --version",
+    "pytest --version",
+    "gradle --version",
+    // R38 I5: deno fmt/lint write files or run lint plugins.
+    "deno fmt",
+    "deno fmt --check",
+    "deno lint",
+    "deno lint --fix",
   ])("mutating: %s", (c) => expect(isDestructiveCommand(c)).toBe(true));
 
   it.each([
@@ -83,15 +108,18 @@ describe("D1 — interpreters and task runners running repo files are mutating",
     "npm ls",
     "npm view react version",
     "pnpm ls --depth 0",
-    "yarn why react",
-    "cargo tree",
-    "cargo metadata --format-version 1",
     "go version",
     "go env GOPATH",
     "go list ./...",
     "deno --version",
     "Rscript --version",
     "/usr/bin/grep x f",
+    "/bin/ls",
+    "/sbin/ifconfig",
+    "/opt/homebrew/bin/rg x",
+    "/usr/local/bin/jq . f",
+    "/nix/store/abc-ripgrep/bin/rg x",
+    "cargo --version",
   ])("read-only: %s", (c) => expect(findDestructiveToken(c)).toBeNull());
 
   it("names the script and how to allow it", () => {
@@ -100,6 +128,35 @@ describe("D1 — interpreters and task runners running repo files are mutating",
     );
     expect(findDestructiveToken("env X=1 npm run lint")).toMatch(/^runs repository script npm run lint /);
   });
+});
+
+describe("R38 I4: tool-config environment variables are command-bearing", () => {
+  it.each([
+    "RUSTC=./x cargo --version",
+    "RUSTC_WRAPPER=./x cargo --version",
+    "CARGO_BUILD_RUSTC=./x ls",
+    "CARGO_BUILD_RUSTC_WRAPPER=./x ls",
+    "GOFLAGS=-toolexec=./x go version",
+    "npm_config_script_shell=./evil npm ls",
+    "NPM_CONFIG_SCRIPT_SHELL=./evil npm ls",
+    "npm_config_node_options=--require=./evil npm ls",
+    "MAKEFLAGS=--eval=x make --version",
+    "MFLAGS=x ls",
+    "env GOFLAGS=-toolexec=./x go version",
+    "env RUSTC_WRAPPER=./x ls",
+    "export RUSTC_WRAPPER=./x",
+    "export MAKEFLAGS=x; make --version",
+    "export npm_config_script_shell=./evil",
+    "declare -x GOFLAGS=x",
+  ])("mutating: %s", (c) => expect(isDestructiveCommand(c)).toBe(true));
+
+  it.each([
+    "npm_config_script_shell=./evil npm run lint",
+    "MAKEFLAGS=--eval=x make test",
+    "GOFLAGS=-toolexec=./evil go test ./...",
+    "RUSTC_WRAPPER=./evil cargo test",
+  ])("an allowlisted run with a command-bearing prefix stays mutating: %s", (c) =>
+    expect(isDestructiveCommand(c, { allowScripts: ["npm run lint", "make test", "go test", "cargo test"] })).toBe(true));
 });
 
 describe("D1 user allowlist (ClassifierOptions.allowScripts)", () => {
@@ -132,6 +189,16 @@ describe("D1 user allowlist (ClassifierOptions.allowScripts)", () => {
     expect(findDestructiveToken("python3 -u scripts/report.py", byPath)).toBeNull();
     expect(isDestructiveCommand("python3 scripts/other.py", byPath)).toBe(true);
     expect(findDestructiveToken("./build.sh", { allowScripts: ["./build.sh"] })).toBeNull();
+  });
+
+  it("a one-word path entry never matches a python -m module (R38 minor 2)", () => {
+    expect(isDestructiveCommand("python3 -m json", { allowScripts: ["json"] })).toBe(true);
+    expect(isDestructiveCommand("python3 -m x.py", { allowScripts: ["x.py"] })).toBe(true);
+    expect(findDestructiveToken("python3 -m mypkg", { allowScripts: ["python3 -m mypkg"] })).toBeNull();
+  });
+
+  it("an absolute-path repo executable is allowlistable by its exact path", () => {
+    expect(findDestructiveToken("/Users/u/repo/build.sh", { allowScripts: ["/Users/u/repo/build.sh"] })).toBeNull();
   });
 
   it("does not leak into a later call without options", () => {
