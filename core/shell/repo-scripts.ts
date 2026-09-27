@@ -197,11 +197,17 @@ const BUN_RUNNING = new Set(["run", "test", "x", "exec"]);
 /**
  * A subcommand-driven package manager/build tool that is read-only only for
  * a known reader subcommand. Global options before the subcommand must be
- * known valueless or carry their value with `=`; otherwise the subcommand
- * position is unknown and the invocation fails closed.
+ * listed valueless ones; anything else fails closed.
  */
 interface SubcommandTool {
+  /**
+   * The only global options accepted before the subcommand (R65, R43c style):
+   * any other — a config selector like `--userconfig=x`, an `=`-valued or
+   * unknown option — makes the invocation fail closed.
+   */
   valuelessGlobals: ReadonlySet<string>;
+  /** rustup's `+toolchain` selector is accepted before the subcommand. */
+  toolchainSelector?: boolean;
   /**
    * Reader subcommands; a list names the word that must follow at once
    * (`config get`); anything else there is not a read.
@@ -218,8 +224,10 @@ const SUBCOMMAND_TOOLS: Readonly<Record<string, SubcommandTool>> = {
     valuelessGlobals: new Set(["-g", "--global", "-s", "--silent", "--json", "--long", "--parseable", "--no-color", "--workspaces"]),
     readers: {
       ls: null, list: null, ll: null, la: null, view: null, info: null, show: null, v: null, outdated: null, why: null,
-      explain: null, root: null, prefix: null, bin: null, help: null, "help-search": null, search: null, s: null,
-      se: null, find: null, fund: null, query: null, whoami: null, ping: null, audit: null,
+      // Not help/help-search/fund: they open the configured browser or
+      // viewer (`browser`, `viewer` config), which a repository .npmrc sets (R65).
+      explain: null, root: null, prefix: null, bin: null, search: null, s: null,
+      se: null, find: null, query: null, whoami: null, ping: null, audit: null,
       config: ["get", "list", "ls"], pkg: ["get"],
     },
     bareRuns: false,
@@ -248,6 +256,7 @@ const SUBCOMMAND_TOOLS: Readonly<Record<string, SubcommandTool>> = {
       version: null, help: null, search: null, "locate-project": null, "verify-project": null, "read-manifest": null,
     },
     bareRuns: false,
+    toolchainSelector: true,
   },
   go: {
     valuelessGlobals: new Set(),
@@ -264,7 +273,7 @@ function subcommandToolRuns(tool: SubcommandTool, args: readonly string[]): bool
   for (; i < args.length; i++) {
     const word = args[i]!;
     if (!word.startsWith("-") && !word.startsWith("+")) break;
-    if (word.startsWith("+") || word.includes("=") || tool.valuelessGlobals.has(word)) continue;
+    if (word.startsWith("+") ? tool.toolchainSelector === true : tool.valuelessGlobals.has(word)) continue;
     return true;
   }
   const sub = args[i];

@@ -866,6 +866,9 @@ function findDestructiveTokenInternal(cmd: string, depth: number, fragment = fal
     if (EVAL_INTERPRETERS.has(head)) {
       const extracted = interpreterEvalPrograms(segment);
       if (extracted.kind === "violation") return `${head} eval: ${extracted.reason}`;
+      // R65: bun's inline eval loads bunfig.toml `preload` scripts from the
+      // repository first, whatever the program says.
+      if (extracted.kind === "eval" && interpreterFamily(head) === "bun") return "bun eval (bunfig.toml preload)";
       if (extracted.kind === "eval") {
         const language = interpreterLanguage(head);
         const programs = extracted.join ? [extracted.programs.join("\n")] : extracted.programs;

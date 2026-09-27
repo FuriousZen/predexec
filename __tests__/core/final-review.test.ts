@@ -169,3 +169,31 @@ describe("I2 — deno script operand after value-taking options (R62)", () => {
     expect(repositoryScriptRun("ruby -w scripts/r.rb")?.script).toBe("scripts/r.rb");
   });
 });
+
+// I5 / R65 (cheap fail-closed parts, no live measurement): npm's help/fund
+// open a configured browser/viewer; D1's subcommand-tool globals become
+// allowlist-shaped (a config selector or any unknown global stops); bun's
+// inline eval loads bunfig.toml `preload` from the repository.
+describe("I5 — config-driven execution in reader rows (R65)", () => {
+  it.each([
+    "npm help ls",
+    "npm help-search foo",
+    "npm fund",
+    "npm --userconfig=./x ls",
+    "npm --globalconfig=./x ls",
+    "npm --userconfig ./x ls",
+    "npm --foo=bar ls",
+    "pnpm --config.x=y list",
+    "pnpm --dir=sub list",
+    "go -C=x version",
+    "cargo --config=x version",
+    "cargo -Zx version",
+    "npm +x ls",
+    "bun -e 'console.log(1)'",
+    "bun -p 1",
+    "bun --eval 'console.log(1)'",
+    "bun --print 1",
+  ])("%j is mutating", (c) => expect(isDestructiveCommand(c)).toBe(true));
+  it.each(["npm ls", "npm -g ls", "npm --json ls", "npm view left-pad", "pnpm -r list", "cargo -q version", "go version", "bun --version"])(
+    "%j stays read-only", (c) => expect(findDestructiveToken(c)).toBeNull());
+});
