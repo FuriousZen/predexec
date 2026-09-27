@@ -906,6 +906,9 @@ export const READ_ONLY_HEAD_WRITES: Record<string, ReadOnlyHeadWriteCheck> = {
     }
     return lessArgvWrite(args);
   },
+  // R60 (C3): macOS's /usr/bin/more is less, with every one of less's
+  // environment and argv hooks.
+  more: (args, context) => READ_ONLY_HEAD_WRITES.less!(args, context),
   uniq: uniqWrite,
   // -i/--inplace rewrites the file; --split-exp writes one file per document.
   yq: (args) => {

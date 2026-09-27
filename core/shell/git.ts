@@ -153,10 +153,13 @@ function gitConfigOptionMutation(tokens: string[], index: number): { token: stri
   return { token: null, consumed: separate ? 1 : 0 };
 }
 
-function gitReadOnlyOptionMutation(tokens: string[], start: number): string | null {
+function gitReadOnlyOptionMutation(tokens: string[], start: number, verb: string): string | null {
   for (let i = start; i < tokens.length; i++) {
     const token = tokens[i]!;
     if (token === "--") return null;
+    // R60 (C4): `git grep -O[cmd]` (attached or clustered) opens the matches
+    // in a pager, like --open-files-in-pager. On log/diff `-O` is an orderfile.
+    if (verb === "grep" && /^-[^-]*O/.test(token)) return token;
     if (token === "--ext-diff" || token === "--textconv" || token === "--paginate" || token === "-p" ||
       /^--open-files-in-pager(?:=|$)/.test(token) || /^--output(?:=|$)/.test(token) || /^-[^-]*o(?:.|$)/.test(token)) {
       return token;
@@ -217,6 +220,8 @@ export function findGitMutationToken(segment: string): string | null {
       continue;
     }
     if (option.startsWith("--exec-path=")) {
+      // R66 (M1): a verb after it runs with sub-programs from that directory.
+      if (verbIndex + 1 < normalized.argv.length) return `git ${option}`;
       readOnlyGlobalQuery = true;
       verbIndex++;
       continue;
@@ -242,7 +247,7 @@ export function findGitMutationToken(segment: string): string | null {
   const verb = normalized.argv[verbIndex];
   if (!verb) return readOnlyGlobalQuery ? null : "git";
   if (READ_ONLY_GIT_VERBS.has(verb)) {
-    const optionMutation = gitReadOnlyOptionMutation(normalized.argv, verbIndex + 1);
+    const optionMutation = gitReadOnlyOptionMutation(normalized.argv, verbIndex + 1, verb);
     return optionMutation ? `git ${optionMutation}` : null;
   }
   if (isGitReadOnlySubform(normalized.argv, verbIndex)) return null;

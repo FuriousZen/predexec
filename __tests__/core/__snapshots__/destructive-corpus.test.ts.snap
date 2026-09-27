@@ -1532,7 +1532,7 @@ dir1/": "runs repository script dir1/ (allow via PREDEXEC_ALLOW_SCRIPTS or ~/.co
   "git --exec-path": null,
   "git --exec-path /tmp": null,
   "git --exec-path add file.txt": "git add",
-  "git --exec-path=/tmp add file.txt": "git add",
+  "git --exec-path=/tmp add file.txt": "git --exec-path=/tmp",
   "git --exec-path=/usr/libexec/git-core": null,
   "git --git-dir /repo/.git log -5": null,
   "git --git-dir=. --exec-path": null,
