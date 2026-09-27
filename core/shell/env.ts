@@ -141,7 +141,18 @@ export function commandBearingEnvironmentSetting(segment: string): string | null
   // `declare -x NAME[0]`) sets an unknown value.
   if (normalized.argv.length === 0) settings = normalized.assignments;
   else if (DECLARATION_HEADS.has(normalized.argv[0]!.replace(/^.*\//, ""))) {
-    settings = normalized.argv.slice(1).filter((operand) => !/^[-+]/.test(operand));
+    const operands = normalized.argv.slice(1);
+    settings = operands.filter((operand) => !/^[-+]/.test(operand));
+    // A nameref (`declare -n r=PATH`) makes every later `r=…` write its
+    // target: a command-bearing, dynamic or not-yet-given target stops.
+    if (operands.some((operand) => /^-[A-Za-z]*n/.test(operand))) {
+      for (const setting of settings) {
+        const assignment = ENV_ASSIGNMENT_RE.exec(setting);
+        const target = assignment?.[2];
+        if (target === undefined || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(target)) return "nameref";
+        if (commandBearingEnvironment(target, undefined)) return target;
+      }
+    }
   } else return assigningBuiltinTarget(normalized.argv);
   for (const setting of settings) {
     const assignment = ENV_ASSIGNMENT_RE.exec(setting);
@@ -163,6 +174,11 @@ const ASSIGNING_BUILTINS: Readonly<Record<string, { valueLetters: string; names:
   readarray: { valueLetters: "dnOsuCc", names: (operands) => operands },
   getopts: { valueLetters: "", names: (operands) => operands.slice(1, 2) },
   printf: { valueLetters: "v", names: (_operands, values) => values.get("v") ?? [] },
+  // R43: unsetting PATH makes bash look bare names up in the cwd.
+  unset: { valueLetters: "", names: (operands) => operands },
+  // `let` expressions: every variable they name (a read of PATH there is
+  // no read worth keeping).
+  let: { valueLetters: "", names: (operands) => operands.flatMap((operand) => operand.match(/[A-Za-z_][A-Za-z0-9_]*/g) ?? []) },
 };
 
 /**
@@ -194,6 +210,42 @@ function assigningBuiltinTarget(argv: readonly string[]): string | null {
     if (/[$`]/.test(name)) return `${head} dynamic variable`;
     const bare = name.replace(/\[.*$/s, "");
     if (commandBearingEnvironment(bare, undefined)) return bare;
+  }
+  return null;
+}
+
+/** Whether writing `name` (any value) can make a later command run code. */
+export function isCommandBearingName(name: string): boolean {
+  return commandBearingEnvironment(name, undefined);
+}
+
+/**
+ * R43 (a): command-bearing names written by constructs that are not an
+ * assignment word or a builtin's argv — a `for`/`select` loop variable, a
+ * `${NAME:=…}`/`${NAME=…}` expansion, and any variable named inside
+ * arithmetic (`(( PATH = 0 ))`, `$(( … ))`, `$[ … ]`). `loopHeaders` are the
+ * command texts that start with `for`/`select` (from the shared walker). The
+ * expansion and arithmetic scans read the raw text, quotes included, which
+ * can only over-stop.
+ */
+export function commandBearingNameWrite(text: string, loopHeaders: readonly string[]): string | null {
+  for (const header of loopHeaders) {
+    const name = /^(?:for|select)\s+([A-Za-z_][A-Za-z0-9_]*)/.exec(header)?.[1];
+    if (name && commandBearingEnvironment(name, undefined)) return name;
+  }
+  for (const match of text.matchAll(/\$\{([A-Za-z_][A-Za-z0-9_]*)(?:\[[^\]]*\])?:?=/g)) {
+    if (commandBearingEnvironment(match[1]!, undefined)) return match[1]!;
+  }
+  for (const [open, close] of [["((", "))"], ["$[", "]"]] as const) {
+    // indexOf pairs, not a lazy regex: a run of unclosed `((` stays linear.
+    for (let at = text.indexOf(open); at !== -1; at = text.indexOf(open, at)) {
+      const end = text.indexOf(close, at + open.length);
+      if (end === -1) break;
+      for (const name of text.slice(at + open.length, end).match(/[A-Za-z_][A-Za-z0-9_]*/g) ?? []) {
+        if (commandBearingEnvironment(name, undefined)) return name;
+      }
+      at = end + close.length;
+    }
   }
   return null;
 }

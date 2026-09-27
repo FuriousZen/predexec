@@ -75,6 +75,7 @@ import {
 } from "./shell/heads.ts";
 import {
   commandBearingEnvironmentSetting,
+  commandBearingNameWrite,
   shellEnvironmentPrefixMutation,
 } from "./shell/env.ts";
 import {
@@ -466,7 +467,7 @@ function isArithmeticCommand(text: string): boolean {
  * Every other rule has run by now; this only turns "nothing objected" into
  * "and the program is one we know".
  */
-function unknownHeadToken(text: string): string | null {
+function unknownHeadToken(text: string, envTouched: boolean, stdinFed: boolean): string | null {
   const tokens = tokenizeShellWords(text, ARGV);
   // `command -v make` looks the name up; it runs nothing.
   if (tokens[0] === "command" && /^-[vV]+$/.test(tokens[1] ?? "")) return null;
@@ -486,8 +487,11 @@ function unknownHeadToken(text: string): string | null {
   if (EVAL_INTERPRETERS.has(interpreterFamily(head)) || governedByRepositoryScripts(head)) return null;
   const run = repositoryScriptRun(text);
   if (run && userAllowsScript(run)) return null;
+  // Multi-tools read their configuration from the environment, so any
+  // assignment or export anywhere in the command strips them (R43), and curl
+  // fed stdin can send it.
   const reads = Object.hasOwn(READ_ONLY_SUBCOMMANDS, head) ? READ_ONLY_SUBCOMMANDS[head]! : null;
-  if (reads && normalized.assignments.length === 0 && reads(argv.slice(1))) return null;
+  if (reads && !envTouched && !(stdinFed && head === "curl") && reads(argv.slice(1))) return null;
   return label(shown);
 }
 
@@ -502,7 +506,32 @@ function unknownHeadToken(text: string): string | null {
  * every rule but this one.
  */
 function unknownCommandToken(cmd: string): string | null {
-  for (const { command, notCommand } of withHeredocMasking(() => commandStdin(cmd))) {
+  const commands = simpleCommands(cmd);
+  const envTouched = rootEnvironmentTouched || environmentTouched(cmd, commands);
+  for (const { text, stdinFed } of commands) {
+    // `((…))` is arithmetic; loop/case/function headers hold no command.
+    if (text.startsWith("((")) {
+      if (isArithmeticCommand(text)) continue;
+      return "complex shell syntax";
+    }
+    if (text === "" || NON_COMMAND_HEADER_RE.test(text)) continue;
+    const token = unknownHeadToken(text, envTouched, stdinFed);
+    if (token) return token;
+  }
+  return null;
+}
+
+interface SimpleCommand {
+  /** The command's text: redirections removed, leading control words stripped. */
+  text: string;
+  /** A redirection, here-string or heredoc feeds its stdin. */
+  stdinFed: boolean;
+}
+
+/** Every simple command in `cmd` (shared walker, heredoc bodies as data), minus case patterns and the like. */
+function simpleCommands(cmd: string): SimpleCommand[] {
+  const out: SimpleCommand[] = [];
+  for (const { command, notCommand, redirected, literals } of withHeredocMasking(() => commandStdin(cmd))) {
     if (notCommand) continue;
     let text = command.trim();
     for (let i = 0; i < 8; i++) {
@@ -510,17 +539,42 @@ function unknownCommandToken(cmd: string): string | null {
       if (next === text) break;
       text = next;
     }
-    // `((…))` is arithmetic; loop/case/function headers hold no command.
-    if (text.startsWith("((")) {
-      if (isArithmeticCommand(text)) continue;
-      return "complex shell syntax";
-    }
-    if (text === "" || NON_COMMAND_HEADER_RE.test(text)) continue;
-    const token = unknownHeadToken(text);
-    if (token) return token;
+    out.push({ text, stdinFed: redirected || literals.length > 0 });
   }
-  return null;
+  return out;
 }
+
+/** Heads that set or unset shell variables from their argv. */
+const VARIABLE_WRITING_HEADS = new Set([
+  "export", "declare", "typeset", "local", "readonly", "unset", "read", "mapfile", "readarray", "getopts", "let",
+]);
+
+/**
+ * Whether `cmd` assigns, exports or unsets any variable anywhere: an
+ * assignment word, an `env` operand, a declaration or variable-writing
+ * builtin, `printf -v`, a loop variable, `${NAME:=…}`, or arithmetic with an
+ * assignment. Unparseable commands count.
+ */
+function environmentTouched(cmd: string, commands: readonly SimpleCommand[]): boolean {
+  if (/\$\{[A-Za-z_][A-Za-z0-9_]*(?:\[[^\]]*\])?:?=/.test(cmd)) return true;
+  for (const { text } of commands) {
+    if (/^(?:for|select)\s/.test(text)) return true;
+    if (text.startsWith("((") && /[^=!<>]=(?!=)|\+\+|--/.test(text)) return true;
+    const normalized = normalizeEnvInvocation(tokenizeShellWords(text, ARGV));
+    if (!normalized.complete || normalized.assignments.length > 0) return true;
+    const head = normalized.argv[0]?.replace(/^.*\//, "");
+    if (head === undefined) continue;
+    if (VARIABLE_WRITING_HEADS.has(head)) return true;
+    if (head === "printf" && normalized.argv.some((arg) => /^-v/.test(arg))) return true;
+  }
+  return false;
+}
+
+/**
+ * Whether the top-level command of the classification in progress touches
+ * the environment: a `sh -c` body or `find -exec` command inherits it.
+ */
+let rootEnvironmentTouched = false;
 
 /**
  * The classifier. Returns the offending token for the hard-stop message, or
@@ -663,6 +717,10 @@ function findDestructiveTokenInternal(cmd: string, depth: number, fragment = fal
     const name = commandBearingEnvironmentSetting(stripShellControlPrefix(segment));
     if (name) return name;
   }
+  // R43: loop variables, `${NAME:=…}` and arithmetic write names too.
+  const loopHeaders = simpleCommands(shellCommand).map((command) => command.text).filter((text) => /^(?:for|select)\s/.test(text));
+  const nameWrite = commandBearingNameWrite(shellCommand, loopHeaders);
+  if (nameWrite) return nameWrite;
 
   // Read-only heads skip the word scan, so each one's own write/exec forms
   // (`sed -n 'w F'`, `sort --output=F`, awk `print | "sh"`, `find -okdir rm`)
@@ -848,9 +906,11 @@ export function findDestructiveToken(cmd: string, options: ClassifierOptions = {
   const previous = activeOptions;
   const previousEntries = activeReadOnlyEntries;
   const previousBudget = unescapeBudget;
+  const previousTouched = rootEnvironmentTouched;
   activeOptions = options;
   activeReadOnlyEntries = (options.extraReadOnlyHeads ?? []).map((entry) => tokenizeShellWords(entry, ARGV));
   try {
+    rootEnvironmentTouched = environmentTouched(cmd, simpleCommands(cmd));
     unescapeBudget = UNESCAPE_BUDGET;
     const masked = findDestructiveTokenInternal(cmd, 0);
     if (masked) return masked;
@@ -866,6 +926,7 @@ export function findDestructiveToken(cmd: string, options: ClassifierOptions = {
     activeOptions = previous;
     activeReadOnlyEntries = previousEntries;
     unescapeBudget = previousBudget;
+    rootEnvironmentTouched = previousTouched;
   }
 }
 

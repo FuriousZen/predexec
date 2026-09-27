@@ -47,9 +47,8 @@ describe("isDestructiveCommand — heuristic coverage (2026-07 audit)", () => {
   const reads = [
     'grep "a->b" src/x.ts',
     'grep "x > 5" log.txt',
-    "wget -qO- http://x",
-    "wget -O- http://x",
-    "wget -O - http://x",
+    // R43: wget stdout forms moved to unknown-heads.test.ts as mutating (wget
+    // writes its HSTS file every run).
     "crontab -l",
     "curl http://x",
     "curl -s http://x",
@@ -1519,7 +1518,6 @@ describe("isDestructiveCommand — bypasses found in the 2026-08 audit", () => {
     "git config --get user.name",
     "git remote -v",
     "git tag -l",
-    "wget -qO- https://x",
     "env",
     "printenv PATH",
     "node --version",

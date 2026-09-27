@@ -32,7 +32,7 @@ export const READ_ONLY_HEADS = new Set([
   "tac", "sha224sum", "sha384sum", "sha512sum", "b2sum", "cksum", "sum", "shasum", "md5",
   "seq", "expr", "yes", "uptime", "nproc", "sw_vers", "locale", "groups", "pgrep", "lsof",
   "tty", "logname", "users", "who", "getconf", "fd", "fdfind", "base64", "mapfile", "readarray",
-  "look", "pr", "iconv", "bat", "batcat",
+  "look", "pr", "iconv",
 ]);
 
 /**
@@ -51,173 +51,331 @@ export const SHELL_BUILTIN_READERS: ReadonlySet<string> = new Set([
 ]);
 
 /**
- * A multi-tool whose read verbs are known. Global options before the
- * subcommand must be listed (valueless, or taking the next word or an
- * attached `=value`); anything else leaves the subcommand position unknown.
+ * The options one read verb may carry: `flags` stand alone, `values` take the
+ * next word or an attached `--name=value`. Anything else — another option,
+ * a short cluster, an attached short value — is not a known read (R43).
+ */
+interface ReadOptions {
+  flags?: readonly string[];
+  values?: readonly string[];
+}
+
+/**
+ * A multi-tool whose read verbs, and every option each accepts, are listed.
+ * `global` options may appear before the verb and after it; a verb maps to its
+ * options, or to `{ sub }` when a second word picks the read (`config view`).
  */
 interface SubcommandReaders {
-  flagGlobals?: readonly string[];
-  valueGlobals?: readonly string[];
-  /** Read verbs; a list names the word that must follow at once (`config view`). */
-  readers: Readonly<Record<string, readonly string[] | null>>;
-  /** An argument anywhere after the subcommand that makes it write or run something. */
-  hazard?: (arg: string) => boolean;
+  global: ReadOptions;
+  verbs: Readonly<Record<string, ReadOptions | { sub: Readonly<Record<string, ReadOptions>> }>>;
+  /** An operand the verb must not take (a path brew would load as Ruby). */
+  badOperand?: (arg: string) => boolean;
 }
 
 const HELP_OR_VERSION = new Set(["--help", "-h", "--version", "-v", "-V"]);
+
+/** Consume the option at `args[i]`; the index of its last word, or -1 when it is not allowed. */
+function allowedOption(args: readonly string[], i: number, ...sets: ReadOptions[]): number {
+  const word = args[i]!;
+  const eq = word.startsWith("--") ? word.indexOf("=") : -1;
+  const name = eq === -1 ? word : word.slice(0, eq);
+  if (eq === -1 && sets.some((set) => set.flags?.includes(word))) return i;
+  if (!sets.some((set) => set.values?.includes(name))) return -1;
+  if (eq !== -1) return i;
+  return i + 1 < args.length ? i + 1 : -1;
+}
 
 function subcommandReads(spec: SubcommandReaders, args: readonly string[]): boolean {
   if (args.length > 0 && args.every((arg) => HELP_OR_VERSION.has(arg))) return true;
   let i = 0;
   for (; i < args.length; i++) {
     const word = args[i]!;
-    if (Object.hasOwn(spec.readers, word) || !word.startsWith("-")) break;
-    const name = word.split("=")[0]!;
-    if (spec.flagGlobals?.includes(word)) continue;
-    if (spec.valueGlobals?.includes(name)) {
-      if (!word.includes("=")) i++;
-      continue;
-    }
-    return false;
+    if (Object.hasOwn(spec.verbs, word) || !word.startsWith("-")) break;
+    const end = allowedOption(args, i, spec.global);
+    if (end === -1) return false;
+    i = end;
   }
-  const sub = args[i];
   // A bare invocation (or globals only) prints usage.
-  if (sub === undefined) return i === args.length;
-  if (!Object.hasOwn(spec.readers, sub)) return false;
-  const second = spec.readers[sub];
-  const rest = args.slice(i + 1);
-  if (second && !second.includes(rest[0] ?? "")) return false;
-  return spec.hazard === undefined || !rest.some(spec.hazard);
-}
-
-const KUBECTL: SubcommandReaders = {
-  flagGlobals: ["--insecure-skip-tls-verify"],
-  valueGlobals: ["-n", "--namespace", "--context", "--cluster", "--user", "-s", "--server", "--request-timeout"],
-  readers: {
-    get: null, describe: null, logs: null, explain: null, "api-resources": null, "api-versions": null, version: null,
-    top: null, events: null,
-    config: ["view", "get-contexts", "current-context", "get-clusters", "get-users"],
-    auth: ["can-i", "whoami"],
-  },
-  // A kubeconfig names exec credential plugins: a repository file must not choose them.
-  hazard: (arg) => /^--kubeconfig(?:=|$)/.test(arg),
-};
-
-const DOCKER: SubcommandReaders = {
-  flagGlobals: ["-D", "--debug"],
-  // Not --config/-H/--host: a config directory or remote host chooses helpers to run.
-  valueGlobals: ["--context", "-c", "--log-level", "-l"],
-  readers: {
-    ps: null, images: null, inspect: null, logs: null, version: null, info: null, history: null, port: null, top: null,
-    stats: null, diff: null, search: null,
-    image: ["ls", "list", "inspect", "history"],
-    container: ["ls", "list", "inspect", "logs", "port", "top", "stats", "diff"],
-    network: ["ls", "list", "inspect"],
-    volume: ["ls", "list", "inspect"],
-    system: ["df", "info"],
-    context: ["ls", "list", "inspect", "show"],
-  },
-};
-
-const GH: SubcommandReaders = {
-  readers: {
-    pr: ["view", "list", "diff", "status", "checks"],
-    issue: ["view", "list", "status"],
-    repo: ["view", "list"],
-    run: ["view", "list"],
-    release: ["view", "list"],
-    workflow: ["view", "list"],
-    search: ["repos", "issues", "prs", "code", "commits"],
-    label: ["list"],
-    auth: ["status"],
-    status: null,
-  },
-  // --web opens a browser.
-  hazard: (arg) => /^(?:--web(?:=|$)|-[a-zA-Z]*w)/.test(arg),
-};
-
-const PIP: SubcommandReaders = {
-  // Not --python: pip re-executes itself under that interpreter.
-  flagGlobals: ["-q", "--quiet", "-v", "--verbose", "--no-color", "--disable-pip-version-check", "--isolated"],
-  readers: { list: null, show: null, freeze: null, check: null, inspect: null, help: null, config: ["list", "get"] },
-};
-
-const BREW: SubcommandReaders = {
-  flagGlobals: ["-q", "--quiet", "-v", "--verbose", "-d", "--debug"],
-  // Not outdated/upgrade/tap/update: those may auto-update or write.
-  readers: {
-    list: null, ls: null, info: null, abv: null, search: null, deps: null, uses: null, leaves: null, desc: null,
-    config: null, doctor: null, commands: null, "--prefix": null, "--cellar": null, "--repository": null,
-    "--repo": null, "--cache": null, "--caskroom": null, "--env": null,
-  },
-};
-
-/** curl options that only shape a request or its console output. */
-const CURL_FLAGS = new Set([
-  "--silent", "--show-error", "--location", "--fail", "--fail-with-body", "--head", "--include", "--verbose",
-  "--insecure", "--compressed", "--globoff", "--no-buffer", "--http1.1", "--http2", "--no-progress-meter",
-]);
-const CURL_FLAG_LETTERS = /^-[sSLfIivkgN46]+$/;
-const CURL_VALUE_OPTIONS = new Set([
-  "-H", "--header", "-A", "--user-agent", "-e", "--referer", "-m", "--max-time", "--connect-timeout", "--retry",
-  "-u", "--user", "--url",
-]);
-
-/**
- * A curl GET/HEAD printed to stdout. Anything else — an output, header,
- * cookie-jar, trace or config file, a request body or upload, `-w`
- * (`%output{}` writes a file), another method — is not a known read.
- */
-function curlReads(args: readonly string[]): boolean {
-  for (let i = 0; i < args.length; i++) {
-    const arg = args[i]!;
-    if (!arg.startsWith("-")) continue;
-    if (CURL_FLAGS.has(arg) || CURL_FLAG_LETTERS.test(arg)) continue;
-    if (CURL_VALUE_OPTIONS.has(arg)) {
-      if (++i >= args.length) return false;
+  if (i >= args.length) return true;
+  const verb = args[i]!;
+  if (!Object.hasOwn(spec.verbs, verb)) return false;
+  let options = spec.verbs[verb]!;
+  i++;
+  if ("sub" in options) {
+    const second = args[i];
+    if (second === undefined || !Object.hasOwn(options.sub, second)) return false;
+    options = options.sub[second]!;
+    i++;
+  }
+  for (; i < args.length; i++) {
+    const word = args[i]!;
+    if (word === "--") return !args.slice(i + 1).some((arg) => spec.badOperand?.(arg));
+    if (word.startsWith("-") && word !== "-") {
+      const end = allowedOption(args, i, options as ReadOptions, spec.global);
+      if (end === -1) return false;
+      i = end;
       continue;
     }
-    if (arg === "-X" || arg === "--request") {
-      if (!/^(?:GET|HEAD)$/.test(args[++i] ?? "")) return false;
-      continue;
-    }
-    if (/^-X(?:GET|HEAD)$/.test(arg)) continue;
-    return false;
+    if (spec.badOperand?.(word)) return false;
   }
   return true;
 }
 
-/** wget writing only to stdout (`-O-`, `-qO-`, `-O -`); every other option is unknown. */
-function wgetReads(args: readonly string[]): boolean {
-  let stdout = false;
+const K8S_SELECT = ["-n", "--namespace", "-l", "--selector", "--field-selector"];
+const K8S_OUTPUT = ["-o", "--output", "--template", "--sort-by"];
+const KUBECTL: SubcommandReaders = {
+  // Not -s/--server, --kubeconfig, --token, --cache-dir, --log-file: they send
+  // the context's credentials elsewhere, run a kubeconfig's exec plugin, or write.
+  global: { values: ["-n", "--namespace", "--context", "--cluster", "--user", "--request-timeout"] },
+  verbs: {
+    get: {
+      flags: ["-A", "--all-namespaces", "-w", "--watch", "--watch-only", "--show-labels", "--no-headers", "--show-kind",
+        "--ignore-not-found"],
+      values: [...K8S_SELECT, ...K8S_OUTPUT, "-L", "--label-columns", "--chunk-size", "--raw", "-f", "--filename"],
+    },
+    describe: { flags: ["-A", "--all-namespaces", "--show-events"], values: [...K8S_SELECT, "-f", "--filename"] },
+    logs: {
+      flags: ["-f", "--follow", "-p", "--previous", "--timestamps", "--all-containers", "--prefix"],
+      values: [...K8S_SELECT, "-c", "--container", "--tail", "--since", "--since-time", "--limit-bytes"],
+    },
+    explain: { flags: ["--recursive"], values: ["--api-version", "-o", "--output"] },
+    "api-resources": { flags: ["--namespaced", "--no-headers"], values: ["-o", "--output", "--api-group", "--verbs", "--sort-by"] },
+    "api-versions": {},
+    version: { flags: ["--client"], values: ["-o", "--output"] },
+    top: { sub: Object.fromEntries(["pod", "pods", "po", "node", "nodes", "no"].map((kind) =>
+      [kind, { flags: ["-A", "--all-namespaces", "--containers", "--no-headers"], values: [...K8S_SELECT, "--sort-by"] }])) },
+    events: { flags: ["-A", "--all-namespaces", "-w", "--watch"], values: [...K8S_SELECT, ...K8S_OUTPUT, "--for", "--types"] },
+    config: {
+      sub: {
+        view: { flags: ["--minify", "--raw", "--flatten"], values: ["-o", "--output"] },
+        "get-contexts": { flags: ["--no-headers"], values: ["-o", "--output"] },
+        "current-context": {},
+        "get-clusters": {},
+        "get-users": {},
+      },
+    },
+    auth: { sub: { "can-i": { flags: ["--list", "-A", "--all-namespaces", "-q", "--quiet"] }, whoami: { values: ["-o", "--output"] } } },
+  },
+};
+
+const DOCKER_PS: ReadOptions = {
+  flags: ["-a", "--all", "-q", "--quiet", "--no-trunc", "-l", "--latest", "-s", "--size"],
+  values: ["-f", "--filter", "--format", "-n", "--last"],
+};
+const DOCKER_IMAGES: ReadOptions = { flags: ["-a", "--all", "-q", "--quiet", "--no-trunc", "--digests"], values: ["-f", "--filter", "--format"] };
+const DOCKER_INSPECT: ReadOptions = { flags: ["-s", "--size"], values: ["-f", "--format", "--type"] };
+const DOCKER_LOGS: ReadOptions = { flags: ["-f", "--follow", "-t", "--timestamps", "--details"], values: ["--tail", "-n", "--since", "--until"] };
+const DOCKER_HISTORY: ReadOptions = { flags: ["-H", "--human", "-q", "--quiet", "--no-trunc"], values: ["--format"] };
+const DOCKER_STATS: ReadOptions = { flags: ["-a", "--all", "--no-stream", "--no-trunc"], values: ["--format"] };
+const DOCKER_LIST: ReadOptions = { flags: ["-q", "--quiet", "--no-trunc"], values: ["-f", "--filter", "--format"] };
+const DOCKER_FORMAT: ReadOptions = { values: ["-f", "--format"] };
+const DOCKER: SubcommandReaders = {
+  // Not --config/-H/--host: a config directory or remote host chooses helpers to run.
+  global: { flags: ["-D", "--debug"], values: ["--context", "-c", "--log-level", "-l"] },
+  verbs: {
+    ps: DOCKER_PS, images: DOCKER_IMAGES, inspect: DOCKER_INSPECT, logs: DOCKER_LOGS, version: DOCKER_FORMAT,
+    info: DOCKER_FORMAT, history: DOCKER_HISTORY, port: {}, top: {}, stats: DOCKER_STATS, diff: {},
+    search: { flags: ["--no-trunc"], values: ["-f", "--filter", "--format", "--limit"] },
+    image: { sub: { ls: DOCKER_IMAGES, list: DOCKER_IMAGES, inspect: DOCKER_INSPECT, history: DOCKER_HISTORY } },
+    container: {
+      sub: {
+        ls: DOCKER_PS, list: DOCKER_PS, inspect: DOCKER_INSPECT, logs: DOCKER_LOGS, port: {}, top: {}, stats: DOCKER_STATS,
+        diff: {},
+      },
+    },
+    network: { sub: { ls: DOCKER_LIST, list: DOCKER_LIST, inspect: DOCKER_FORMAT } },
+    volume: { sub: { ls: DOCKER_LIST, list: DOCKER_LIST, inspect: DOCKER_FORMAT } },
+    system: { sub: { df: { flags: ["-v", "--verbose"], values: ["--format"] }, info: DOCKER_FORMAT } },
+    context: { sub: { ls: DOCKER_LIST, list: DOCKER_LIST, inspect: DOCKER_FORMAT, show: {} } },
+  },
+};
+
+const GH_JSON = ["--json", "-q", "--jq", "-t", "--template"];
+const GH_REPO = ["-R", "--repo"];
+const GH_LIST = ["-L", "--limit", "-S", "--search", "-l", "--label", "-a", "--assignee", "-A", "--author", "-s", "--state"];
+const GH: SubcommandReaders = {
+  // No --web/-w anywhere (a browser), no api/checkout/download.
+  global: {},
+  verbs: {
+    pr: {
+      sub: {
+        view: { flags: ["-c", "--comments"], values: [...GH_JSON, ...GH_REPO] },
+        list: { flags: ["-d", "--draft"], values: [...GH_LIST, ...GH_JSON, ...GH_REPO, "-B", "--base", "-H", "--head"] },
+        diff: { flags: ["--patch", "--name-only"], values: ["--color", ...GH_REPO] },
+        status: { flags: ["-c", "--conflict-status"], values: [...GH_JSON, ...GH_REPO] },
+        checks: { flags: ["--watch", "--required", "--fail-fast"], values: ["-i", "--interval", ...GH_JSON, ...GH_REPO] },
+      },
+    },
+    issue: {
+      sub: {
+        view: { flags: ["-c", "--comments"], values: [...GH_JSON, ...GH_REPO] },
+        list: { values: [...GH_LIST, ...GH_JSON, ...GH_REPO, "-m", "--milestone", "--mention"] },
+        status: { values: [...GH_JSON, ...GH_REPO] },
+      },
+    },
+    repo: {
+      sub: {
+        view: { values: ["-b", "--branch", ...GH_JSON] },
+        list: { flags: ["--fork", "--source", "--archived", "--no-archived"], values: ["-L", "--limit", "--visibility", "--language", "--topic", ...GH_JSON] },
+      },
+    },
+    run: {
+      sub: {
+        view: { flags: ["--log", "--log-failed", "-v", "--verbose", "--exit-status"], values: ["-j", "--job", "-a", "--attempt", ...GH_JSON, ...GH_REPO] },
+        list: { values: ["-L", "--limit", "-w", "--workflow", "-b", "--branch", "-u", "--user", "-s", "--status", "-e", "--event", "-c", "--commit", ...GH_JSON, ...GH_REPO] },
+      },
+    },
+    release: {
+      sub: {
+        view: { values: [...GH_JSON, ...GH_REPO] },
+        list: { flags: ["--exclude-drafts", "--exclude-pre-releases"], values: ["-L", "--limit", ...GH_JSON, ...GH_REPO] },
+      },
+    },
+    workflow: {
+      sub: {
+        view: { flags: ["-y", "--yaml"], values: ["-r", "--ref", ...GH_REPO] },
+        list: { flags: ["-a", "--all"], values: ["-L", "--limit", ...GH_JSON, ...GH_REPO] },
+      },
+    },
+    search: {
+      sub: Object.fromEntries(["repos", "issues", "prs", "code", "commits"].map((kind) =>
+        [kind, { values: ["-L", "--limit", "--owner", ...GH_REPO, ...GH_JSON, "--language", "--state", "--sort", "--order"] }])),
+    },
+    label: { sub: { list: { values: ["-L", "--limit", "-S", "--search", "--sort", "--order", ...GH_JSON, ...GH_REPO] } } },
+    auth: { sub: { status: { flags: ["--active"], values: ["-h", "--hostname"] } } },
+    status: { values: ["-o", "--org", "-e", "--exclude"] },
+  },
+};
+
+const PIP: SubcommandReaders = {
+  // Not --python (re-executes pip under it), --log/--cache-dir/--src (write),
+  // --index-url/--cert/--client-cert and other network or file options.
+  global: { flags: ["-q", "--quiet", "-v", "--verbose", "--no-color", "--disable-pip-version-check", "--isolated"] },
+  verbs: {
+    list: {
+      flags: ["-o", "--outdated", "-u", "--uptodate", "-e", "--editable", "-l", "--local", "--user", "--not-required",
+        "--exclude-editable", "--include-editable", "--pre"],
+      values: ["--format", "--exclude"],
+    },
+    show: { flags: ["-f", "--files"] },
+    freeze: { flags: ["-l", "--local", "--user", "--all", "--exclude-editable"], values: ["--exclude"] },
+    check: {},
+    inspect: { flags: ["--local", "--user"] },
+    help: {},
+    config: { sub: { list: { flags: ["--user", "--global", "--site"] }, get: { flags: ["--user", "--global", "--site"] } } },
+  },
+};
+
+/**
+ * A brew operand that is a path or URL, not a formula name: Homebrew loads a
+ * formula from it, and a formula is Ruby. `user/tap/formula` names stay names.
+ */
+function brewPathOperand(arg: string): boolean {
+  if (/^[.~\/]/.test(arg) || /\.rb$/i.test(arg) || arg.includes("://") || arg.includes("..")) return true;
+  return arg.includes("/") && !/^[\w-]+\/[\w-]+\/[\w@.+-]+$/.test(arg);
+}
+
+const BREW_KIND = ["--formula", "--formulae", "--cask", "--casks"];
+const BREW: SubcommandReaders = {
+  global: { flags: ["-q", "--quiet", "-v", "--verbose", "-d", "--debug"] },
+  // Not outdated/upgrade/tap/update (auto-update or writes); not info --github (a browser).
+  verbs: {
+    list: { flags: [...BREW_KIND, "-1", "-l", "--versions", "--pinned", "--full-name", "--multiple"] },
+    ls: { flags: [...BREW_KIND, "-1", "-l", "--versions", "--pinned", "--full-name", "--multiple"] },
+    info: { flags: [...BREW_KIND, "--installed", "--json"], values: ["--json"] },
+    abv: { flags: [...BREW_KIND, "--installed", "--json"], values: ["--json"] },
+    search: { flags: [...BREW_KIND, "--desc"] },
+    deps: {
+      flags: [...BREW_KIND, "--tree", "--installed", "--direct", "--topological", "-1", "--include-build", "--include-test",
+        "--annotate", "--full-name"],
+    },
+    uses: { flags: [...BREW_KIND, "--installed", "--recursive"] },
+    leaves: { flags: ["-r", "--installed-on-request", "-p", "--installed-as-dependency"] },
+    desc: { flags: [...BREW_KIND, "--search", "--name", "--description"] },
+    config: {},
+    doctor: {},
+    commands: { flags: ["--include-aliases"] },
+    "--prefix": { flags: ["--installed"] },
+    "--cellar": {},
+    "--repository": {},
+    "--repo": {},
+    "--cache": {},
+    "--caskroom": {},
+    "--env": {},
+  },
+  badOperand: brewPathOperand,
+};
+
+/**
+ * bat prints files: listed display options only (no pager, config or cache
+ * option), and never the `cache` subcommand.
+ */
+const BAT_FLAGS = ["-p", "-pp", "--plain", "-n", "--number", "-A", "--show-all", "-P", "--paging=never", "-d", "--diff",
+  "-S", "--chop-long-lines", "--list-languages", "--list-themes"];
+const BAT_VALUES = ["-l", "--language", "-r", "--line-range", "-H", "--highlight-line", "--style", "--theme", "--color",
+  "--tabs", "--wrap", "--terminal-width", "--decorations", "-m", "--map-syntax"];
+function batReads(args: readonly string[]): boolean {
+  let operands = 0;
   for (let i = 0; i < args.length; i++) {
     const arg = args[i]!;
-    if (!arg.startsWith("-")) continue;
-    if (arg === "-O-" || arg === "-qO-" || arg === "--output-document=-") { stdout = true; continue; }
-    if ((arg === "-O" || arg === "-qO" || arg === "--output-document") && args[i + 1] === "-") {
-      stdout = true;
-      i++;
+    if (arg === "--") return true;
+    if (arg.startsWith("-") && arg !== "-") {
+      const end = allowedOption(args, i, { flags: BAT_FLAGS, values: BAT_VALUES });
+      if (end === -1) return false;
+      i = end;
       continue;
     }
-    if (arg === "-q" || arg === "--quiet" || arg === "-nv" || arg === "--no-verbose" || arg === "-S" ||
-      arg === "--server-response" || /^--(?:header|user-agent|timeout|tries)=/.test(arg)) continue;
-    return false;
+    if (operands++ === 0 && arg === "cache") return false;
   }
-  return stdout;
+  return true;
+}
+
+/** curl options that only shape an http(s) GET or its console output (R43). */
+const CURL_FLAGS = ["--silent", "--show-error", "--location", "--head", "--include", "--fail", "--compressed"];
+const CURL_FLAG_LETTERS = /^-[sSLIif]+$/;
+const CURL_VALUES = ["-m", "--max-time", "-A", "--user-agent", "-H", "--header"];
+
+/**
+ * An http(s) fetch printed to stdout. Every operand must be an http:// or
+ * https:// URL (no file:, telnet:, gopher:, dict:, ...), and every option
+ * must be listed; a value starting with `@` (curl reads that file) is not.
+ * Anything else — an output, header, cookie or config file, a request body
+ * or upload, another method — is not a known read. Stdin fed to curl is
+ * refused by the caller. Residual: any allowed GET can still carry data out
+ * in its URL; that is inherent to allowing network reads at all.
+ */
+function curlReads(args: readonly string[]): boolean {
+  let urls = 0;
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i]!;
+    if (arg.startsWith("-")) {
+      if (CURL_FLAGS.includes(arg) || CURL_FLAG_LETTERS.test(arg)) continue;
+      if (!CURL_VALUES.includes(arg)) return false;
+      const value = args[++i];
+      if (value === undefined || value.startsWith("@")) return false;
+      if ((arg === "-m" || arg === "--max-time") && !/^\d+(?:\.\d+)?$/.test(value)) return false;
+      continue;
+    }
+    if (!/^https?:\/\//i.test(arg)) return false;
+    urls++;
+  }
+  return urls > 0;
 }
 
 /**
- * Multi-mode tools whose read forms pass the allowlist inversion: multi-tools'
- * read verbs, plus curl/wget to stdout and `crontab -l`. Each predicate gets
- * the argv after the head; true means a known read. Git (git.ts) and
- * npm/pnpm/cargo/go (repo-scripts.ts) keep their own verb tables. Any
- * environment assignment on the invocation (KUBECONFIG, DOCKER_HOST, a pager,
- * CURL_HOME) fails closed in the caller.
+ * Multi-mode tools whose read forms pass the allowlist inversion. Each
+ * predicate gets the argv after the head; true means a known read. Git
+ * (git.ts) and npm/pnpm/cargo/go (repo-scripts.ts) keep their own verb
+ * tables. These tools read configuration from their environment
+ * (KUBECONFIG, DOCKER_HOST, PIP_*, CURL_HOME, BAT_CONFIG_PATH, ...), so the
+ * caller refuses them when the command assigns or exports anything (R43).
+ * wget is not here: it writes an HSTS file or its download every time.
  */
 export const READ_ONLY_SUBCOMMANDS: Readonly<Record<string, (args: readonly string[]) => boolean>> = {
   curl: curlReads,
-  wget: wgetReads,
   crontab: (args) => args.length === 1 && args[0] === "-l",
+  bat: batReads,
+  batcat: batReads,
   kubectl: (args) => subcommandReads(KUBECTL, args),
   docker: (args) => subcommandReads(DOCKER, args),
   gh: (args) => subcommandReads(GH, args),
@@ -652,6 +810,24 @@ export const READ_ONLY_HEAD_WRITES: Record<string, ReadOnlyHeadWriteCheck> = {
   // holding x/X stops even when it is an option value (`-tx`): fail closed.
   fd: fdWrite,
   fdfind: fdWrite,
+  // -C/--compile writes a compiled magic file; -m/--magic-file loads a magic
+  // source, which is what -C compiles (R43: any write/compile flag stops).
+  file: (args) => {
+    for (const arg of args) {
+      if (arg === "--") break;
+      if (/^--(?:compile|magic-file)(?:=|$)/.test(arg)) return `file ${arg.split("=")[0]}`;
+      if (!/^-[^-]/.test(arg)) continue;
+      for (const letter of arg.slice(1)) {
+        if (letter === "C" || letter === "m") return `file -${letter}`;
+        // -f/-F/-e/-P take the rest of the cluster as their value.
+        if ("fFeP".includes(letter)) break;
+      }
+    }
+    return null;
+  },
+  date: dateWrite,
+  // Any operand (or -F FILE) sets the host name.
+  hostname: (args) => (args.some((arg) => !arg.startsWith("-") || /^-[^-]*F|^--file(?:=|$)/.test(arg)) ? "hostname set" : null),
   // BSD/macOS base64 writes -o/--output FILE.
   base64: (args) => {
     for (const arg of args) {
@@ -995,6 +1171,37 @@ function batWrite(args: string[], { assignments }: ReadOnlyHeadContext): string 
   }
   const operand = args.find((arg) => !arg.startsWith("-"));
   return operand === "cache" ? "bat cache" : null;
+}
+
+/**
+ * date sets the clock with -s/--set, or with a positional date operand (GNU
+ * `MMDDhhmm…`, BSD `[[cc]yy]mmddHHMM` and `-f FMT STR`) unless BSD -j says
+ * "parse only". A `+FORMAT` operand only formats. Unknown options stop.
+ */
+const DATE_FLAGS = new Set(["-u", "--utc", "--universal", "-R", "--rfc-email", "-j", "-n", "--debug", "-I"]);
+const DATE_VALUES = new Set(["-d", "--date", "-f", "--file", "-r", "--reference", "-v", "-z"]);
+function dateWrite(args: string[]): string | null {
+  const parseOnly = args.includes("-j");
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i]!;
+    if (arg.startsWith("+")) continue;
+    if (/^-I[a-z]*$|^--iso-8601(?:=|$)|^--rfc-3339=/.test(arg)) continue;
+    // BSD -v adjusts the displayed date (`-v-1d`); -r/-z/-d may be attached.
+    if (/^-[vrzd]./.test(arg)) continue;
+    if (arg === "-s" || /^--set(?:=|$)/.test(arg) || /^-[^-]*s/.test(arg)) return "date -s";
+    if (!arg.startsWith("-")) {
+      if (!parseOnly) return "date set";
+      continue;
+    }
+    const name = arg.split("=")[0]!;
+    if (DATE_FLAGS.has(arg)) continue;
+    if (DATE_VALUES.has(name)) {
+      if (!arg.includes("=")) i++;
+      continue;
+    }
+    return `date ${arg}`;
+  }
+  return null;
 }
 
 function mapfileWrite(args: string[]): string | null {
