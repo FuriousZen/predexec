@@ -60,8 +60,10 @@ export const INTERPRETER_PRELOAD_ENV: Record<string, ReadonlySet<string>> = {
   perl: new Set(["PERL5OPT", "PERL5LIB", "PERLLIB"]),
   ruby: new Set(["RUBYOPT", "RUBYLIB"]),
   php: new Set(["PHPRC", "PHP_INI_SCAN_DIR"]),
-  python: new Set(["PYTHONPATH", "PYTHONSTARTUP", "PYTHONHOME"]),
-  python3: new Set(["PYTHONPATH", "PYTHONSTARTUP", "PYTHONHOME"]),
+  // R69: PYTHONUSERBASE moves the user site dir (its .pth files run at
+  // startup); PYTHONPYCACHEPREFIX moves where cached bytecode is read from.
+  python: new Set(["PYTHONPATH", "PYTHONSTARTUP", "PYTHONHOME", "PYTHONUSERBASE", "PYTHONPYCACHEPREFIX"]),
+  python3: new Set(["PYTHONPATH", "PYTHONSTARTUP", "PYTHONHOME", "PYTHONUSERBASE", "PYTHONPYCACHEPREFIX"]),
 };
 
 /**

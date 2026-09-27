@@ -160,6 +160,10 @@ function gitReadOnlyOptionMutation(tokens: string[], start: number, verb: string
     // R60 (C4): `git grep -O[cmd]` (attached or clustered) opens the matches
     // in a pager, like --open-files-in-pager. On log/diff `-O` is an orderfile.
     if (verb === "grep" && /^-[^-]*O/.test(token)) return token;
+    // R69: git grep's parse-options accepts unambiguous abbreviations, so any
+    // >=2-char prefix of --open-files-in-pager (attached or separate value) stops.
+    const grepLong = verb === "grep" ? /^--([^=]{2,})(?:=|$)/.exec(token) : null;
+    if (grepLong && "open-files-in-pager".startsWith(grepLong[1]!)) return token;
     if (token === "--ext-diff" || token === "--textconv" || token === "--paginate" || token === "-p" ||
       /^--open-files-in-pager(?:=|$)/.test(token) || /^--output(?:=|$)/.test(token) || /^-[^-]*o(?:.|$)/.test(token)) {
       return token;

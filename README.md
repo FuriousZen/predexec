@@ -653,7 +653,8 @@ Both are empty by default.
 | allowed scripts | `PREDEXEC_ALLOW_SCRIPTS` | `allowScripts` | repository scripts and task-runner commands you trust to run during speculation |
 
 Environment values are comma-separated. The file is `$XDG_CONFIG_HOME/predexec/config.json`
-(default `~/.config/predexec/config.json`); a relative `XDG_CONFIG_HOME` is ignored. The two sources
+(default `~/.config/predexec/config.json`); a relative `XDG_CONFIG_HOME` is never used for the path,
+and a relative `HOME` or `XDG_CONFIG_HOME` disables the allowlists (see Security below). The two sources
 are merged:
 
 ```json
@@ -702,8 +703,11 @@ predexec checks for the cases it can see and then **disables the allowlists for 
 
 - the config file path resolves inside the session root (for example, `XDG_CONFIG_HOME` or `HOME`
   points into the checkout, or you run the agent from your home directory);
+- `HOME` or `XDG_CONFIG_HOME` is a relative path, which would resolve against a working directory
+  the repository controls;
 - on Claude Code, the project's `.claude/settings.json` or `.claude/settings.local.json` sets
-  `PREDEXEC_READONLY_HEADS`, `PREDEXEC_ALLOW_SCRIPTS` or `XDG_CONFIG_HOME` in its `env` block.
+  `PREDEXEC_READONLY_HEADS`, `PREDEXEC_ALLOW_SCRIPTS`, `XDG_CONFIG_HOME` or `HOME` in its `env`
+  block.
   If you set these deliberately in project settings, move them to your user settings or the
   config file.
 
@@ -840,7 +844,8 @@ antigravity-plugin/skills/predexec/SKILL.md  Antigravity routing skill          
 .claude-plugin/plugin.json         Claude Code plugin manifest (MCP server + skills path)
 .claude-plugin/marketplace.json    self-hosting marketplace listing (source: "./") for `/plugin install`
 .codex-plugin/plugin.json          Codex plugin manifest (mcpServers/skills point at companion files)
-.codex-plugin/mcp.json             Codex plugin's MCP server config (env_vars forwards CODEX_HOME)
+.codex-plugin/mcp.json             Codex plugin's MCP server config (env_vars forwards CODEX_HOME,
+                                   PREDEXEC_READONLY_HEADS, PREDEXEC_ALLOW_SCRIPTS, XDG_CONFIG_HOME)
 .agents/plugins/marketplace.json   self-hosting marketplace listing (path: "./") for `codex plugin add`
 antigravity-plugin/                self-hosting Antigravity plugin: plugin.json, mcp_config.json, skill
 configs/opencode/AGENTS.md         drop-in routing block for opencode projects

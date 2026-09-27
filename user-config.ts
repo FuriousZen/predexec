@@ -14,8 +14,10 @@
  *
  * R63: the repository can still reach these sources indirectly — a config
  * path that resolves inside the session root, or (on Claude Code) a project
- * settings `env` block that sets the variables. `sessionTrustProblem` detects
- * both, and the adapter runtime then disables the allowlists (fail closed).
+ * settings `env` block that sets the variables (HOME included), or a relative
+ * HOME/XDG_CONFIG_HOME resolved against its cwd (R68). `sessionTrustProblem`
+ * detects each, and the adapter runtime then disables the allowlists (fail
+ * closed).
  *
  * File format: `{ "readOnlyHeads": string[], "allowScripts": string[] }`.
  * A malformed file never throws: it contributes nothing, with a warning.
@@ -23,7 +25,7 @@
 
 import { readFileSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { ClassifierOptions } from "./core/index.ts";
 
 export interface UserConfig {
@@ -116,9 +118,10 @@ export function loadUserConfig(env: NodeJS.ProcessEnv = process.env): UserConfig
 
 /**
  * The environment keys that choose the user's allowlists: a repository that
- * sets one picks what speculation may run.
+ * sets one picks what speculation may run. HOME (R68) picks the default
+ * config directory.
  */
-const ALLOWLIST_ENV_KEYS = ["PREDEXEC_READONLY_HEADS", "PREDEXEC_ALLOW_SCRIPTS", "XDG_CONFIG_HOME"] as const;
+const ALLOWLIST_ENV_KEYS = ["PREDEXEC_READONLY_HEADS", "PREDEXEC_ALLOW_SCRIPTS", "XDG_CONFIG_HOME", "HOME"] as const;
 
 /** Largest Claude project settings file inspected; bigger fails closed. */
 const MAX_SETTINGS_BYTES = 1024 * 1024;
@@ -140,9 +143,11 @@ function canonical(path: string): string {
   }
 }
 
+/** R68: only a `..` path component leaves the root; a name like `..x` is inside it. */
 function inside(root: string, path: string): boolean {
   const rel = relative(root, path);
-  return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+  if (isAbsolute(rel)) return false;
+  return !(rel === ".." || rel.startsWith(`..${sep}`));
 }
 
 /** The allowlist env keys a Claude settings file's `env` block sets, or an error. */
@@ -172,7 +177,8 @@ function settingsEnvKeys(path: string): string[] | { error: string } {
 
 /**
  * R63: why the user's allowlists cannot be trusted for this session, or null.
- * (a) the resolved config file lies inside the session root; (b) on Claude
+ * (a) the resolved config file lies inside the session root, or HOME or
+ * XDG_CONFIG_HOME is relative (R68); (b) on Claude
  * Code, `<root>/.claude/settings.json` or `settings.local.json` sets one of
  * ALLOWLIST_ENV_KEYS in its `env` block (an unreadable one fails closed).
  * An approved repo-scoped MCP registration chooses the server command itself,
@@ -181,6 +187,13 @@ function settingsEnvKeys(path: string): string[] | { error: string } {
 export function sessionTrustProblem(input: { sessionRoot: string; host?: string; env?: NodeJS.ProcessEnv }): string | null {
   const env = input.env ?? process.env;
   const root = canonical(input.sessionRoot);
+  // R68: a relative HOME or XDG_CONFIG_HOME resolves against a cwd the
+  // repository controls (userConfigPath ignores a relative XDG_CONFIG_HOME,
+  // but its presence still says something set it); fail closed.
+  for (const key of ["HOME", "XDG_CONFIG_HOME"] as const) {
+    const value = env[key];
+    if (value && !isAbsolute(value)) return `${key} is a relative path (${value})`;
+  }
   let path: string;
   try {
     path = canonical(userConfigPath(env));

@@ -727,11 +727,15 @@ const awkWrite: ReadOnlyHeadWriteCheck = (args) => {
 /**
  * Whether setting `name` (to `value`, or to an unknown value) makes `less`
  * run a command or write: LESSOPEN/LESSCLOSE are input preprocessors, lesskey
- * sources can set them, and $LESS holds options parsed like argv.
+ * sources can set them, and $LESS holds options parsed like argv. R69: less
+ * running as `more` (or under LESS_IS_MORE) reads $MORE in place of $LESS,
+ * so MORE and LESS_IS_MORE get the same treatment.
  */
+const LESS_OPTION_ENV: ReadonlySet<string> = new Set(["LESS", "MORE", "LESS_IS_MORE"]);
+
 export function lessEnvironmentWrite(name: string, value: string | undefined): boolean {
   if (name === "LESSOPEN" || name === "LESSCLOSE" || name.startsWith("LESSKEY")) return true;
-  if (name !== "LESS") return false;
+  if (!LESS_OPTION_ENV.has(name)) return false;
   if (value === undefined) return true;
   // $LESS options may omit the leading dash (`LESS=FRX`).
   const words = value.split(/\s+/).filter(Boolean).map((word) => /^[-+]/.test(word) ? word : `-${word}`);

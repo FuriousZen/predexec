@@ -197,3 +197,52 @@ describe("I5 — config-driven execution in reader rows (R65)", () => {
   it.each(["npm ls", "npm -g ls", "npm --json ls", "npm view left-pad", "pnpm -r list", "cargo -q version", "go version", "bun --version"])(
     "%j stays read-only", (c) => expect(findDestructiveToken(c)).toBeNull());
 });
+
+// R69 residual siblings. PYTHONUSERBASE moves the user site dir (its .pth
+// files run at interpreter start); PYTHONPYCACHEPREFIX moves where bytecode
+// is read from. Both join the python preload set (dangerous for any head).
+describe("R69 — python user-site and pycache-prefix variables", () => {
+  it.each([
+    "PYTHONUSERBASE=x python3 -c 1",
+    "PYTHONPYCACHEPREFIX=x python3 -c 1",
+    "export PYTHONUSERBASE=x; python3 -c 1",
+    "env PYTHONPYCACHEPREFIX=x python -c 1",
+    "PYTHONUSERBASE=x ls",
+  ])("%j is mutating", (c) => expect(isDestructiveCommand(c)).toBe(true));
+  it.each(["python3 -c 1", "echo $PYTHONUSERBASE"])("%j stays read-only", (c) =>
+    expect(findDestructiveToken(c)).toBeNull());
+});
+
+// R69: less running as `more` (or with LESS_IS_MORE) reads $MORE in place of
+// $LESS, so MORE and LESS_IS_MORE get $LESS's treatment.
+describe("R69 — MORE and LESS_IS_MORE get LESS's treatment", () => {
+  it.each([
+    "MORE=-ofile more f",
+    "MORE=-kkeys more f",
+    "MORE='--log-file=log' more f",
+    "LESS_IS_MORE=1 MORE=-ofile less f",
+    "export MORE=-ofile; more f",
+    "env MORE=-ofile more f",
+    "export MORE; more f",
+    "export LESS_IS_MORE; less f",
+  ])("%j is mutating", (c) => expect(isDestructiveCommand(c)).toBe(true));
+  it.each(["MORE=-R more f", "LESS_IS_MORE=1 less f", "more f"])("%j stays read-only", (c) =>
+    expect(findDestructiveToken(c)).toBeNull());
+});
+
+// R69: git grep's parse-options accepts unambiguous abbreviations, so any
+// long option that is a >=2-char prefix of --open-files-in-pager stops.
+describe("R69 — abbreviated git grep --open-files-in-pager", () => {
+  it.each([
+    "git grep --op foo",
+    "git grep --op=x foo",
+    "git grep --open foo",
+    "git grep --open=x foo",
+    "git grep --open-files x foo",
+    "git grep --open-files-in=x foo",
+    "git grep -n --open-files-in-pa=x foo",
+    "git -C . grep --ope=x foo",
+  ])("%j is mutating", (c) => expect(isDestructiveCommand(c)).toBe(true));
+  it.each(["git grep --or -e a -e b", "git grep --only-matching foo", "git grep -n foo", "git log --oneline"])(
+    "%j stays read-only", (c) => expect(findDestructiveToken(c)).toBeNull());
+});

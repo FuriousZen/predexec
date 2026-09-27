@@ -204,6 +204,40 @@ describe("session trust (R63)", () => {
     expect(sessionTrustProblem({ sessionRoot: repo, host: "claude-code", env })).toMatch(/could not be read/);
   });
 
+  // R68: a first path component that merely BEGINS with ".." is inside.
+  it("(a) refuses a config under a root subdirectory whose name begins with \"..\"", () => {
+    const problem = sessionTrustProblem({ sessionRoot: repo, host: "pi", env: { HOME: home, XDG_CONFIG_HOME: join(repo, "..h") } });
+    expect(problem).toMatch(/inside the session root/);
+    expect(sessionTrustProblem({ sessionRoot: repo, host: "pi", env: { HOME: join(repo, "..h") } })).toMatch(/inside the session root/);
+  });
+
+  it("(a) still accepts a config in a sibling directory of the root", () => {
+    const sibling = `${repo}-sibling`;
+    try {
+      mkdirSync(sibling);
+      expect(sessionTrustProblem({ sessionRoot: repo, host: "pi", env: { HOME: home, XDG_CONFIG_HOME: sibling } })).toBeNull();
+    } finally {
+      rmSync(sibling, { recursive: true, force: true });
+    }
+  });
+
+  // R68: a relative HOME or XDG_CONFIG_HOME resolves against the cwd, which
+  // the repository controls; fail closed on every host.
+  it.each([
+    ["a relative HOME", { HOME: "..h" }],
+    ["a relative HOME (plain name)", { HOME: "h" }],
+    ["a relative XDG_CONFIG_HOME", { XDG_CONFIG_HOME: "rel" }],
+  ] as const)("refuses %s", (_label, overrides) => {
+    const env = { HOME: home, XDG_CONFIG_HOME: xdg, ...overrides };
+    expect(sessionTrustProblem({ sessionRoot: repo, host: "codex", env })).toMatch(/relative/);
+  });
+
+  it("(b) refuses Claude project settings env setting HOME", () => {
+    claudeSettings("settings.json", JSON.stringify({ env: { HOME: "..h" } }));
+    const problem = sessionTrustProblem({ sessionRoot: repo, host: "claude-code", env: { HOME: home, XDG_CONFIG_HOME: xdg } });
+    expect(problem).toContain("HOME");
+  });
+
   it("the adapter runtime disables the allowlists and says so in the transcript", async () => {
     const saved = { xdg: process.env.XDG_CONFIG_HOME, allow: process.env.PREDEXEC_ALLOW_SCRIPTS, home: process.env.HOME };
     try {
