@@ -13,6 +13,7 @@
 import { existsSync, readdirSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import {
+  inlineProgramReadPaths,
   inspectCommandSubstitutionTree,
   lexShellWords,
   splitCommandSegments,
@@ -24,6 +25,8 @@ import {
 interface RawWord {
   value: string;
   raw: string;
+  /** Taken from an option's `=value`. */
+  inline?: boolean;
   /** git's `<rev>:<path>` object names and pathspecs resolve differently from shell paths. */
   git?: "rev" | "pathspec";
 }
@@ -96,9 +99,74 @@ const VALUE_OPTIONS: Record<string, ReadonlySet<string>> = {
   iconv: new Set(["-f", "-t", "-o", "--from-code", "--to-code", "--output"]),
 };
 
-const INPUT_REDIRECT_RE = /^\d*<(?!<|&|\()>?(.*)$/s;
-const SKIP_NEXT_REDIRECT_RE = /^(?:\d*<<<?-?|\d*>>?|&>>?|\d*>\|)$/;
+/** Redirect operators, tested against a token's SOURCE spelling: a quoted `'<'` is a word. */
+const INPUT_REDIRECT_RE = /^\d*<>?(?![<&(])/;
+const DUP_INPUT_REDIRECT_RE = /^\d*<&$/;
+const SKIP_NEXT_REDIRECT_RE = /^(?:\d*<<<?-?|\d*>>?|&>>?|\d*>\||\d*>&)$/;
 const OUTPUT_REDIRECT_RE = /^(?:\d*|&)>/;
+const REDIRECT_OPERATOR_RE = /^(?:<<<|<<-|<<|<>|<&|<|>>|>&|>\||>)/;
+
+/**
+ * Space out every unquoted redirect operator so it is its own word: bash
+ * splits `cat<.env`, `cat -n<.env` and `x 2>/dev/null<.env` at the operator,
+ * but the word lexer keeps them whole. A leading all-digit run (`2>`, `0<`)
+ * or `&` (`&>`) stays with its operator, as in bash. Text inside `$(…)`,
+ * `${…}`, backticks and process substitutions is left alone — those bodies
+ * are inspected as commands of their own.
+ */
+function spaceRedirects(segment: string): string {
+  let out = "";
+  let quote: "'" | '"' | null = null;
+  let depth = 0;
+  let backtick = false;
+  for (let i = 0; i < segment.length; i++) {
+    const ch = segment[i]!;
+    if (quote === "'") {
+      out += ch;
+      if (ch === "'") quote = null;
+      continue;
+    }
+    if (ch === "\\") {
+      out += ch + (segment[i + 1] ?? "");
+      i++;
+      continue;
+    }
+    if (ch === "`") backtick = !backtick;
+    else if (ch === "$" && (segment[i + 1] === "(" || segment[i + 1] === "{")) {
+      depth++;
+      out += ch + segment[i + 1];
+      i++;
+      continue;
+    } else if (depth > 0 && (ch === "(" || ch === "{")) depth++;
+    else if (depth > 0 && (ch === ")" || ch === "}")) depth--;
+    if (quote === '"') {
+      out += ch;
+      if (ch === '"' && depth === 0 && !backtick) quote = null;
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      quote = ch;
+      out += ch;
+      continue;
+    }
+    if ((ch !== "<" && ch !== ">") || depth > 0 || backtick) {
+      out += ch;
+      continue;
+    }
+    if (segment[i + 1] === "(") {
+      depth++; // `<(…)` / `>(…)`: a process substitution, not a redirect
+      out += ch + "(";
+      i++;
+      continue;
+    }
+    const op = REDIRECT_OPERATOR_RE.exec(segment.slice(i))![0];
+    const fd = /(?:^|\s)(\d+|&)$/.exec(out);
+    const prefix = fd ? fd[1]! : "";
+    out = `${out.slice(0, out.length - prefix.length)} ${prefix}${op} `;
+    i += op.length - 1;
+  }
+  return out;
+}
 
 /**
  * File operands named by a shell command: known readers' operands, every
@@ -118,6 +186,12 @@ interface ShellOperands {
   operands: RawWord[];
   /** Every other head's non-option words and `--opt=value` values (E-E). */
   generic: RawWord[];
+  /**
+   * Values attached to a short option (`-i.env`, `-f.env`) on any head (R27(a)):
+   * checked as the named path only — never as a searched directory, since
+   * `cut -d.` names no directory to walk.
+   */
+  direct: RawWord[];
   /** `cd`/`pushd` targets in source order; null for a bare `cd` (home). */
   cdTargets: (RawWord | null)[];
   afterCd: boolean;
@@ -141,23 +215,31 @@ function shellReadOperands(command: string, wrapperOptions?: WrapperInspectionOp
   const operands: RawWord[] = [];
   const generic: RawWord[] = [];
   const cdTargets: (RawWord | null)[] = [];
+  const direct: RawWord[] = [];
   let afterCd = false;
   for (const text of inspected.commands) {
     for (const line of text.split("\n")) {
       for (const segment of splitCommandSegments(line)) {
         // Keep each word's source spelling: brace expansion must know which
         // braces were quoted or escaped (literal) — the value has lost that.
-        const tokens: RawWord[] = lexShellWords(segment).words.map((w) => ({ value: w.value, raw: segment.slice(w.start, w.end) }));
+        const spaced = spaceRedirects(segment);
+        const tokens: RawWord[] = lexShellWords(spaced).words.map((w) => ({ value: w.value, raw: spaced.slice(w.start, w.end) }));
         const words: RawWord[] = [];
         for (let i = 0; i < tokens.length; i++) {
           const token = tokens[i]!;
-          const input = INPUT_REDIRECT_RE.exec(token.value);
+          const input = INPUT_REDIRECT_RE.exec(token.raw);
           if (input) {
-            const target = input[1] ? { value: input[1], raw: token.raw } : tokens[++i];
+            // `<`, `N<`, `<>`: the next word (or an attached rest) is read.
+            const rest = token.raw.slice(input[0].length);
+            const target = rest ? { value: lexShellWords(rest).words.map((w) => w.value).join(""), raw: rest } : tokens[++i];
             if (target !== undefined) operands.push(target);
-          } else if (SKIP_NEXT_REDIRECT_RE.test(token.value)) {
+          } else if (DUP_INPUT_REDIRECT_RE.test(token.raw)) {
+            // `<&N` duplicates a descriptor; `<&word` with a non-number names a file.
+            const target = tokens[++i];
+            if (target !== undefined && !/^(?:\d+-?|-)$/.test(target.value)) operands.push(target);
+          } else if (SKIP_NEXT_REDIRECT_RE.test(token.raw)) {
             i++; // heredoc delimiter, here-string word, or output target
-          } else if (!OUTPUT_REDIRECT_RE.test(token.value) && !/^\d*<[<&(]/.test(token.value)) {
+          } else if (!OUTPUT_REDIRECT_RE.test(token.raw) && !/^\d*<[<&(]/.test(token.raw)) {
             words.push(token);
           }
         }
@@ -174,8 +256,15 @@ function shellReadOperands(command: string, wrapperOptions?: WrapperInspectionOp
           const target = genericOperands(argv.slice(1))[0];
           if (target?.value !== "-") cdTargets.push(target ?? null); // `cd -` returns to a dir already in play
         }
-        if (SHELL_READERS.has(head)) operands.push(...readerOperands(head, argv.slice(1)));
-        else if (!NON_READING_HEADS.has(head)) {
+        const args = argv.slice(1);
+        if (!NON_READING_HEADS.has(head)) direct.push(...attachedOptionValues(args));
+        if (SHELL_READERS.has(head)) {
+          const read = readerOperands(head, args);
+          operands.push(...read);
+          // Values of `--opt=value` the reader tables do not know (`diff --from-file=.env`).
+          generic.push(...genericOperands(args).filter((word) => word.inline));
+          if (read.length === 0 && searchesCwdImplicitly(head, args)) generic.push({ value: ".", raw: "." });
+        } else if (!NON_READING_HEADS.has(head)) {
           // Any other head may read a path it is handed (`column .env`,
           // `git diff --no-index .env x`); perl's loop operands stay reader
           // operands too, so the old verdict is kept as a subset.
@@ -183,13 +272,15 @@ function shellReadOperands(command: string, wrapperOptions?: WrapperInspectionOp
           if (head === "git") {
             generic.push(...gitOperands(argv.slice(1), cdTargets));
           } else {
-            generic.push(...genericOperands(argv.slice(1)));
+            const words = genericOperands(args);
+            generic.push(...words);
+            if (words.filter((word) => !word.inline).length <= 1 && searchesCwdImplicitly(head, args)) generic.push({ value: ".", raw: "." });
           }
         }
       }
     }
   }
-  return { operands, generic, cdTargets, afterCd, complete: inspected.complete };
+  return { operands, generic, direct, cdTargets, afterCd, complete: inspected.complete };
 }
 
 /**
@@ -220,10 +311,41 @@ function genericOperands(args: readonly RawWord[]): RawWord[] {
     else if (arg.startsWith("--") && arg.includes("=")) {
       const eq = word.raw.indexOf("=");
       // The raw spelling after `=` keeps its quoting when it maps cleanly.
-      out.push({ value: arg.slice(arg.indexOf("=") + 1), raw: eq === -1 ? "\\" : word.raw.slice(eq + 1) });
+      out.push({ value: arg.slice(arg.indexOf("=") + 1), raw: eq === -1 ? "\\" : word.raw.slice(eq + 1), inline: true });
     }
   }
   return out;
+}
+
+/** The value part of each attached short option (`-i.env` → `.env`), before `--`. */
+function attachedOptionValues(args: readonly RawWord[]): RawWord[] {
+  const out: RawWord[] = [];
+  for (const word of args) {
+    const arg = word.value;
+    if (arg === "--") break;
+    if (!/^-[^-]./s.test(arg)) continue;
+    const flag = arg.slice(0, 2);
+    out.push({ value: arg.slice(2), raw: word.raw.startsWith(flag) ? word.raw.slice(2) : "\\" });
+  }
+  return out;
+}
+
+/** Heads that search the cwd recursively when no path is given. */
+const RECURSIVE_SEARCH_HEADS = new Set(["rg", "ag", "ack", "ack-grep", "rgrep"]);
+const GREP_HEADS = new Set(["grep", "egrep", "fgrep"]);
+
+/** True for a recursive search head (`rg`, `grep -r`, …): given no path, it reads the whole cwd. */
+function searchesCwdImplicitly(head: string, args: readonly RawWord[]): boolean {
+  if (RECURSIVE_SEARCH_HEADS.has(head)) return true;
+  if (!GREP_HEADS.has(head)) return false;
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i]!.value;
+    if (arg === "--") break;
+    if (arg === "--recursive" || arg === "--dereference-recursive" || arg === "--directories=recurse") return true;
+    if ((arg === "-d" || arg === "--directories") && args[i + 1]?.value === "recurse") return true;
+    if (/^-[A-Za-z]*[rR]/.test(arg)) return true;
+  }
+  return false;
 }
 
 function readerOperands(head: string, args: readonly RawWord[]): RawWord[] {
@@ -254,6 +376,10 @@ function readerOperands(head: string, args: readonly RawWord[]): RawWord[] {
         if (value !== undefined) optionFiles.push(value);
       } else if (VALUE_OPTIONS[head]?.has(name) && inline === undefined) {
         i++;
+      } else if (!arg.startsWith("--") && arg.length > 2 && FILE_OPTIONS[head]?.has(arg.slice(0, 2))) {
+        // Attached file value on any reader: `base64 -i.env`, `grep -f.env`.
+        scriptGiven = true;
+        optionFiles.push({ value: arg.slice(2), raw: word.raw.startsWith(arg.slice(0, 2)) ? word.raw.slice(2) : "\\" });
       } else if (SCRIPT_FIRST.has(head) && /^-[ef]./.test(arg) && !arg.startsWith("--")) {
         // Attached short forms: `-eexpr`, `-f.env`.
         scriptGiven = true;
@@ -455,6 +581,8 @@ function expandGlobUnder(pattern: string, root: string): string[] | null {
       current = current.map((dir) => join(dir, segment));
       continue;
     }
+    const tokens = compileGlobSegment(segment);
+    if (tokens === null) return null;
     const next: string[] = [];
     for (const dir of current) {
       let names: string[];
@@ -465,7 +593,7 @@ function expandGlobUnder(pattern: string, root: string): string[] | null {
       }
       budget -= names.length;
       if (budget < 0) return null;
-      for (const name of names) if (globSegmentMatches(segment, name)) next.push(join(dir, name));
+      for (const name of names) if (globSegmentMatches(tokens, name)) next.push(join(dir, name));
       if (next.length > MAX_GLOB_MATCHES) return null;
     }
     current = next;
@@ -473,48 +601,86 @@ function expandGlobUnder(pattern: string, root: string): string[] | null {
   return current;
 }
 
+/** POSIX character classes a bracket expression may name (`[[:alpha:]]`). */
+const POSIX_CLASSES: Record<string, RegExp> = {
+  alpha: /[A-Za-z]/, digit: /[0-9]/, alnum: /[A-Za-z0-9]/, upper: /[A-Z]/, lower: /[a-z]/, space: /\s/,
+  blank: /[ \t]/, punct: /[!-\/:-@[-`{-~]/, xdigit: /[0-9A-Fa-f]/, word: /\w/, cntrl: /[\x00-\x1f\x7f]/,
+  print: /[\x20-\x7e]/, graph: /[\x21-\x7e]/,
+};
+
+type GlobToken = { star: true } | { test: (c: string) => boolean };
+
 /**
- * One path segment against one glob segment: `*`, `?` and `[...]` classes
- * (`!`/`^` negation, ranges). A POSIX class (`[[:alpha:]]`) is taken as
- * "any character" — over-matching only adds checks. Linear-backtracking
- * two-pointer match, so a model-authored `*a*a*a*b` cannot blow up.
+ * Compile one glob segment: `*`, `?`, and bracket expressions with `!`/`^`
+ * negation, a leading literal `]`, ranges, POSIX classes (`[:alpha:]`),
+ * equivalence classes (`[=e=]`) and collating symbols (`[.e.]`). An unclosed
+ * `[` is a literal, as in bash. Null — the caller treats the operand as
+ * unresolvable — for a bracket expression this parser cannot read (an
+ * unterminated `[:…:]`, an unknown class, a multi-character collating symbol).
  */
-function globSegmentMatches(pattern: string, name: string): boolean {
-  type Token = { any: true } | { star: true } | { chars: (c: string) => boolean };
-  const tokens: Token[] = [];
+function compileGlobSegment(pattern: string): GlobToken[] | null {
+  const tokens: GlobToken[] = [];
   for (let i = 0; i < pattern.length; i++) {
     const ch = pattern[i]!;
     if (ch === "*") tokens.push({ star: true });
-    else if (ch === "?") tokens.push({ any: true });
+    else if (ch === "?") tokens.push({ test: () => true });
     else if (ch === "[") {
       let j = i + 1;
       const negate = pattern[j] === "!" || pattern[j] === "^";
       if (negate) j++;
-      const start = j;
-      if (pattern[j] === "]") j++;
-      while (j < pattern.length && pattern[j] !== "]") j++;
-      if (j >= pattern.length) {
-        tokens.push({ chars: (c) => c === "[" }); // unclosed: a literal `[`
-        continue;
-      }
-      const body = pattern.slice(start, j);
-      i = j;
-      if (body.includes("[:")) {
-        tokens.push({ any: true });
-        continue;
-      }
-      const test = (c: string): boolean => {
-        for (let k = 0; k < body.length; k++) {
-          if (body[k + 1] === "-" && k + 2 < body.length) {
-            if (c >= body[k]! && c <= body[k + 2]!) return true;
-            k += 2;
-          } else if (body[k] === c) return true;
+      const items: ((c: string) => boolean)[] = [];
+      let first = true;
+      let closed = false;
+      while (j < pattern.length) {
+        const c = pattern[j]!;
+        if (c === "]" && !first) {
+          closed = true;
+          break;
         }
-        return false;
-      };
-      tokens.push({ chars: negate ? (c) => !test(c) : test });
-    } else tokens.push({ chars: (c) => c === ch });
+        first = false;
+        if (c === "[" && (pattern[j + 1] === ":" || pattern[j + 1] === "=" || pattern[j + 1] === ".")) {
+          const kind = pattern[j + 1]!;
+          const close = pattern.indexOf(`${kind}]`, j + 2);
+          if (close === -1) return null;
+          const name = pattern.slice(j + 2, close);
+          if (kind === ":") {
+            const re = POSIX_CLASSES[name];
+            if (!re) return null;
+            items.push((x) => re.test(x));
+          } else {
+            if ([...name].length !== 1) return null;
+            items.push((x) => x === name);
+          }
+          j = close + 2;
+          continue;
+        }
+        if (pattern[j + 1] === "-" && j + 2 < pattern.length && pattern[j + 2] !== "]") {
+          const lo = c;
+          const hi = pattern[j + 2]!;
+          items.push((x) => x >= lo && x <= hi);
+          j += 3;
+          continue;
+        }
+        items.push((x) => x === c);
+        j++;
+      }
+      if (!closed) {
+        tokens.push({ test: (x) => x === "[" }); // unclosed: a literal `[`
+        continue;
+      }
+      i = j;
+      tokens.push({ test: negate ? (x) => !items.some((f) => f(x)) : (x) => items.some((f) => f(x)) });
+    } else tokens.push({ test: (x) => x === ch });
   }
+  return tokens;
+}
+
+/**
+ * One path segment against compiled glob tokens. `*` also matches a leading
+ * dot (more matches than bash only adds checks). Linear-backtracking
+ * two-pointer match, so a model-authored `*a*a*a*b` cannot blow up.
+ */
+function globSegmentMatches(tokens: readonly GlobToken[], name: string): boolean {
   let t = 0;
   let n = 0;
   let star = -1;
@@ -524,7 +690,7 @@ function globSegmentMatches(pattern: string, name: string): boolean {
     if (token && "star" in token) {
       star = t++;
       resume = n;
-    } else if (token && ("any" in token || token.chars(name[n]!))) {
+    } else if (token && token.test(name[n]!)) {
       t++;
       n++;
     } else if (star !== -1) {
@@ -600,45 +766,80 @@ const MAX_OPERAND_PATH_LENGTH = 4096;
 export function resolveShellPathOperands(
   command: string,
   opts: { cwd: string; root: string; home: string; wrapperOptions?: WrapperInspectionOptions },
-): { paths: string[]; unresolved: string | null; complete: boolean } {
+): ShellPathOperands {
   const { cwd, root, home } = opts;
   const parsed = shellReadOperands(command, opts.wrapperOptions);
   const paths: string[] = [];
-  const done = (unresolved: string | null) => ({ paths, unresolved, complete: parsed.complete });
+  const directPaths: string[] = [];
+  const done = (unresolved: string | null): ShellPathOperands => ({ paths, directPaths, unresolved, complete: parsed.complete });
   for (const operand of parsed.operands) {
     const resolved = resolveShellOperand(operand, cwd, home, parsed.afterCd, root);
     if (!Array.isArray(resolved)) return done(resolved.unresolved);
     paths.push(...resolved);
   }
   const bases = cdBases(parsed.cdTargets, cwd, home);
-  for (const word of parsed.generic) {
-    if (word.value === "" || word.value === "-" || word.value.length > MAX_OPERAND_PATH_LENGTH) continue;
-    if (word.git === "rev") {
-      if (bases === null || !isLiteralWord(word.raw)) return done(word.value);
-      const gitPaths = gitRevPaths(word.value, bases, root);
-      if (gitPaths === null) return done(word.value);
-      paths.push(...gitPaths);
-      continue;
+  for (const [words, out] of [[parsed.generic, paths], [parsed.direct, directPaths]] as const) {
+    for (const word of words) {
+      const why = resolveGenericWord(word, bases, { cwd, root, home }, out);
+      if (why !== null) return done(why);
     }
-    // git expands pathspec wildcards itself, quoted or not (`-- '*.env'`).
-    if (word.git === "pathspec" && /[*?[]/.test(word.value)) return done(word.value);
-    if (isLiteralWord(word.raw) && !word.value.startsWith("~")) {
-      if (isAbsolute(word.value)) paths.push(resolve(word.value));
-      else if (bases === null) return done(word.value);
-      else paths.push(...bases.map((base) => resolve(base, word.value)));
-      continue;
-    }
-    for (const base of bases ?? [cwd]) {
-      const resolved = resolveShellOperand(word, base, home, bases === null, root);
-      if (!Array.isArray(resolved)) return done(resolved.unresolved);
-      paths.push(...resolved);
-    }
-    // A quoted `~` is literal; check that spelling as well as home's.
-    if (word.value.startsWith("~") && !isAbsolute(word.value)) paths.push(...(bases ?? [cwd]).map((base) => resolve(base, word.value)));
+  }
+  // Paths inline interpreter programs open (`python3 -c "open('.env')"`), R27(c).
+  const inline = inlineProgramReadPaths(command);
+  if (inline.unresolved !== null) return done(`inline program read: ${inline.unresolved}`);
+  for (const path of inline.paths) {
+    if (path === "" || path.length > MAX_OPERAND_PATH_LENGTH) continue;
+    if (isAbsolute(path)) paths.push(resolve(path));
+    else if (bases === null) return done(path);
+    else paths.push(...bases.map((base) => resolve(base, path)));
   }
   return done(null);
 }
 
+export interface ShellPathOperands {
+  /** Paths read, directories included as searched (their contents are read). */
+  paths: string[];
+  /** Paths named by an attached short-option value: checked as named, never as a searched directory. */
+  directPaths: string[];
+  /** The first operand that cannot be resolved (R27/I2), or null. */
+  unresolved: string | null;
+  /** False when the command could not be fully inspected. */
+  complete: boolean;
+}
+
+/** Resolve one generic (any-head) operand into `out`; the unresolvable spelling, or null. */
+function resolveGenericWord(
+  word: RawWord,
+  bases: readonly string[] | null,
+  env: { cwd: string; root: string; home: string },
+  out: string[],
+): string | null {
+  const { cwd, root, home } = env;
+  if (word.value === "" || word.value === "-" || word.value.length > MAX_OPERAND_PATH_LENGTH) return null;
+  if (word.git === "rev") {
+    if (bases === null || !isLiteralWord(word.raw)) return word.value;
+    const gitPaths = gitRevPaths(word.value, bases, root);
+    if (gitPaths === null) return word.value;
+    out.push(...gitPaths);
+    return null;
+  }
+  // git expands pathspec wildcards itself, quoted or not (`-- '*.env'`).
+  if (word.git === "pathspec" && /[*?[]/.test(word.value)) return word.value;
+  if (isLiteralWord(word.raw) && !word.value.startsWith("~")) {
+    if (isAbsolute(word.value)) out.push(resolve(word.value));
+    else if (bases === null) return word.value;
+    else out.push(...bases.map((base) => resolve(base, word.value)));
+    return null;
+  }
+  for (const base of bases ?? [cwd]) {
+    const resolved = resolveShellOperand(word, base, home, bases === null, root);
+    if (!Array.isArray(resolved)) return resolved.unresolved;
+    out.push(...resolved);
+  }
+  // A quoted `~` is literal; check that spelling as well as home's.
+  if (word.value.startsWith("~") && !isAbsolute(word.value)) out.push(...(bases ?? [cwd]).map((base) => resolve(base, word.value)));
+  return null;
+}
 
 /**
  * Paths a git `<rev>:<path>` object name (or `:`-prefixed pathspec) reads:

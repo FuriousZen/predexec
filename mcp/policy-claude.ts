@@ -787,11 +787,14 @@ export function createClaudeOperationPolicyChecker(
       if (!compiled.some((rule) => ruleApplies(rule, "shell"))) return null;
       const cwd = ctx?.cwd ?? projectDir;
       try {
-        const { paths, unresolved, complete } = resolveShellPathOperands(shell, { cwd, root: projectDir, home, wrapperOptions: WRAPPER_OPTIONS });
+        const { paths, directPaths, unresolved, complete } = resolveShellPathOperands(shell, { cwd, root: projectDir, home, wrapperOptions: WRAPPER_OPTIONS });
         if (unresolved !== null) {
           return `unresolvable shell read operand '${unresolved}' (Read rules are in effect; name the file literally)`;
         }
-        const targets: ReadTarget[] = paths.map((path) => ({ path, searchRoot: true }));
+        const targets: ReadTarget[] = [
+          ...paths.map((path) => ({ path, searchRoot: true })),
+          ...directPaths.map((path) => ({ path, searchRoot: false })),
+        ];
         const hit = matchTargets(compiled, "shell", targets);
         if (hit) return hit;
         // `xargs cat` names no operand at all; a Read rule cannot see what it reads.

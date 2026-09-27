@@ -1073,7 +1073,7 @@ describe("path operands of any head (E-E, Claude Read rules)", () => {
     "cd src; cd ..; unknowntool .env",
     "perl -e 'print 1' .env",
   ])("Read(./.env) deny stops `%s`", (command) => {
-    expect(setup(["Read(./.env)"]).check(command)).not.toBeNull();
+    expect(setup(["Read(./.env)"]).check(command)).toBe("./.env");
   });
 
   it.each(["echo hello", "ls src", "git status", "find . -name '*.ts'", "cd src && git status", "node -e 'console.log($x)'", "column README.md"])(
@@ -1084,7 +1084,7 @@ describe("path operands of any head (E-E, Claude Read rules)", () => {
   );
 
   it("a directory operand covered by a Read(dir/**) rule stops, for any head", () => {
-    expect(setup(["Read(secrets/**)"]).check("du -sh secrets")).not.toBeNull();
+    expect(setup(["Read(secrets/**)"]).check("du -sh secrets")).toBe("secrets/**");
   });
 
   it("an unresolvable operand of any head stops (R27)", () => {
@@ -1168,11 +1168,95 @@ describe("R24: non-reading builtins, shared resolver module, git object paths (C
     "git log -p -- '*.env'",
     "git log -p -- ':(top).env'",
   ])("Read(./.env) deny stops `%s`", (command) => {
-    expect(setup()(command)).not.toBeNull();
+    expect(setup()(command)).toMatch(/^\.\/\.env$|unresolvable shell read operand/);
   });
 
-  it("the resolver lives in its own module", async () => {
-    const mod = await import("../../mcp/shell-path-operands.ts");
-    expect(typeof mod.resolveShellPathOperands).toBe("function");
+  it("the shared module resolves operands itself (attached redirect, git object, cd base)", async () => {
+    const { resolveShellPathOperands } = await import("../../mcp/shell-path-operands.ts");
+    tmp = realpathSync(mkdtempSync(join(tmpdir(), "px-r24-mod-")));
+    mkdirSync(join(tmp, ".git"));
+    mkdirSync(join(tmp, "src"));
+    const opts = { cwd: tmp, root: tmp, home: join(tmp, "home") };
+    expect(resolveShellPathOperands("cat<.env", opts)).toEqual({ paths: [join(tmp, ".env")], directPaths: [], unresolved: null, complete: true });
+    expect(resolveShellPathOperands("cd src && git show HEAD:.env", opts).paths).toContain(join(tmp, ".env"));
+    expect(resolveShellPathOperands("unknowntool $F", opts).unresolved).toBe("$F");
+    expect(resolveShellPathOperands("echo .env", opts).paths).toEqual([]);
+  });
+});
+
+describe("Task 7 fix round 1: attached redirects/option values, POSIX classes, inline programs (Claude)", () => {
+  let tmp: string;
+  afterEach(() => tmp && rmSync(tmp, { recursive: true, force: true }));
+  const setup = () => {
+    tmp = realpathSync(mkdtempSync(join(tmpdir(), "px-claude-t7f1-")));
+    const repo = join(tmp, "repo");
+    const home = join(tmp, "home");
+    const managed = join(tmp, "managed");
+    for (const dir of [join(repo, ".claude"), join(repo, ".git"), join(repo, "src"), join(home, ".claude"), managed]) mkdirSync(dir, { recursive: true });
+    writeFileSync(join(repo, ".env"), "TOKEN=1\n");
+    writeFileSync(join(repo, "README.md"), "hello\n");
+    writeFileSync(join(repo, ".claude", "settings.json"), JSON.stringify({ permissions: { deny: ["Read(./.env)"] } }));
+    const check = createClaudeHostPolicyChecker(repo, {
+      env: { CLAUDE_CONFIG_DIR: join(home, ".claude") } as NodeJS.ProcessEnv,
+      managedDir: managed,
+      home,
+      managedPolicySources: () => [],
+    });
+    return { repo, check: (command: string) => check(command, { cwd: repo, sessionRoot: repo }) };
+  };
+
+  it.each([
+    // C1: `<` attached to a word
+    "cat<.env", "cat -n<.env", "head<.env", "column<.env", "x=1 cat<.env", "echo hi;cat<.env", "cat 2>/dev/null<.env",
+    "cat 0<.env", "cat 3<.env", "cat <>.env", "cat<'.env'",
+    // C2: POSIX bracket classes and other bracket forms
+    "cat .[[:alpha:]]nv", "cat .[[:alpha:]]n?", "cat .e[[:alpha:]]v", "cat .[!x]nv", "cat .[^x]nv", "cat .[]e]nv",
+    // C3 / R27(a): attached short-option values, any head
+    "base64 -i.env", "unknowntool -i.env", "grep -f.env README.md",
+    // C4: `--opt=value` on reader heads
+    "diff --from-file=.env README.md", "diff --to-file=.env README.md",
+    // R27(c): inline interpreter programs
+    `python3 -c "print(open('.env').read())"`,
+    `node -e "console.log(require('fs').readFileSync('.env','utf8'))"`,
+    `ruby -e 'puts File.read(".env")'`,
+    `perl -e 'open(my $f, "<", ".env"); print <$f>'`,
+    `perl -e 'open(F, "<.env"); print <F>'`,
+    "python3 - <<'EOF'\nprint(open('.env').read())\nEOF",
+    "python3 <<< \"print(open('.env').read())\"",
+    `python3 -c "print(open('src/../.env').read())"`,
+  ])("Read(./.env) deny stops `%s` naming the rule", (command) => {
+    expect(setup().check(command)).toBe("./.env");
+  });
+
+  it.each([
+    "cat .[[:alpha:nv",
+    `python3 -c "import os; print(open(os.environ['F']).read())"`,
+    `node -e "const p='.env'; console.log(require('fs').readFileSync(p,'utf8'))"`,
+    `python3 -c "print(open(f'.{chr(101)}nv').read())"`,
+  ])("Read(./.env) deny stops `%s` as unresolvable", (command) => {
+    expect(setup().check(command)).toMatch(/unresolvable/);
+  });
+
+  it.each([
+    `python3 -c "print(open('README.md').read())"`,
+    `node -e "console.log(1)"`,
+    `node -e "console.log(require('fs').readFileSync('README.md','utf8'))"`,
+    "cat README.md<README.md",
+    "echo 'a<b'",
+    'echo "x<.env"',
+    "cat .[[:digit:]]nv",
+    "sort -t, -k2 README.md",
+  ])("Read(./.env) deny allows `%s`", (command) => {
+    expect(setup().check(command)).toBeNull();
+  });
+
+  it("an inline program read hard-stops through runPlanTree before running", async () => {
+    const { repo, check } = setup();
+    const r = await runPlanTree(
+      { root: "a", nodes: [{ id: "a", commands: [`python3 -c "print(open('.env').read())"`] }] },
+      { cwd: repo, checkOperationPolicy: (op, ctx) => check(typeof op === "string" ? op : "") ?? null },
+    );
+    expect(r.stoppedReason).toBe("policyStop");
+    expect(r.transcript).not.toContain("TOKEN=1");
   });
 });

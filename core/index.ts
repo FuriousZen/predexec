@@ -35,6 +35,7 @@ export {
   ruleHeadCouldMatch,
   type UnresolvableOperand,
 } from "./shell/operands.ts";
+export { inlineProgramReadPaths, type InlineProgramReads } from "./shell/program-reads.ts";
 export {
   MAX_OPERATIONS_PER_NODE,
   MAX_PARALLEL_CONCURRENCY,

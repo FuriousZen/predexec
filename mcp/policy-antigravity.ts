@@ -406,15 +406,16 @@ function checkShell(cmd: string, c: Compiled, ctx: PolicyCheckContext): PolicyVe
 function checkShellPaths(cmd: string, c: Compiled, ctx: PolicyCheckContext): PolicyVerdict {
   const grants = [...c.deny.paths, ...c.ask.paths];
   if (grants.length === 0 && !c.brokenTool) return null;
-  const { paths, unresolved, complete } = resolveShellPathOperands(cmd, { cwd: ctx.cwd, root: ctx.sessionRoot, home: c.home });
+  const { paths, directPaths, unresolved, complete } = resolveShellPathOperands(cmd, { cwd: ctx.cwd, root: ctx.sessionRoot, home: c.home });
   const label = grants[0]?.label ?? c.brokenTool;
   if (unresolved !== null) return `unresolvable shell operand '${unresolved}' (your Antigravity grant "${label}" is in effect; name the file literally)`;
-  if (c.brokenTool && paths.length > 0) return `${c.brokenTool} — predexec stops rather than guess`;
-  for (const path of paths) {
+  if (c.brokenTool && paths.length + directPaths.length > 0) return `${c.brokenTool} — predexec stops rather than guess`;
+  const targets = [...paths.map((path) => ({ path, searched: true })), ...directPaths.map((path) => ({ path, searched: false }))];
+  for (const { path, searched } of targets) {
     const candidates = pathVariants(path);
     let isDir = false;
     try {
-      isDir = statSync(path).isDirectory();
+      isDir = searched && statSync(path).isDirectory();
     } catch {
       // not on disk: only a direct match applies
     }

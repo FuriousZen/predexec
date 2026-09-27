@@ -1,0 +1,36 @@
+import { describe, expect, it } from "vitest";
+import { inlineProgramReadPaths } from "../../core/index.ts";
+
+describe("inlineProgramReadPaths (R27(c))", () => {
+  it.each<[string, string[]]>([
+    [`python3 -c "print(open('.env').read())"`, [".env"]],
+    [`python3 -c "import io; print(io.open('a/b').read())"`, ["a/b"]],
+    [`node -e "console.log(require('fs').readFileSync('.env','utf8'))"`, [".env"]],
+    [`node -e "const fs=require('fs'); console.log(fs.readFileSync('x.txt','utf8'))"`, ["x.txt"]],
+    [`node -e "console.log(require('./cfg.json').a)"`, ["./cfg.json"]],
+    [`ruby -e 'puts File.read(".env")'`, [".env"]],
+    [`perl -e 'open(my $f, "<", ".env"); print <$f>'`, [".env"]],
+    [`perl -e 'open(F, "<.env"); print <F>'`, [".env"]],
+    [`perl -e 'open F, "<", ".env"; print <F>'`, [".env"]],
+    [`php -r 'echo file_get_contents(".env");'`, [".env"]],
+    ["python3 - <<'EOF'\nprint(open('.env').read())\nEOF", [".env"]],
+    [`python3 <<< "print(open('.env').read())"`, [".env"]],
+    [`timeout 5 python3 -c "print(open('.env').read())"`, [".env"]],
+    [`echo hi && python3 -c "print(1)"`, []],
+    [`python3 -c "# open('.env')\nprint(1)"`, []],
+    [`python3 -c "print('open(.env)')"`, []],
+    ["cat .env", []],
+  ])("%s reads %j", (command, paths) => {
+    expect(inlineProgramReadPaths(command)).toEqual({ paths, unresolved: null });
+  });
+
+  it.each([
+    `python3 -c "import os; print(open(os.environ['F']).read())"`,
+    `python3 -c "print(open(f'.{1}').read())"`,
+    `node -e "const p='.env'; console.log(require('fs').readFileSync(p,'utf8'))"`,
+    `perl -e 'open(F, $ARGV[0])'`,
+    `ruby -e 'puts File.read ".env"'`,
+  ])("%s is unresolvable", (command) => {
+    expect(inlineProgramReadPaths(command).unresolved).not.toBeNull();
+  });
+});

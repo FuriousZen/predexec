@@ -491,12 +491,12 @@ describe("path operands of any head (E-E, Antigravity read_file grants)", () => 
     const { ws, run } = checker({ permissions: { deny: ["read_file(.env)"] } });
     mkdirSync(join(ws, "src"));
     writeFileSync(join(ws, ".env"), "TOKEN=1\n");
-    expect(run(command)).not.toBeNull();
+    expect(run(command)).toMatch(/deny: read_file\(\.env\)/);
   });
   it.each(stops)("read_file(.env) ask stops `%s`", (command) => {
     const { ws, run } = checker({ permissions: { ask: ["read_file(.env)"] } });
     writeFileSync(join(ws, ".env"), "TOKEN=1\n");
-    expect(run(command)).not.toBeNull();
+    expect(run(command)).toMatch(/ask: read_file\(\.env\)/);
   });
 
   it.each(["echo hello", "ls src", "git status", "grep -r KEY src", "cat src/a.ts"])("read_file(.env) deny allows `%s`", (command) => {
@@ -514,7 +514,7 @@ describe("path operands of any head (E-E, Antigravity read_file grants)", () => 
 
   it("an unevaluable read_file deny fails closed for shell path operands too", () => {
     const { run } = checker({ permissions: { deny: ["read_file(regex:.*)"] } });
-    expect(run("cat README.md")).not.toBeNull();
+    expect(run("cat README.md")).toMatch(/read_file target predexec cannot evaluate/);
   });
 });
 
@@ -538,6 +538,35 @@ describe("R24: non-reading builtins and git object paths (Antigravity)", () => {
     "git diff HEAD~1 -- .env",
     "cd src && git show HEAD:.env",
   ])("read_file(.env) deny stops `%s`", (command) => {
-    expect(prep()(command)).not.toBeNull();
+    expect(prep()(command)).toMatch(/deny: read_file\(\.env\)/);
+  });
+});
+
+describe("Task 7 fix round 1 (Antigravity)", () => {
+  const prep = () => {
+    const c = checker({ permissions: { deny: ["read_file(.env)"] } });
+    mkdirSync(join(c.ws, "src"));
+    writeFileSync(join(c.ws, "src", "a.ts"), "a\n");
+    writeFileSync(join(c.ws, ".env"), "TOKEN=1\n");
+    writeFileSync(join(c.ws, "README.md"), "hello\n");
+    return c.run;
+  };
+  it.each([
+    "cat<.env", "cat -n<.env", "head<.env", "column<.env", "x=1 cat<.env", "echo hi;cat<.env", "cat 2>/dev/null<.env",
+    "cat .[[:alpha:]]nv", "cat .[[:alpha:]]n?", "cat .e[[:alpha:]]v",
+    "base64 -i.env", "unknowntool -i.env", "diff --from-file=.env README.md", "diff --to-file=.env README.md",
+    // I1: recursive searches with no path search the cwd
+    "grep -r KEY", "grep -rn KEY", "grep -R KEY", "grep --recursive KEY", "rg KEY", "rg --hidden KEY", "rg -uu KEY",
+    "rg -e KEY", "ag KEY", "ack KEY",
+    `python3 -c "print(open('.env').read())"`,
+    `node -e "console.log(require('fs').readFileSync('.env','utf8'))"`,
+  ])("read_file(.env) deny stops `%s`", (command) => {
+    expect(prep()(command)).toMatch(/deny: read_file\(\.env\)/);
+  });
+  it.each([
+    "grep KEY README.md", "rg KEY src", "grep -r KEY src", "cut -d. -f1 README.md",
+    `python3 -c "print(open('README.md').read())"`,
+  ])("read_file(.env) deny allows `%s`", (command) => {
+    expect(prep()(command)).toBeNull();
   });
 });
