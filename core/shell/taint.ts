@@ -765,7 +765,16 @@ function liveArithmeticText(command: string): { text: string; inert: string; com
       if (spans.length > 0 && (text[j] === "`" || (text[j] === "$" && text[j + 1] === "(" && text[j + 2] !== "("))) complete = false;
       if (text[j] === "$" && (text[j + 1] === "(" && text[j + 2] === "(" || text[j + 1] === "[" || text[j + 1] === "{")) {
         const bracket = text[j + 1]!;
-        j = closeOf(j + 1, bracket, bracket === "(" ? ")" : bracket === "[" ? "]" : "}") + 1;
+        const close = closeOf(j + 1, bracket, bracket === "(" ? ")" : bracket === "[" ? "]" : "}");
+        // R53 (R50 in double quotes): closeOf does not track a substitution
+        // inside the span, and one can hold the span's closer.
+        for (let k = j + 2; k < close; k++) {
+          if (text[k] === "`" || (text[k] === "$" && text[k + 1] === "(" && text[k + 2] !== "(")) {
+            complete = false;
+            break;
+          }
+        }
+        j = close + 1;
         continue;
       }
       // `$name` stays live too (`[[ "$n" -eq 3 ]]` evaluates n's value).

@@ -477,3 +477,24 @@ describe("R50/R51 — substitutions inside expansion spans; $[ in [[ ]]", () => 
     "echo $(pwd) ${x}; ls", "echo `pwd` ${#x}; ls", "[[ ${#a[@]} -gt 0 ]] && ls", "[[ $(( a + 1 )) -eq 2 ]] && ls",
   ])("%j stays read-only", (c) => expect(findDestructiveToken(c)).toBeNull());
 });
+
+// R53: R50 extended to double quotes — a backtick or `$(` inside a
+// double-quoted `${…}`, `$((…))` or `$[…]` span is not tracked by the
+// projection, so it fails closed.
+describe("R53 — substitutions inside double-quoted expansion spans", () => {
+  it.each([
+    "[[ \"${x+`echo }`  #}\" -eq P\"AT\"H=0 ]]; ls",
+    "[[ \"${x+`echo \"}\"` #}\" -eq P\"AT\"H=0 ]]; ls",
+    "[[ \"${x+`echo \"}\"` #}\" -eq HO\"ME\"=0 ]]; git log",
+    "[[ \"${x+$(echo \"}\") #}\" -eq HO\"ME\"=0 ]]; git log",
+    "[[ P\"AT\"H=0 -eq \"${x+`echo \"}\"` #}\" ]]; ls",
+    "(( \"${x+`echo \"}\"` #}\" + P\"AT\"H=0 )); ls",
+    "echo \"${x+`echo \"}\"` #}\"; (( P\"AT\"H=0 )); ls",
+    "echo \"${x:-$(id)}\"; ls",
+    "echo \"$(( `echo 1` ))\"; ls",
+  ])("%j is mutating", (c) => expect(isDestructiveCommand(c)).toBe(true));
+  it.each([
+    "echo \"${x}\"; ls", "echo \"${x:-a}\" \"$((1+2))\"; ls", "echo \"$(pwd)\" \"${#x}\"; ls",
+    "echo \"${x:-$((1+2))}\"; ls",
+  ])("%j stays read-only", (c) => expect(findDestructiveToken(c)).toBeNull());
+});
