@@ -484,7 +484,11 @@ function unknownHeadToken(text: string, envTouched: boolean, stdinFed: boolean):
   // Tools whose every write/run form an earlier rule stops: mode-sensitive
   // writers, vetted interpreters and shells, D1's runners and reader tables.
   if (Object.hasOwn(WRITER_HEAD_MODES, head) || EVAL_SHELLS.has(head) || isUnvettedInterpreter(head)) return null;
-  if (EVAL_INTERPRETERS.has(interpreterFamily(head)) || governedByRepositoryScripts(head)) return null;
+  if (EVAL_INTERPRETERS.has(interpreterFamily(head))) return null;
+  // R60 (C1): D1's reader verdicts (`npm ls`, `jest --version`) trust the
+  // tool's configuration like a multi-tool's do, so any environment write
+  // strips them too (R43b); an allowlisted run below still passes.
+  if (governedByRepositoryScripts(head) && !envTouched) return null;
   const run = repositoryScriptRun(text);
   if (run && userAllowsScript(run)) return null;
   // Multi-tools read their configuration from the environment, so any

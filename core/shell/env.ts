@@ -102,24 +102,33 @@ export const DANGEROUS_ENV: ReadonlySet<string> = new Set([
   "XDG_RUNTIME_DIR",
   "XDG_CONFIG_DIRS",
   "XDG_DATA_DIRS",
+  // R60 (C2): under xtrace bash expands PS4, command substitution included,
+  // before every traced command; SHELLOPTS/BASHOPTS turn xtrace (and other
+  // options) on in a child shell.
+  "PS4",
+  "SHELLOPTS",
+  "BASHOPTS",
 ]);
 
+/** Every interpreter preload variable, whichever interpreter reads it. R60 (C1):
+ * dangerous for any head, since many tools (npm, jest, tsx, …) are node,
+ * perl or python programs that honor them. */
+const PRELOAD_ENV_NAMES: ReadonlySet<string> = new Set(
+  Object.values(INTERPRETER_PRELOAD_ENV).flatMap((names) => [...names]),
+);
+
 /**
- * DANGEROUS_ENV, plus every npm config variable: npm reads any
+ * DANGEROUS_ENV, plus every interpreter preload variable (R60) and every npm
+ * config variable: npm reads any
  * `npm_config_<key>` (either case) as config, and keys such as `script-shell`
  * and `node-options` choose what runs.
  */
 export function isDangerousEnv(name: string): boolean {
-  return DANGEROUS_ENV.has(name) || /^npm_config_/i.test(name);
+  return DANGEROUS_ENV.has(name) || PRELOAD_ENV_NAMES.has(name) || /^npm_config_/i.test(name);
 }
 
 /** Shell builtins whose operands set (and may export) variables. */
 const DECLARATION_HEADS = new Set(["export", "declare", "typeset", "readonly", "local"]);
-
-/** Every interpreter preload variable, whichever interpreter reads it. */
-const PRELOAD_ENV_NAMES: ReadonlySet<string> = new Set(
-  Object.values(INTERPRETER_PRELOAD_ENV).flatMap((names) => [...names]),
-);
 
 /** Whether a variable, set to `value` (undefined: unknown), can make a later command run code. */
 function commandBearingEnvironment(name: string, value: string | undefined): boolean {
