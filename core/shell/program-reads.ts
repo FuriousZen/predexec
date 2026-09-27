@@ -194,13 +194,21 @@ function programReads(program: Program, out: string[]): string | null {
 const QW_CLOSERS: Record<string, string> = { "(": ")", "[": "]", "{": "}", "<": ">" };
 
 /**
- * Perl's `@ARGV` channel (R28): `<>`, `<<>>` and `<ARGV>` open every element
- * of `@ARGV` as a file, so a program that fills `@ARGV` itself reads those
- * paths. A list assignment of static literals (`@ARGV = (".env")`,
- * `local @ARGV = qw(a b)`) yields its paths; any other way of changing
- * `@ARGV` (push/unshift/splice, element or `$#ARGV` assignment, a computed
- * list, a glob or reference alias) is unresolvable. Command-line file
- * arguments are shell operands, checked by the caller.
+ * Perl's `@ARGV` channel (R28/R29): `<>`, `<<>>`, `<ARGV>`, `readline`/`eof`
+ * on ARGV and the `-n`/`-p` loops open every element of `@ARGV` as a file,
+ * and `@ARGV` can be rewritten in more ways than any list of spellings covers
+ * (aliasing through `for`/`map`/`s///`, slices, `@main::ARGV`, symbolic
+ * `@{"AR"."GV"}`, …). So instead of enumerating writes, a perl program is
+ * accepted only when the RAW text — strings included — mentions `ARGV` solely
+ * inside recognized literal list assignments (`@ARGV = (".a", ".b")`,
+ * `local @ARGV = qw(a b)`, `local(@ARGV) = …`) or a `<ARGV>` read in code,
+ * with the assignments' elements becoming paths
+ * for the caller to check; and its code has no symbolic dereference
+ * (`@{…}`/`${…}`/`*{…}`/`%{…}`/`&{…}` around anything but a plain identifier,
+ * or `@$x`-style), no `eval`, no `do`, no `require`. Anything else is
+ * unresolvable. This applies to every perl program, not just ones that read
+ * `<>` visibly: a symbolic glob can alias ARGV into any filehandle.
+ * Command-line file arguments are shell operands, checked by the caller.
  */
 function perlArgvReads(
   text: string,
@@ -208,38 +216,51 @@ function perlArgvReads(
   syntax: { hashComments: boolean; slashComments: boolean },
   out: string[],
 ): string | null {
-  if (!/ARGV/.test(view)) return null;
-  if (/\b(?:push|unshift|splice)\s*\(?\s*@ARGV\b/.test(view)) return "@ARGV modified in place";
-  if (/\$#?ARGV\s*(?:\[[^\]]*\]\s*)?(?:[-+*\/.x|&^]|\*\*|\/\/|<<|>>|&&|\|\|)?=(?![=~])/.test(view)) return "$ARGV element assigned";
-  if (/\*ARGV\b|\\\s*@ARGV\b|@\{\s*\\?\s*@?ARGV/.test(view)) return "@ARGV aliased";
-  for (const match of view.matchAll(/@ARGV\s*\)?\s*=(?![=~])/g)) {
+  const dynamic = /\b(?:eval|do|require)\b/.exec(view);
+  if (dynamic) return `perl ${dynamic[0]}`;
+  if (/[@$%*&]\s*\{(?!\s*\^?[A-Za-z_]\w*\s*\})/.test(view) || /[@%*&]\s*\$|\$\s*\$(?=\s*[\w{$:])/.test(view)) {
+    return "perl symbolic dereference";
+  }
+  if (!text.includes("ARGV")) return null;
+  const spans: [number, number][] = [];
+  const paths: string[] = [];
+  const assignment = /(?<![\w:$@%&*{\\])(?:local\s*(?:\(\s*)?)?(?:\(\s*)?@ARGV(?![\w:])\s*\)?\s*=(?![=~])/g;
+  for (const match of text.matchAll(assignment)) {
     let at = match.index! + match[0].length;
-    // Skip spaces in the SOURCE: the view blanks a `qw(...)` literal entirely.
     while (at < text.length && /\s/.test(text[at]!)) at++;
-    if (view[at] === "(") {
+    let end: number;
+    if (text[at] === "(") {
       const args = captureLanguageCall(text, at, syntax);
       const fields = args === null ? null : splitTopLevelArguments(args, syntax);
-      if (fields === null) return "@ARGV list";
+      if (args === null || fields === null) return "@ARGV list";
       for (const field of fields) {
         if (field.trim() === "") continue;
         const path = staticString(field, "perl");
         if (path === null) return `@ARGV element ${field.trim().slice(0, 64)}`;
-        out.push(path);
+        paths.push(path);
       }
-      continue;
-    }
-    const qw = /^qw\s*(\S)/.exec(text.slice(at));
-    if (qw) {
-      const open = qw[1]!;
-      const close = QW_CLOSERS[open] ?? open;
+      end = at + args.length + 2;
+    } else {
+      const qw = /^qw\s*(\S)/.exec(text.slice(at));
+      if (!qw) return "@ARGV assigned a computed list";
+      const close = QW_CLOSERS[qw[1]!] ?? qw[1]!;
       const bodyStart = at + qw[0].length;
-      const end = text.indexOf(close, bodyStart);
-      if (end === -1) return "@ARGV qw list";
-      out.push(...text.slice(bodyStart, end).split(/\s+/).filter((word) => word !== ""));
-      continue;
+      const closeAt = text.indexOf(close, bodyStart);
+      if (closeAt === -1) return "@ARGV qw list";
+      paths.push(...text.slice(bodyStart, closeAt).split(/\s+/).filter((word) => word !== ""));
+      end = closeAt + 1;
     }
-    return "@ARGV assigned a computed list";
+    // The literal list must be the whole right-hand side (`(".e") . "nv"` is not).
+    if (!/^\s*(?:;|\}|$)/.test(text.slice(end))) return "@ARGV assigned a computed list";
+    spans.push([match.index!, end]);
   }
+  // `<ARGV>` in code only reads the channel whose elements are checked.
+  for (const read of view.matchAll(/<\s*ARGV\s*>/g)) spans.push([read.index!, read.index! + read[0].length]);
+  for (const mention of text.matchAll(/ARGV/g)) {
+    const at = mention.index!;
+    if (!spans.some(([start, end]) => at >= start && at < end)) return "ARGV used outside a literal @ARGV list assignment";
+  }
+  out.push(...paths);
   return null;
 }
 

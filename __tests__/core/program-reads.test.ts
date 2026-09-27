@@ -22,7 +22,7 @@ describe("inlineProgramReadPaths (R27(c))", () => {
     ["cat .env", []],
     [`perl -e 'local @ARGV=(".env"); print <>'`, [".env"]],
     [`perl -e '@ARGV = qw(a .env); print <<>>'`, ["a", ".env"]],
-    [`perl -e 'print scalar(@ARGV)'`, []],
+    [`perl -ne 'print if /x/'`, []],
   ])("%s reads %j", (command, paths) => {
     expect(inlineProgramReadPaths(command)).toEqual({ paths, unresolved: null });
   });
@@ -37,6 +37,9 @@ describe("inlineProgramReadPaths (R27(c))", () => {
     `perl -e 'push @ARGV, ".env"; print <>'`,
     `perl -e '$ARGV[0] = ".env"; print <>'`,
     `perl -e '*ARGV = [".env"]; print <>'`,
+    `perl -e 'print scalar(@ARGV)'`,
+    `perl -e '@{"AR"."GV"}=(".env"); print <>'`,
+    `perl -e '$_ = ".env" for @ARGV; print <>'`,
   ])("%s is unresolvable", (command) => {
     expect(inlineProgramReadPaths(command).unresolved).not.toBeNull();
   });

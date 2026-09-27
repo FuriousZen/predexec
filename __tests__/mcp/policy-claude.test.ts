@@ -1346,12 +1346,71 @@ describe("Task 7 fix round 2: lexer-derived redirects, perl @ARGV (Claude)", () 
 
   it.each([
     `perl -e '@ARGV=("README.md"); print <>'`,
-    `perl -e 'print scalar(@ARGV)'`,
+    "perl -ne 'print if /x/' README.md",
+    `perl -e 'local @ARGV=("README.md"); print <>'`,
     "cat README.md",
     "wc -l < README.md",
     "echo 'a<b' README.md",
     'grep -c "<" README.md',
     "diff <(sort README.md) <(sort README.md)",
+  ])("allows `%s`", (command) => {
+    expect(setup()(command)).toBeNull();
+  });
+});
+
+describe("Task 7 fix round 3: perl ARGV channel fails closed (R29, Claude)", () => {
+  let tmp: string;
+  afterEach(() => tmp && rmSync(tmp, { recursive: true, force: true }));
+  const setup = () => {
+    tmp = realpathSync(mkdtempSync(join(tmpdir(), "px-claude-t7f3-")));
+    const repo = join(tmp, "repo");
+    const home = join(tmp, "home");
+    const managed = join(tmp, "managed");
+    for (const dir of [join(repo, ".claude"), join(repo, ".git"), join(home, ".claude"), managed]) mkdirSync(dir, { recursive: true });
+    writeFileSync(join(repo, ".env"), "TOKEN=1\n");
+    writeFileSync(join(repo, "README.md"), "hello\n");
+    writeFileSync(join(repo, ".claude", "settings.json"), JSON.stringify({ permissions: { deny: ["Read(./.env)"] } }));
+    const check = createClaudeHostPolicyChecker(repo, {
+      env: { CLAUDE_CONFIG_DIR: join(home, ".claude") } as NodeJS.ProcessEnv,
+      managedDir: managed,
+      home,
+      managedPolicySources: () => [],
+    });
+    return (command: string) => check(command, { cwd: repo, sessionRoot: repo });
+  };
+
+  it.each([
+    `perl -e 'for (@ARGV) { $_ = ".env" } print <>' README.md`,
+    `perl -e '$_ = ".env" for @ARGV; print <>' README.md`,
+    `perl -e 's/.*/.env/ for @ARGV; print <>' README.md`,
+    `perl -e 'map { $_ = ".env" } @ARGV; print <>' README.md`,
+    `perl -pe 'BEGIN{$_=".env" for @ARGV}' README.md`,
+    `perl -e '@ARGV[0]=".env"; print <>' README.md`,
+    `perl -e '@ARGV[0..0]=(".env"); print <>' README.md`,
+    `perl -e '($ARGV[0]) = (".env"); print <>' README.md`,
+    `perl -e '@main::ARGV=(".env"); print <>'`,
+    `perl -e '@::ARGV=(".env"); print <>'`,
+    `perl -e '$main::ARGV[0]=".env"; print <>' README.md`,
+    `perl -e '@{"ARGV"}=(".env"); print <>'`,
+    `perl -e '@{"main::ARGV"}=(".env"); print <>'`,
+    `perl -e '@ ARGV=(".env"); print <>'`,
+    `perl -e '@{"AR"."GV"}=(".env"); print <>'`,
+    `perl -e '*{"AR"."GV"}=[".env"]; print <>'`,
+    `perl -e 'my $n="AR"."GV"; @$n=(".env"); print <>'`,
+    `perl -e 'print scalar(@ARGV)'`,
+    `perl -e '@ARGV=(".e") . "nv"; print <>'`,
+    `perl -e 'eval q{@ARGV=(".env")}; print <>'`,
+    `perl -e 'do "x.pl"; print <>'`,
+    `perl -e 'require "x.pl"; print <>'`,
+  ])("stops `%s` as unresolvable", (command) => {
+    expect(setup()(command)).toMatch(/unresolvable/);
+  });
+
+  it.each([
+    "perl -ne 'print if /x/' README.md",
+    `perl -e 'local @ARGV=("README.md"); print <>'`,
+    `perl -e '@ARGV = qw(README.md); print while <>'`,
+    `perl -e 'my %h = (a => 1); print "\${x}"'`,
   ])("allows `%s`", (command) => {
     expect(setup()(command)).toBeNull();
   });
