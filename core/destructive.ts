@@ -37,6 +37,7 @@ import {
   extractShellCommandClauses,
   hasAnsiCEscapedQuote,
   hasDynamicCommandName,
+  heredocScanHazard,
   inspectCommandSubstitutions,
   inspectCommandSubstitutionTree,
   inspectShellCommandClauses,
@@ -377,6 +378,8 @@ function findDestructiveTokenInternal(cmd: string, depth: number): string | null
   if (evalPreflight && evalPreflight.payloadLength > LANGUAGE_EVAL_EARLY_LIMIT) {
     return "oversized interpreter eval";
   }
+  const heredocHazard = heredocScanHazard(cmd);
+  if (heredocHazard) return heredocHazard;
   // Here-document bodies are shell data, not separate command clauses. Keep
   // them out of every structural recursion below so a literal `>` in the body
   // cannot be mistaken for a redirect.

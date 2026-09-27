@@ -72,6 +72,12 @@ type EvalPrograms =
 /** Modules a `perl -M`/`-m` or `ruby -r` preload may name: loading them runs no repo code. */
 const PERL_PRELOAD_MODULES = new Set(["strict", "warnings", "utf8", "JSON::PP", "Data::Dumper", "List::Util"]);
 const RUBY_PRELOAD_LIBRARIES = new Set(["json", "set", "pp", "yaml"]);
+/**
+ * Node/bun options known to take no separate value; any other option without
+ * `=` may consume the next word, so a word after it is not a known script.
+ */
+const NODE_VALUELESS_OPTION_RE =
+  /^(?:-e|-p|-pe|-ep|--eval|--print|-v|--version|-h|--help|--no-warnings|--no-deprecation|--trace-warnings|--trace-deprecation|--trace-uncaught|--throw-deprecation|--pending-deprecation|--enable-source-maps|--expose-gc|--inspect|--inspect-brk|--preserve-symlinks|--abort-on-uncaught-exception|--experimental-strip-types|--experimental-vm-modules|--bun|--smol|--hot|--watch|--silent)$/;
 /** Node options that load code before the eval program runs. */
 const NODE_PRELOAD_OPTION_RE =
   /^(?:-r|--require|--import|--loader|--experimental-loader|--preload|--env-file|--env-file-if-exists|--experimental-config-file|--experimental-default-config-file)(?:=|$)/;
@@ -101,6 +107,11 @@ export function interpreterEvalPrograms(segment: string): EvalPrograms {
   // text no scanner can see before the shell produces it.
   const dynamicWords = new Set(lexShellWords(segment, ARGV).words.filter((word) => word.dynamic).map((word) => word.value));
   const dynamicProgram = (word: string) => dynamicWords.has(word);
+  // Allowlist-shaped: stdin is not read only when every argument is a flag
+  // that prints and exits (`python3 --version`), never because some flag
+  // might mean "info" (`ruby -v -w` still runs stdin).
+  const infoOnly = (flags: RegExp, single = false) =>
+    argv.length > 1 && (!single || argv.length === 2) && argv.slice(1).every((word) => flags.test(word));
 
   const preloadEnv = INTERPRETER_PRELOAD_ENV[head];
   for (const assignment of normalized.assignments) {
@@ -109,17 +120,29 @@ export function interpreterEvalPrograms(segment: string): EvalPrograms {
   }
 
   if (head === "deno") {
-    return argv[1] === "eval" || argv[1] === "run" ? violation(`deno ${argv[1]}`) : none(argv.length === 1);
+    if (infoOnly(/^(?:--version|-V|--help|-h)$/)) return none(false);
+    // The first word that is not an option is the subcommand, unless an
+    // option before it might have taken it as a value; then fail closed.
+    for (let i = 1; i < argv.length; i++) {
+      const word = argv[i]!;
+      if (word.startsWith("-")) {
+        if (word.includes("=") || /^(?:-q|--quiet|--unstable(?:-[\w-]+)?)$/.test(word)) continue;
+        return none(true);
+      }
+      if (word === "eval" || word === "run") return violation(`deno ${word}`);
+      return none(word === "repl");
+    }
+    return none(true);
   }
 
   if (head === "python" || head === "python3") {
-    let info = false;
+    const info = infoOnly(/^(?:--version|--help|-V|-VV|-h)$/);
     for (let i = 1; i < argv.length; i++) {
       const word = argv[i]!;
-      if (word === "-" || !word.startsWith("-")) return none(word === "-" && !info);
-      if (word === "--") return none(!info && (argv[i + 1] === undefined || argv[i + 1] === "-"));
+      if (word === "-" || !word.startsWith("-")) return none(word === "-");
+      if (word === "--") return none(argv[i + 1] === undefined || argv[i + 1] === "-");
       if (word.startsWith("--")) {
-        if (/^--(?:version|help)$/.test(word)) { info = true; continue; }
+        if (/^--(?:version|help)$/.test(word)) continue;
         return violation(word);
       }
       for (let j = 1; j < word.length; j++) {
@@ -133,7 +156,6 @@ export function interpreterEvalPrograms(segment: string): EvalPrograms {
           return result(false);
         }
         if (letter === "m") return none(false);
-        if (letter === "V" || letter === "h") info = true;
         if (letter === "W" || letter === "X") {
           const value = j === word.length - 1 ? argv[++i] : word.slice(j + 1);
           // A warning filter's category (`action:message:category:...`) is
@@ -165,19 +187,18 @@ export function interpreterEvalPrograms(segment: string): EvalPrograms {
       : { "0": /^[0-7]*/, W: /^[0-2:a-z]*/, K: /^[a-zA-Z]?/ };
     const separate = isPerl ? "eEI" : "eErIC";
     const attachOnly = isPerl ? "FiMmx" : "Fix";
-    let info = false;
+    // perl's -v/-V/-h always exit; ruby's -v exits only as the sole switch.
+    const info = isPerl ? infoOnly(/^(?:-v|-V|-h|--version|--help)$/) : infoOnly(/^(?:-v|-h|--version|--help)$/, true);
     let operand = argv.length;
     for (let i = 1; i < argv.length; i++) {
       const word = argv[i]!;
       if (word === "--" || word === "-" || !word.startsWith("-")) { operand = i; break; }
       if (word.startsWith("--")) {
-        if (/^--(?:version|help)$/.test(word)) info = true;
         if (/^--(?:version|help|verbose|disable-gems|disable=gems)$/.test(word)) continue;
         return violation(word);
       }
       for (let j = 1; j < word.length; j++) {
         const letter = word[j]!;
-        if (letter === "v" || letter === "h") info = true;
         if (plain.includes(letter)) continue;
         const digitRe = digits[letter];
         if (digitRe) {
@@ -221,7 +242,7 @@ export function interpreterEvalPrograms(segment: string): EvalPrograms {
   }
 
   if (head === "php") {
-    let info = false;
+    const info = infoOnly(/^-[hvim]$/);
     let operand = argv.length;
     for (let i = 1; i < argv.length; i++) {
       const word = argv[i]!;
@@ -233,10 +254,7 @@ export function interpreterEvalPrograms(segment: string): EvalPrograms {
         programs.push(argv[++i]!);
         continue;
       }
-      if (/^-[nqHhviem]+$/.test(word)) {
-        if (/[hvim]/.test(word)) info = true;
-        continue;
-      }
+      if (/^-[nqHhviem]+$/.test(word)) continue;
       return violation(word);
     }
     const stop = argv[operand];
@@ -247,20 +265,25 @@ export function interpreterEvalPrograms(segment: string): EvalPrograms {
   // an earlier one, and an unknown option may take a separate value, so every
   // eval flag anywhere in argv is collected (a script argument spelled like
   // one fails closed).
-  let info = false;
+  // A script operand counts only when no option before it could have taken
+  // it as a value (`node --title x`, `node --input-type module` read stdin).
+  const info = infoOnly(head === "bun" ? /^(?:-v|--version|-h|--help|--revision)$/ : /^(?:-v|--version|-h|--help)$/);
   let operand = false;
+  let firstWordSeen = false;
+  let ambiguous = false;
   for (let i = 1; i < argv.length; i++) {
     const word = argv[i]!;
     if (word === "--") {
-      if (argv[i + 1] !== undefined && argv[i + 1] !== "-") operand = true;
+      if (!firstWordSeen && !ambiguous && argv[i + 1] !== undefined && argv[i + 1] !== "-") operand = true;
       break;
     }
     if (!word.startsWith("-") || word === "-") {
-      if (word !== "-") operand = true;
+      if (!firstWordSeen && word !== "-" && !ambiguous && !(head === "bun" && word === "repl")) operand = true;
+      firstWordSeen = true;
       continue;
     }
-    if (/^(?:-v|--version|-h|--help)$/.test(word)) info = true;
     if (NODE_PRELOAD_OPTION_RE.test(word)) return violation(word.replace(/=.*$/s, ""));
+    if (!word.includes("=") && !NODE_VALUELESS_OPTION_RE.test(word)) ambiguous = true;
     const attached = /^--(?:eval|print)=(.*)$/s.exec(word);
     if (attached) {
       if (dynamicProgram(word)) return violation("dynamic program");
@@ -313,13 +336,17 @@ export function interpreterStdinProgram(command: string): StdinProgramInvocation
   if (normalized.argv.length === 0) return { kind: "none" };
   const rawHead = normalized.argv[0]!.replace(/^.*\//, "");
   if (STDIN_UNVETTED_INTERPRETER_RE.test(rawHead)) {
-    const bare = normalized.argv.length === 1 || normalized.argv[1] === "-";
+    // A script only when the first argument is one (`tclsh x.tcl`); any
+    // leading option (`-encoding utf-8`) may be followed by stdin reading.
+    const first = normalized.argv[1];
+    const bare = first === undefined || first.startsWith("-");
     return { kind: "unvetted", head: rawHead, bare };
   }
   const head = interpreterFamily(rawHead);
   if (!EVAL_INTERPRETERS.has(head)) return { kind: "none" };
   const programs = interpreterEvalPrograms(clause);
-  if (programs.kind === "violation") return { kind: "unvetted", head, bare: false };
+  // An argv the grammar rejects may read stdin in a way it cannot see.
+  if (programs.kind === "violation") return { kind: "unvetted", head, bare: true };
   return programs.kind === "eval" ? { kind: "none" } : { kind: "program", head, bare: programs.stdin };
 }
 

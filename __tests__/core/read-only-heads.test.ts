@@ -308,3 +308,26 @@ describe("dynamic inline interpreter programs (R14c)", () => {
   it.each(DYNAMIC_INLINE_MUTATING)("mutating: %s", (c) => expect(isDestructiveCommand(c)).toBe(true));
   it.each(["python3 -c 'print(\"$x\")'", "perl -e 'print $x'"])("read-only: %s", (c) => expect(isDestructiveCommand(c)).toBe(false));
 });
+
+// Review fix round 1 (R16, R17). R16: a backslash (or quote) inside an
+// arithmetic context makes its extent unknowable, so the command stops rather
+// than risk a fake heredoc hiding the next line.
+const FIX1_MUTATING = [
+  "false && echo $(( \\)\\) <<true ))\nrm -rf x\ntrue", "false && (( \\)\\) <<true ))\nrm -rf x\ntrue",
+  "false && echo $[ \\] <<true ]\nrm -rf x\ntrue", "false && echo $(( \")\" <<true ))\nrm -rf x\ntrue",
+  // A CR anywhere in a heredoc feeding an interpreter: bash's delimiter match is raw.
+  "python3 <<pass\nprint(1)\npass\r\nimport os\nos.system('x')\npass",
+  // R17: stdin readers unless the argv is solely info flags.
+  "echo x | node --input-type module", "echo x | node --title x", "echo x | ruby -wv", "echo x | ruby -v -w",
+  "echo x | ruby -v -", "cat f | deno repl", "cat f | deno -q", "cat f | bun repl", "echo x | tclsh -encoding utf-8",
+  "echo x | python3 -u --version", "echo x | deno --log-level debug",
+];
+const FIX1_READ_ONLY = [
+  "echo $((1<<2))", "echo x | ruby -v", "deno --version", "bun --version", "echo x | perl -v", "node --help",
+  "echo x | node x.js", "cat <<EOF\r\nx\r\nEOF\r\n",
+];
+
+describe("review fix round 1 (R16, R17)", () => {
+  it.each(FIX1_MUTATING)("mutating: %s", (c) => expect(isDestructiveCommand(c)).toBe(true));
+  it.each(FIX1_READ_ONLY)("read-only: %s", (c) => expect(isDestructiveCommand(c)).toBe(false));
+});

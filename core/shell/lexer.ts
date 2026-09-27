@@ -1518,6 +1518,22 @@ function arithmeticCommandStart(text: string, i: number): boolean {
  * "body" hid the command lines after it (`cat <<< 'E'` + `rm -rf x` + `E`).
  */
 export function scanHeredocs(cmd: string): HeredocSpan[] {
+  return scanHeredocsDetailed(cmd).spans;
+}
+
+/**
+ * Why the heredoc scan cannot trust its own view of `cmd`, or null. A
+ * backslash or quote inside `$((…))`/`$[…]`/`((…))` can hide or fake the
+ * closing bracket (bash's matched-pair reader honors both), so the scan's
+ * arithmetic extent, and every heredoc after it, may not be bash's
+ * (`false && echo $(( \)\) <<true ))` + a hidden line).
+ */
+export function heredocScanHazard(cmd: string): string | null {
+  return scanHeredocsDetailed(cmd).hazard;
+}
+
+function scanHeredocsDetailed(cmd: string): { spans: HeredocSpan[]; hazard: string | null } {
+  let hazard: string | null = null;
   const spans: HeredocSpan[] = [];
   const pending: HeredocSpan[] = [];
   let quote: "'" | '"' | null = null;
@@ -1543,7 +1559,12 @@ export function scanHeredocs(cmd: string): HeredocSpan[] {
     }
     for (let i = lineStart; i < lineEnd; i++) {
       const ch = cmd[i]!;
-      if (arithmetic.close !== null) { stepArithmetic(arithmetic, ch); continue; }
+      if (arithmetic.close !== null) {
+        if (ch === "\\") hazard ??= "backslash in arithmetic";
+        else if (ch === "'" || ch === '"') hazard ??= "quote in arithmetic";
+        stepArithmetic(arithmetic, ch);
+        continue;
+      }
       if (ch === "\\" && quote !== "'") { i++; continue; }
       if (quote !== null) {
         if (ch === quote) quote = null;
@@ -1597,7 +1618,7 @@ export function scanHeredocs(cmd: string): HeredocSpan[] {
     }
     lineStart = nextLine;
   }
-  return spans;
+  return { spans, hazard };
 }
 
 function maskHeredocSpans(cmd: string, spans: readonly HeredocSpan[]): string {
@@ -1643,6 +1664,9 @@ export interface CommandStdin {
 /** The body an unquoted-delimiter heredoc delivers, or null when the shell would expand it. */
 function heredocText(cmd: string, span: HeredocSpan): string | null {
   if (!span.simple) return null;
+  // Bash matches the delimiter line raw, CR included; the scan forgives a
+  // trailing CR, so with any CR around, its body extent is not bash's.
+  if (cmd.slice(cmd.lastIndexOf("\n", span.operator) + 1, span.end).includes("\r")) return null;
   let body = cmd.slice(span.bodyStart, span.bodyEnd);
   if (span.stripTabs) body = body.replace(/^\t+/gm, "");
   if (span.quoted) return body;
