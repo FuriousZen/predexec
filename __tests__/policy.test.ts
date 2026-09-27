@@ -1097,3 +1097,27 @@ describe("R20: opencode built-in read defaults don't trigger unresolvable-operan
     for (const command of COMMANDS) expect(check(hostMajor, { read: { "*.env": "ask" } })(command)).toMatch(/can't be checked/);
   });
 });
+
+describe("fix round 1: xargs shell payloads, find -exec and parallel (opencode)", () => {
+  const LAUNCHED = [
+    "cat list | xargs -I{} sh -c 'cat {}'",
+    "find . -name '.e*' -exec cat {} +",
+    "find . -name '.e*' -execdir cat {} \;",
+    "cat list | parallel cat",
+    "parallel cat :::: list",
+  ];
+  const checker = (permission: Record<string, unknown>, hostMajor: 1 | 2) => {
+    const ctx = setup();
+    ctx.projectConfig({ permission });
+    return createPolicyChecker(readOpencodeRuleset(ctx.project, ctx.env, { hostMajor }), { directory: ctx.project, hostMajor });
+  };
+  it.each(LAUNCHED)("v1 bash deny stops %s", (command) => {
+    expect(checker({ bash: { "cat .env*": "deny" } }, 1)(command)).toMatch(/operands of 'cat'.*can't be checked/);
+  });
+  it.each(LAUNCHED)("v2 bash deny stops %s", (command) => {
+    expect(checker({ bash: { "cat .env*": "deny" } }, 2)(command)).toMatch(/operands of 'cat'.*can't be checked/);
+  });
+  it.each(LAUNCHED)("v1 user read deny stops %s", (command) => {
+    expect(checker({ read: { ".env": "deny" } }, 1)(command)).toMatch(/can't be checked/);
+  });
+});

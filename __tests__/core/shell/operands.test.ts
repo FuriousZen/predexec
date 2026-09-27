@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  ANY_HEAD,
   commandsWithUnresolvableOperands,
   operandHeadMayReadPaths,
   ruleHeadCouldMatch,
@@ -86,5 +87,63 @@ describe("operandHeadMayReadPaths", () => {
     expect(operandHeadMayReadPaths("python3")).toBe(true);
     expect(operandHeadMayReadPaths("echo")).toBe(false);
     expect(operandHeadMayReadPaths("printf")).toBe(false);
+  });
+});
+
+describe("fix round 1: shell payloads, find -exec and parallel feed data too", () => {
+  it.each<[string, string, string]>([
+    ["cat list | xargs -I{} sh -c 'cat {}'", "cat", "xargs"],
+    ["cat list | xargs -I{} bash -c 'head -c 99 {}'", "head", "xargs"],
+    ["xargs sh -c 'cat \"$1\"' _", "cat", "xargs"],
+    ["find . -name '.e*' -exec cat {} +", "cat", "find-exec"],
+    ["find . -name '.e*' -exec cat {} \;", "cat", "find-exec"],
+    ["find . -execdir timeout 5 cat {} ';'", "cat", "find-exec"],
+    ["find . -ok cat {} \;", "cat", "find-exec"],
+    ["find . -exec sh -c 'cat \"$1\"' _ {} \;", "cat", "find-exec"],
+    ["cat list | parallel cat", "cat", "parallel"],
+    ["parallel cat :::: list", "cat", "parallel"],
+    ["parallel cat ::: $(cat list)", "cat", "parallel"],
+    ["parallel -j4 cat ::: a", "cat", "parallel"],
+    ["parallel -j 4 --xargs cat", "cat", "parallel"],
+    ["xargs parallel cat", "cat", "parallel"],
+  ])("%s ⇒ %s via %s", (command, head, reason) => {
+    expect(heads(command)).toContainEqual({ head, reason });
+  });
+
+  it.each([
+    "parallel --frobnicate cat",
+    "parallel ::: 'cat .env'",
+    "cat cmds | parallel",
+  ])("parallel it cannot parse confidently is unresolvable for any rule: %s", (command) => {
+    expect(heads(command)).toContainEqual({ head: ANY_HEAD, reason: "parallel" });
+  });
+
+  it("the for-loop header names no command, and one head/reason is reported once", () => {
+    expect(heads("for f in $(cat list); do cat \"$f\"; done")).toEqual([{ head: "cat", reason: "variable-operand" }]);
+    expect(heads("while read f; do head \"$f\"; done < l")).toEqual([{ head: "head", reason: "read-loop" }]);
+  });
+
+  it("find without an exec action feeds nothing", () => {
+    expect(heads("find . -name '*.ts' -print")).toEqual([]);
+  });
+});
+
+describe("ruleHeadCouldMatch — unknown words, the any-head, and bounded globbing", () => {
+  it("an unknown (null) word in the head position could match anything", () => {
+    expect(ruleHeadCouldMatch([null, "x"], "cat")).toBe(true);
+    expect(ruleHeadCouldMatch(["timeout", "5", null], "cat")).toBe(true);
+    expect(ruleHeadCouldMatch(["git", null], "cat")).toBe(false);
+  });
+
+  it("the any-head matches every rule", () => {
+    expect(ruleHeadCouldMatch(["git", "push"], ANY_HEAD)).toBe(true);
+    expect(ruleHeadCouldMatch(["git"], ANY_HEAD, { glob: false })).toBe(true);
+  });
+
+  it("a pathological glob against a long head stays fast", () => {
+    const started = Date.now();
+    expect(ruleHeadCouldMatch([`${"*a".repeat(30)}*b`], "a".repeat(100_000))).toBe(true);
+    expect(ruleHeadCouldMatch([`${"*a".repeat(30)}*b`], "a".repeat(200))).toBe(false);
+    expect(Date.now() - started).toBeLessThan(500);
   });
 });

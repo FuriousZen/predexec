@@ -148,6 +148,18 @@ interface Compiled {
   confineToWorkspace: boolean;
 }
 
+/**
+ * A regex grant part as the literal word it matches, or null when it is not a
+ * plain literal (metacharacters, anchors, alternation). A null word in the head
+ * position could match any command (R1 fails closed), so only a literal regex
+ * like `/usr/bin/cat` or `timeout 5 cat` is matched by basename and through
+ * wrappers.
+ */
+function regexLiteral(part: string): string | null {
+  if (!/^(?:\\[^A-Za-z0-9]|[^\\.^$|?*+()[\]{}])+$/.test(part)) return null;
+  return part.replace(/\\(.)/g, "$1");
+}
+
 function compileCommandGrant(grant: AntigravityGrant, label: string): CommandGrant | null {
   const { kind, value } = grant.target;
   if (kind === "any") return { label, any: true, exact: null, matches: () => true, headMatches: () => true };
@@ -183,7 +195,7 @@ function compileCommandGrant(grant: AntigravityGrant, label: string): CommandGra
     any: false,
     exact: null,
     matches: (tokens) => tokens.length >= res.length && res.every((re, i) => re.test(tokens[i]!)),
-    headMatches: (head) => res[0]!.test(head),
+    headMatches: (head) => ruleHeadCouldMatch(parts.map(regexLiteral), head, { glob: false }),
   };
 }
 

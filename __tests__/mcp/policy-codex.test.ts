@@ -1046,3 +1046,15 @@ describe("data-fed operands (E-B): stop when a rule could match the command that
     }
   });
 });
+
+describe("fix round 1: xargs shell payloads, find -exec and parallel (Codex)", () => {
+  it.each([
+    "cat list | xargs -I{} sh -c 'cat {}'",
+    "find . -name '.e*' -exec cat {} +",
+    "find . -name '.e*' -execdir cat {} \;",
+    "cat list | parallel cat",
+    "parallel cat :::: list",
+  ])("forbidden [\"cat\",\".env\"] stops %s", (command) => {
+    expect(createCodexPolicyChecker([{ pattern: ["cat", ".env"], decision: "forbidden" }], [])(command)).toMatch(/operands of 'cat'.*can't be checked/);
+  });
+});

@@ -438,3 +438,32 @@ describe("data-fed operands (E-B): stop when a grant could match the command tha
     expect(r.transcript).toContain("PLAIN");
   });
 });
+
+describe("fix round 1: xargs shell payloads, find -exec, parallel and regex grants (Antigravity)", () => {
+  const LAUNCHED = [
+    "cat list | xargs -I{} sh -c 'cat {}'",
+    "find . -name '.e*' -exec cat {} +",
+    "find . -name '.e*' -execdir cat {} \;",
+    "cat list | parallel cat",
+    "parallel cat :::: list",
+  ];
+  it.each(LAUNCHED)("command(cat .env) deny stops %s", (command) => {
+    expect(checker({ permissions: { deny: ["command(cat .env)"] } }).run(command)).toMatch(/operands of 'cat'.*can't be checked/);
+  });
+  it.each(LAUNCHED)("read_file(.env) deny stops %s", (command) => {
+    expect(checker({ permissions: { deny: ["read_file(.env)"] } }).run(command)).toMatch(/can't be checked/);
+  });
+
+  it.each<[string, string]>([
+    ["command(regex:/usr/bin/cat \\.env)", "echo .env | xargs /usr/bin/cat"],
+    ["command(regex:timeout 5 cat \\.env)", "echo .env | xargs timeout 5 cat"],
+    ["command(regex:^(cat|head)$ \\.env)", "echo .env | xargs cat"],
+    ["command(regex:.*cat \\.env)", "echo .env | xargs cat"],
+  ])("regex grant %s stops %s", (grant, command) => {
+    expect(checker({ permissions: { deny: [grant] } }).run(command)).toMatch(/can't be checked/);
+  });
+
+  it("a literal regex grant naming another command does not stop", () => {
+    expect(checker({ permissions: { deny: ["command(regex:git push)"] } }).run("echo .env | xargs cat")).toBeNull();
+  });
+});

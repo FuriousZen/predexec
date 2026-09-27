@@ -1005,3 +1005,26 @@ describe("data-fed operands (E-B): stop when a rule could match the command that
     expect(read({ deny: ["Read(./.env)"] })("ls | xargs echo")).toBeNull();
   });
 });
+
+describe("fix round 1: xargs shell payloads, find -exec and parallel (Claude)", () => {
+  const LAUNCHED = [
+    "cat list | xargs -I{} sh -c 'cat {}'",
+    "find . -name '.e*' -exec cat {} +",
+    "find . -name '.e*' -execdir cat {} \;",
+    "cat list | parallel cat",
+    "parallel cat :::: list",
+  ];
+  it.each(LAUNCHED)("Bash(cat .env) deny stops %s", (command) => {
+    const check = createClaudePolicyChecker(parseClaudeBashRules(JSON.stringify({ permissions: { deny: ["Bash(cat .env)"] } })));
+    expect(check(command)).toMatch(/operands of 'cat'.*can't be checked/);
+  });
+  it.each(LAUNCHED)("Read(./.env) deny stops %s", (command) => {
+    const dir = realpathSync(mkdtempSync(join(tmpdir(), "px-claude-launch-")));
+    try {
+      const check = createClaudeOperationPolicyChecker(parseClaudeOperationRules(JSON.stringify({ permissions: { deny: ["Read(./.env)"] } })), [], { projectDir: dir, home: dir });
+      expect(check(command, { cwd: dir, sessionRoot: dir })).toMatch(/can't be checked/);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});

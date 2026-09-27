@@ -28,6 +28,7 @@ export {
   type WrapperInspectionOptions,
 } from "./shell/inspection.ts";
 export {
+  ANY_HEAD,
   commandsWithUnresolvableOperands,
   describeUnresolvableOperand,
   operandHeadMayReadPaths,
