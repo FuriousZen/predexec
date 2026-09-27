@@ -37,8 +37,10 @@
  * is "no rules"; a file that exists but will not parse, or has the wrong
  * shape, stops EVERY operation. An unknown grant syntax — or an unsafe
  * `regex:` (isSafeRegex) — in deny/ask stops every operation that grant's
- * action could cover (all shell commands for `command`, all tool ops for
- * `read_file`, everything for an unknown action). Unknown syntax in allow is
+ * action could cover (all shell commands for `command`, all tool ops and
+ * every shell command naming a path operand for `read_file`, everything for
+ * an unknown action). `read_file` deny/ask also applies to the path operands
+ * of every shell command, whatever its head (see checkShellPaths). Unknown syntax in allow is
  * ignored: dropping an allow can only add stops.
  *
  * Grants for actions predexec never performs (`write_file`, `read_url`,
@@ -47,10 +49,8 @@
  * per the docs.
  *
  * Known gaps: grants made in the app/IDE UI or per-project grants under
- * `~/.gemini/config/projects/` are not read; `read_file` deny rules are not
- * mapped onto shell readers (`cat .env`) the way policy-claude.ts maps
- * `Read(...)`; agy's other exact-match triggers (non-literal command names,
- * fd/network redirections, `git -c`-style subcommand flags) are not modelled.
+ * `~/.gemini/config/projects/` are not read; agy's other exact-match
+ * triggers (non-literal command names, fd/network redirections, `git -c`-style subcommand flags) are not modelled.
  */
 
 import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
@@ -72,6 +72,7 @@ import {
   type PolicyVerdict,
   type WrapperInspectionOptions,
 } from "../core/index.ts";
+import { resolveShellPathOperands } from "./policy-claude.ts";
 
 export interface AntigravityGrant {
   action: string;
@@ -146,6 +147,8 @@ interface Compiled {
   strict: boolean;
   strictReason: string;
   confineToWorkspace: boolean;
+  /** Home dir shell operands' `~` expands to. */
+  home: string;
 }
 
 /**
@@ -276,6 +279,7 @@ function compile(settings: Record<string, unknown>, file: string, workspace: str
       ? `toolPermission "${tp}" is not a known mode — treated as strict`
       : "toolPermission is strict",
     confineToWorkspace: nwa === false,
+    home,
   };
 
   for (const list of ["deny", "ask", "allow"] as const) {
@@ -376,6 +380,8 @@ function checkShell(cmd: string, c: Compiled, ctx: PolicyCheckContext): PolicyVe
       return describeUnresolvableOperand(entry, `your Antigravity grant "${readGrant.label}"`);
     }
   }
+  const pathHit = checkShellPaths(cmd, c, ctx);
+  if (pathHit) return pathHit;
   if (!c.strict || ctx.variant) return null;
 
   if (c.allow.commands.some((g) => g.any || g.exact === line)) return null;
@@ -389,6 +395,35 @@ function checkShell(cmd: string, c: Compiled, ctx: PolicyCheckContext): PolicyVe
     }
   }
   return null;
+}
+
+/**
+ * read_file deny/ask against the paths a shell command names (E-E): every
+ * operand of every head, `<` targets and expanded globs — agy's grant is on
+ * the file, whatever program opens it. As with grep/find/ls tool ops, a
+ * directory operand containing a denied path stops too (`grep -r KEY .`).
+ */
+function checkShellPaths(cmd: string, c: Compiled, ctx: PolicyCheckContext): PolicyVerdict {
+  const grants = [...c.deny.paths, ...c.ask.paths];
+  if (grants.length === 0 && !c.brokenTool) return null;
+  const { paths, unresolved, complete } = resolveShellPathOperands(cmd, { cwd: ctx.cwd, root: ctx.sessionRoot, home: c.home });
+  const label = grants[0]?.label ?? c.brokenTool;
+  if (unresolved !== null) return `unresolvable shell operand '${unresolved}' (your Antigravity grant "${label}" is in effect; name the file literally)`;
+  if (c.brokenTool && paths.length > 0) return `${c.brokenTool} — predexec stops rather than guess`;
+  for (const path of paths) {
+    const candidates = pathVariants(path);
+    let isDir = false;
+    try {
+      isDir = statSync(path).isDirectory();
+    } catch {
+      // not on disk: only a direct match applies
+    }
+    const hit = grants.find(
+      (g) => pathMatches(g, candidates) || (isDir && g.paths.some((gp) => candidates.some((p) => isInside(p, gp)))),
+    );
+    if (hit) return hit.label;
+  }
+  return complete ? null : "incomplete shell syntax (read_file inspection budget exceeded)";
 }
 
 function pathMatches(g: PathGrant, candidates: string[]): boolean {

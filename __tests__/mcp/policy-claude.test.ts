@@ -1028,3 +1028,84 @@ describe("fix round 1: xargs shell payloads, find -exec and parallel (Claude)", 
     }
   });
 });
+
+describe("path operands of any head (E-E, Claude Read rules)", () => {
+  let tmp: string;
+  afterEach(() => tmp && rmSync(tmp, { recursive: true, force: true }));
+
+  const setup = (deny: string[]) => {
+    tmp = realpathSync(mkdtempSync(join(tmpdir(), "px-claude-ee-")));
+    const repo = join(tmp, "repo");
+    const home = join(tmp, "home");
+    const managed = join(tmp, "managed");
+    for (const dir of [join(repo, ".claude"), join(repo, ".git"), join(repo, "src"), join(repo, "secrets"), join(home, ".claude"), managed]) {
+      mkdirSync(dir, { recursive: true });
+    }
+    writeFileSync(join(repo, ".env"), "TOKEN=1\n");
+    writeFileSync(join(repo, "README.md"), "hello\n");
+    writeFileSync(join(repo, "src", "a.ts"), "a\n");
+    writeFileSync(join(repo, "secrets", "k.pem"), "k\n");
+    writeFileSync(join(repo, ".claude", "settings.json"), JSON.stringify({ permissions: { deny } }));
+    const check = createClaudeHostPolicyChecker(repo, {
+      env: { CLAUDE_CONFIG_DIR: join(home, ".claude") } as NodeJS.ProcessEnv,
+      managedDir: managed,
+      home,
+      managedPolicySources: () => [],
+    });
+    return { repo, home, check: (command: string, cwd = repo) => check(command, { cwd, sessionRoot: repo }) };
+  };
+
+  it.each([
+    "column .env",
+    "fold .env",
+    "expand .env",
+    "strings .env",
+    "unknowntool .env",
+    "git diff --no-index .env x",
+    "unknowntool --file=.env",
+    "unknowntool -- .env",
+    "unknowntool '.env'",
+    "unknowntool ./src/../.env",
+    "column .en?",
+    "fold [.]env",
+    "expand ./.en[v]",
+    "echo *",
+    "cd src && unknowntool ../.env",
+    "cd src; cd ..; unknowntool .env",
+    "perl -e 'print 1' .env",
+  ])("Read(./.env) deny stops `%s`", (command) => {
+    expect(setup(["Read(./.env)"]).check(command)).not.toBeNull();
+  });
+
+  it.each(["echo hello", "ls src", "git status", "find . -name '*.ts'", "cd src && git status", "node -e 'console.log($x)'", "column README.md"])(
+    "Read(./.env) deny allows `%s`",
+    (command) => {
+      expect(setup(["Read(./.env)"]).check(command)).toBeNull();
+    },
+  );
+
+  it("a directory operand covered by a Read(dir/**) rule stops, for any head", () => {
+    expect(setup(["Read(secrets/**)"]).check("du -sh secrets")).not.toBeNull();
+  });
+
+  it("an unresolvable operand of any head stops (R27)", () => {
+    const { check } = setup(["Read(./.env)"]);
+    expect(check("unknowntool $F")).toMatch(/unresolvable/);
+    expect(check('unknowntool "$F"')).toMatch(/unresolvable/);
+    expect(check("cd $D && unknowntool x")).toMatch(/unresolvable/);
+  });
+
+  it("glob operands are expanded only inside the session root, and boundedly", () => {
+    const { check, repo } = setup(["Read(./.env)"]);
+    expect(check("column ../*")).toMatch(/unresolvable/);
+    for (let i = 0; i < 1100; i++) writeFileSync(join(repo, "src", `f${i}`), "");
+    expect(check("column src/*")).toMatch(/unresolvable/);
+    expect(check("column src/a.t?")).toBeNull();
+  });
+
+  it("the reader-specific checks still apply (a reader's script word is not a path)", () => {
+    const { check } = setup(["Read(./.env)"]);
+    expect(check("grep .env README.md")).toBeNull();
+    expect(check("cd src && cat x")).toMatch(/unresolvable/);
+  });
+});

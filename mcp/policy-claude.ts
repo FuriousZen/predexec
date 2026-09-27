@@ -40,7 +40,7 @@
  */
 
 import { execFileSync } from "node:child_process";
-import { existsSync, globSync, readFileSync, readdirSync, realpathSync, statSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, realpathSync, statSync } from "node:fs";
 import { homedir, platform, userInfo } from "node:os";
 import { basename, dirname, isAbsolute, join, parse as parsePath, relative, resolve, sep } from "node:path";
 import {
@@ -810,7 +810,9 @@ const SKIP_NEXT_REDIRECT_RE = /^(?:\d*<<<?-?|\d*>>?|&>>?|\d*>\|)$/;
 const OUTPUT_REDIRECT_RE = /^(?:\d*|&)>/;
 
 /**
- * File operands named by a shell command: known readers' operands and every
+ * File operands named by a shell command: known readers' operands, every
+ * other head's non-option words and `--opt=value` values (E-E: `column .env`
+ * reads the file whether or not the host recognizes `column`), and every
  * `<` redirect target ("Read and Edit deny rules apply ... to file commands
  * Claude Code recognizes in Bash, such as `cat`, `head`, `tail`, `sed` ... and
  * to the targets of Bash redirections such as ... `< file`").
@@ -820,9 +822,25 @@ const OUTPUT_REDIRECT_RE = /^(?:\d*|&)>/;
  * relative operands unresolvable (the host prompts on "a relative path that
  * follows a `cd` in the same command").
  */
-function shellReadOperands(command: string): { operands: RawWord[]; afterCd: boolean; complete: boolean } {
+interface ShellOperands {
+  /** Known readers' file operands and `<` targets: the host's own recognized reads. */
+  operands: RawWord[];
+  /** Every other head's non-option words and `--opt=value` values (E-E). */
+  generic: RawWord[];
+  /** `cd`/`pushd` targets in source order; null for a bare `cd` (home). */
+  cdTargets: (RawWord | null)[];
+  afterCd: boolean;
+  complete: boolean;
+}
+
+/** Heads whose words are never file operands. */
+const NON_READING_HEADS = new Set(["cd", "pushd", "popd"]);
+
+function shellReadOperands(command: string): ShellOperands {
   const inspected = inspectCommandSubstitutionTree(command);
   const operands: RawWord[] = [];
+  const generic: RawWord[] = [];
+  const cdTargets: (RawWord | null)[] = [];
   let afterCd = false;
   for (const text of inspected.commands) {
     for (const line of text.split("\n")) {
@@ -851,13 +869,40 @@ function shellReadOperands(command: string): { operands: RawWord[]; afterCd: boo
           ? words.slice(offset)
           : stripped.map((value) => ({ value, raw: "\\" })); // unmappable: mark as quoted (fail closed on braces)
         const head = argv[0] === undefined ? "" : basename(argv[0].value);
-        if (head === "cd" || head === "pushd") afterCd = true;
+        if (head === "cd" || head === "pushd") {
+          afterCd = true;
+          const target = genericOperands(argv.slice(1))[0];
+          if (target?.value !== "-") cdTargets.push(target ?? null); // `cd -` returns to a dir already in play
+        }
         if (SHELL_READERS.has(head)) operands.push(...readerOperands(head, argv.slice(1)));
-        else if (head === "perl") operands.push(...perlLoopOperands(argv.slice(1)));
+        else if (!NON_READING_HEADS.has(head)) {
+          // Any other head may read a path it is handed (`column .env`,
+          // `git diff --no-index .env x`); perl's loop operands stay reader
+          // operands too, so the old verdict is kept as a subset.
+          if (head === "perl") operands.push(...perlLoopOperands(argv.slice(1)));
+          generic.push(...genericOperands(argv.slice(1)));
+        }
       }
     }
   }
-  return { operands, afterCd, complete: inspected.complete };
+  return { operands, generic, cdTargets, afterCd, complete: inspected.complete };
+}
+
+/** Non-option words, every word after `--`, and the value of each `--opt=value`. */
+function genericOperands(args: readonly RawWord[]): RawWord[] {
+  const out: RawWord[] = [];
+  let endOfOptions = false;
+  for (const word of args) {
+    const arg = word.value;
+    if (!endOfOptions && arg === "--") endOfOptions = true;
+    else if (endOfOptions || !arg.startsWith("-") || arg === "-") out.push(word);
+    else if (arg.startsWith("--") && arg.includes("=")) {
+      const eq = word.raw.indexOf("=");
+      // The raw spelling after `=` keeps its quoting when it maps cleanly.
+      out.push({ value: arg.slice(arg.indexOf("=") + 1), raw: eq === -1 ? "\\" : word.raw.slice(eq + 1) });
+    }
+  }
+  return out;
 }
 
 function readerOperands(head: string, args: readonly RawWord[]): RawWord[] {
@@ -1028,7 +1073,7 @@ function braceSequence(from: string, to: string, stepText: string | undefined): 
  * tokenizer has removed the quotes the two are indistinguishable — so a word
  * with braces AND quoting is unresolvable (fail closed) rather than guessed.
  */
-function resolveShellOperand(word: RawWord, cwd: string, home: string, afterCd: boolean): string[] | { unresolved: string } {
+function resolveShellOperand(word: RawWord, cwd: string, home: string, afterCd: boolean, root: string): string[] | { unresolved: string } {
   const operand = word.value;
   if (operand === "-" || operand === "") return [];
   if (/[$`]/.test(operand)) return { unresolved: operand };
@@ -1039,7 +1084,7 @@ function resolveShellOperand(word: RawWord, cwd: string, home: string, afterCd: 
     if (words.length > 1 || words[0] !== operand) {
       const out: string[] = [];
       for (const expanded of words) {
-        const resolved = resolveShellOperand({ value: expanded, raw: expanded }, cwd, home, afterCd);
+        const resolved = resolveShellOperand({ value: expanded, raw: expanded }, cwd, home, afterCd, root);
         if (!Array.isArray(resolved)) return { unresolved: operand };
         out.push(...resolved);
       }
@@ -1054,15 +1099,214 @@ function resolveShellOperand(word: RawWord, cwd: string, home: string, afterCd: 
     // Expand the glob ourselves so `cat .en*` cannot slip past `Read(./.env)`.
     // `**` is recursive (zsh) and unbounded — refuse rather than walk it.
     if (path.includes("**")) return { unresolved: operand };
-    try {
-      const matches = globSync(path, { cwd });
-      if (matches.length > 1000) return { unresolved: operand };
-      return [resolve(cwd, path), ...matches.map((m) => resolve(cwd, m))];
-    } catch {
-      return { unresolved: operand };
-    }
+    const matches = expandGlobUnder(resolve(cwd, path), root);
+    if (matches === null) return { unresolved: operand };
+    return [resolve(cwd, path), ...matches];
   }
   return [resolve(cwd, path)];
+}
+
+/** Most paths one glob operand may match before it counts as unresolvable. */
+const MAX_GLOB_MATCHES = 1000;
+/** Most directory entries one glob operand may examine before it counts as unresolvable. */
+const MAX_GLOB_ENTRIES = 10_000;
+
+const isInsideDir = (root: string, p: string): boolean => {
+  const rel = relative(root, p);
+  return rel === "" || (rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
+};
+
+/**
+ * Expand an absolute glob path the way the shell would, so `cat .en?`,
+ * `column [.]env` and `echo *` are checked against every name they can
+ * reach. Bounded and confined: null (unresolvable) when the pattern leaves
+ * `root`, or examines more than MAX_GLOB_ENTRIES entries, or matches more
+ * than MAX_GLOB_MATCHES paths. `*` also matches a leading dot — more
+ * matches than bash only adds checks.
+ */
+function expandGlobUnder(pattern: string, root: string): string[] | null {
+  if (!isInsideDir(root, pattern)) return null;
+  const rel = relative(root, pattern);
+  let current = [root];
+  let budget = MAX_GLOB_ENTRIES;
+  for (const segment of rel === "" ? [] : rel.split(sep)) {
+    if (!/[*?[]/.test(segment)) {
+      current = current.map((dir) => join(dir, segment));
+      continue;
+    }
+    const next: string[] = [];
+    for (const dir of current) {
+      let names: string[];
+      try {
+        names = readdirSync(dir);
+      } catch {
+        continue; // not a directory (or unreadable): the shell matches nothing there either
+      }
+      budget -= names.length;
+      if (budget < 0) return null;
+      for (const name of names) if (globSegmentMatches(segment, name)) next.push(join(dir, name));
+      if (next.length > MAX_GLOB_MATCHES) return null;
+    }
+    current = next;
+  }
+  return current;
+}
+
+/**
+ * One path segment against one glob segment: `*`, `?` and `[...]` classes
+ * (`!`/`^` negation, ranges). A POSIX class (`[[:alpha:]]`) is taken as
+ * "any character" — over-matching only adds checks. Linear-backtracking
+ * two-pointer match, so a model-authored `*a*a*a*b` cannot blow up.
+ */
+function globSegmentMatches(pattern: string, name: string): boolean {
+  type Token = { any: true } | { star: true } | { chars: (c: string) => boolean };
+  const tokens: Token[] = [];
+  for (let i = 0; i < pattern.length; i++) {
+    const ch = pattern[i]!;
+    if (ch === "*") tokens.push({ star: true });
+    else if (ch === "?") tokens.push({ any: true });
+    else if (ch === "[") {
+      let j = i + 1;
+      const negate = pattern[j] === "!" || pattern[j] === "^";
+      if (negate) j++;
+      const start = j;
+      if (pattern[j] === "]") j++;
+      while (j < pattern.length && pattern[j] !== "]") j++;
+      if (j >= pattern.length) {
+        tokens.push({ chars: (c) => c === "[" }); // unclosed: a literal `[`
+        continue;
+      }
+      const body = pattern.slice(start, j);
+      i = j;
+      if (body.includes("[:")) {
+        tokens.push({ any: true });
+        continue;
+      }
+      const test = (c: string): boolean => {
+        for (let k = 0; k < body.length; k++) {
+          if (body[k + 1] === "-" && k + 2 < body.length) {
+            if (c >= body[k]! && c <= body[k + 2]!) return true;
+            k += 2;
+          } else if (body[k] === c) return true;
+        }
+        return false;
+      };
+      tokens.push({ chars: negate ? (c) => !test(c) : test });
+    } else tokens.push({ chars: (c) => c === ch });
+  }
+  let t = 0;
+  let n = 0;
+  let star = -1;
+  let resume = 0;
+  while (n < name.length) {
+    const token = tokens[t];
+    if (token && "star" in token) {
+      star = t++;
+      resume = n;
+    } else if (token && ("any" in token || token.chars(name[n]!))) {
+      t++;
+      n++;
+    } else if (star !== -1) {
+      t = star + 1;
+      n = ++resume;
+    } else return false;
+  }
+  while (t < tokens.length && "star" in tokens[t]!) t++;
+  return t === tokens.length;
+}
+
+/**
+ * True when the shell passes this word through unchanged: no `$`/backtick
+ * outside single quotes, and no unquoted glob, brace or leading tilde. Such a
+ * word's dequoted value IS the argument, so it is checked as a literal path —
+ * `node -e 'console.log($x)'` names no expansion. Anything else (or unbalanced
+ * quoting) goes to the conservative resolver.
+ */
+function isLiteralWord(raw: string): boolean {
+  let quote: "'" | '"' | null = null;
+  for (let i = 0; i < raw.length; i++) {
+    const ch = raw[i]!;
+    if (ch === "\\" && quote !== "'" && i + 1 >= raw.length) return false; // dangling escape (also the unmappable-word marker)
+    if (quote === "'") {
+      if (ch === "'") quote = null;
+    } else if (quote === '"') {
+      if (ch === "\\") i++;
+      else if (ch === '"') quote = null;
+      else if (ch === "$" || ch === "`") return false;
+    } else if (ch === "\\") i++;
+    else if (ch === "'" || ch === '"') quote = ch;
+    else if (ch === "$" || ch === "`" || /[*?[{}]/.test(ch) || (i === 0 && ch === "~")) return false;
+  }
+  return quote === null;
+}
+
+/** Most directories `cd` targets may put a later relative operand in before it counts as unresolvable. */
+const MAX_CD_BASES = 32;
+
+/**
+ * Every directory a relative operand might be relative to: the node's cwd
+ * plus each literal `cd` target applied to every base so far (`cd a && cd b`
+ * reaches a/b; clause order is not tracked, so every combination is tried).
+ * Null when a target cannot be resolved (`cd $D`) or CDPATH could redirect it.
+ */
+function cdBases(targets: readonly (RawWord | null)[], cwd: string, home: string): string[] | null {
+  let bases = [cwd];
+  if (targets.length === 0) return bases;
+  if (process.env.CDPATH) return null;
+  for (const target of targets) {
+    let next: string[];
+    if (target === null) next = [home];
+    else if (/^~(?:\/|$)/.test(target.raw)) next = [join(home, target.value.slice(1))];
+    else if (isLiteralWord(target.raw)) next = bases.map((base) => resolve(base, target.value));
+    else return null;
+    bases = [...new Set([...bases, ...next])];
+    if (bases.length > MAX_CD_BASES) return null;
+  }
+  return bases;
+}
+
+/** Longest word treated as a possible path: a longer argument cannot be opened (ENAMETOOLONG). */
+const MAX_OPERAND_PATH_LENGTH = 4096;
+
+/**
+ * Absolute paths every file operand of `command` may name, relative to `cwd`,
+ * or the first operand that cannot be resolved (R27/I2), or `incomplete`
+ * when the command could not be fully inspected. Known readers' operands keep
+ * their host-parity handling (any `cd` makes a relative one unresolvable);
+ * every other head's operands (E-E) are resolved against each `cd` base.
+ * Globs expand only under `root` (see expandGlobUnder).
+ */
+export function resolveShellPathOperands(
+  command: string,
+  opts: { cwd: string; root: string; home: string },
+): { paths: string[]; unresolved: string | null; complete: boolean } {
+  const { cwd, root, home } = opts;
+  const parsed = shellReadOperands(command);
+  const paths: string[] = [];
+  const done = (unresolved: string | null) => ({ paths, unresolved, complete: parsed.complete });
+  for (const operand of parsed.operands) {
+    const resolved = resolveShellOperand(operand, cwd, home, parsed.afterCd, root);
+    if (!Array.isArray(resolved)) return done(resolved.unresolved);
+    paths.push(...resolved);
+  }
+  const bases = cdBases(parsed.cdTargets, cwd, home);
+  for (const word of parsed.generic) {
+    if (word.value === "" || word.value === "-" || word.value.length > MAX_OPERAND_PATH_LENGTH) continue;
+    if (isLiteralWord(word.raw) && !word.value.startsWith("~")) {
+      if (isAbsolute(word.value)) paths.push(resolve(word.value));
+      else if (bases === null) return done(word.value);
+      else paths.push(...bases.map((base) => resolve(base, word.value)));
+      continue;
+    }
+    for (const base of bases ?? [cwd]) {
+      const resolved = resolveShellOperand(word, base, home, bases === null, root);
+      if (!Array.isArray(resolved)) return done(resolved.unresolved);
+      paths.push(...resolved);
+    }
+    // A quoted `~` is literal; check that spelling as well as home's.
+    if (word.value.startsWith("~") && !isAbsolute(word.value)) paths.push(...(bases ?? [cwd]).map((base) => resolve(base, word.value)));
+  }
+  return done(null);
 }
 
 export interface ClaudeOperationCheckerOptions {
@@ -1121,15 +1365,11 @@ export function createClaudeOperationPolicyChecker(
       if (!compiled.some((rule) => ruleApplies(rule, "shell"))) return null;
       const cwd = ctx?.cwd ?? projectDir;
       try {
-        const { operands, afterCd, complete } = shellReadOperands(shell);
-        const targets: ReadTarget[] = [];
-        for (const operand of operands) {
-          const resolved = resolveShellOperand(operand, cwd, home, afterCd);
-          if (!Array.isArray(resolved)) {
-            return `unresolvable shell read operand '${resolved.unresolved}' (Read rules are in effect; name the file literally)`;
-          }
-          for (const path of resolved) targets.push({ path, searchRoot: true });
+        const { paths, unresolved, complete } = resolveShellPathOperands(shell, { cwd, root: projectDir, home });
+        if (unresolved !== null) {
+          return `unresolvable shell read operand '${unresolved}' (Read rules are in effect; name the file literally)`;
         }
+        const targets: ReadTarget[] = paths.map((path) => ({ path, searchRoot: true }));
         const hit = matchTargets(compiled, "shell", targets);
         if (hit) return hit;
         // `xargs cat` names no operand at all; a Read rule cannot see what it reads.

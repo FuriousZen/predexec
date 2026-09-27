@@ -231,10 +231,11 @@ describe("antigravity policy — read_file grants and tool ops", () => {
     expect(await run({ tool: "read", path: "a" })).not.toBeNull();
   });
 
-  it("command grants do not touch tool ops, and read_file grants do not touch shell commands", async () => {
+  it("command grants do not touch tool ops; read_file grants reach shell path operands (E-E)", async () => {
     const { run } = checker({ permissions: { deny: ["command(cat)", "read_file(secrets)"] } });
     expect(await run({ tool: "read", path: "cat" })).toBeNull();
-    expect(await run("ls secrets")).toBeNull();
+    expect(await run("ls secrets")).toMatch(/read_file\(secrets\)/);
+    expect(await run("ls src")).toBeNull();
   });
 
   it("strict: a tool op stops unless a read_file (or write_file) allow covers its path", async () => {
@@ -465,5 +466,54 @@ describe("fix round 1: xargs shell payloads, find -exec, parallel and regex gran
 
   it("a literal regex grant naming another command does not stop", () => {
     expect(checker({ permissions: { deny: ["command(regex:git push)"] } }).run("echo .env | xargs cat")).toBeNull();
+  });
+});
+
+describe("path operands of any head (E-E, Antigravity read_file grants)", () => {
+  const stops = [
+    "cat .env",
+    "column .env",
+    "fold .env",
+    "expand .env",
+    "strings .env",
+    "unknowntool .env",
+    "git diff --no-index .env x",
+    "unknowntool --file=.env",
+    "cat < .env",
+    "cat .en?",
+    "cat .e*",
+    "cat [.]env",
+    "head ./.en[v]",
+    "grep -r KEY .",
+    "unknowntool $F",
+  ];
+  it.each(stops)("read_file(.env) deny stops `%s`", (command) => {
+    const { ws, run } = checker({ permissions: { deny: ["read_file(.env)"] } });
+    mkdirSync(join(ws, "src"));
+    writeFileSync(join(ws, ".env"), "TOKEN=1\n");
+    expect(run(command)).not.toBeNull();
+  });
+  it.each(stops)("read_file(.env) ask stops `%s`", (command) => {
+    const { ws, run } = checker({ permissions: { ask: ["read_file(.env)"] } });
+    writeFileSync(join(ws, ".env"), "TOKEN=1\n");
+    expect(run(command)).not.toBeNull();
+  });
+
+  it.each(["echo hello", "ls src", "git status", "grep -r KEY src", "cat src/a.ts"])("read_file(.env) deny allows `%s`", (command) => {
+    const { ws, run } = checker({ permissions: { deny: ["read_file(.env)"] } });
+    mkdirSync(join(ws, "src"));
+    writeFileSync(join(ws, "src", "a.ts"), "a\n");
+    writeFileSync(join(ws, ".env"), "TOKEN=1\n");
+    expect(run(command)).toBeNull();
+  });
+
+  it("no read_file grants: shell operands are not inspected", () => {
+    const { run } = checker({ permissions: { deny: ["command(git push)"] } });
+    expect(run("cat $F")).toBeNull();
+  });
+
+  it("an unevaluable read_file deny fails closed for shell path operands too", () => {
+    const { run } = checker({ permissions: { deny: ["read_file(regex:.*)"] } });
+    expect(run("cat README.md")).not.toBeNull();
   });
 });
