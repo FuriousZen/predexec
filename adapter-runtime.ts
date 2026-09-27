@@ -7,12 +7,24 @@
  *   raw input -> coercePlan -> runPlanTree -> recordRun -> CoreResult
  *                error -------------------------------> error CoreResult
  *
+ * It also loads the user-level classifier config (user-config.ts) once per
+ * plan run and hands it to the engine's mutation gate, so every adapter
+ * classifies with the same options.
+ *
  * Pure orchestration: tool execution, permissions, progress mapping,
  * and result rendering remain in each adapter.
  */
 
-import { coercePlan, runPlanTree, type CoreResult, type PlanTree, type RunOptions } from "./core/index.ts";
+import {
+  type ClassifierOptions,
+  coercePlan,
+  runPlanTree,
+  type CoreResult,
+  type PlanTree,
+  type RunOptions,
+} from "./core/index.ts";
 import { recordRun, type Harness } from "./stats.ts";
+import { loadUserConfig } from "./user-config.ts";
 
 const errText = (e: unknown): string => (e instanceof Error ? e.message : String(e));
 
@@ -41,9 +53,10 @@ export async function executeAdapterPlan(
     return errorResult(`plan validation failed: ${errText(err)}`);
   }
 
+  const userConfig = loadUserConfig();
   let result: CoreResult;
   try {
-    result = await runPlanTree(plan, options);
+    result = await runPlanTree(plan, { ...options, classifier: options.classifier ?? userConfig.classifier });
   } catch (err) {
     return errorResult(
       `predexec: the plan walk failed unexpectedly (${errText(err)}) — this is a predexec bug, not a plan you can fix. ` +
@@ -52,5 +65,17 @@ export async function executeAdapterPlan(
   }
 
   void recordRun(plan, result, harness);
+  // A config problem must not be silent: the user's opt-ins are not in force.
+  if (userConfig.warnings.length > 0) {
+    result = { ...result, transcript: `${userConfig.warnings.join("\n")}\n\n${result.transcript}` };
+  }
   return result;
+}
+
+/**
+ * The user-level classifier options, for an adapter that classifies outside a
+ * plan run (e.g. deciding whether to nudge after a native shell call).
+ */
+export function userClassifierOptions(): ClassifierOptions {
+  return loadUserConfig().classifier;
 }

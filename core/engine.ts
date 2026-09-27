@@ -42,6 +42,7 @@ import {
   type PlanNode,
   type PlanTree,
   type RunOptions,
+  type ClassifierOptions,
   type StoppedReason,
   type ToolOp,
 } from "./types.ts";
@@ -80,7 +81,7 @@ export async function runPlanTree(plan: PlanTree, opts: RunOptions): Promise<Cor
   // eslint-disable-next-line no-constant-condition
   while (true) {
     // Mutation hard-stop: never RUN a mutating node in the read-only MVP.
-    const detected = current.mutates ? null : findDestructive(current);
+    const detected = current.mutates ? null : findDestructive(current, opts.classifier);
     if (current.mutates || detected) {
       blocks.push(mutationBlock(current, detected));
       return result(pathTaken, depth, "mutationStop", blocks.join("\n\n"), edgesEvaluated, edgesMatched);
@@ -246,25 +247,28 @@ export function validatePlan(plan: PlanTree, byId: Map<string, PlanNode>): strin
  * Returns the offending command (+ matched token) so the hard-stop can tell the
  * model exactly what tripped it; null if the node is read-only.
  */
-function findDestructive(node: PlanNode): { index: number; command: string; token: string } | null {
+function findDestructive(
+  node: PlanNode,
+  classifier: ClassifierOptions | undefined,
+): { index: number; command: string; token: string } | null {
   for (let i = 0; i < node.commands.length; i++) {
     const op = node.commands[i]!;
     if (isToolOp(op)) {
-      const result = checkToolOpDestructive(op);
+      const result = checkToolOpDestructive(op, classifier);
       if (result) return { index: i, command: formatToolOpLabel(op), token: result };
       continue;
     }
-    const token = findDestructiveToken(op);
+    const token = findDestructiveToken(op, classifier);
     if (token) return { index: i, command: op, token };
   }
   return null;
 }
 
-function checkToolOpDestructive(op: ToolOp): string | null {
+function checkToolOpDestructive(op: ToolOp, classifier: ClassifierOptions | undefined): string | null {
   if (READ_ONLY_TOOLS.has(op.tool)) return null;
   if (MUTATING_TOOLS.has(op.tool)) return `tool:${op.tool}`;
   if (op.tool === "bash" && typeof op.command === "string") {
-    return findDestructiveToken(op.command);
+    return findDestructiveToken(op.command, classifier);
   }
   return `unknown tool:${op.tool}`;
 }

@@ -58,7 +58,8 @@ import {
   WRAPPERS,
   WRAPPERS_WITH_DURATION,
 } from "./shell/lexer.ts";
-import { MAX_CLASSIFY_WORD_LENGTH, MAX_COMMAND_LENGTH, TOOL_NAMES } from "./types.ts";
+import { type ClassifierOptions, MAX_CLASSIFY_WORD_LENGTH, MAX_COMMAND_LENGTH, TOOL_NAMES } from "./types.ts";
+import { type RepositoryScriptRun, repositoryScriptRun } from "./shell/repo-scripts.ts";
 import {
   findGitMutationToken,
 } from "./shell/git.ts";
@@ -375,6 +376,47 @@ function stdinProgramToken(cmd: string): string | null {
 }
 
 /**
+ * The caller's ClassifierOptions for the classification in progress. Set by
+ * findDestructiveToken for the duration of one synchronous call (and restored
+ * after), so every recursive pass — substitutions, clauses, `-exec` bodies,
+ * shell bodies inside interpreter programs — sees the same options.
+ */
+let activeOptions: ClassifierOptions = {};
+
+const ALLOW_SCRIPTS_HINT = "(allow via PREDEXEC_ALLOW_SCRIPTS or ~/.config/predexec/config.json)";
+const MAX_SCRIPT_LABEL = 200;
+
+/**
+ * Whether the user allowlisted this run: an entry whose decoded words are an
+ * exact prefix of the argv, or a one-word entry naming the script itself.
+ */
+function userAllowsScript(run: RepositoryScriptRun): boolean {
+  for (const entry of activeOptions.allowScripts ?? []) {
+    const words = tokenizeShellWords(entry, ARGV);
+    if (words.length === 0) continue;
+    if (words.length <= run.argv.length && words.every((word, i) => word === run.argv[i])) return true;
+    if (words.length === 1 && run.script !== null && words[0] === run.script) return true;
+  }
+  return false;
+}
+
+/**
+ * D1: the first segment that runs a repository script the user has not
+ * allowlisted. The allowlist lifts only this stop; every other check has
+ * already classified the command by the time this runs.
+ */
+function repositoryScriptToken(segments: readonly string[]): string | null {
+  for (const segment of segments) {
+    const run = repositoryScriptRun(stripShellControlPrefix(segment));
+    if (!run || userAllowsScript(run)) continue;
+    const label = run.argv.join(" ");
+    const shown = label.length > MAX_SCRIPT_LABEL ? `${label.slice(0, MAX_SCRIPT_LABEL)}…` : label;
+    return `runs repository script ${shown} ${ALLOW_SCRIPTS_HINT}`;
+  }
+  return null;
+}
+
+/**
  * The classifier. Returns the offending token for the hard-stop message, or
  * null when the command is (heuristically) read-only.
  */
@@ -570,7 +612,9 @@ function findDestructiveTokenInternal(cmd: string, depth: number): string | null
       const gitReadOnly = head === "git" && gitTokens[i] === null;
       return head !== null && (READ_ONLY_HEADS.has(head) || gitReadOnly);
     });
-  if (allSafe) return stdinProgramToken(cmd) ?? findTaintedEvaluation(cmd);
+  // A relative-path head (`./cat`) is a repository file even when its
+  // basename is a known reader.
+  if (allSafe) return repositoryScriptToken(segments) ?? stdinProgramToken(cmd) ?? findTaintedEvaluation(cmd);
 
   const caseInspection = inspectShellCommandClauses(shellCommand);
   const wordScanSegments = /^case\b/.test(shellCommand.trim()) && caseInspection.complete && caseInspection.clauses.length > 0
@@ -662,7 +706,8 @@ function findDestructiveTokenInternal(cmd: string, depth: number): string | null
   // command substitution.
   // It reads the unmasked command: an unquoted heredoc body expands `$((…))`.
   // So does the stdin check: a heredoc body is exactly what it judges.
-  return stdinProgramToken(cmd) ?? findTaintedEvaluation(cmd);
+  // D1 goes first so a script run reads as one, not as a stdin program.
+  return repositoryScriptToken(segments) ?? stdinProgramToken(cmd) ?? findTaintedEvaluation(cmd);
 }
 
 /**
@@ -670,20 +715,26 @@ function findDestructiveTokenInternal(cmd: string, depth: number): string | null
  * whitespace-free run past MAX_CLASSIFY_WORD_LENGTH, is mutating without a
  * scan: the evaluator must terminate promptly on any input.
  */
-export function findDestructiveToken(cmd: string): string | null {
+export function findDestructiveToken(cmd: string, options: ClassifierOptions = {}): string | null {
   if (cmd.length > MAX_COMMAND_LENGTH) return "oversized command";
   if (longestWordLength(cmd) > MAX_CLASSIFY_WORD_LENGTH) return "oversized shell word";
-  const masked = findDestructiveTokenInternal(cmd, 0);
-  if (masked) return masked;
-  // Second pass with no heredoc masking (R18): every physical line is
-  // command text, for every stage including the stdin-program checks.
-  // Masking decides what is data, and each scanner miss there (a here-string,
-  // an arithmetic shift, a comment, quoted arithmetic, a backtick heredoc)
-  // used to hide the next line; now a line the first pass took for heredoc
-  // body is still classified here.
-  return withoutHeredocMasking(() => findDestructiveTokenInternal(cmd, 0));
+  const previous = activeOptions;
+  activeOptions = options;
+  try {
+    const masked = findDestructiveTokenInternal(cmd, 0);
+    if (masked) return masked;
+    // Second pass with no heredoc masking (R18): every physical line is
+    // command text, for every stage including the stdin-program checks.
+    // Masking decides what is data, and each scanner miss there (a here-string,
+    // an arithmetic shift, a comment, quoted arithmetic, a backtick heredoc)
+    // used to hide the next line; now a line the first pass took for heredoc
+    // body is still classified here.
+    return withoutHeredocMasking(() => findDestructiveTokenInternal(cmd, 0));
+  } finally {
+    activeOptions = previous;
+  }
 }
 
-export function isDestructiveCommand(cmd: string): boolean {
-  return findDestructiveToken(cmd) !== null;
+export function isDestructiveCommand(cmd: string, options?: ClassifierOptions): boolean {
+  return findDestructiveToken(cmd, options) !== null;
 }

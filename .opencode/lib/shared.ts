@@ -13,7 +13,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { isDestructiveCommand, type OperationPolicyChecker, type RunOptions } from "../../core/index.ts";
-import { executeAdapterPlan } from "../../adapter-runtime.ts";
+import { executeAdapterPlan, userClassifierOptions } from "../../adapter-runtime.ts";
 import {
   DESCRIPTION_BASE,
   RECOVERY_LINE,
@@ -77,7 +77,7 @@ export const PACKAGED_OPENCODE_SKILL_DIR: string | null = (() => {
 export function shouldNudge(tool: string, command: unknown): boolean {
   if (["read", "grep", "glob"].includes(tool)) return true;
   if (tool === "bash" || tool === "shell") {
-    return typeof command === "string" && command !== "" && !isDestructiveCommand(command);
+    return typeof command === "string" && command !== "" && !isDestructiveCommand(command, userClassifierOptions());
   }
   return false;
 }

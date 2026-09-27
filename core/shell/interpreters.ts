@@ -311,6 +311,14 @@ export function interpreterEvalPrograms(segment: string): EvalPrograms {
       continue;
     }
     if (NODE_PRELOAD_OPTION_RE.test(word)) return violation(word.replace(/=.*$/s, ""));
+    // `node --run SCRIPT` runs a package.json script and `node --test` the
+    // repo's test files: the program is repository code, not stdin.
+    if (head === "node" && /^--(?:run|test)(?:=|$)/.test(word)) {
+      if (word === "--run") i++;
+      operand = true;
+      firstWordSeen = true;
+      continue;
+    }
     if (!word.includes("=") && !NODE_VALUELESS_OPTION_RE.test(word)) ambiguous = true;
     const attached = /^--(?:eval|print)=(.*)$/s.exec(word);
     if (attached) {

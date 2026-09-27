@@ -21,7 +21,7 @@ import {
 import { coercePlan, isDestructiveCommand, OUTPUT_CAP, validateOperation, type ToolOp } from "../../core/index.ts";
 import { TRUNCATION_MARKER } from "../../core/runner.ts";
 import type { ProgressEvent } from "../../core/types.ts";
-import { executeAdapterPlan } from "../../adapter-runtime.ts";
+import { executeAdapterPlan, userClassifierOptions } from "../../adapter-runtime.ts";
 import { BASH_NUDGE, JSON_PATH_SINGLE_OP_LINE, VERIFY_FIRST_LINE } from "../../steering.ts";
 import {
   CONDITION_KINDS,
@@ -291,7 +291,7 @@ export default function predexec(pi: ExtensionAPI): void {
     if (event.isError) return;
     if (event.toolName === "bash" || event.toolName === "powershell") {
       const cmd = (event as { input?: { command?: string } }).input?.command ?? "";
-      if (!cmd || isDestructiveCommand(cmd)) return;
+      if (!cmd || isDestructiveCommand(cmd, userClassifierOptions())) return;
       return {
         content: [
           ...event.content,

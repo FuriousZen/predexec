@@ -66,4 +66,5 @@ export {
   type CoreResult,
   type ToolExecutor,
   type RunOptions,
+  type ClassifierOptions,
 } from "./types.ts";

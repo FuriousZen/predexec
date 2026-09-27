@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { isDestructiveCommand } from "../../core/index.ts";
+import { findDestructiveToken } from "../../core/destructive.ts";
 
 // CORE-1: heads in READ_ONLY_HEADS skip the word scan, so every write/exec
 // form they support must be caught by that head's argv predicate instead.
@@ -326,12 +327,17 @@ const FIX1_MUTATING = [
 ];
 const FIX1_READ_ONLY = [
   "echo $((1<<2))", "echo x | ruby -v", "deno --version", "bun --version", "echo x | perl -v", "node --help",
-  "echo x | node x.js", "cat <<EOF\r\nx\r\nEOF\r\n",
+  "cat <<EOF\r\nx\r\nEOF\r\n",
 ];
 
 describe("review fix round 1 (R16, R17)", () => {
   it.each(FIX1_MUTATING)("mutating: %s", (c) => expect(isDestructiveCommand(c)).toBe(true));
   it.each(FIX1_READ_ONLY)("read-only: %s", (c) => expect(isDestructiveCommand(c)).toBe(false));
+  // A script operand means stdin is data, not the program; the script itself
+  // is repository code, so D1 (not the stdin rule) stops it.
+  it("echo x | node x.js: stdin is data, the script is D1", () => {
+    expect(findDestructiveToken("echo x | node x.js")).toMatch(/^runs repository script node x\.js /);
+  });
 });
 
 // R18: every known trick that made heredoc masking hide a command line. The
@@ -357,7 +363,10 @@ describe("heredoc masking can never hide a line (R18)", () => {
 // Fix round 2: bun is allowlist-shaped like node.
 describe("bun stdin programs (fix round 2)", () => {
   it.each(["echo x | bun run -", "echo x | bun run", "echo x | bun run --watch x.ts", "cat f | bun repl"])("mutating: %s", (c) => expect(isDestructiveCommand(c)).toBe(true));
-  it.each(["echo x | bun x.ts", "bun --version", "echo x | bun run x.ts"])("read-only: %s", (c) => expect(isDestructiveCommand(c)).toBe(false));
+  it.each(["bun --version"])("read-only: %s", (c) => expect(isDestructiveCommand(c)).toBe(false));
+  // A script operand: stdin is data; the script is repository code (D1).
+  it.each(["echo x | bun x.ts", "echo x | bun run x.ts"])("D1, not a stdin program: %s", (c) =>
+    expect(findDestructiveToken(c)).toMatch(/^runs repository script bun /));
 });
 
 // Fix round 3: a heredoc inside backticks has no body in the outer parse, and

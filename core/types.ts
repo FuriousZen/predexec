@@ -203,8 +203,25 @@ export type ToolExecutor = (
   stderrTruncated?: boolean;
 }>;
 
+/**
+ * User-level classifier options. Loaded by the harness (never from anything
+ * under the session root) and passed to every place that classifies.
+ */
+export interface ClassifierOptions {
+  /** Extra heads the user declares pure readers. */
+  extraReadOnlyHeads?: readonly string[];
+  /**
+   * D1 opt-in: exact command prefixes (`python3 scripts/report.py`) or script
+   * paths (`scripts/report.py`) that lift ONLY the "runs repository script"
+   * stop; every other rule still classifies the command.
+   */
+  allowScripts?: readonly string[];
+}
+
 export interface RunOptions {
   cwd: string;
+  /** User-level classifier options for the mutation gate (see ClassifierOptions). */
+  classifier?: ClassifierOptions;
   signal?: AbortSignal;
   onProgress?: OnProgress;
   onCommandOutput?: OnCommandOutput;

@@ -328,9 +328,9 @@ describe("interpreter eval — fs-writer APIs are caught", () => {
     expect(isDestructiveCommand(cmd)).toBe(false);
   });
 
-  it("a plain script invocation (no eval flag) keeps status-quo scanning", () => {
-    expect(isDestructiveCommand("node scripts/report.js")).toBe(false);
-    expect(isDestructiveCommand("pnpm test")).toBe(false);
+  it("a plain script invocation (no eval flag) runs repository code: D1 stops it", () => {
+    expect(findDestructiveToken("node scripts/report.js")).toMatch(/^runs repository script /);
+    expect(findDestructiveToken("pnpm test")).toMatch(/^runs repository script /);
     expect(isDestructiveCommand("tsc --noEmit")).toBe(false);
   });
 
@@ -2055,8 +2055,11 @@ describe("perl magic-open channel (R31)", () => {
     `perl -e 'print <>' < README.md`,
     `perl -lane '$s += $F[0] * $F[1]; END{print $s}' f`,
     `perl -e 'print 1' 'x|'`,
-    `perl script.pl README.md`,
   ])("read-only: %s", (c) => expect(isDestructiveCommand(c)).toBe(false));
+
+  it("a perl script with a plain operand is D1, not magic open", () => {
+    expect(findDestructiveToken(`perl script.pl README.md`)).toMatch(/^runs repository script perl script\.pl /);
+  });
 });
 
 describe("perl magic-open channel, fix round 5", () => {
