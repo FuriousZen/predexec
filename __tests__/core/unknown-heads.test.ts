@@ -235,3 +235,39 @@ describe("nested backtick substitutions", () => {
     expect(performance.now() - started).toBeLessThan(3000);
   });
 });
+
+// R39: the inversion vouches for a head by name, so a PATH whose new value can
+// resolve names to repository files is command-bearing.
+describe("R39 — PATH changes that can reach repository files", () => {
+  it.each([
+    "PATH=./bin:$PATH ls", "PATH=bin:$PATH ls", "PATH=.:$PATH ls", "PATH=:$PATH ls", "PATH=$PATH: ls",
+    "PATH=/usr/bin::/bin ls", "PATH=/Users/u/repo/bin:$PATH ls", "PATH=/usr/../tmp:$PATH ls", "PATH=$HOME/bin:$PATH ls",
+    "PATH=$(pwd)/bin:$PATH ls", "PATH=~/bin:$PATH ls", "PATH+=:./bin ls",
+    "env PATH=./bin ls", "env PATH=./bin:$PATH ls", "export PATH=./bin:$PATH; ls", "declare -x PATH=./bin; ls",
+    "typeset -x PATH=./bin; ls", "PATH=./bin:$PATH; ls", "export PATH=\"$PATH:/x\"; ls",
+  ])("%s -> PATH", (c) => expect(findDestructiveToken(c)).toBe("PATH"));
+  it.each([
+    "export PATH=\"$PATH:/usr/local/bin\"; ls", "PATH=/usr/bin:/bin ls", "PATH=/opt/homebrew/bin:$PATH ls",
+    "PATH=${PATH}:/usr/sbin ls", "env PATH=/usr/bin:/bin ls", "export PATH=/nix/store/abc-x/bin:$PATH; ls",
+  ])("%s stays read-only", (c) => expect(findDestructiveToken(c)).toBeNull());
+});
+
+// R40: builtins that assign a variable are as command-bearing as `NAME=…` when
+// they target a variable that makes a later command run code.
+describe("R40 — variable-assigning builtins targeting command-bearing names", () => {
+  it.each([
+    ["read LESSOPEN < f; less x", "LESSOPEN"],
+    ["read -r a PAGER < f", "PAGER"],
+    ["read -a NODE_OPTIONS < f", "NODE_OPTIONS"],
+    ["mapfile NODE_OPTIONS < f", "NODE_OPTIONS"],
+    ["readarray -t LD_PRELOAD < f", "LD_PRELOAD"],
+    ["getopts x PATH", "PATH"],
+    ["printf -v PAGER '%s' x", "PAGER"],
+    ["printf -vGIT_PAGER x", "GIT_PAGER"],
+    ["declare -x GIT_PAGER", "GIT_PAGER"],
+    ["read $name < f", "read dynamic variable"],
+    ["printf -v \"$n\" x", "printf dynamic variable"],
+  ])("%s -> %s", (c, token) => expect(findDestructiveToken(c)).toBe(token));
+  it.each(["read -r line < f", "read -p 'Name: ' x", "mapfile -t arr < f", "getopts ab opt", "printf -v out '%s' x",
+    "while read -r a b; do echo $a; done < f"])("%s stays read-only", (c) => expect(findDestructiveToken(c)).toBeNull());
+});

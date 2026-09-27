@@ -1327,7 +1327,7 @@ printf two": null,
   "export NODE_OPTIONS+=' --require=x'; node -e 1": "NODE_OPTIONS",
   "export NODE_OPTIONS=--require=x; node -e 1": "NODE_OPTIONS",
   "export PAGER_WIDTH=80; less f": null,
-  "export PATH="$PATH:/x"; ls": null,
+  "export PATH="$PATH:/x"; ls": "PATH",
   "export const server = 1;
 ": null,
   "export const server = 1;

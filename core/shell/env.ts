@@ -22,6 +22,31 @@ import {
 } from "./heads.ts";
 
 /**
+ * Directories whose executables are system or package-manager installs, not
+ * repository files. The classifier does not know the session root, so any
+ * other absolute path may be inside the checkout and fails closed (R38).
+ */
+export const SYSTEM_PREFIXES: readonly string[] = ["/usr/", "/bin/", "/sbin/", "/opt/homebrew/", "/nix/store/"];
+
+/**
+ * R39: whether a new PATH value can resolve a bare head to a repository file.
+ * Every `:` component must be `$PATH`/`${PATH}` or a plain absolute directory
+ * under SYSTEM_PREFIXES; an empty component or `.` (the cwd), a relative or
+ * `~` path, a `.`/`..` segment, any other expansion, or an unknown value
+ * (`PATH+=…`, a bare `export PATH`) fails closed.
+ */
+export function pathValueCommandBearing(value: string | undefined): boolean {
+  if (value === undefined) return true;
+  return value.split(":").some((component) => {
+    if (component === "$PATH" || component === "${PATH}") return false;
+    if (/[$`~]/.test(component) || !component.startsWith("/")) return true;
+    if (/(?:^|\/)\.\.?(?:\/|$)/.test(component)) return true;
+    const dir = component.endsWith("/") ? component : `${component}/`;
+    return !SYSTEM_PREFIXES.some((prefix) => dir.startsWith(prefix));
+  });
+}
+
+/**
  * Environment variables that make an interpreter load code or options before
  * the eval program (`NODE_OPTIONS='"--require" x'`, `PERL5OPT=-Mevil`, an ini
  * `auto_prepend_file` via PHPRC). Any value is refused: their parsers (quote
@@ -89,6 +114,7 @@ function commandBearingEnvironment(name: string, value: string | undefined): boo
   if (lessEnvironmentWrite(name, value)) return true;
   if (MAN_COMMAND_ENV.has(name)) return true;
   if (PRELOAD_ENV_NAMES.has(name) || isDangerousEnv(name)) return true;
+  if (name === "PATH" && pathValueCommandBearing(value)) return true;
   return gitEnvironmentPrefixMutation([`${name}=`]) !== null;
 }
 
@@ -103,8 +129,11 @@ export function commandBearingEnvironmentSetting(segment: string): string | null
   const normalized = normalizeEnvInvocation(tokenizeShellWords(segment, ARGV));
   if (!normalized.complete) return null;
   for (const assignment of normalized.assignments) {
-    const name = ENV_ASSIGNMENT_RE.exec(assignment)?.[1];
+    const match = ENV_ASSIGNMENT_RE.exec(assignment);
+    const name = match?.[1];
     if (name && isDangerousEnv(name)) return name;
+    // PATH picks the program behind every later bare head, the prefixed one included.
+    if (name === "PATH" && pathValueCommandBearing(isAppendAssignment(assignment) ? undefined : match![2])) return name;
   }
   let settings: readonly string[];
   // Assignments (`NAME=v`, `NAME+=v`, `NAME[i]=v`) name the bare variable;
@@ -113,12 +142,58 @@ export function commandBearingEnvironmentSetting(segment: string): string | null
   if (normalized.argv.length === 0) settings = normalized.assignments;
   else if (DECLARATION_HEADS.has(normalized.argv[0]!.replace(/^.*\//, ""))) {
     settings = normalized.argv.slice(1).filter((operand) => !/^[-+]/.test(operand));
-  } else return null;
+  } else return assigningBuiltinTarget(normalized.argv);
   for (const setting of settings) {
     const assignment = ENV_ASSIGNMENT_RE.exec(setting);
     const name = assignment ? assignment[1]! : setting.replace(/\[.*$/s, "");
     const value = assignment && !isAppendAssignment(setting) ? assignment[2] : undefined;
     if (commandBearingEnvironment(name, value)) return name;
+  }
+  return null;
+}
+
+/**
+ * R40: builtins that assign the variables named in their argv, with the
+ * short options that take a value. Bash builtins stop option parsing at the
+ * first operand.
+ */
+const ASSIGNING_BUILTINS: Readonly<Record<string, { valueLetters: string; names: (operands: string[], values: Map<string, string[]>) => string[] }>> = {
+  read: { valueLetters: "adinNptu", names: (operands, values) => [...operands, ...(values.get("a") ?? [])] },
+  mapfile: { valueLetters: "dnOsuCc", names: (operands) => operands },
+  readarray: { valueLetters: "dnOsuCc", names: (operands) => operands },
+  getopts: { valueLetters: "", names: (operands) => operands.slice(1, 2) },
+  printf: { valueLetters: "v", names: (_operands, values) => values.get("v") ?? [] },
+};
+
+/**
+ * The command-bearing variable a `read`/`mapfile`/`getopts`/`printf -v` sets,
+ * or `<head> dynamic variable` when a target name is an expansion. Their
+ * values come from data, so the value is unknown.
+ */
+function assigningBuiltinTarget(argv: readonly string[]): string | null {
+  const head = argv[0]!.replace(/^.*\//, "");
+  if (!Object.hasOwn(ASSIGNING_BUILTINS, head)) return null;
+  const spec = ASSIGNING_BUILTINS[head]!;
+  const values = new Map<string, string[]>();
+  let i = 1;
+  for (; i < argv.length; i++) {
+    const word = argv[i]!;
+    if (word === "--") { i++; break; }
+    if (!/^-./.test(word)) break;
+    for (let j = 1; j < word.length; j++) {
+      const letter = word[j]!;
+      if (!spec.valueLetters.includes(letter)) continue;
+      const value = word.slice(j + 1) || argv[++i];
+      if (value !== undefined) values.set(letter, [...(values.get(letter) ?? []), value]);
+      break;
+    }
+  }
+  // printf's operands are its format and arguments, not names.
+  const operands = head === "printf" ? [] : argv.slice(i);
+  for (const name of spec.names(operands, values)) {
+    if (/[$`]/.test(name)) return `${head} dynamic variable`;
+    const bare = name.replace(/\[.*$/s, "");
+    if (commandBearingEnvironment(bare, undefined)) return bare;
   }
   return null;
 }

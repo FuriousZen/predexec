@@ -16,6 +16,7 @@
 
 import { ARGV, lexShellWords, normalizeEnvInvocation, tokenizeShellWords } from "./lexer.ts";
 import { EVAL_INTERPRETERS, interpreterEvalPrograms, interpreterFamily } from "./interpreters.ts";
+import { SYSTEM_PREFIXES } from "./env.ts";
 
 export interface RepositoryScriptRun {
   /** The decoded argv after wrappers and assignments (`env X=1` dropped). */
@@ -283,13 +284,6 @@ function withoutRedirections(segment: string): string {
   }
   return kept.join(" ");
 }
-
-/**
- * Directories whose executables are system or package-manager installs, not
- * repository files. The classifier does not know the session root, so any
- * other absolute path may be inside the checkout and fails closed (R38).
- */
-const SYSTEM_PREFIXES = ["/usr/", "/bin/", "/sbin/", "/opt/homebrew/", "/nix/store/"];
 
 /** A path head that may be a repository file: relative, `~`, or absolute outside SYSTEM_PREFIXES. */
 function maybeRepositoryPath(head: string): boolean {

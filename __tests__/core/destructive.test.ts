@@ -1759,7 +1759,9 @@ describe("shell-lexer must-fix (task 5)", () => {
   it.each([
     "export PAGER_WIDTH=80; less f",
     "FOO=1; echo $FOO",
-    "export PATH=\"$PATH:/x\"; ls",
+    // R39: /x may be inside the checkout, so that spelling is now PATH; a
+    // system directory keeps the row's intent.
+    "export PATH=\"$PATH:/usr/local/bin\"; ls",
   ])("ordinary environment assignments stay read-only: %s", (command) => {
     expect(isDestructiveCommand(command)).toBe(false);
   });
