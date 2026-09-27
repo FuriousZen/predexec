@@ -56,8 +56,10 @@ import {
   ARGV,
   ENV_ASSIGNMENT_RE,
   inspectCommandSubstitutions,
+  heredocScanHazard,
   inspectCommandSubstitutionTree,
   lexShellWords,
+  scanHeredocs,
   splitCommandSegments,
   type ShellWord,
 } from "./lexer.ts";
@@ -624,6 +626,10 @@ const QUOTED_EXPANSION_RE = /"(\$\{?[A-Za-z_][A-Za-z0-9_]*\}?)"/g;
  * A value with no name in it: an integer literal, or numbers and operators
  * only (`1<<2`). Evaluating it can reference or assign no variable.
  */
+/** Characters inert inside a comment or heredoc body. */
+const INERT_QUOTE_RE = /['"\\`]/;
+/** lexer.ts's word boundary: a `#` after one of these starts a comment. */
+const COMMENT_BOUNDARY_RE = /[\s;|&()`]/;
 const NAMELESS_VALUE_RE = /^[\s0-9+\-*\/%<>=!&|^~()?:,]+$/;
 
 /**
@@ -632,8 +638,23 @@ const NAMELESS_VALUE_RE = /^[\s0-9+\-*\/%<>=!&|^~()?:,]+$/;
  * except the `$name`, `$((…))`, `$[…]` and `${…}` expansions that stay live there. The
  * quote characters themselves stay, so a quote splitting a name inside a
  * context (`P"AT"H=0`) is still seen. Same length as the input; linear.
+ *
+ * R47: comments and heredoc bodies follow the lexer's model (a word-initial
+ * unquoted `#` comments to the end of the line; heredoc bodies come from
+ * scanHeredocs). A quote or backslash there is inert, so it is blanked and can
+ * never open a span that hides a later line. The rest of that text stays
+ * live: a context there is evaluated anyway (fail closed). `inert` is the
+ * command with only those inert characters blanked, for the data-flow pass,
+ * whose segmenter would otherwise read them as quotes too. `complete` is false
+ * when the heredoc scan distrusts itself or a quoted span never closes.
  */
-function liveArithmeticText(text: string): string {
+function liveArithmeticText(command: string): { text: string; inert: string; complete: boolean } {
+  const inert = command.split("");
+  for (const { bodyStart, end } of scanHeredocs(command)) {
+    for (let k = bodyStart; k < end; k++) if (INERT_QUOTE_RE.test(inert[k]!)) inert[k] = " ";
+  }
+  const text = inert.join("");
+  let complete = heredocScanHazard(command) === null;
   const out = text.split("");
   const blank = (from: number, to: number) => { for (let k = from; k < to; k++) if (out[k] !== "\n") out[k] = " "; };
   const closeOf = (start: number, open: string, close: string) => {
@@ -647,10 +668,17 @@ function liveArithmeticText(text: string): string {
   for (let i = 0; i < text.length; i++) {
     const ch = text[i]!;
     if (ch === "\\") { i++; continue; }
+    if (ch === "#" && (i === 0 || COMMENT_BOUNDARY_RE.test(text[i - 1]!))) {
+      let j = i + 1;
+      for (; j < text.length && text[j] !== "\n"; j++) if (INERT_QUOTE_RE.test(text[j]!)) out[j] = inert[j] = " ";
+      i = j - 1;
+      continue;
+    }
     if (ch === "'" || (ch === "$" && text[i + 1] === "'")) {
       const open = ch === "'" ? i : i + 1;
       let j = open + 1;
       while (j < text.length && text[j] !== "'") j += ch === "$" && text[j] === "\\" ? 2 : 1;
+      if (j >= text.length) complete = false;
       blank(open + 1, Math.min(j, text.length));
       i = j;
       continue;
@@ -673,9 +701,10 @@ function liveArithmeticText(text: string): string {
       blank(j, j + 1);
       j++;
     }
+    if (j >= text.length) complete = false;
     i = j;
   }
-  return out.join("");
+  return { text: out.join(""), inert: inert.join(""), complete };
 }
 
 /**
@@ -692,10 +721,11 @@ function liveArithmeticText(text: string): string {
  *   but an integer literal (`w=PATH=0; (( w ))` assigns PATH).
  */
 export function arithmeticAssignedNames(command: string): { names: string[]; complete: boolean; failClosed: string | null } {
-  const { flow } = analyze(command);
   // Contexts come from the live text: quoted program text (`python3 -c
   // "print(d['a'])"`) holds no shell arithmetic.
-  const ranges = arithmeticRangeIdentifiers(liveArithmeticText(command));
+  const live = liveArithmeticText(command);
+  const { flow } = analyze(live.inert);
+  const ranges = arithmeticRangeIdentifiers(live.text);
   const texts = [...ranges.covered, ...flow.arithmeticTexts];
   for (const { name, value } of flow.rawAssignments) if (flow.integerNames.has(name)) texts.push(value);
   const values = new Map<string, string[]>();
@@ -705,7 +735,7 @@ export function arithmeticAssignedNames(command: string): { names: string[]; com
     list.push(value);
   }
   const names: string[] = [];
-  const complete = ranges.complete && flow.complete;
+  const complete = ranges.complete && flow.complete && live.complete;
   let failClosed: string | null = null;
   for (const raw of texts) {
     const text = raw.replace(QUOTED_EXPANSION_RE, "$1");

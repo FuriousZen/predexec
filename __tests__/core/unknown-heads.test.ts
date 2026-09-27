@@ -391,3 +391,35 @@ describe("R45 — quoted, escaped, indirect or data-valued arithmetic", () => {
     "x=-2; (( x < 0 )) && echo neg", "x=1<<2; echo $((x))", "for ((i=1<<2; i<9; i++)); do :; done", "echo \"$((1 + 2))\"", "[[ ${#a[@]} -gt 0 ]] && ls"])(
     "%s stays read-only", (c) => expect(findDestructiveToken(c)).toBeNull());
 });
+
+// Fix round 4 (R47): the arithmetic projection honors comments and heredoc
+// bodies; a quote there is inert and cannot hide a later context.
+describe("R47 — comments and heredoc bodies cannot desync the arithmetic projection", () => {
+  it.each([
+    "ls # don't\n(( PATH=0 ))\nls # won't",
+    "echo a # it's\n(( PATH=0 )); ls # '",
+    "echo a # it's\n(( HOME=0 ))\ngit log # '",
+    "echo a # it's\n(( x=0 ))\nkubectl get pods # '",
+    "echo a # it\"s\n(( PATH=0 ))\nls # \"",
+    "echo a # it's\necho ${a[PATH=0]}\nls # '",
+    "echo a # it's\nw=PATH=0; (( w ))\nls # '",
+    "echo a # it's\nv=PATH; (( $v=0 ))\nls # '",
+    "# it's\n(( PATH=0 ))\nls # '",
+    "ls #it's\n(( PATH=0 ))\nls #'",
+    "ls;# it's\n(( PATH=0 ))\nls # '",
+    "echo a # it\\\n(( PATH=0 ))\nls",
+    "cat <<E\nit's\nE\n(( PATH=0 ))\nls # '",
+    "cat <<'E'\nit's\nE\n(( PATH=0 ))\nls # '",
+    "cat <<E\n$(( PATH=0 ))\nE",
+    "ls # $(( PATH=0 ))",
+    "echo 'unterminated\n(( PATH=0 ))",
+  ])("%j is mutating", (c) => expect(isDestructiveCommand(c)).toBe(true));
+  it.each([
+    "ls # don't\nls # won't",
+    "echo a#b'c'; ls",
+    "echo \"a # it's\"; echo $((1+2))",
+    `python3 -c "import sys, json; d = json.load(sys.stdin); print(d['a'])"`,
+    `ruby -e "puts(([1])[0])" # it's fine, isn't it`,
+    "git log # don't, won't\n(( 1 ))",
+  ])("%j stays read-only", (c) => expect(findDestructiveToken(c)).toBeNull());
+});
