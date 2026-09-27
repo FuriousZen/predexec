@@ -1069,7 +1069,6 @@ describe("path operands of any head (E-E, Claude Read rules)", () => {
     "column .en?",
     "fold [.]env",
     "expand ./.en[v]",
-    "echo *",
     "cd src && unknowntool ../.env",
     "cd src; cd ..; unknowntool .env",
     "perl -e 'print 1' .env",
@@ -1107,5 +1106,73 @@ describe("path operands of any head (E-E, Claude Read rules)", () => {
     const { check } = setup(["Read(./.env)"]);
     expect(check("grep .env README.md")).toBeNull();
     expect(check("cd src && cat x")).toMatch(/unresolvable/);
+  });
+});
+
+describe("R24: non-reading builtins, shared resolver module, git object paths (Claude)", () => {
+  let tmp: string;
+  afterEach(() => tmp && rmSync(tmp, { recursive: true, force: true }));
+
+  const setup = () => {
+    tmp = realpathSync(mkdtempSync(join(tmpdir(), "px-claude-r24-")));
+    const repo = join(tmp, "repo");
+    const home = join(tmp, "home");
+    const managed = join(tmp, "managed");
+    for (const dir of [join(repo, ".claude"), join(repo, ".git"), join(repo, "src"), join(home, ".claude"), managed]) mkdirSync(dir, { recursive: true });
+    writeFileSync(join(repo, ".env"), "TOKEN=1\n");
+    writeFileSync(join(repo, "README.md"), "hello\n");
+    writeFileSync(join(repo, ".claude", "settings.json"), JSON.stringify({ permissions: { deny: ["Read(./.env)"] } }));
+    const check = createClaudeHostPolicyChecker(repo, {
+      env: { CLAUDE_CONFIG_DIR: join(home, ".claude") } as NodeJS.ProcessEnv,
+      managedDir: managed,
+      home,
+      managedPolicySources: () => [],
+    });
+    return (command: string) => check(command, { cwd: repo, sessionRoot: repo });
+  };
+
+  it.each([
+    "echo .env",
+    'echo "$HOME"',
+    "echo *",
+    "printf '%s\\n' \"$x\" .env",
+    "printenv HOME",
+    "true .env",
+    "false .env",
+    ": .env",
+    "test -f .env",
+    "[ -r .env ]",
+    '[[ "$a" == b ]]',
+    "git show HEAD:README.md",
+    "cd src && git show HEAD:README.md",
+    "git log --oneline",
+  ])("allows `%s`", (command) => {
+    expect(setup()(command)).toBeNull();
+  });
+
+  it.each([
+    "echo x < .env",
+    "echo $(cat .env)",
+    "git show HEAD:.env",
+    "git show :.env",
+    "git show :0:.env",
+    "git cat-file -p HEAD:.env",
+    "git cat-file blob HEAD:.env",
+    "git log -p -- .env",
+    "git diff HEAD~1 -- .env",
+    "git log -p .env",
+    "cd src && git show HEAD:.env",
+    "cd src && git show HEAD:./../.env",
+    "git -C src log -p -- ../.env",
+    "git show 'HEAD:.env'",
+    "git log -p -- '*.env'",
+    "git log -p -- ':(top).env'",
+  ])("Read(./.env) deny stops `%s`", (command) => {
+    expect(setup()(command)).not.toBeNull();
+  });
+
+  it("the resolver lives in its own module", async () => {
+    const mod = await import("../../mcp/shell-path-operands.ts");
+    expect(typeof mod.resolveShellPathOperands).toBe("function");
   });
 });

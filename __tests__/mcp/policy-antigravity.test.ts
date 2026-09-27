@@ -517,3 +517,27 @@ describe("path operands of any head (E-E, Antigravity read_file grants)", () => 
     expect(run("cat README.md")).not.toBeNull();
   });
 });
+
+describe("R24: non-reading builtins and git object paths (Antigravity)", () => {
+  const prep = () => {
+    const c = checker({ permissions: { deny: ["read_file(.env)"] } });
+    mkdirSync(join(c.ws, "src"));
+    writeFileSync(join(c.ws, ".env"), "TOKEN=1\n");
+    writeFileSync(join(c.ws, "README.md"), "hello\n");
+    return c.run;
+  };
+  it.each(["echo .env", 'echo "$HOME"', "printenv HOME", "test -f .env", "git show HEAD:README.md"])("allows `%s`", (command) => {
+    expect(prep()(command)).toBeNull();
+  });
+  it.each([
+    "git show HEAD:.env",
+    "git show :.env",
+    "git cat-file -p HEAD:.env",
+    "git cat-file blob HEAD:.env",
+    "git log -p -- .env",
+    "git diff HEAD~1 -- .env",
+    "cd src && git show HEAD:.env",
+  ])("read_file(.env) deny stops `%s`", (command) => {
+    expect(prep()(command)).not.toBeNull();
+  });
+});

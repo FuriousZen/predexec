@@ -72,7 +72,7 @@ import {
   type PolicyVerdict,
   type WrapperInspectionOptions,
 } from "../core/index.ts";
-import { resolveShellPathOperands } from "./policy-claude.ts";
+import { resolveShellPathOperands } from "./shell-path-operands.ts";
 
 export interface AntigravityGrant {
   action: string;
